@@ -1,6 +1,8 @@
 #![feature(portable_simd)]
 /// ! This module contains helpers to express and use constraints for components.
 mod component;
+
+// TODO(Ohad): flag this with a std feature instead.
 #[cfg(feature = "prover")]
 pub mod expr;
 mod info;
