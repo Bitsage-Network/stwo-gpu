@@ -7,11 +7,12 @@ use super::super::fields::qm31::SecureField;
 use super::super::fri::{CirclePolyDegreeBound, FriVerifier};
 use super::quotients::{fri_answers, PointSample};
 use super::utils::TreeVec;
-use super::{CommitmentSchemeProof, PcsConfig};
+use super::PcsConfig;
 use crate::core::channel::{Channel, MerkleChannel};
-use crate::core::prover::VerificationError;
-use crate::core::vcs::ops::MerkleHasher;
+use crate::core::pcs::quotients::CommitmentSchemeProof;
 use crate::core::vcs::verifier::MerkleVerifier;
+use crate::core::vcs::MerkleHasher;
+use crate::core::verifier::VerificationError;
 use crate::core::ColumnVec;
 
 /// The verifier side of a FRI polynomial commitment scheme. See [super].

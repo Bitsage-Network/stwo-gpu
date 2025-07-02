@@ -5,16 +5,17 @@ use stwo_constraint_framework::{
     relation, EvalAtRow, FrameworkComponent, FrameworkEval, InfoEvaluator, RelationEntry,
     PREPROCESSED_TRACE_IDX,
 };
-use stwo_prover::core::air::{Component, ComponentProver};
-use stwo_prover::core::backend::simd::SimdBackend;
+use stwo_prover::core::air::Component;
 use stwo_prover::core::channel::Channel;
 use stwo_prover::core::fields::m31::{BaseField, M31};
 use stwo_prover::core::fields::qm31::{SecureField, QM31};
 use stwo_prover::core::pcs::TreeVec;
-use stwo_prover::core::poly::circle::CircleEvaluation;
-use stwo_prover::core::poly::BitReversedOrder;
-use stwo_prover::core::prover::StarkProof;
-use stwo_prover::core::vcs::ops::MerkleHasher;
+use stwo_prover::core::proof::StarkProof;
+use stwo_prover::core::vcs::MerkleHasher;
+use stwo_prover::prover::backend::simd::SimdBackend;
+use stwo_prover::prover::poly::circle::CircleEvaluation;
+use stwo_prover::prover::poly::BitReversedOrder;
+use stwo_prover::prover::ComponentProver;
 
 const LOG_CONSTRAINT_DEGREE: u32 = 1;
 pub const STATE_SIZE: usize = 2;

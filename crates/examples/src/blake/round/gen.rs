@@ -3,18 +3,18 @@ use std::vec;
 
 use itertools::{chain, Itertools};
 use num_traits::One;
-use stwo_constraint_framework::logup::LogupTraceGenerator;
-use stwo_constraint_framework::{Relation, ORIGINAL_TRACE_IDX};
-use stwo_prover::core::backend::simd::column::BaseColumn;
-use stwo_prover::core::backend::simd::m31::{PackedBaseField, LOG_N_LANES};
-use stwo_prover::core::backend::simd::qm31::PackedSecureField;
-use stwo_prover::core::backend::simd::SimdBackend;
-use stwo_prover::core::backend::{Col, Column};
+use stwo_constraint_framework::{LogupTraceGenerator, Relation, ORIGINAL_TRACE_IDX};
 use stwo_prover::core::fields::m31::BaseField;
 use stwo_prover::core::fields::qm31::SecureField;
-use stwo_prover::core::poly::circle::{CanonicCoset, CircleEvaluation};
-use stwo_prover::core::poly::BitReversedOrder;
+use stwo_prover::core::poly::circle::CanonicCoset;
 use stwo_prover::core::ColumnVec;
+use stwo_prover::prover::backend::simd::column::BaseColumn;
+use stwo_prover::prover::backend::simd::m31::{PackedBaseField, LOG_N_LANES};
+use stwo_prover::prover::backend::simd::qm31::PackedSecureField;
+use stwo_prover::prover::backend::simd::SimdBackend;
+use stwo_prover::prover::backend::{Col, Column};
+use stwo_prover::prover::poly::circle::CircleEvaluation;
+use stwo_prover::prover::poly::BitReversedOrder;
 use tracing::{span, Level};
 
 use super::{BlakeXorElements, RoundElements};

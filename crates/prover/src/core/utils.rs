@@ -1,6 +1,5 @@
 use std::iter::Peekable;
 
-use super::fields::m31::BaseField;
 use super::fields::Field;
 
 pub trait IteratorMutExt<'a, T: 'a>: Iterator<Item = &'a mut T> {
@@ -57,9 +56,26 @@ pub const fn bit_reverse_index(i: usize, log_size: u32) -> usize {
     i.reverse_bits() >> (usize::BITS - log_size)
 }
 
+/// Performs a naive bit-reversal permutation inplace.
+///
+/// # Panics
+///
+/// Panics if the length of the slice is not a power of two.
+pub fn bit_reverse<T>(v: &mut [T]) {
+    let n = v.len();
+    assert!(n.is_power_of_two());
+    let log_n = n.ilog2();
+    for i in 0..n {
+        let j = bit_reverse_index(i, log_n);
+        if j > i {
+            v.swap(i, j);
+        }
+    }
+}
+
 /// Returns the index of the previous element in a bit reversed
-/// [super::poly::circle::CircleEvaluation] of log size `eval_log_size` relative to a smaller domain
-/// of size `domain_log_size`.
+/// [crate::prover::poly::circle::CircleEvaluation] of log size `eval_log_size` relative to a
+/// smaller domain of size `domain_log_size`.
 pub const fn previous_bit_reversed_circle_domain_index(
     i: usize,
     domain_log_size: u32,
@@ -69,8 +85,8 @@ pub const fn previous_bit_reversed_circle_domain_index(
 }
 
 /// Returns the index of the offset element in a bit reversed
-/// [super::poly::circle::CircleEvaluation] of log size `eval_log_size` relative to a smaller domain
-/// of size `domain_log_size`.
+/// [crate::prover::poly::circle::CircleEvaluation] of log size `eval_log_size` relative to a
+/// smaller domain of size `domain_log_size`.
 pub const fn offset_bit_reversed_circle_domain_index(
     i: usize,
     domain_log_size: u32,
@@ -91,7 +107,10 @@ pub const fn offset_bit_reversed_circle_domain_index(
 
 // TODO(AlonH): Pair both functions below with bit reverse. Consider removing both and calculating
 // the indices instead.
-pub(crate) fn circle_domain_order_to_coset_order(values: &[BaseField]) -> Vec<BaseField> {
+#[cfg(feature = "prover")]
+pub(crate) fn circle_domain_order_to_coset_order(
+    values: &[crate::core::fields::m31::BaseField],
+) -> Vec<crate::core::fields::m31::BaseField> {
     let n = values.len();
     let mut coset_order = vec![];
     for i in 0..(n / 2) {
@@ -169,20 +188,20 @@ pub unsafe fn uninit_vec<T>(len: usize) -> Vec<T> {
     vec
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "prover"))]
 mod tests {
     use itertools::Itertools;
 
     use super::{
         offset_bit_reversed_circle_domain_index, previous_bit_reversed_circle_domain_index,
     };
-    use crate::core::backend::cpu::CpuCircleEvaluation;
     use crate::core::poly::circle::CanonicCoset;
-    use crate::core::poly::NaturalOrder;
     use crate::core::utils::{
         circle_domain_index_to_coset_index, coset_index_to_circle_domain_index,
     };
     use crate::m31;
+    use crate::prover::backend::cpu::CpuCircleEvaluation;
+    use crate::prover::poly::NaturalOrder;
 
     #[test]
     fn test_offset_bit_reversed_circle_domain_index() {
