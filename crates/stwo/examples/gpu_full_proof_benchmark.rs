@@ -12,7 +12,6 @@
 
 #[cfg(all(feature = "cuda-runtime", feature = "prover"))]
 fn main() {
-    use std::time::Instant;
     use stwo::prover::backend::gpu::pipeline::{
         benchmark_proof_pipeline, 
         benchmark_full_proof_pipeline,
