@@ -26,7 +26,7 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(feature = "cuda-runtime")]
-use cudarc::driver::{CudaDevice, CudaSlice};
+use cudarc::driver::{CudaDevice, CudaSlice, LaunchAsync, LaunchConfig};
 
 #[cfg(feature = "cuda-runtime")]
 use super::cuda_executor::{CudaFftError, CudaFftExecutor};
@@ -328,7 +328,7 @@ impl GpuExecutorContext {
             let n_twiddles = twiddles.twiddles_cpu[layer].len();
             let grid_size = ((n_twiddles as u32) + block_size - 1) / block_size;
             
-            let cfg = cudarc::driver::LaunchConfig {
+            let cfg = LaunchConfig {
                 grid_dim: (grid_size, 1, 1),
                 block_dim: (block_size, 1, 1),
                 shared_mem_bytes: 0,
