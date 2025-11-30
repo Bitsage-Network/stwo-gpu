@@ -1258,6 +1258,7 @@ impl std::fmt::Display for BatchProofBenchmarkResult {
 /// Stream 2 (Download): [Download 0]  [Download 1]  [Download 2]  ...
 /// ```
 #[cfg(feature = "cuda-runtime")]
+#[allow(dead_code)]  // Fields are used for future stream-based async operations
 pub struct GpuStreamingPipeline {
     /// Double-buffered polynomial data on GPU
     buffers: [Vec<CudaSlice<u32>>; 2],
