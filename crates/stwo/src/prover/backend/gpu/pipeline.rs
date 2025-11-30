@@ -595,9 +595,10 @@ impl GpuProofPipeline {
     // Merkle Hashing Operations (on persistent GPU memory)
     // =========================================================================
     
-    /// Execute Blake2s Merkle hashing on GPU.
+    /// Execute Blake2s Merkle hashing on GPU (data stays on GPU).
     /// 
     /// Hashes polynomial columns to create Merkle tree leaves.
+    /// This version keeps polynomial data on GPU - no unnecessary transfers!
     /// 
     /// # Arguments
     /// * `column_indices` - Indices of polynomials to hash
@@ -613,24 +614,32 @@ impl GpuProofPipeline {
         let executor = get_cuda_executor().map_err(|e| e.clone())?;
         
         let n_columns = column_indices.len();
+        let n = 1usize << self.log_size;
         
-        // Gather column data from GPU
-        let mut flat_columns: Vec<u32> = Vec::new();
+        // Validate indices
         for &idx in column_indices {
             if idx >= self.poly_data.len() {
                 return Err(CudaFftError::InvalidSize(
                     format!("Invalid column index: {}", idx)
                 ));
             }
-            let mut col_data = vec![0u32; 1 << self.log_size];
-            executor.device.dtoh_sync_copy_into(&self.poly_data[idx], &mut col_data)
-                .map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
-            flat_columns.extend_from_slice(&col_data);
         }
         
-        // Upload to GPU
-        let d_columns = executor.device.htod_sync_copy(&flat_columns)
-            .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        // Allocate contiguous buffer for columns on GPU (data is already there!)
+        // We need to gather the columns into a contiguous buffer for the kernel
+        let mut d_columns = unsafe {
+            executor.device.alloc::<u32>(n_columns * n)
+        }.map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        
+        // Copy polynomial data on GPU (device-to-device copy)
+        for (i, &idx) in column_indices.iter().enumerate() {
+            unsafe {
+                executor.device.dtod_copy(
+                    &self.poly_data[idx],
+                    &mut d_columns.slice_mut(i * n..(i + 1) * n),
+                ).map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
+            }
+        }
         
         // Allocate output (32 bytes per hash)
         let mut d_output = unsafe {
@@ -675,6 +684,156 @@ impl GpuProofPipeline {
             .map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
         
         Ok(output)
+    }
+    
+    /// Build a full Merkle tree from leaves, keeping all data on GPU.
+    /// 
+    /// This builds the entire tree in one call, avoiding per-layer transfers.
+    /// Only the final root is downloaded.
+    /// 
+    /// # Arguments
+    /// * `column_indices` - Indices of polynomials to hash for leaves
+    /// * `n_leaves` - Number of leaves
+    /// 
+    /// # Returns
+    /// Merkle root (32 bytes)
+    pub fn merkle_tree_full(
+        &self,
+        column_indices: &[usize],
+        n_leaves: usize,
+    ) -> Result<[u8; 32], CudaFftError> {
+        let executor = get_cuda_executor().map_err(|e| e.clone())?;
+        
+        let n_columns = column_indices.len();
+        let n = 1usize << self.log_size;
+        
+        // Validate indices
+        for &idx in column_indices {
+            if idx >= self.poly_data.len() {
+                return Err(CudaFftError::InvalidSize(
+                    format!("Invalid column index: {}", idx)
+                ));
+            }
+        }
+        
+        // Allocate contiguous buffer for columns on GPU
+        let mut d_columns = unsafe {
+            executor.device.alloc::<u32>(n_columns * n)
+        }.map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        
+        // Copy polynomial data on GPU (device-to-device copy)
+        for (i, &idx) in column_indices.iter().enumerate() {
+            unsafe {
+                executor.device.dtod_copy(
+                    &self.poly_data[idx],
+                    &mut d_columns.slice_mut(i * n..(i + 1) * n),
+                ).map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
+            }
+        }
+        
+        // Allocate two buffers for ping-pong between layers
+        let max_layer_size = n_leaves * 32;
+        let mut d_layer_a = unsafe {
+            executor.device.alloc::<u8>(max_layer_size)
+        }.map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        let mut d_layer_b = unsafe {
+            executor.device.alloc::<u8>(max_layer_size)
+        }.map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        
+        // Dummy buffer for columns (not used after leaf layer)
+        let dummy_cols = unsafe {
+            executor.device.alloc::<u32>(1)
+        }.map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        
+        // Phase 1: Hash leaves
+        let block_size = 256u32;
+        let grid_size = ((n_leaves as u32) + block_size - 1) / block_size;
+        
+        let cfg = LaunchConfig {
+            grid_dim: (grid_size, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        
+        // Dummy prev_layer for leaf hashing
+        let dummy_prev = unsafe {
+            executor.device.alloc::<u8>(1)
+        }.map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        
+        unsafe {
+            executor.kernels.merkle_layer.clone().launch(
+                cfg,
+                (
+                    &mut d_layer_a,
+                    &d_columns,
+                    &dummy_prev,
+                    n_columns as u32,
+                    n_leaves as u32,
+                    0u32, // has_prev_layer = false
+                ),
+            ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
+        }
+        
+        // Phase 2: Build tree layers (all on GPU)
+        let mut current_size = n_leaves;
+        let mut use_a = true;  // Ping-pong between buffers
+        
+        while current_size > 1 {
+            let next_size = current_size / 2;
+            let grid_size = ((next_size as u32) + block_size - 1) / block_size;
+            
+            let cfg = LaunchConfig {
+                grid_dim: (grid_size, 1, 1),
+                block_dim: (block_size, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            
+            if use_a {
+                // Read from A, write to B
+                unsafe {
+                    executor.kernels.merkle_layer.clone().launch(
+                        cfg,
+                        (
+                            &mut d_layer_b,
+                            &dummy_cols,
+                            &d_layer_a,
+                            0u32, // n_columns = 0
+                            next_size as u32,
+                            1u32, // has_prev_layer = true
+                        ),
+                    ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
+                }
+            } else {
+                // Read from B, write to A
+                unsafe {
+                    executor.kernels.merkle_layer.clone().launch(
+                        cfg,
+                        (
+                            &mut d_layer_a,
+                            &dummy_cols,
+                            &d_layer_b,
+                            0u32, // n_columns = 0
+                            next_size as u32,
+                            1u32, // has_prev_layer = true
+                        ),
+                    ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
+                }
+            }
+            
+            current_size = next_size;
+            use_a = !use_a;
+        }
+        
+        executor.device.synchronize()
+            .map_err(|e| CudaFftError::KernelExecution(format!("Sync failed: {:?}", e)))?;
+        
+        // Download only the root (32 bytes)
+        let mut root = [0u8; 32];
+        let root_buffer = if use_a { &d_layer_a } else { &d_layer_b };
+        executor.device.dtoh_sync_copy_into(&root_buffer.slice(0..32), &mut root)
+            .map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
+        
+        Ok(root)
     }
     
     /// Build a full Merkle tree layer from previous layer hashes.
@@ -877,17 +1036,11 @@ pub fn benchmark_full_proof_pipeline(
     pipeline.sync()?;
     let fri_time = fri_start.elapsed();
     
-    // Phase 3: Merkle Hashing
+    // Phase 3: Merkle Hashing (all on GPU with single download of root)
     let merkle_start = Instant::now();
     let column_indices: Vec<usize> = (0..num_polynomials).collect();
-    let n_hashes = n / 2;  // Simplified
-    let leaf_hashes = pipeline.merkle_hash(&column_indices, n_hashes)?;
-    
-    // Build tree layers
-    let mut current_layer = leaf_hashes;
-    while current_layer.len() > 64 {  // Until we have small root
-        current_layer = pipeline.merkle_tree_layer(&current_layer)?;
-    }
+    let n_leaves = n / 2;  // Simplified
+    let _merkle_root = pipeline.merkle_tree_full(&column_indices, n_leaves)?;
     let merkle_time = merkle_start.elapsed();
     
     // Download final results (just the Merkle root in real proof)
