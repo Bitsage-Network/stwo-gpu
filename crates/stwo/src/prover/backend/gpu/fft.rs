@@ -427,22 +427,17 @@ extern "C" __global__ void ifft_fused_kernel(
     if (load_idx1 < n) data[load_idx1] = shared_data[tid + BLOCK_SIZE];
 }
 
-// Simple fused kernel for remaining layers (global memory only)
-// Processes 3 layers at a time to reduce kernel launches
-extern "C" __global__ void ifft_fused_global_kernel(
+// Simple fused kernel for 2 layers (global memory only)
+// Reduces kernel launches by half
+extern "C" __global__ void ifft_fused_2layer_kernel(
     uint32_t* data,
     const uint32_t* twiddles_0,
     const uint32_t* twiddles_1,
-    const uint32_t* twiddles_2,
     uint32_t n_twiddles_0,
     uint32_t n_twiddles_1,
-    uint32_t n_twiddles_2,
     uint32_t layer_0,
     uint32_t layer_1,
-    uint32_t layer_2,
-    uint32_t log_n,
-    uint32_t do_layer_1,  // Boolean flags
-    uint32_t do_layer_2
+    uint32_t log_n
 ) {
     uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     
@@ -473,8 +468,8 @@ extern "C" __global__ void ifft_fused_global_kernel(
     __threadfence();
     __syncthreads();
     
-    // Layer 1 (if requested)
-    if (do_layer_1) {
+    // Layer 1
+    {
         uint32_t butterflies_per_twiddle = 1u << layer_1;
         uint32_t total_butterflies = n_twiddles_1 * butterflies_per_twiddle;
         
@@ -486,33 +481,6 @@ extern "C" __global__ void ifft_fused_global_kernel(
             uint32_t idx1 = idx0 + (1u << layer_1);
             
             uint32_t twiddle_dbl = twiddles_1[h];
-            
-            uint32_t a = data[idx0];
-            uint32_t b = data[idx1];
-            
-            ibutterfly(&a, &b, twiddle_dbl);
-            
-            data[idx0] = a;
-            data[idx1] = b;
-        }
-        
-        __threadfence();
-        __syncthreads();
-    }
-    
-    // Layer 2 (if requested)
-    if (do_layer_2) {
-        uint32_t butterflies_per_twiddle = 1u << layer_2;
-        uint32_t total_butterflies = n_twiddles_2 * butterflies_per_twiddle;
-        
-        if (tid < total_butterflies) {
-            uint32_t h = tid / butterflies_per_twiddle;
-            uint32_t l = tid % butterflies_per_twiddle;
-            
-            uint32_t idx0 = (h << (layer_2 + 1)) + l;
-            uint32_t idx1 = idx0 + (1u << layer_2);
-            
-            uint32_t twiddle_dbl = twiddles_2[h];
             
             uint32_t a = data[idx0];
             uint32_t b = data[idx1];
