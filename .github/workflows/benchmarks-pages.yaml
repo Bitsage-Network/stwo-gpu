@@ -1,0 +1,38 @@
+name:
+
+on:
+  push:
+    branches:
+      - dev
+
+permissions:
+  # deployments permission to deploy GitHub pages website
+  deployments: write
+  # contents permission to update benchmark contents in gh-pages branch
+  contents: write
+
+jobs:
+  run-avx-bench:
+    runs-on: stwo-avx
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/bootstrap_runners
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2025-07-14
+      - name: Run benchmark
+        run: |
+          cargo install cargo-criterion
+          ./scripts/bench.sh |& tee output.txt
+      - name: Download previous benchmark data
+        uses: actions/cache@v4
+        with:
+          path: ./cache
+          key: ${{ runner.os }}-${{github.event.pull_request.base.ref}}-benchmark
+      - name: Store benchmark result
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          tool: "cargo"
+          output-file-path: output.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
