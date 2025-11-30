@@ -303,9 +303,9 @@ mod cuda_fft {
     /// - For log_size >= 14, GPU computation dominates
     /// - Radix-8 kernel provides best throughput for large sizes
     pub fn execute_gpu_ifft(
-        data: &mut [u32],
-        twiddles: &[Vec<u32>],
-        log_size: u32,
+        _data: &mut [u32],
+        _twiddles: &[Vec<u32>],
+        _log_size: u32,
     ) -> Result<(), String> {
         // This would use cudarc or cuda-sys to:
         // 1. Initialize CUDA context
@@ -322,9 +322,9 @@ mod cuda_fft {
     
     /// Execute FFT on GPU using CUDA.
     pub fn execute_gpu_fft(
-        data: &mut [u32],
-        twiddles: &[Vec<u32>],
-        log_size: u32,
+        _data: &mut [u32],
+        _twiddles: &[Vec<u32>],
+        _log_size: u32,
     ) -> Result<(), String> {
         // Similar to IFFT but with forward twiddles
         Err("CUDA runtime not yet integrated".to_string())

@@ -158,7 +158,7 @@ impl CudaFftExecutor {
         })
     }
     
-    fn get_device_info(device: &CudaDevice) -> Result<DeviceInfo, CudaFftError> {
+    fn get_device_info(_device: &CudaDevice) -> Result<DeviceInfo, CudaFftError> {
         // Note: cudarc doesn't expose all device properties directly
         // We use reasonable defaults for now
         Ok(DeviceInfo {
