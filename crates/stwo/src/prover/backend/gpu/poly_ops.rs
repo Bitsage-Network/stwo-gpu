@@ -140,7 +140,7 @@ impl PolyOps for GpuBackend {
         
         // Small polynomials or few columns: use sequential approach
         if log_size < GPU_FFT_THRESHOLD_LOG_SIZE || num_columns < 2 {
-            eprintln!("[GPU] interpolate_columns: SEQUENTIAL path (log_size={}, num_columns={}, threshold={})", 
+            tracing::debug!("GPU interpolate_columns: sequential (log_size={}, num_columns={}, threshold={})", 
                      log_size, num_columns, GPU_FFT_THRESHOLD_LOG_SIZE);
             return columns
                 .into_iter()
@@ -156,7 +156,7 @@ impl PolyOps for GpuBackend {
             );
         }
         
-        eprintln!("[GPU] interpolate_columns: BATCH path (log_size={}, num_columns={})", log_size, num_columns);
+        tracing::info!("GPU interpolate_columns: batch (log_size={}, num_columns={})", log_size, num_columns);
         
         gpu_batch_interpolate(columns, log_size)
     }
@@ -194,7 +194,7 @@ impl PolyOps for GpuBackend {
         
         // Small polynomials or few: use sequential approach
         if log_size < GPU_FFT_THRESHOLD_LOG_SIZE || num_polys < 2 {
-            eprintln!("[GPU] evaluate_columns: SEQUENTIAL path (log_size={}, num_polys={}, threshold={})", 
+            tracing::debug!("GPU evaluate_columns: sequential (log_size={}, num_polys={}, threshold={})", 
                      log_size, num_polys, GPU_FFT_THRESHOLD_LOG_SIZE);
             return polynomials
                 .into_iter()
@@ -210,7 +210,7 @@ impl PolyOps for GpuBackend {
             );
         }
         
-        eprintln!("[GPU] evaluate_columns: BATCH path (log_size={}, num_polys={}, domain_log_size={})", 
+        tracing::info!("GPU evaluate_columns: batch (log_size={}, num_polys={}, domain_log_size={})", 
                  log_size, num_polys, domain_log_size);
         
         gpu_batch_evaluate_columns(polynomials, domain, domain_log_size)
@@ -575,7 +575,7 @@ fn gpu_batch_interpolate(
             })
             .collect();
         
-        eprintln!("[GPU] batch_interpolate: upload={:?}, compute={:?}, download={:?}, total={:?}",
+        tracing::debug!("GPU batch_interpolate: upload={:?}, compute={:?}, download={:?}, total={:?}",
                  upload_time, compute_time, download_time, 
                  upload_time + compute_time + download_time);
         
@@ -756,7 +756,7 @@ fn gpu_batch_evaluate_columns(
             })
             .collect();
         
-        eprintln!("[GPU] batch_evaluate_columns: upload={:?}, compute={:?}, download={:?}, total={:?}",
+        tracing::debug!("GPU batch_evaluate_columns: upload={:?}, compute={:?}, download={:?}, total={:?}",
                  upload_time, compute_time, download_time,
                  upload_time + compute_time + download_time);
         
