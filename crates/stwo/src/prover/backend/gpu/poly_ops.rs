@@ -55,8 +55,8 @@ use std::cell::RefCell;
 #[cfg(feature = "cuda-runtime")]
 use std::collections::HashMap;
 
-/// Thread-local cache of GPU pipelines by log_size.
-/// This allows reusing GPU memory allocations across multiple batch operations.
+// Thread-local cache of GPU pipelines by log_size.
+// This allows reusing GPU memory allocations across multiple batch operations.
 #[cfg(feature = "cuda-runtime")]
 thread_local! {
     static PIPELINE_CACHE: RefCell<HashMap<u32, GpuProofPipeline>> = RefCell::new(HashMap::new());
