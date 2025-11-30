@@ -718,8 +718,8 @@ pub fn benchmark_full_proof_pipeline(
         })
         .collect();
     
-    // Generate FRI twiddles and alpha
-    let itwiddles: Vec<u32> = (0..n/2)
+    // Generate FRI twiddles and alpha (unused in simplified benchmark)
+    let _itwiddles: Vec<u32> = (0..n/2)
         .map(|i| ((i * 11 + 3) as u32) % ((1 << 31) - 1))
         .collect();
     let _alpha: [u32; 4] = [12345, 67890, 11111, 22222];
