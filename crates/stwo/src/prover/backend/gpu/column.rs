@@ -37,6 +37,8 @@ use crate::core::fields::qm31::SecureField;
 use crate::core::vcs::blake2_hash::Blake2sHash;
 use crate::prover::backend::simd::column::{BaseColumn, SecureColumn};
 use crate::prover::backend::ColumnOps;
+#[cfg(feature = "cuda-runtime")]
+use crate::prover::backend::Column;
 
 use super::GpuBackend;
 

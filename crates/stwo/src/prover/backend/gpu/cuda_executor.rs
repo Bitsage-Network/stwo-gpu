@@ -830,9 +830,8 @@ impl CudaFftExecutor {
                 }
                 (Some(cols), None) => {
                     // Need a dummy buffer for prev_layer
-                    let dummy_prev = unsafe {
-                        self.device.alloc::<u8>(1)
-                    }.map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+                    let dummy_prev = self.device.alloc::<u8>(1)
+                        .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
                     self.kernels.merkle_layer.clone().launch(
                         cfg,
                         (
@@ -847,9 +846,8 @@ impl CudaFftExecutor {
                 }
                 (None, Some(prev)) => {
                     // Need a dummy buffer for columns
-                    let dummy_cols = unsafe {
-                        self.device.alloc::<u32>(1)
-                    }.map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+                    let dummy_cols = self.device.alloc::<u32>(1)
+                        .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
                     self.kernels.merkle_layer.clone().launch(
                         cfg,
                         (
