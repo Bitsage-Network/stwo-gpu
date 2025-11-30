@@ -128,7 +128,6 @@ where
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod poseidon252 {
-    #[cfg(feature = "parallel")]
     use starknet_crypto::poseidon_hash_many;
     use starknet_ff::FieldElement as FieldElement252;
 
@@ -140,21 +139,20 @@ pub mod poseidon252 {
     impl GrindOps<Poseidon252Channel> for SimdBackend {
         fn grind(channel: &Poseidon252Channel, pow_bits: u32) -> u64 {
             let digest = channel.digest();
+            let prefixed_digest = poseidon_hash_many(&[
+                Poseidon252Channel::POW_PREFIX.into(),
+                digest,
+                pow_bits.into(),
+            ]);
             
             #[cfg(not(feature = "parallel"))]
             let res = (0..)
-                .find_map(|hi| grind_poseidon(digest, hi, pow_bits))
+                .find_map(|hi| grind_poseidon(prefixed_digest, hi, pow_bits))
                 .expect("Grind failed to find a solution.");
 
             #[cfg(feature = "parallel")]
-            let res = {
-                let prefixed_digest = poseidon_hash_many(&[
-                    Poseidon252Channel::POW_PREFIX.into(),
-                    digest,
-                    pow_bits.into(),
-                ]);
-                parallel_grind(prefixed_digest, pow_bits, grind_poseidon)
-            };
+            let res = parallel_grind(prefixed_digest, pow_bits, grind_poseidon);
+            
             res
         }
     }

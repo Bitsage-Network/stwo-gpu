@@ -158,12 +158,13 @@ fn accumulate_quotients_on_subdomain(
     #[cfg(not(feature = "parallel"))]
     let iter = {
         // OBELYSK FIX: Replace unstable array_chunks with stable collect+chunks_exact
+        // Note: quad_row indices start from 0 and increment by 1 for each group of 4 points
         let quad_rows_vec: Vec<_> = quad_rows.collect();
         quad_rows_vec
             .chunks_exact(4)
             .zip(values.chunks_mut(4))
             .enumerate()
-            .map(|(i, (chunk, vals))| (i, ([chunk[0], chunk[1], chunk[2], chunk[3]], vals)))
+            .map(|(quad_row, (chunk, vals))| (quad_row, ([chunk[0], chunk[1], chunk[2], chunk[3]], vals)))
             .collect::<Vec<_>>()
             .into_iter()
     };
