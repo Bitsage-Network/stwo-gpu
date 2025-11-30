@@ -121,8 +121,6 @@ impl ColumnOps<Blake2sHash> for GpuBackend {
 /// Perform bit reversal on a BaseColumn using GPU.
 #[cfg(feature = "cuda-runtime")]
 fn gpu_bit_reverse_base_column(column: &mut BaseColumn) -> Result<(), CudaFftError> {
-    use crate::prover::backend::simd::m31::LOG_N_LANES;
-    
     let executor = get_cuda_executor().map_err(|e| e.clone())?;
     let len = column.len();
     let log_size = len.ilog2();
@@ -145,11 +143,23 @@ fn gpu_bit_reverse_base_column(column: &mut BaseColumn) -> Result<(), CudaFftErr
 /// Perform bit reversal on a SecureColumn using GPU.
 #[cfg(feature = "cuda-runtime")]
 fn gpu_bit_reverse_secure_column(column: &mut SecureColumn) -> Result<(), CudaFftError> {
-    // SecureColumn is SecureColumnByCoords with 4 BaseColumns
-    // Bit reverse each coordinate column
-    for coord in column.columns.iter_mut() {
-        gpu_bit_reverse_base_column(coord)?;
-    }
+    // SecureColumn has a flat data array of PackedSecureField
+    // For bit reversal, we need to treat it as raw u32 data
+    let executor = get_cuda_executor().map_err(|e| e.clone())?;
+    let len = column.length;
+    let log_size = len.ilog2();
+    
+    // Convert to raw u32 array (SecureField = 4 M31 values)
+    let raw_data: &mut [u32] = unsafe {
+        std::slice::from_raw_parts_mut(
+            column.data.as_mut_ptr() as *mut u32,
+            len * 4  // 4 M31 values per SecureField
+        )
+    };
+    
+    // Execute bit reversal on GPU
+    executor.bit_reverse(raw_data, log_size)?;
+    
     Ok(())
 }
 

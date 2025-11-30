@@ -202,7 +202,7 @@ fn gpu_commit_on_layer_blake2s_m31(
     prev_layer: Option<&Col<GpuBackend, Blake2sHash>>,
     columns: &[&Col<GpuBackend, BaseField>],
 ) -> Col<GpuBackend, Blake2sHash> {
-    use crate::core::vcs::blake2_merkle::reduce_to_m31;
+    use crate::core::vcs::blake2_hash::reduce_to_m31;
     
     // Use the regular Blake2s implementation
     let mut result = gpu_commit_on_layer_blake2s(log_size, prev_layer, columns);
