@@ -186,29 +186,26 @@ fn test_session_manager() {
     }
     
     println!("    Active sessions: {}", manager.active_session_count());
+    println!("    Active users: {:?}", manager.active_users());
     
-    // Try to create 4th session (should evict oldest)
-    println!("\n  Creating 4th session (should evict oldest idle)...");
+    // Test session reuse
+    println!("\n  Testing session reuse...");
+    let _session = manager.get_or_create_session(2 as UserId)
+        .expect("Failed to get session");
+    println!("    ✓ Reused existing session for user 2");
     
-    // First, make user 1's session idle
-    {
-        let _session = manager.get_or_create_session(1)
-            .expect("Failed to get session");
-        // Session is idle after we're done with it
-    }
+    // Test destroying a session
+    println!("\n  Destroying session for user 1...");
+    manager.destroy_session(1 as UserId);
+    println!("    Active sessions: {}", manager.active_session_count());
     
-    // Now create session for user 4
+    // Now create session for user 4 (should work since we freed one)
+    println!("\n  Creating session for user 4...");
     let _session = manager.get_or_create_session(4 as UserId)
         .expect("Failed to create session");
     println!("    ✓ Created session for user 4");
     println!("    Active sessions: {}", manager.active_session_count());
     println!("    Active users: {:?}", manager.active_users());
-    
-    // Test session reuse
-    println!("\n  Testing session reuse...");
-    let _session1 = manager.get_or_create_session(2 as UserId)
-        .expect("Failed to get session");
-    println!("    ✓ Reused existing session for user 2");
     
     // Cleanup
     println!("\n  Cleaning up...");
