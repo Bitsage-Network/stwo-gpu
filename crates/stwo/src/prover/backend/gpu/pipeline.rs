@@ -224,6 +224,14 @@ impl GpuProofPipeline {
         self.log_size
     }
     
+    /// Clear all polynomial data from GPU memory.
+    /// 
+    /// This allows reusing the pipeline for a new batch of polynomials
+    /// while keeping the twiddles cached on GPU.
+    pub fn clear_polynomials(&mut self) {
+        self.poly_data.clear();
+    }
+    
     /// Synchronize GPU operations.
     pub fn sync(&self) -> Result<(), CudaFftError> {
         let executor = get_cuda_executor().map_err(|e| e.clone())?;

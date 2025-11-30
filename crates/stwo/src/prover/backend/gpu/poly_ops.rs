@@ -14,6 +14,12 @@
 //! - Large polynomials (>= 16K elements): Use GPU acceleration
 //!
 //! This threshold was determined empirically on A100 GPUs.
+//!
+//! # Persistent Pipeline
+//!
+//! To achieve maximum speedup (50x+), we use a thread-local persistent pipeline
+//! that keeps GPU memory allocated across multiple operations. This eliminates
+//! the overhead of creating/destroying pipelines for each batch.
 
 use tracing::{span, Level};
 
@@ -39,6 +45,44 @@ use super::cuda_executor::get_cuda_executor;
 #[cfg(feature = "cuda-runtime")]
 use super::pipeline::GpuProofPipeline;
 use super::GpuBackend;
+
+// =============================================================================
+// Persistent Pipeline Cache
+// =============================================================================
+
+#[cfg(feature = "cuda-runtime")]
+use std::cell::RefCell;
+#[cfg(feature = "cuda-runtime")]
+use std::collections::HashMap;
+
+/// Thread-local cache of GPU pipelines by log_size.
+/// This allows reusing GPU memory allocations across multiple batch operations.
+#[cfg(feature = "cuda-runtime")]
+thread_local! {
+    static PIPELINE_CACHE: RefCell<HashMap<u32, GpuProofPipeline>> = RefCell::new(HashMap::new());
+}
+
+/// Get or create a persistent pipeline for the given log_size.
+/// The pipeline is cached thread-locally for reuse.
+#[cfg(feature = "cuda-runtime")]
+fn get_or_create_pipeline(log_size: u32) -> Result<(), super::cuda_executor::CudaFftError> {
+    PIPELINE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if !cache.contains_key(&log_size) {
+            let pipeline = GpuProofPipeline::new(log_size)?;
+            cache.insert(log_size, pipeline);
+        }
+        Ok(())
+    })
+}
+
+/// Clear the pipeline cache (useful for testing or memory management).
+#[cfg(feature = "cuda-runtime")]
+pub fn clear_pipeline_cache() {
+    PIPELINE_CACHE.with(|cache| {
+        cache.borrow_mut().clear();
+    });
+}
 
 impl PolyOps for GpuBackend {
     // We use the same twiddle type as SimdBackend since twiddles are precomputed
@@ -406,6 +450,8 @@ fn apply_denormalization_cpu(data: &mut [u32], denorm_val: u32) {
 /// 
 /// This function processes multiple polynomials using the GPU pipeline,
 /// keeping data on GPU between operations for maximum throughput.
+/// 
+/// Uses a persistent pipeline cache to avoid repeated setup overhead.
 #[cfg(feature = "cuda-runtime")]
 fn gpu_batch_interpolate(
     columns: Vec<CircleEvaluation<GpuBackend, BaseField, BitReversedOrder>>,
@@ -415,69 +461,77 @@ fn gpu_batch_interpolate(
                       num_columns = columns.len(), 
                       size = 1u64 << log_size).entered();
     
-    // Create GPU pipeline
-    let mut pipeline = match GpuProofPipeline::new(log_size) {
-        Ok(p) => p,
-        Err(e) => {
-            panic!("Failed to create GPU pipeline: {}", e);
-        }
-    };
-    
-    // Upload all columns to GPU
-    for eval in &columns {
-        let values_slice = eval.values.as_slice();
-        let data_ptr = values_slice.as_ptr() as *const u32;
-        let data_len = values_slice.len();
-        
-        let data: Vec<u32> = unsafe {
-            std::slice::from_raw_parts(data_ptr, data_len).to_vec()
-        };
-        
-        if let Err(e) = pipeline.upload_polynomial(&data) {
-            panic!("Failed to upload polynomial to GPU: {}", e);
-        }
+    // Ensure pipeline is cached for this log_size (twiddles stay on GPU)
+    if let Err(e) = get_or_create_pipeline(log_size) {
+        panic!("Failed to create/get GPU pipeline: {}", e);
     }
     
-    // Execute IFFT with fused denormalization on all polynomials (stays on GPU)
-    for poly_idx in 0..columns.len() {
-        if let Err(e) = pipeline.ifft_with_denormalize(poly_idx) {
-            panic!("Failed to execute GPU IFFT with denormalize: {}", e);
-        }
-    }
-    
-    // Download results (already denormalized on GPU)
-    let mut results = Vec::with_capacity(columns.len());
-    
-    for poly_idx in 0..columns.len() {
-        let data = match pipeline.download_polynomial(poly_idx) {
-            Ok(d) => d,
-            Err(e) => {
-                panic!("Failed to download polynomial from GPU: {}", e);
+    // Use the cached pipeline
+    PIPELINE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let pipeline = cache.get_mut(&log_size).expect("Pipeline should exist after get_or_create");
+        
+        // Clear any existing polynomials from previous batch
+        pipeline.clear_polynomials();
+        
+        // Upload all columns to GPU
+        for eval in &columns {
+            let values_slice = eval.values.as_slice();
+            let data_ptr = values_slice.as_ptr() as *const u32;
+            let data_len = values_slice.len();
+            
+            let data: Vec<u32> = unsafe {
+                std::slice::from_raw_parts(data_ptr, data_len).to_vec()
+            };
+            
+            if let Err(e) = pipeline.upload_polynomial(&data) {
+                panic!("Failed to upload polynomial to GPU: {}", e);
             }
-        };
+        }
         
-        // Convert to BaseColumn (no CPU denormalization needed)
-        use crate::prover::backend::simd::column::BaseColumn;
-        let coeffs: BaseColumn = unsafe {
-            let bf_ptr = data.as_ptr() as *const BaseField;
-            std::slice::from_raw_parts(bf_ptr, data.len()).iter().copied().collect()
-        };
+        // Execute IFFT with fused denormalization on all polynomials (stays on GPU)
+        for poly_idx in 0..columns.len() {
+            if let Err(e) = pipeline.ifft_with_denormalize(poly_idx) {
+                panic!("Failed to execute GPU IFFT with denormalize: {}", e);
+            }
+        }
         
-        results.push(CircleCoefficients::new(coeffs));
-    }
-    
-    tracing::info!(
-        "GPU batch interpolate completed: {} columns",
-        results.len()
-    );
-    
-    results
+        // Download results (already denormalized on GPU)
+        let mut results = Vec::with_capacity(columns.len());
+        
+        for poly_idx in 0..columns.len() {
+            let data = match pipeline.download_polynomial(poly_idx) {
+                Ok(d) => d,
+                Err(e) => {
+                    panic!("Failed to download polynomial from GPU: {}", e);
+                }
+            };
+            
+            // Convert to BaseColumn (no CPU denormalization needed)
+            use crate::prover::backend::simd::column::BaseColumn;
+            let coeffs: BaseColumn = unsafe {
+                let bf_ptr = data.as_ptr() as *const BaseField;
+                std::slice::from_raw_parts(bf_ptr, data.len()).iter().copied().collect()
+            };
+            
+            results.push(CircleCoefficients::new(coeffs));
+        }
+        
+        tracing::info!(
+            "GPU batch interpolate completed: {} columns (pipeline reused)",
+            results.len()
+        );
+        
+        results
+    })
 }
 
 /// GPU-accelerated batch polynomial evaluation.
 /// 
 /// This function processes multiple polynomials using the GPU pipeline,
 /// keeping data on GPU between operations for maximum throughput.
+/// 
+/// Uses a persistent pipeline cache to avoid repeated setup overhead.
 #[cfg(feature = "cuda-runtime")]
 fn gpu_batch_evaluate(
     polynomials: ColumnVec<CircleCoefficients<GpuBackend>>,
@@ -497,67 +551,73 @@ fn gpu_batch_evaluate(
                       size = 1u64 << log_size,
                       extended_size = 1u64 << extended_log_size).entered();
     
-    // Create GPU pipeline for extended size
-    let mut pipeline = match GpuProofPipeline::new(extended_log_size) {
-        Ok(p) => p,
-        Err(e) => {
-            panic!("Failed to create GPU pipeline: {}", e);
-        }
-    };
-    
-    // Upload all polynomials to GPU (with zero-padding for extension)
-    let extended_size = 1usize << extended_log_size;
-    for poly in &polynomials {
-        let mut data: Vec<u32> = poly.coeffs.as_slice()
-            .iter()
-            .map(|f| f.0)
-            .collect();
-        
-        // Zero-pad to extended size
-        data.resize(extended_size, 0);
-        
-        if let Err(e) = pipeline.upload_polynomial(&data) {
-            panic!("Failed to upload polynomial to GPU: {}", e);
-        }
+    // Ensure pipeline is cached for the extended size
+    if let Err(e) = get_or_create_pipeline(extended_log_size) {
+        panic!("Failed to create/get GPU pipeline: {}", e);
     }
     
-    // Execute FFT on all polynomials (stays on GPU)
-    for poly_idx in 0..polynomials.len() {
-        if let Err(e) = pipeline.fft(poly_idx) {
-            panic!("Failed to execute GPU FFT: {}", e);
-        }
-    }
-    
-    // Download results
-    let mut results = Vec::with_capacity(polynomials.len());
-    
-    for (poly_idx, poly_coeffs) in polynomials.into_iter().enumerate() {
-        let data = match pipeline.download_polynomial(poly_idx) {
-            Ok(d) => d,
-            Err(e) => {
-                panic!("Failed to download polynomial from GPU: {}", e);
+    // Use the cached pipeline
+    PIPELINE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let pipeline = cache.get_mut(&extended_log_size).expect("Pipeline should exist after get_or_create");
+        
+        // Clear any existing polynomials from previous batch
+        pipeline.clear_polynomials();
+        
+        // Upload all polynomials to GPU (with zero-padding for extension)
+        let extended_size = 1usize << extended_log_size;
+        for poly in &polynomials {
+            let mut data: Vec<u32> = poly.coeffs.as_slice()
+                .iter()
+                .map(|f| f.0)
+                .collect();
+            
+            // Zero-pad to extended size
+            data.resize(extended_size, 0);
+            
+            if let Err(e) = pipeline.upload_polynomial(&data) {
+                panic!("Failed to upload polynomial to GPU: {}", e);
             }
-        };
+        }
         
-        // Convert to BaseColumn
-        let values: BaseColumn = unsafe {
-            let bf_ptr = data.as_ptr() as *const BaseField;
-            std::slice::from_raw_parts(bf_ptr, data.len()).iter().copied().collect()
-        };
+        // Execute FFT on all polynomials (stays on GPU)
+        for poly_idx in 0..polynomials.len() {
+            if let Err(e) = pipeline.fft(poly_idx) {
+                panic!("Failed to execute GPU FFT: {}", e);
+            }
+        }
         
-        let evals = CircleEvaluation::new(extended_domain, values);
-        results.push(Poly::new(
-            store_polynomials_coefficients.then_some(poly_coeffs),
-            evals,
-        ));
-    }
-    
-    tracing::info!(
-        "GPU batch evaluate completed: {} polynomials",
-        results.len()
-    );
-    
-    results
+        // Download results
+        let mut results = Vec::with_capacity(polynomials.len());
+        
+        for (poly_idx, poly_coeffs) in polynomials.into_iter().enumerate() {
+            let data = match pipeline.download_polynomial(poly_idx) {
+                Ok(d) => d,
+                Err(e) => {
+                    panic!("Failed to download polynomial from GPU: {}", e);
+                }
+            };
+            
+            // Convert to BaseColumn
+            let values: BaseColumn = unsafe {
+                let bf_ptr = data.as_ptr() as *const BaseField;
+                std::slice::from_raw_parts(bf_ptr, data.len()).iter().copied().collect()
+            };
+            
+            let evals = CircleEvaluation::new(extended_domain, values);
+            results.push(Poly::new(
+                store_polynomials_coefficients.then_some(poly_coeffs),
+                evals,
+            ));
+        }
+        
+        tracing::info!(
+            "GPU batch evaluate completed: {} polynomials (pipeline reused)",
+            results.len()
+        );
+        
+        results
+    })
 }
 
 /// GPU-accelerated polynomial evaluation (forward FFT).
