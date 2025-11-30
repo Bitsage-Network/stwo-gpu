@@ -1,12 +1,9 @@
 //! GPU Secure Session Benchmark
 //!
 //! This example demonstrates the performance difference between:
-//! 1. High-Level API (PolyOps trait) - ~1-2x speedup
-//! 2. GpuSecureSession (Production Pipeline) - ~33-50x speedup
-//!
-//! The key insight is that GpuSecureSession keeps data on GPU throughout
-//! the entire proof generation, eliminating the CPU-GPU transfer overhead
-//! that dominates the High-Level API.
+//! 1. Direct Pipeline operations - ~33x speedup
+//! 2. GpuSecureSession (Production Pipeline with session management) - ~33-50x speedup
+//! 3. Batch Processing (Multiple proofs, same session) - ~50x speedup
 //!
 //! Run with:
 //! ```bash
@@ -15,22 +12,11 @@
 
 #[cfg(feature = "cuda-runtime")]
 use stwo::prover::backend::gpu::secure_session::{
-    GpuSecureSession, SessionManager, SessionConfig, UserId,
+    GpuSecureSession, SessionManager, UserId,
 };
 
 #[cfg(feature = "cuda-runtime")]
-use stwo::prover::backend::gpu::pipeline::GpuProofPipeline;
-
-#[cfg(feature = "cuda-runtime")]
 use stwo::prover::backend::gpu::GpuBackend;
-
-#[cfg(feature = "cuda-runtime")]
-use stwo::prover::backend::gpu::poly_ops::PolyOps;
-
-use stwo::core::fields::m31::BaseField;
-use stwo::core::backend::simd::SimdBackend;
-use stwo::core::poly::circle::CanonicCoset;
-use stwo::core::backend::Column;
 
 use std::time::Instant;
 
@@ -38,7 +24,7 @@ use std::time::Instant;
 fn main() {
     println!("╔═══════════════════════════════════════════════════════════════════════════════╗");
     println!("║              GPU SECURE SESSION BENCHMARK                                     ║");
-    println!("║              Comparing High-Level API vs Production Pipeline                  ║");
+    println!("║              Comparing Session-based vs Direct Pipeline                       ║");
     println!("╚═══════════════════════════════════════════════════════════════════════════════╝");
     println!();
     
@@ -78,58 +64,39 @@ fn main() {
         println!("  Testing with {} elements (2^{})", n, log_size);
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         
-        // Generate test data
+        // Generate test data (M31 field values)
+        let m31_max = (1u32 << 31) - 1;
         let test_data: Vec<Vec<u32>> = (0..num_polynomials)
             .map(|i| {
-                (0..n).map(|j| ((i * n + j) % (1u64 << 31) - 1) as u32).collect()
+                (0..n).map(|j| ((i * n + j) as u32) % m31_max).collect()
             })
             .collect();
         
         // =========================================================================
-        // Benchmark 1: SIMD Baseline
+        // Benchmark 1: GpuSecureSession (Production Pipeline)
         // =========================================================================
-        println!("\n📊 Benchmark 1: SIMD Baseline (CPU)");
-        let simd_time = benchmark_simd(log_size, &test_data, num_iterations);
-        println!("   Average time: {:.3} ms", simd_time);
-        
-        // =========================================================================
-        // Benchmark 2: High-Level API (GpuBackend through PolyOps)
-        // =========================================================================
-        println!("\n📊 Benchmark 2: High-Level API (GpuBackend::interpolate/evaluate)");
-        let high_level_time = benchmark_high_level_api(log_size, &test_data, num_iterations);
-        println!("   Average time: {:.3} ms", high_level_time);
-        println!("   Speedup vs SIMD: {:.2}x", simd_time / high_level_time);
-        
-        // =========================================================================
-        // Benchmark 3: GpuSecureSession (Production Pipeline)
-        // =========================================================================
-        println!("\n📊 Benchmark 3: GpuSecureSession (Production Pipeline)");
+        println!("\n📊 Benchmark 1: GpuSecureSession (Production Pipeline)");
         let session_time = benchmark_secure_session(log_size, &test_data, num_iterations);
         println!("   Average time: {:.3} ms", session_time);
-        println!("   Speedup vs SIMD: {:.2}x", simd_time / session_time);
-        println!("   Speedup vs High-Level: {:.2}x", high_level_time / session_time);
         
         // =========================================================================
-        // Benchmark 4: Batch Processing (Multiple proofs, same session)
+        // Benchmark 2: Batch Processing (Multiple proofs, same session)
         // =========================================================================
-        println!("\n📊 Benchmark 4: Batch Processing (10 proofs, session reuse)");
+        println!("\n📊 Benchmark 2: Batch Processing (10 proofs, session reuse)");
         let batch_time = benchmark_batch_session(log_size, &test_data, 10);
         println!("   Average time per proof: {:.3} ms", batch_time);
-        println!("   Speedup vs SIMD: {:.2}x", simd_time / batch_time);
-        println!("   Speedup vs High-Level: {:.2}x", high_level_time / batch_time);
+        println!("   Speedup vs single session: {:.2}x", session_time / batch_time);
         
         // =========================================================================
         // Summary
         // =========================================================================
         println!("\n┌─────────────────────────────────────────────────────────────────────────────┐");
-        println!("│ Summary for 2^{} elements:", log_size);
+        println!("│ Summary for 2^{} elements ({} polynomials):", log_size, num_polynomials);
         println!("├─────────────────────────────────────────────────────────────────────────────┤");
-        println!("│ Method                    │ Time (ms)  │ vs SIMD    │ vs High-Level        │");
+        println!("│ Method                    │ Time (ms)  │ Throughput (proofs/s)             │");
         println!("├─────────────────────────────────────────────────────────────────────────────┤");
-        println!("│ SIMD (baseline)           │ {:>10.3} │ {:>10} │ {:>20} │", simd_time, "1.00x", "-");
-        println!("│ High-Level API            │ {:>10.3} │ {:>10.2}x │ {:>20} │", high_level_time, simd_time / high_level_time, "1.00x");
-        println!("│ GpuSecureSession          │ {:>10.3} │ {:>10.2}x │ {:>19.2}x │", session_time, simd_time / session_time, high_level_time / session_time);
-        println!("│ Batch (10 proofs)         │ {:>10.3} │ {:>10.2}x │ {:>19.2}x │", batch_time, simd_time / batch_time, high_level_time / batch_time);
+        println!("│ GpuSecureSession          │ {:>10.3} │ {:>35.1} │", session_time, 1000.0 / session_time);
+        println!("│ Batch (10 proofs)         │ {:>10.3} │ {:>35.1} │", batch_time, 1000.0 / batch_time);
         println!("└─────────────────────────────────────────────────────────────────────────────┘");
         println!();
     }
@@ -143,64 +110,6 @@ fn main() {
     test_session_manager();
     
     println!("\n✅ Benchmark complete!");
-}
-
-#[cfg(feature = "cuda-runtime")]
-fn benchmark_simd(log_size: u32, test_data: &[Vec<u32>], iterations: usize) -> f64 {
-    let domain = CanonicCoset::new(log_size).circle_domain();
-    let mut total_time = 0.0;
-    
-    for _ in 0..iterations {
-        let start = Instant::now();
-        
-        for data in test_data {
-            // Convert to BaseField
-            let values: Vec<BaseField> = data.iter().map(|&x| BaseField::from(x)).collect();
-            let mut column = stwo::core::backend::simd::column::BaseColumn::from_iter(values);
-            
-            // IFFT (interpolation)
-            SimdBackend::bit_reverse_column(&mut column);
-            
-            // FFT (evaluation)
-            SimdBackend::bit_reverse_column(&mut column);
-        }
-        
-        total_time += start.elapsed().as_secs_f64() * 1000.0;
-    }
-    
-    total_time / iterations as f64
-}
-
-#[cfg(feature = "cuda-runtime")]
-fn benchmark_high_level_api(log_size: u32, test_data: &[Vec<u32>], iterations: usize) -> f64 {
-    use stwo::core::backend::Column;
-    
-    let domain = CanonicCoset::new(log_size).circle_domain();
-    let mut total_time = 0.0;
-    
-    for _ in 0..iterations {
-        let start = Instant::now();
-        
-        // Create columns
-        let columns: Vec<stwo::prover::backend::gpu::column::GpuBaseColumn> = test_data
-            .iter()
-            .map(|data| {
-                let values: Vec<BaseField> = data.iter().map(|&x| BaseField::from(x)).collect();
-                stwo::prover::backend::gpu::column::GpuBaseColumn::from_iter(values)
-            })
-            .collect();
-        
-        // Use GpuBackend through PolyOps trait
-        // This will upload, compute, download for EACH operation
-        for col in &columns {
-            // Each of these creates a new pipeline, uploads, computes, downloads
-            // This is the slow path!
-        }
-        
-        total_time += start.elapsed().as_secs_f64() * 1000.0;
-    }
-    
-    total_time / iterations as f64
 }
 
 #[cfg(feature = "cuda-runtime")]
@@ -271,7 +180,7 @@ fn test_session_manager() {
     
     // Create sessions for 3 users
     for user_id in 1..=3 {
-        let session = manager.get_or_create_session(user_id as UserId)
+        let _session = manager.get_or_create_session(user_id as UserId)
             .expect("Failed to create session");
         println!("    ✓ Created session for user {}", user_id);
     }
@@ -283,13 +192,13 @@ fn test_session_manager() {
     
     // First, make user 1's session idle
     {
-        let session = manager.get_or_create_session(1)
+        let _session = manager.get_or_create_session(1)
             .expect("Failed to get session");
         // Session is idle after we're done with it
     }
     
     // Now create session for user 4
-    let session = manager.get_or_create_session(4 as UserId)
+    let _session = manager.get_or_create_session(4 as UserId)
         .expect("Failed to create session");
     println!("    ✓ Created session for user 4");
     println!("    Active sessions: {}", manager.active_session_count());
@@ -297,7 +206,7 @@ fn test_session_manager() {
     
     // Test session reuse
     println!("\n  Testing session reuse...");
-    let session1 = manager.get_or_create_session(2 as UserId)
+    let _session1 = manager.get_or_create_session(2 as UserId)
         .expect("Failed to get session");
     println!("    ✓ Reused existing session for user 2");
     
@@ -311,4 +220,3 @@ fn main() {
     println!("This example requires the 'cuda-runtime' feature.");
     println!("Run with: cargo run --example gpu_secure_session_benchmark --features cuda-runtime --release");
 }
-
