@@ -1120,14 +1120,33 @@ pub fn benchmark_full_proof_pipeline(
     pipeline.sync()?;
     let fft_time = fft_start.elapsed();
     
-    // Phase 2: Simulated FRI Folding (using FFT as proxy since FRI needs SecureField)
-    // In a real implementation, FRI folding would use SecureField polynomials
+    // Phase 2: FRI Folding using actual FRI kernels
+    // Generate mock twiddles and alpha for the benchmark
     let fri_start = Instant::now();
-    for _layer in 0..num_fri_layers.min(log_size as usize - 4) {
-        // Simulate FRI work with FFT operations
-        for poly_idx in 0..num_polynomials {
-            pipeline.ifft(poly_idx)?;
-        }
+    let alpha: [u32; 4] = [12345, 67890, 11111, 22222];  // Mock alpha
+    
+    // Generate twiddles for each layer
+    let mut all_itwiddles: Vec<Vec<u32>> = Vec::new();
+    let mut current_size = n;
+    for _ in 0..num_fri_layers.min(log_size as usize - 4) {
+        let n_twiddles = current_size / 2;
+        // Mock twiddles (in real code, these would be computed from the domain)
+        let layer_twiddles: Vec<u32> = (0..n_twiddles)
+            .map(|i| ((i as u64 * 31337) % 0x7FFFFFFF) as u32)
+            .collect();
+        all_itwiddles.push(layer_twiddles);
+        current_size /= 2;
+    }
+    
+    // Use multi-layer folding for better performance
+    if !all_itwiddles.is_empty() {
+        // Fold first polynomial using batched FRI
+        let _folded_idx = pipeline.fri_fold_multi_layer(
+            0,
+            &all_itwiddles,
+            &alpha,
+            all_itwiddles.len(),
+        )?;
     }
     pipeline.sync()?;
     let fri_time = fri_start.elapsed();
