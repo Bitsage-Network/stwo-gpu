@@ -319,6 +319,12 @@ impl GpuProofPipeline {
             ));
         }
         
+        if dst_idx == src_idx {
+            return Err(CudaFftError::InvalidSize(
+                "dst_idx and src_idx must be different".into()
+            ));
+        }
+        
         let executor = get_cuda_executor().map_err(|e| e.clone())?;
         let n = 1usize << self.log_size;
         let n_dst = n / 2;
@@ -340,10 +346,20 @@ impl GpuProofPipeline {
             shared_mem_bytes: 0,
         };
         
+        // Use split_at_mut to get non-overlapping mutable references
+        // We need to handle the case where dst_idx < src_idx and dst_idx > src_idx
+        let (dst_slice, src_slice) = if dst_idx < src_idx {
+            let (left, right) = self.poly_data.split_at_mut(src_idx);
+            (&mut left[dst_idx], &right[0])
+        } else {
+            let (left, right) = self.poly_data.split_at_mut(dst_idx);
+            (&mut right[0], &left[src_idx])
+        };
+        
         unsafe {
             executor.kernels.fold_circle_into_line.clone().launch(
                 cfg,
-                (&mut self.poly_data[dst_idx], &self.poly_data[src_idx], &d_itwiddles, &d_alpha, n as u32, log_n),
+                (dst_slice, src_slice, &d_itwiddles, &d_alpha, n as u32, log_n),
             ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
         }
         
