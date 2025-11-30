@@ -506,14 +506,17 @@ fn apply_denormalization_cpu(data: &mut [u32], denorm_val: u32) {
 /// This function processes multiple polynomials using the GPU pipeline,
 /// keeping data on GPU between operations for maximum throughput.
 /// 
-/// Uses a persistent pipeline cache to avoid repeated setup overhead.
+/// Uses bulk upload/download for minimal transfer overhead.
 #[cfg(feature = "cuda-runtime")]
 fn gpu_batch_interpolate(
     columns: Vec<CircleEvaluation<GpuBackend, BaseField, BitReversedOrder>>,
     log_size: u32,
 ) -> Vec<CircleCoefficients<GpuBackend>> {
+    use std::time::Instant;
+    
+    let num_columns = columns.len();
     let _span = span!(Level::INFO, "GPU batch interpolate", 
-                      num_columns = columns.len(), 
+                      num_columns = num_columns, 
                       size = 1u64 << log_size).entered();
     
     // Ensure pipeline is cached for this log_size (twiddles stay on GPU)
@@ -529,53 +532,52 @@ fn gpu_batch_interpolate(
         // Clear any existing polynomials from previous batch
         pipeline.clear_polynomials();
         
-        // Upload all columns to GPU
-        for eval in &columns {
-            let values_slice = eval.values.as_slice();
-            let data_ptr = values_slice.as_ptr() as *const u32;
-            let data_len = values_slice.len();
-            
-            let data: Vec<u32> = unsafe {
-                std::slice::from_raw_parts(data_ptr, data_len).to_vec()
-            };
-            
-            if let Err(e) = pipeline.upload_polynomial(&data) {
-                panic!("Failed to upload polynomial to GPU: {}", e);
-            }
-        }
+        // Prepare data for bulk upload
+        let upload_start = Instant::now();
+        let poly_slices: Vec<Vec<u32>> = columns.iter()
+            .map(|eval| {
+                let values_slice = eval.values.as_slice();
+                let data_ptr = values_slice.as_ptr() as *const u32;
+                let data_len = values_slice.len();
+                unsafe { std::slice::from_raw_parts(data_ptr, data_len).to_vec() }
+            })
+            .collect();
         
-        // Execute IFFT with fused denormalization on all polynomials (stays on GPU)
-        for poly_idx in 0..columns.len() {
+        // Bulk upload all columns to GPU
+        let num_uploaded = pipeline.upload_polynomials_bulk(poly_slices.iter().map(|v| v.as_slice()))
+            .expect("Failed to bulk upload polynomials");
+        let upload_time = upload_start.elapsed();
+        
+        // Execute IFFT with fused denormalization on all polynomials
+        let compute_start = Instant::now();
+        for poly_idx in 0..num_uploaded {
             if let Err(e) = pipeline.ifft_with_denormalize(poly_idx) {
                 panic!("Failed to execute GPU IFFT with denormalize: {}", e);
             }
         }
+        let compute_time = compute_start.elapsed();
         
-        // Download results (already denormalized on GPU)
-        let mut results = Vec::with_capacity(columns.len());
+        // Bulk download all results
+        let download_start = Instant::now();
+        let all_data = pipeline.download_polynomials_bulk()
+            .expect("Failed to bulk download polynomials");
+        let download_time = download_start.elapsed();
         
-        for poly_idx in 0..columns.len() {
-            let data = match pipeline.download_polynomial(poly_idx) {
-                Ok(d) => d,
-                Err(e) => {
-                    panic!("Failed to download polynomial from GPU: {}", e);
-                }
-            };
-            
-            // Convert to BaseColumn (no CPU denormalization needed)
-            use crate::prover::backend::simd::column::BaseColumn;
-            let coeffs: BaseColumn = unsafe {
-                let bf_ptr = data.as_ptr() as *const BaseField;
-                std::slice::from_raw_parts(bf_ptr, data.len()).iter().copied().collect()
-            };
-            
-            results.push(CircleCoefficients::new(coeffs));
-        }
+        // Convert to CircleCoefficients
+        use crate::prover::backend::simd::column::BaseColumn;
+        let results: Vec<CircleCoefficients<GpuBackend>> = all_data.into_iter()
+            .map(|data| {
+                let coeffs: BaseColumn = unsafe {
+                    let bf_ptr = data.as_ptr() as *const BaseField;
+                    std::slice::from_raw_parts(bf_ptr, data.len()).iter().copied().collect()
+                };
+                CircleCoefficients::new(coeffs)
+            })
+            .collect();
         
-        tracing::info!(
-            "GPU batch interpolate completed: {} columns (pipeline reused)",
-            results.len()
-        );
+        eprintln!("[GPU] batch_interpolate: upload={:?}, compute={:?}, download={:?}, total={:?}",
+                 upload_time, compute_time, download_time, 
+                 upload_time + compute_time + download_time);
         
         results
     })
@@ -679,16 +681,20 @@ fn gpu_batch_evaluate(
 /// 
 /// This function processes multiple polynomials using the GPU pipeline,
 /// evaluating them all on the same domain with minimal transfer overhead.
+/// 
+/// Uses bulk upload/download for minimal transfer overhead.
 #[cfg(feature = "cuda-runtime")]
 fn gpu_batch_evaluate_columns(
     polynomials: Vec<CircleCoefficients<GpuBackend>>,
     domain: CircleDomain,
     domain_log_size: u32,
 ) -> Vec<CircleEvaluation<GpuBackend, BaseField, BitReversedOrder>> {
+    use std::time::Instant;
     use crate::prover::backend::simd::column::BaseColumn;
     
+    let num_polys = polynomials.len();
     let _span = span!(Level::INFO, "GPU batch evaluate_columns", 
-                      num_polys = polynomials.len(), 
+                      num_polys = num_polys, 
                       domain_size = 1u64 << domain_log_size).entered();
     
     // Ensure pipeline is cached for the domain size
@@ -704,53 +710,55 @@ fn gpu_batch_evaluate_columns(
         // Clear any existing polynomials from previous batch
         pipeline.clear_polynomials();
         
-        // Upload all polynomials to GPU (with zero-padding to domain size)
+        // Prepare data for bulk upload (with zero-padding to domain size)
+        let upload_start = Instant::now();
         let domain_size = 1usize << domain_log_size;
-        for poly in &polynomials {
-            let mut data: Vec<u32> = poly.coeffs.as_slice()
-                .iter()
-                .map(|f| f.0)
-                .collect();
-            
-            // Zero-pad to domain size
-            data.resize(domain_size, 0);
-            
-            if let Err(e) = pipeline.upload_polynomial(&data) {
-                panic!("Failed to upload polynomial to GPU: {}", e);
-            }
-        }
+        let poly_slices: Vec<Vec<u32>> = polynomials.iter()
+            .map(|poly| {
+                let mut data: Vec<u32> = poly.coeffs.as_slice()
+                    .iter()
+                    .map(|f| f.0)
+                    .collect();
+                // Zero-pad to domain size
+                data.resize(domain_size, 0);
+                data
+            })
+            .collect();
+        
+        // Bulk upload all polynomials to GPU
+        let num_uploaded = pipeline.upload_polynomials_bulk(poly_slices.iter().map(|v| v.as_slice()))
+            .expect("Failed to bulk upload polynomials");
+        let upload_time = upload_start.elapsed();
         
         // Execute FFT on all polynomials (stays on GPU)
-        for poly_idx in 0..polynomials.len() {
+        let compute_start = Instant::now();
+        for poly_idx in 0..num_uploaded {
             if let Err(e) = pipeline.fft(poly_idx) {
                 panic!("Failed to execute GPU FFT: {}", e);
             }
         }
+        let compute_time = compute_start.elapsed();
         
-        // Download results
-        let mut results = Vec::with_capacity(polynomials.len());
+        // Bulk download all results
+        let download_start = Instant::now();
+        let all_data = pipeline.download_polynomials_bulk()
+            .expect("Failed to bulk download polynomials");
+        let download_time = download_start.elapsed();
         
-        for poly_idx in 0..polynomials.len() {
-            let data = match pipeline.download_polynomial(poly_idx) {
-                Ok(d) => d,
-                Err(e) => {
-                    panic!("Failed to download polynomial from GPU: {}", e);
-                }
-            };
-            
-            // Convert to BaseColumn
-            let values: BaseColumn = unsafe {
-                let bf_ptr = data.as_ptr() as *const BaseField;
-                std::slice::from_raw_parts(bf_ptr, data.len()).iter().copied().collect()
-            };
-            
-            results.push(CircleEvaluation::new(domain, values));
-        }
+        // Convert to CircleEvaluation
+        let results: Vec<CircleEvaluation<GpuBackend, BaseField, BitReversedOrder>> = all_data.into_iter()
+            .map(|data| {
+                let values: BaseColumn = unsafe {
+                    let bf_ptr = data.as_ptr() as *const BaseField;
+                    std::slice::from_raw_parts(bf_ptr, data.len()).iter().copied().collect()
+                };
+                CircleEvaluation::new(domain, values)
+            })
+            .collect();
         
-        tracing::info!(
-            "GPU batch evaluate_columns completed: {} polynomials (pipeline reused)",
-            results.len()
-        );
+        eprintln!("[GPU] batch_evaluate_columns: upload={:?}, compute={:?}, download={:?}, total={:?}",
+                 upload_time, compute_time, download_time,
+                 upload_time + compute_time + download_time);
         
         results
     })
