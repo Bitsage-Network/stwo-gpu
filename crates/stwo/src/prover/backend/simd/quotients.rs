@@ -156,7 +156,7 @@ fn accumulate_quotients_on_subdomain(
     };
 
     #[cfg(not(feature = "parallel"))]
-    let iter = quad_rows
+        let iter = quad_rows
         .array_chunks::<4>()
         .zip(values.chunks_mut(4))
         .enumerate();

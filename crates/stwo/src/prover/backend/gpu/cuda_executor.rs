@@ -131,7 +131,7 @@ impl CudaFftExecutor {
     /// 
     /// This initializes the CUDA context and compiles all FFT kernels.
     pub fn new() -> Result<Self, CudaFftError> {
-        // Initialize CUDA device
+        // Initialize CUDA device (returns Arc<CudaDevice>)
         let device = CudaDevice::new(0)
             .map_err(|e| CudaFftError::DriverInit(format!("{:?}", e)))?;
         
@@ -152,13 +152,13 @@ impl CudaFftExecutor {
         tracing::info!("CUDA FFT kernels compiled successfully");
         
         Ok(Self {
-            device: Arc::new(device),
+            device,
             kernels,
             device_info,
         })
     }
     
-    fn get_device_info(_device: &CudaDevice) -> Result<DeviceInfo, CudaFftError> {
+    fn get_device_info(_device: &Arc<CudaDevice>) -> Result<DeviceInfo, CudaFftError> {
         // Note: cudarc doesn't expose all device properties directly
         // We use reasonable defaults for now
         Ok(DeviceInfo {
@@ -170,12 +170,12 @@ impl CudaFftExecutor {
         })
     }
     
-    fn compile_kernels(device: &CudaDevice) -> Result<CompiledKernels, CudaFftError> {
+    fn compile_kernels(device: &Arc<CudaDevice>) -> Result<CompiledKernels, CudaFftError> {
         // Compile CUDA source to PTX using NVRTC
         let ptx = cudarc::nvrtc::compile_ptx(CIRCLE_FFT_CUDA_KERNEL)
             .map_err(|e| CudaFftError::KernelCompilation(format!("{:?}", e)))?;
         
-        // Load PTX into device
+        // Load PTX into device (load_ptx is on Arc<CudaDevice>)
         device.load_ptx(ptx.clone(), "circle_fft", &[
             "bit_reverse_kernel",
             "ifft_layer_kernel",
@@ -184,7 +184,7 @@ impl CudaFftExecutor {
             "fft_layer_kernel",
         ]).map_err(|e| CudaFftError::KernelCompilation(format!("{:?}", e)))?;
         
-        // Get function handles
+        // Get function handles (get_func is on Arc<CudaDevice>)
         let bit_reverse = device.get_func("circle_fft", "bit_reverse_kernel")
             .ok_or_else(|| CudaFftError::KernelCompilation("bit_reverse_kernel not found".into()))?;
         
@@ -285,10 +285,14 @@ impl CudaFftExecutor {
                 shared_mem_bytes: 0,
             };
             
+            // Create a twiddle view for this layer
+            let twiddle_view = d_twiddles.slice(twiddle_offset..);
+            
             unsafe {
+                // Reborrow d_data each iteration to avoid move in loop
                 self.kernels.ifft_layer.clone().launch(
                     cfg,
-                    (d_data, &d_twiddles.slice(twiddle_offset..), layer, log_size),
+                    (&mut *d_data, &twiddle_view, layer, log_size),
                 ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
             }
         }
@@ -367,10 +371,14 @@ impl CudaFftExecutor {
                 shared_mem_bytes: 0,
             };
             
+            // Create a twiddle view for this layer
+            let twiddle_view = d_twiddles.slice(twiddle_offset..);
+            
             unsafe {
+                // Reborrow d_data each iteration to avoid move in loop
                 self.kernels.fft_layer.clone().launch(
                     cfg,
-                    (d_data, &d_twiddles.slice(twiddle_offset..), layer, log_size),
+                    (&mut *d_data, &twiddle_view, layer, log_size),
                 ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
             }
         }
