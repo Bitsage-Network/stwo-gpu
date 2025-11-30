@@ -113,6 +113,8 @@ struct CompiledKernels {
     bit_reverse: CudaFunction,
     ifft_layer: CudaFunction,
     fft_layer: CudaFunction,
+    // Optimized shared memory FFT kernel
+    ifft_shared_mem: CudaFunction,
     // FRI folding kernels
     fold_line: CudaFunction,
     fold_circle_into_line: CudaFunction,
@@ -187,6 +189,7 @@ impl CudaFftExecutor {
             "bit_reverse_kernel",
             "ifft_layer_kernel",
             "fft_layer_kernel",
+            "ifft_shared_mem_kernel",
         ]).map_err(|e| CudaFftError::KernelCompilation(format!("FFT load: {:?}", e)))?;
         
         // Compile FRI folding CUDA source to PTX
@@ -220,6 +223,9 @@ impl CudaFftExecutor {
         let fft_layer = device.get_func("circle_fft", "fft_layer_kernel")
             .ok_or_else(|| CudaFftError::KernelCompilation("fft_layer_kernel not found".into()))?;
         
+        let ifft_shared_mem = device.get_func("circle_fft", "ifft_shared_mem_kernel")
+            .ok_or_else(|| CudaFftError::KernelCompilation("ifft_shared_mem_kernel not found".into()))?;
+        
         // Get FRI function handles
         let fold_line = device.get_func("fri_folding", "fold_line_kernel")
             .ok_or_else(|| CudaFftError::KernelCompilation("fold_line_kernel not found".into()))?;
@@ -251,6 +257,7 @@ impl CudaFftExecutor {
             bit_reverse,
             ifft_layer,
             fft_layer,
+            ifft_shared_mem,
             fold_line,
             fold_circle_into_line,
             accumulate_quotients,
@@ -320,43 +327,110 @@ impl CudaFftExecutor {
             )));
         }
         
-        // Calculate twiddle offsets
-        let mut twiddle_offsets: Vec<usize> = Vec::new();
-        let mut offset = 0usize;
+        // Calculate twiddle offsets (as u32 for GPU)
+        let mut twiddle_offsets: Vec<u32> = Vec::new();
+        let mut offset = 0u32;
         for tw in twiddles_dbl {
             twiddle_offsets.push(offset);
-            offset += tw.len();
+            offset += tw.len() as u32;
         }
         
-        // Execute butterfly layers
-        // Each layer depends on the previous layer completing, so we need synchronization.
-        // However, CUDA kernel launches on the same stream are serialized, so we only need
-        // to sync at the end (the GPU will execute kernels in order).
-        for layer in 0..num_layers {
-            let n_twiddles = twiddles_dbl[layer].len() as u32;
-            let butterflies_per_twiddle = 1u32 << layer;
-            let total_butterflies = n_twiddles * butterflies_per_twiddle;
-            let grid_size = (total_butterflies + block_size - 1) / block_size;
+        // Shared memory kernel configuration:
+        // - SHMEM_ELEMENTS = 1024 elements per block
+        // - SHMEM_BLOCK_SIZE = 256 threads per block
+        // - Can process up to 10 layers in shared memory (log2(1024) = 10)
+        const SHMEM_ELEMENTS: u32 = 1024;
+        const SHMEM_LOG_ELEMENTS: u32 = 10;
+        const SHMEM_BLOCK_SIZE: u32 = 256;
+        
+        // Determine how many layers we can process in shared memory
+        // We can process min(log_size, SHMEM_LOG_ELEMENTS) layers
+        let shared_mem_layers = std::cmp::min(log_size, SHMEM_LOG_ELEMENTS);
+        let n = 1u32 << log_size;
+        
+        if shared_mem_layers > 0 && n >= SHMEM_ELEMENTS {
+            // Copy twiddle offsets to device
+            let d_twiddle_offsets = self.device.htod_sync_copy(&twiddle_offsets)
+                .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
             
-            let twiddle_offset = twiddle_offsets[layer];
+            // Launch shared memory kernel for first layers
+            let num_blocks = n / SHMEM_ELEMENTS;
             
             let cfg = LaunchConfig {
-                grid_dim: (grid_size, 1, 1),
-                block_dim: (block_size, 1, 1),
-                shared_mem_bytes: 0,
+                grid_dim: (num_blocks, 1, 1),
+                block_dim: (SHMEM_BLOCK_SIZE, 1, 1),
+                shared_mem_bytes: SHMEM_ELEMENTS * 4, // 4 bytes per u32
             };
             
-            let twiddle_view = d_twiddles.slice(twiddle_offset..);
-            
             unsafe {
-                self.kernels.ifft_layer.clone().launch(
+                self.kernels.ifft_shared_mem.clone().launch(
                     cfg,
-                    (&mut *d_data, &twiddle_view, layer as u32, log_size, n_twiddles),
-                ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
+                    (
+                        &mut *d_data,
+                        d_twiddles,
+                        &d_twiddle_offsets,
+                        shared_mem_layers,
+                        log_size,
+                    ),
+                ).map_err(|e| CudaFftError::KernelExecution(format!("Shared mem kernel: {:?}", e)))?;
+            }
+            
+            // Sync after shared memory kernel
+            self.device.synchronize()
+                .map_err(|e| CudaFftError::KernelExecution(format!("Shared mem sync: {:?}", e)))?;
+            
+            // Process remaining layers with per-layer kernels
+            for layer in (shared_mem_layers as usize)..num_layers {
+                let n_twiddles = twiddles_dbl[layer].len() as u32;
+                let butterflies_per_twiddle = 1u32 << layer;
+                let total_butterflies = n_twiddles * butterflies_per_twiddle;
+                let grid_size = (total_butterflies + block_size - 1) / block_size;
+                
+                let twiddle_offset = twiddle_offsets[layer] as usize;
+                
+                let cfg = LaunchConfig {
+                    grid_dim: (grid_size, 1, 1),
+                    block_dim: (block_size, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                
+                let twiddle_view = d_twiddles.slice(twiddle_offset..);
+                
+                unsafe {
+                    self.kernels.ifft_layer.clone().launch(
+                        cfg,
+                        (&mut *d_data, &twiddle_view, layer as u32, log_size, n_twiddles),
+                    ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
+                }
+            }
+        } else {
+            // Small FFT: use per-layer kernels only
+            for layer in 0..num_layers {
+                let n_twiddles = twiddles_dbl[layer].len() as u32;
+                let butterflies_per_twiddle = 1u32 << layer;
+                let total_butterflies = n_twiddles * butterflies_per_twiddle;
+                let grid_size = (total_butterflies + block_size - 1) / block_size;
+                
+                let twiddle_offset = twiddle_offsets[layer] as usize;
+                
+                let cfg = LaunchConfig {
+                    grid_dim: (grid_size, 1, 1),
+                    block_dim: (block_size, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                
+                let twiddle_view = d_twiddles.slice(twiddle_offset..);
+                
+                unsafe {
+                    self.kernels.ifft_layer.clone().launch(
+                        cfg,
+                        (&mut *d_data, &twiddle_view, layer as u32, log_size, n_twiddles),
+                    ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
+                }
             }
         }
         
-        // Single sync at the end - kernels on the same stream execute in order
+        // Final sync
         self.device.synchronize()
             .map_err(|e| CudaFftError::KernelExecution(format!("Final sync failed: {:?}", e)))?;
         

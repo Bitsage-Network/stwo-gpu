@@ -266,75 +266,114 @@ extern "C" __global__ void ifft_layer_kernel(
 }
 
 // =============================================================================
-// Optimized Multi-Layer Kernels (Radix-8)
+// Optimized Shared Memory IFFT Kernel
 // =============================================================================
+//
+// This kernel processes multiple FFT layers within a single block using shared memory.
+// Key optimizations:
+// 1. Each block loads a contiguous chunk of data to shared memory
+// 2. All layers where butterfly pairs fit within the chunk are processed in shared memory
+// 3. __syncthreads() ensures proper synchronization between layers WITHIN the block
+// 4. Only one global memory read and one write per element
+//
+// For BLOCK_ELEMENTS = 1024 (2^10), we can process up to 10 layers in shared memory.
+// This reduces kernel launches from log_n to approximately log_n - 10 for large FFTs.
 
-// Process 8 elements per thread for better memory coalescing
-// This is a radix-8 approach that handles 3 layers at once
-extern "C" __global__ void ifft_radix8_kernel(
+#define SHMEM_BLOCK_SIZE 256    // Threads per block
+#define SHMEM_ELEMENTS 1024     // Elements per block (each thread handles 4 elements)
+#define SHMEM_LOG_ELEMENTS 10   // log2(SHMEM_ELEMENTS)
+
+// Shared memory IFFT kernel - processes multiple layers in one kernel launch
+// This kernel handles the FIRST several layers where butterfly pairs are close together
+extern "C" __global__ void ifft_shared_mem_kernel(
     uint32_t* data,
-    const uint32_t* twiddles_dbl_0,  // Layer 0 twiddles (4 per block)
-    const uint32_t* twiddles_dbl_1,  // Layer 1 twiddles (2 per block)
-    const uint32_t* twiddles_dbl_2,  // Layer 2 twiddles (1 per block)
-    uint32_t base_layer,             // Starting layer index
-    uint32_t log_n
+    const uint32_t* all_twiddles,      // All twiddles flattened [layer0, layer1, ...]
+    const uint32_t* twiddle_offsets,   // Offset into all_twiddles for each layer
+    uint32_t num_layers_to_process,    // How many layers to process (up to SHMEM_LOG_ELEMENTS)
+    uint32_t log_n                     // Total log size
 ) {
-    uint32_t block_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    // Shared memory for the data chunk this block processes
+    __shared__ uint32_t shmem[SHMEM_ELEMENTS];
+    
+    uint32_t tid = threadIdx.x;
+    uint32_t block_id = blockIdx.x;
     uint32_t n = 1u << log_n;
-    uint32_t n_blocks = n >> 3;  // n / 8
     
-    if (block_idx >= n_blocks) return;
+    // Each block processes SHMEM_ELEMENTS contiguous elements
+    uint32_t base_idx = block_id * SHMEM_ELEMENTS;
     
-    uint32_t step = 1u << base_layer;
-    uint32_t offset = block_idx * 8 * step;
+    // Coalesced load: each thread loads 4 consecutive elements
+    // Thread 0 loads [0,1,2,3], Thread 1 loads [4,5,6,7], etc.
+    uint32_t load_base = tid * 4;
+    if (base_idx + load_base + 3 < n) {
+        shmem[load_base + 0] = data[base_idx + load_base + 0];
+        shmem[load_base + 1] = data[base_idx + load_base + 1];
+        shmem[load_base + 2] = data[base_idx + load_base + 2];
+        shmem[load_base + 3] = data[base_idx + load_base + 3];
+    }
+    __syncthreads();
     
-    // Load 8 values
-    uint32_t v0 = data[offset + 0 * step];
-    uint32_t v1 = data[offset + 1 * step];
-    uint32_t v2 = data[offset + 2 * step];
-    uint32_t v3 = data[offset + 3 * step];
-    uint32_t v4 = data[offset + 4 * step];
-    uint32_t v5 = data[offset + 5 * step];
-    uint32_t v6 = data[offset + 6 * step];
-    uint32_t v7 = data[offset + 7 * step];
+    // Process layers in shared memory
+    // For each layer, the butterfly stride is 2^layer
+    // We can process layers 0 through (num_layers_to_process - 1) in shared memory
+    for (uint32_t layer = 0; layer < num_layers_to_process; layer++) {
+        uint32_t half_block = 1u << layer;
+        uint32_t block_size = half_block << 1;
+        
+        // Number of butterflies per block for this layer
+        uint32_t butterflies_in_shmem = SHMEM_ELEMENTS / 2;
+        
+        // Each thread handles multiple butterflies
+        uint32_t butterflies_per_thread = butterflies_in_shmem / SHMEM_BLOCK_SIZE;
+        if (butterflies_per_thread == 0) butterflies_per_thread = 1;
+        
+        for (uint32_t b = 0; b < butterflies_per_thread; b++) {
+            uint32_t butterfly_idx = tid * butterflies_per_thread + b;
+            if (butterfly_idx >= butterflies_in_shmem) break;
+            
+            // Calculate local indices within shared memory
+            // For layer i: pairs are (j, j + 2^i) where j has bit i = 0
+            uint32_t pair_block = butterfly_idx / half_block;
+            uint32_t pair_offset = butterfly_idx % half_block;
+            
+            uint32_t local_idx0 = pair_block * block_size + pair_offset;
+            uint32_t local_idx1 = local_idx0 + half_block;
+            
+            if (local_idx1 < SHMEM_ELEMENTS) {
+                // Calculate global twiddle index
+                // The twiddle for this butterfly depends on which "h" group it belongs to
+                // h = (base_idx + local_idx0) / block_size for global indexing
+                uint32_t global_idx0 = base_idx + local_idx0;
+                uint32_t h = global_idx0 >> (layer + 1);  // Equivalent to global_idx0 / block_size
+                
+                // Get twiddle from the flattened array
+                uint32_t twiddle_base = twiddle_offsets[layer];
+                uint32_t n_twiddles_this_layer = 1u << (log_n - 1 - layer);
+                uint32_t twiddle_idx = h % n_twiddles_this_layer;
+                uint32_t twiddle_dbl = all_twiddles[twiddle_base + twiddle_idx];
+                
+                // Load from shared memory
+                uint32_t a = shmem[local_idx0];
+                uint32_t b_val = shmem[local_idx1];
+                
+                // Apply butterfly
+                ibutterfly(&a, &b_val, twiddle_dbl);
+                
+                // Store back to shared memory
+                shmem[local_idx0] = a;
+                shmem[local_idx1] = b_val;
+            }
+        }
+        __syncthreads();  // Sync before next layer
+    }
     
-    // Layer 0: 4 butterflies
-    uint32_t tw0_0 = twiddles_dbl_0[(block_idx * 4 + 0) % (1u << (log_n - base_layer - 1))];
-    uint32_t tw0_1 = twiddles_dbl_0[(block_idx * 4 + 1) % (1u << (log_n - base_layer - 1))];
-    uint32_t tw0_2 = twiddles_dbl_0[(block_idx * 4 + 2) % (1u << (log_n - base_layer - 1))];
-    uint32_t tw0_3 = twiddles_dbl_0[(block_idx * 4 + 3) % (1u << (log_n - base_layer - 1))];
-    
-    ibutterfly(&v0, &v1, tw0_0);
-    ibutterfly(&v2, &v3, tw0_1);
-    ibutterfly(&v4, &v5, tw0_2);
-    ibutterfly(&v6, &v7, tw0_3);
-    
-    // Layer 1: 4 butterflies with 2 unique twiddles
-    uint32_t tw1_0 = twiddles_dbl_1[(block_idx * 2 + 0) % (1u << (log_n - base_layer - 2))];
-    uint32_t tw1_1 = twiddles_dbl_1[(block_idx * 2 + 1) % (1u << (log_n - base_layer - 2))];
-    
-    ibutterfly(&v0, &v2, tw1_0);
-    ibutterfly(&v1, &v3, tw1_0);
-    ibutterfly(&v4, &v6, tw1_1);
-    ibutterfly(&v5, &v7, tw1_1);
-    
-    // Layer 2: 4 butterflies with 1 unique twiddle
-    uint32_t tw2 = twiddles_dbl_2[block_idx % (1u << (log_n - base_layer - 3))];
-    
-    ibutterfly(&v0, &v4, tw2);
-    ibutterfly(&v1, &v5, tw2);
-    ibutterfly(&v2, &v6, tw2);
-    ibutterfly(&v3, &v7, tw2);
-    
-    // Store 8 values
-    data[offset + 0 * step] = v0;
-    data[offset + 1 * step] = v1;
-    data[offset + 2 * step] = v2;
-    data[offset + 3 * step] = v3;
-    data[offset + 4 * step] = v4;
-    data[offset + 5 * step] = v5;
-    data[offset + 6 * step] = v6;
-    data[offset + 7 * step] = v7;
+    // Coalesced store back to global memory
+    if (base_idx + load_base + 3 < n) {
+        data[base_idx + load_base + 0] = shmem[load_base + 0];
+        data[base_idx + load_base + 1] = shmem[load_base + 1];
+        data[base_idx + load_base + 2] = shmem[load_base + 2];
+        data[base_idx + load_base + 3] = shmem[load_base + 3];
+    }
 }
 
 "#;
