@@ -11,11 +11,10 @@ fn main() {
     use stwo::core::fields::m31::BaseField;
     use stwo::core::poly::circle::CanonicCoset;
     use stwo::prover::backend::gpu::cuda_executor::{get_cuda_executor, is_cuda_available};
-    use stwo::prover::backend::gpu::fft::{compute_itwiddle_dbls_cpu, compute_twiddle_dbls_cpu};
+    use stwo::prover::backend::gpu::fft::compute_itwiddle_dbls_cpu;
     use stwo::prover::backend::gpu::GpuBackend;
     use stwo::prover::backend::simd::column::BaseColumn;
     use stwo::prover::backend::simd::SimdBackend;
-    use stwo::prover::backend::Column;
     use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
     use stwo::prover::poly::BitReversedOrder;
 
