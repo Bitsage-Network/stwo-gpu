@@ -79,18 +79,10 @@ fn main() {
     
     let start = Instant::now();
     
-    // Define the processing function
-    // Note: We perform upload + sync to demonstrate multi-GPU parallelism
-    // The full FFT requires more complex borrow management
-    let results = prover.prove_parallel(workloads, |gpu_idx, ctx, data, _log_size| {
-        // Upload data to GPU
-        let d_poly = ctx.upload_poly(data)?;
-        
-        // Sync to ensure upload completes
-        ctx.sync()?;
-        
-        // Download to verify (this exercises the GPU)
-        let _result = ctx.download_poly(&d_poly)?;
+    // Define the processing function - Full FFT pipeline!
+    let results = prover.prove_parallel(workloads, |gpu_idx, ctx, data, log_size| {
+        // Execute full proof pipeline: IFFT -> FFT
+        let _result = ctx.execute_proof_pipeline(data, log_size)?;
         
         // Return GPU index as proof of which GPU processed this
         Ok(gpu_idx)

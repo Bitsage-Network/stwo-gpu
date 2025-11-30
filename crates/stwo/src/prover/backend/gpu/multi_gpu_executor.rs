@@ -274,6 +274,102 @@ impl GpuExecutorContext {
         self.executor.device.synchronize()
             .map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))
     }
+    
+    /// Ensure twiddles are cached for a log_size (call before execute_ifft).
+    pub fn ensure_twiddles(&mut self, log_size: u32) -> Result<(), CudaFftError> {
+        if !self.twiddle_cache.contains_key(&log_size) {
+            let cache = self.create_twiddle_cache(log_size)?;
+            self.twiddle_cache.insert(log_size, cache);
+        }
+        Ok(())
+    }
+    
+    /// Execute IFFT on polynomial data.
+    /// 
+    /// Twiddles must be pre-cached via ensure_twiddles().
+    pub fn execute_ifft(&self, d_poly: &mut CudaSlice<u32>, log_size: u32) -> Result<(), CudaFftError> {
+        let twiddles = self.twiddle_cache.get(&log_size)
+            .ok_or_else(|| CudaFftError::InvalidSize(
+                format!("Twiddles not cached for log_size {}. Call ensure_twiddles first.", log_size)
+            ))?;
+        
+        self.executor.execute_ifft_on_device(
+            d_poly,
+            &twiddles.itwiddles,
+            &twiddles.twiddle_offsets,
+            &twiddles.itwiddles_cpu,
+            log_size,
+        )
+    }
+    
+    /// Execute forward FFT on polynomial data using layer-by-layer approach.
+    /// 
+    /// Twiddles must be pre-cached via ensure_twiddles().
+    pub fn execute_fft(&self, d_poly: &mut CudaSlice<u32>, log_size: u32) -> Result<(), CudaFftError> {
+        let twiddles = self.twiddle_cache.get(&log_size)
+            .ok_or_else(|| CudaFftError::InvalidSize(
+                format!("Twiddles not cached for log_size {}. Call ensure_twiddles first.", log_size)
+            ))?;
+        
+        // Execute FFT using the layer kernel
+        let block_size = 256u32;
+        let num_layers = twiddles.twiddles_cpu.len();
+        
+        // Calculate twiddle offsets
+        let mut twiddle_offsets: Vec<usize> = Vec::new();
+        let mut offset = 0usize;
+        for tw in &twiddles.twiddles_cpu {
+            twiddle_offsets.push(offset);
+            offset += tw.len();
+        }
+        
+        // Execute layers in reverse order for forward FFT
+        for layer in (0..num_layers).rev() {
+            let n_twiddles = twiddles.twiddles_cpu[layer].len();
+            let grid_size = ((n_twiddles as u32) + block_size - 1) / block_size;
+            
+            let cfg = cudarc::driver::LaunchConfig {
+                grid_dim: (grid_size, 1, 1),
+                block_dim: (block_size, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            
+            // Create a view into the twiddles at the correct offset
+            let twiddle_offset = twiddle_offsets[layer];
+            let twiddle_view = twiddles.twiddles.slice(twiddle_offset..twiddle_offset + n_twiddles);
+            
+            unsafe {
+                self.executor.kernels.fft_layer.clone().launch(
+                    cfg,
+                    (d_poly, &twiddle_view, layer as u32, log_size, n_twiddles as u32),
+                )
+            }.map_err(|e| CudaFftError::KernelExecution(format!("FFT layer {} failed: {:?}", layer, e)))?;
+        }
+        
+        self.executor.device.synchronize()
+            .map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))
+    }
+    
+    /// Execute full proof pipeline: IFFT -> FFT -> return result.
+    /// 
+    /// This is a convenience method that handles twiddle caching internally.
+    pub fn execute_proof_pipeline(&mut self, data: &[u32], log_size: u32) -> Result<Vec<u32>, CudaFftError> {
+        // Ensure twiddles are cached
+        self.ensure_twiddles(log_size)?;
+        
+        // Upload
+        let mut d_poly = self.upload_poly(data)?;
+        
+        // IFFT
+        self.execute_ifft(&mut d_poly, log_size)?;
+        
+        // FFT
+        self.execute_fft(&mut d_poly, log_size)?;
+        
+        // Sync and download
+        self.sync()?;
+        self.download_poly(&d_poly)
+    }
 }
 
 // =============================================================================
