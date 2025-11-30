@@ -113,8 +113,6 @@ struct CompiledKernels {
     bit_reverse: CudaFunction,
     ifft_layer: CudaFunction,
     fft_layer: CudaFunction,
-    // Optimized fused FFT kernels
-    ifft_fused_2layer: CudaFunction,
     // FRI folding kernels
     fold_line: CudaFunction,
     fold_circle_into_line: CudaFunction,
@@ -189,7 +187,6 @@ impl CudaFftExecutor {
             "bit_reverse_kernel",
             "ifft_layer_kernel",
             "fft_layer_kernel",
-            "ifft_fused_2layer_kernel",
         ]).map_err(|e| CudaFftError::KernelCompilation(format!("FFT load: {:?}", e)))?;
         
         // Compile FRI folding CUDA source to PTX
@@ -223,9 +220,6 @@ impl CudaFftExecutor {
         let fft_layer = device.get_func("circle_fft", "fft_layer_kernel")
             .ok_or_else(|| CudaFftError::KernelCompilation("fft_layer_kernel not found".into()))?;
         
-        let ifft_fused_2layer = device.get_func("circle_fft", "ifft_fused_2layer_kernel")
-            .ok_or_else(|| CudaFftError::KernelCompilation("ifft_fused_2layer_kernel not found".into()))?;
-        
         // Get FRI function handles
         let fold_line = device.get_func("fri_folding", "fold_line_kernel")
             .ok_or_else(|| CudaFftError::KernelCompilation("fold_line_kernel not found".into()))?;
@@ -257,7 +251,6 @@ impl CudaFftExecutor {
             bit_reverse,
             ifft_layer,
             fft_layer,
-            ifft_fused_2layer,
             fold_line,
             fold_circle_into_line,
             accumulate_quotients,
