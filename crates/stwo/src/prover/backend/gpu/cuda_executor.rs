@@ -328,10 +328,10 @@ impl CudaFftExecutor {
             offset += tw.len();
         }
         
-        // Execute butterfly layers one at a time
-        // Note: Fused kernels don't work because __syncthreads() only syncs within a block,
-        // not across blocks. Each FFT layer needs all butterflies from the previous layer
-        // to complete before starting, which requires separate kernel launches.
+        // Execute butterfly layers
+        // Each layer depends on the previous layer completing, so we need synchronization.
+        // However, CUDA kernel launches on the same stream are serialized, so we only need
+        // to sync at the end (the GPU will execute kernels in order).
         for layer in 0..num_layers {
             let n_twiddles = twiddles_dbl[layer].len() as u32;
             let butterflies_per_twiddle = 1u32 << layer;
@@ -354,11 +354,11 @@ impl CudaFftExecutor {
                     (&mut *d_data, &twiddle_view, layer as u32, log_size, n_twiddles),
                 ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
             }
-            
-            // Synchronize after each layer to ensure all butterflies complete
-            self.device.synchronize()
-                .map_err(|e| CudaFftError::KernelExecution(format!("Layer sync failed: {:?}", e)))?;
         }
+        
+        // Single sync at the end - kernels on the same stream execute in order
+        self.device.synchronize()
+            .map_err(|e| CudaFftError::KernelExecution(format!("Final sync failed: {:?}", e)))?;
         
         Ok(())
     }
