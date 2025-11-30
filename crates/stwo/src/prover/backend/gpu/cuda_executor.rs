@@ -309,13 +309,12 @@ impl CudaFftExecutor {
         log_size: u32,
         twiddles_dbl: &[Vec<u32>],
     ) -> Result<(), CudaFftError> {
-        let n = 1usize << log_size;
         let block_size = 256u32;
         let num_layers = twiddles_dbl.len();
         
         // Validate we have the expected number of twiddle layers
         // For a domain of size 2^log_size, we need log_size layers of twiddles:
-        // - Layer 0: circle layer (n/4 twiddles)
+        // - Layer 0: circle layer (n/4 twiddles, derived from layer 1)
         // - Layers 1 to log_size-1: line layers
         if num_layers != log_size as usize {
             return Err(CudaFftError::InvalidSize(format!(
@@ -333,10 +332,13 @@ impl CudaFftExecutor {
         }
         
         // Execute butterfly layers
-        // Layer 0 is the circle layer, layers 1+ are line layers
+        // Each layer has n_twiddles twiddles, and each twiddle handles (1 << layer) butterflies
+        // Total butterflies per layer = n_twiddles * (1 << layer)
         for layer in 0..num_layers {
-            let n_butterflies = n / 2;
-            let grid_size = ((n_butterflies as u32) + block_size - 1) / block_size;
+            let n_twiddles = twiddles_dbl[layer].len() as u32;
+            let butterflies_per_twiddle = 1u32 << layer;
+            let total_butterflies = n_twiddles * butterflies_per_twiddle;
+            let grid_size = (total_butterflies + block_size - 1) / block_size;
             
             let twiddle_offset = twiddle_offsets[layer];
             
@@ -354,7 +356,7 @@ impl CudaFftExecutor {
                 // Reborrow d_data each iteration to avoid move in loop
                 self.kernels.ifft_layer.clone().launch(
                     cfg,
-                    (&mut *d_data, &twiddle_view, layer as u32, log_size),
+                    (&mut *d_data, &twiddle_view, layer as u32, log_size, n_twiddles),
                 ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
             }
         }
@@ -409,7 +411,6 @@ impl CudaFftExecutor {
         log_size: u32,
         twiddles: &[Vec<u32>],
     ) -> Result<(), CudaFftError> {
-        let n = 1usize << log_size;
         let block_size = 256u32;
         let num_layers = twiddles.len();
         
@@ -432,8 +433,10 @@ impl CudaFftExecutor {
         // Execute layers in reverse order for forward FFT
         // Layer 0 is circle layer, layers 1+ are line layers
         for layer in (0..num_layers).rev() {
-            let n_butterflies = n / 2;
-            let grid_size = ((n_butterflies as u32) + block_size - 1) / block_size;
+            let n_twiddles = twiddles[layer].len() as u32;
+            let butterflies_per_twiddle = 1u32 << layer;
+            let total_butterflies = n_twiddles * butterflies_per_twiddle;
+            let grid_size = (total_butterflies + block_size - 1) / block_size;
             
             let twiddle_offset = twiddle_offsets[layer];
             
@@ -450,7 +453,7 @@ impl CudaFftExecutor {
                 // Reborrow d_data each iteration to avoid move in loop
                 self.kernels.fft_layer.clone().launch(
                     cfg,
-                    (&mut *d_data, &twiddle_view, layer as u32, log_size),
+                    (&mut *d_data, &twiddle_view, layer as u32, log_size, n_twiddles),
                 ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
             }
         }

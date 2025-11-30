@@ -57,9 +57,13 @@ fn main() {
     
     // Compute twiddles
     let twiddles = compute_itwiddle_dbls_cpu(log_size);
-    println!("Twiddle layers: {}", twiddles.len());
+    println!("Twiddle layers: {} (expected: {})", twiddles.len(), log_size);
     for (i, t) in twiddles.iter().enumerate() {
-        println!("  Layer {}: {} twiddles, first 4: {:?}", i, t.len(), t.iter().take(4).collect::<Vec<_>>());
+        let butterflies_per_twiddle = 1usize << i;
+        let total_butterflies = t.len() * butterflies_per_twiddle;
+        println!("  Layer {}: {} twiddles × {} butterflies each = {} total butterflies", 
+                 i, t.len(), butterflies_per_twiddle, total_butterflies);
+        println!("    First 4 twiddles: {:?}", t.iter().take(4).collect::<Vec<_>>());
     }
     
     // Run GPU IFFT directly
@@ -86,13 +90,30 @@ fn main() {
     let simd_eval = CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(domain, simd_data);
     let simd_result = SimdBackend::interpolate(simd_eval, &simd_twiddles);
     
+    // SIMD result needs denormalization factor applied
+    let denorm = BaseField::from(size as u32).inverse();
     let simd_coeffs: Vec<u32> = simd_result.coeffs.as_slice().iter().map(|x| x.0).collect();
     println!("SIMD output (first 8): {:?}", &simd_coeffs[..8]);
     println!("SIMD output (last 8):  {:?}", &simd_coeffs[size-8..]);
     
+    // Note: SIMD interpolate already applies denormalization internally
+    // GPU IFFT is raw (no denormalization), so we need to apply it
+    let denorm_val = denorm.0;
+    let gpu_denorm: Vec<u32> = data.iter()
+        .map(|&v| {
+            let prod = (v as u64) * (denorm_val as u64);
+            let lo = (prod & 0x7FFFFFFF) as u32;
+            let hi = (prod >> 31) as u32;
+            let result = lo + hi;
+            if result >= 0x7FFFFFFF { result - 0x7FFFFFFF } else { result }
+        })
+        .collect();
+    
+    println!("\nGPU output after denorm (first 8): {:?}", &gpu_denorm[..8]);
+    
     // Compare
     let mut mismatches = 0;
-    for (i, (&s, &g)) in simd_coeffs.iter().zip(data.iter()).enumerate() {
+    for (i, (&s, &g)) in simd_coeffs.iter().zip(gpu_denorm.iter()).enumerate() {
         if s != g {
             if mismatches < 5 {
                 println!("  Mismatch at {}: SIMD={}, GPU={}", i, s, g);

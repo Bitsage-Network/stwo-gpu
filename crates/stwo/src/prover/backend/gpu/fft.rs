@@ -185,67 +185,84 @@ extern "C" __global__ void bit_reverse_kernel(
 
 // Forward FFT single layer
 // Each thread handles one butterfly operation
+// Matches CPU's fft_layer_loop: for layer i, twiddle h, l in 0..2^i:
+//   idx0 = (h << (i + 1)) + l
+//   idx1 = idx0 + (1 << i)
 extern "C" __global__ void fft_layer_kernel(
     uint32_t* data,
     const uint32_t* twiddles,
     uint32_t layer,        // Layer index (0 = first layer)
-    uint32_t log_n         // log2(n)
+    uint32_t log_n,        // log2(n)
+    uint32_t n_twiddles    // Number of twiddles for this layer
 ) {
-    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t half_block = 1u << layer;
-    uint32_t block_size = half_block << 1;
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t n = 1u << log_n;
     
-    if (idx >= n / 2) return;
+    // Total butterflies = n_twiddles * (1 << layer)
+    uint32_t butterflies_per_twiddle = 1u << layer;
+    uint32_t total_butterflies = n_twiddles * butterflies_per_twiddle;
     
-    uint32_t block_idx = idx / half_block;
-    uint32_t local_idx = idx % half_block;
+    if (tid >= total_butterflies) return;
     
-    uint32_t i = block_idx * block_size + local_idx;
-    uint32_t j = i + half_block;
+    // Determine which twiddle and which l within that twiddle group
+    uint32_t h = tid / butterflies_per_twiddle;  // Twiddle index
+    uint32_t l = tid % butterflies_per_twiddle;  // Position within group
     
-    // Get twiddle factor for this butterfly
-    uint32_t twiddle = twiddles[local_idx];
+    // Calculate indices matching CPU's fft_layer_loop
+    uint32_t idx0 = (h << (layer + 1)) + l;
+    uint32_t idx1 = idx0 + (1u << layer);
+    
+    // Get twiddle factor
+    uint32_t twiddle = twiddles[h];
     
     // Load values
-    uint32_t a = data[i];
-    uint32_t b = data[j];
+    uint32_t a = data[idx0];
+    uint32_t b = data[idx1];
     
-    // Butterfly with twiddle
+    // Forward butterfly: (a, b) -> (a + b*t, a - b*t)
     uint32_t t = m31_mul(b, twiddle);
-    data[i] = m31_add(a, t);
-    data[j] = m31_sub(a, t);
+    data[idx0] = m31_add(a, t);
+    data[idx1] = m31_sub(a, t);
 }
 
 // Inverse FFT single layer
+// Matches CPU's fft_layer_loop with ibutterfly
 extern "C" __global__ void ifft_layer_kernel(
     uint32_t* data,
     const uint32_t* twiddles_dbl,  // Doubled twiddles
     uint32_t layer,
-    uint32_t log_n
+    uint32_t log_n,
+    uint32_t n_twiddles    // Number of twiddles for this layer
 ) {
-    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t half_block = 1u << layer;
-    uint32_t block_size = half_block << 1;
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t n = 1u << log_n;
     
-    if (idx >= n / 2) return;
+    // Total butterflies = n_twiddles * (1 << layer)
+    uint32_t butterflies_per_twiddle = 1u << layer;
+    uint32_t total_butterflies = n_twiddles * butterflies_per_twiddle;
     
-    uint32_t block_idx = idx / half_block;
-    uint32_t local_idx = idx % half_block;
+    if (tid >= total_butterflies) return;
     
-    uint32_t i = block_idx * block_size + local_idx;
-    uint32_t j = i + half_block;
+    // Determine which twiddle and which l within that twiddle group
+    uint32_t h = tid / butterflies_per_twiddle;  // Twiddle index
+    uint32_t l = tid % butterflies_per_twiddle;  // Position within group
     
-    uint32_t twiddle_dbl = twiddles_dbl[local_idx];
+    // Calculate indices matching CPU's fft_layer_loop
+    uint32_t idx0 = (h << (layer + 1)) + l;
+    uint32_t idx1 = idx0 + (1u << layer);
     
-    uint32_t a = data[i];
-    uint32_t b = data[j];
+    // Get twiddle factor
+    uint32_t twiddle_dbl = twiddles_dbl[h];
     
+    // Load values
+    uint32_t a = data[idx0];
+    uint32_t b = data[idx1];
+    
+    // Inverse butterfly: (a, b) -> (a + b, (a - b) * t)
     ibutterfly(&a, &b, twiddle_dbl);
     
-    data[i] = a;
-    data[j] = b;
+    data[idx0] = a;
+    data[idx1] = b;
 }
 
 // =============================================================================
@@ -522,15 +539,15 @@ fn compute_twiddles_for_gpu(log_size: u32) -> GpuTwiddles {
 
 /// Compute inverse twiddles (doubled) on CPU for GPU IFFT.
 /// 
-/// This function generates the twiddle factors needed for the inverse Circle FFT.
-/// The twiddles include both the circle layer (layer 0) and line layers (layers 1+).
+/// This function generates the twiddle factors needed for the inverse Circle FFT,
+/// using the EXACT same structure as the CPU backend.
 /// 
 /// # Structure
 /// 
 /// For a domain of size 2^log_size:
-/// - Layer 0 (circle layer): n/4 twiddles derived from line_twiddles[0]
-/// - Layer 1: n/4 twiddles (line_twiddles[0])
-/// - Layer 2: n/8 twiddles (line_twiddles[1])
+/// - Layer 0 (circle layer): n/4 twiddles, derived from layer 1 via [y, -y, -x, x] pattern
+/// - Layer 1: n/4 twiddles (first line layer)
+/// - Layer 2: n/8 twiddles
 /// - ...
 /// - Layer log_size-1: 1 twiddle
 /// 
@@ -541,7 +558,7 @@ fn compute_twiddles_for_gpu(log_size: u32) -> GpuTwiddles {
 /// 
 /// # Returns
 /// A vector of vectors, where each inner vector contains the doubled inverse
-/// twiddles for that layer.
+/// twiddles for that layer, in bit-reversed order.
 pub fn compute_itwiddle_dbls_cpu(log_size: u32) -> Vec<Vec<u32>> {
     use crate::core::poly::circle::CanonicCoset;
     use crate::core::utils::bit_reverse;
@@ -551,17 +568,20 @@ pub fn compute_itwiddle_dbls_cpu(log_size: u32) -> Vec<Vec<u32>> {
     // Get the half_coset from the domain
     let half_coset = CanonicCoset::new(log_size).circle_domain().half_coset;
     
-    // Compute line twiddles (same as SIMD's get_itwiddle_dbls)
+    // Compute line twiddles (layers 1+)
+    // This matches the CPU backend's get_itwiddle_dbls
     let mut line_twiddles: Vec<Vec<u32>> = Vec::new();
     let mut current_coset = half_coset;
     
     for _ in 0..current_coset.log_size() {
+        // Collect twiddles: inverse of x-coordinate, doubled
         let layer_twiddles: Vec<u32> = current_coset
             .iter()
             .take(current_coset.size() / 2)
             .map(|p| p.x.inverse().0 * 2)  // Doubled inverse twiddle
             .collect_vec();
         
+        // Bit-reverse the twiddles
         let mut reversed = layer_twiddles;
         bit_reverse(&mut reversed);
         
@@ -569,39 +589,22 @@ pub fn compute_itwiddle_dbls_cpu(log_size: u32) -> Vec<Vec<u32>> {
         current_coset = current_coset.double();
     }
     
-    // Compute circle twiddles from first line layer
-    // Circle twiddles are derived from the y-coordinates
-    // For each pair (x, y) in line_twiddles[0], we get [y, -y, -x, x]
-    let circle_twiddles: Vec<u32> = if !line_twiddles.is_empty() {
-        // Convert u32 back to BaseField, compute circle twiddles, convert back
+    // Compute circle twiddles (layer 0) from first line layer
+    // This matches CPU's circle_twiddles_from_line_twiddles
+    // For each pair (x, y) in line_twiddles[0], produces [y, -y, -x, x]
+    let circle_twiddles: Vec<u32> = if !line_twiddles.is_empty() && !line_twiddles[0].is_empty() {
+        // Convert u32 back to BaseField to do field operations
         let first_line: Vec<BaseField> = line_twiddles[0]
             .iter()
-            .map(|&v| BaseField::from_u32_unchecked(v / 2))  // Undo doubling to get inverse
+            .map(|&v| BaseField::from_u32_unchecked(v / 2))  // Undo doubling
             .collect();
-        
-        // For inverse twiddles, the y values need to be computed from x
-        // The circle point (x, y) satisfies x^2 + y^2 = 1
-        // So y = sqrt(1 - x^2) in the field
-        // But for bit-reversed twiddles, we use the relationship from CPU code:
-        // [y, -y, -x, x] for each pair (x, y)
-        
-        // Actually, looking at the CPU code more carefully:
-        // The first_line_twiddles are the x coordinates in bit-reversed order
-        // The y coordinates are at odd indices in the original coset
-        // For simplicity, we'll use the relationship that works for inverse twiddles
-        
-        // The CPU code does:
-        // first_line_twiddles.chunks_exact(2).flat_map(|chunk| {
-        //     let &x = &chunk[0]; let &y = &chunk[1];
-        //     [y, -y, -x, x]
-        // })
         
         first_line
             .chunks_exact(2)
             .flat_map(|chunk| {
                 let x = chunk[0];
                 let y = chunk[1];
-                // Return doubled values
+                // Return doubled values: [y, -y, -x, x]
                 [y.0 * 2, (-y).0 * 2, (-x).0 * 2, x.0 * 2]
             })
             .collect()
@@ -619,7 +622,8 @@ pub fn compute_itwiddle_dbls_cpu(log_size: u32) -> Vec<Vec<u32>> {
 
 /// Compute forward twiddles (doubled) on CPU for GPU FFT.
 /// 
-/// Similar to `compute_itwiddle_dbls_cpu` but for forward FFT.
+/// Uses the EXACT same structure as `compute_itwiddle_dbls_cpu` but with
+/// non-inverted x-coordinates.
 pub fn compute_twiddle_dbls_cpu(log_size: u32) -> Vec<Vec<u32>> {
     use crate::core::poly::circle::CanonicCoset;
     use crate::core::utils::bit_reverse;
@@ -628,11 +632,12 @@ pub fn compute_twiddle_dbls_cpu(log_size: u32) -> Vec<Vec<u32>> {
     
     let half_coset = CanonicCoset::new(log_size).circle_domain().half_coset;
     
-    // Compute line twiddles
+    // Compute line twiddles (layers 1+)
     let mut line_twiddles: Vec<Vec<u32>> = Vec::new();
     let mut current_coset = half_coset;
     
     for _ in 0..current_coset.log_size() {
+        // Collect twiddles: x-coordinate (not inverted), doubled
         let layer_twiddles: Vec<u32> = current_coset
             .iter()
             .take(current_coset.size() / 2)
@@ -646,8 +651,8 @@ pub fn compute_twiddle_dbls_cpu(log_size: u32) -> Vec<Vec<u32>> {
         current_coset = current_coset.double();
     }
     
-    // Compute circle twiddles from first line layer
-    let circle_twiddles: Vec<u32> = if !line_twiddles.is_empty() {
+    // Compute circle twiddles (layer 0) from first line layer
+    let circle_twiddles: Vec<u32> = if !line_twiddles.is_empty() && !line_twiddles[0].is_empty() {
         let first_line: Vec<BaseField> = line_twiddles[0]
             .iter()
             .map(|&v| BaseField::from_u32_unchecked(v / 2))
@@ -658,6 +663,7 @@ pub fn compute_twiddle_dbls_cpu(log_size: u32) -> Vec<Vec<u32>> {
             .flat_map(|chunk| {
                 let x = chunk[0];
                 let y = chunk[1];
+                // Return doubled values: [y, -y, -x, x]
                 [y.0 * 2, (-y).0 * 2, (-x).0 * 2, x.0 * 2]
             })
             .collect()
