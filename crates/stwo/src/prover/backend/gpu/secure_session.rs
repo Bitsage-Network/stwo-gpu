@@ -163,13 +163,8 @@ pub struct TeeContext {
     /// Attestation quote (proof of TEE execution)
     attestation_quote: Vec<u8>,
     
-    /// User ID this context belongs to
-    #[cfg(feature = "cuda-runtime")]
+    /// User ID this context belongs to (used in attestation quote generation)
     user_id: UserId,
-    
-    /// User ID (stored for reference, used in attestation quote)
-    #[cfg(not(feature = "cuda-runtime"))]
-    _user_id: UserId,
 }
 
 impl TeeContext {
@@ -213,10 +208,7 @@ impl TeeContext {
         Self {
             session_key,
             attestation_quote,
-            #[cfg(feature = "cuda-runtime")]
             user_id,
-            #[cfg(not(feature = "cuda-runtime"))]
-            _user_id: user_id,
         }
     }
     
@@ -252,6 +244,11 @@ impl TeeContext {
     /// Get the attestation quote
     pub fn attestation_quote(&self) -> &[u8] {
         &self.attestation_quote
+    }
+    
+    /// Get the user ID this context belongs to
+    pub fn user_id(&self) -> UserId {
+        self.user_id
     }
     
     /// Securely destroy the context (zero out keys)
