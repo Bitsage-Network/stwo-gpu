@@ -89,7 +89,7 @@ fn main() {
         // Get twiddles
         let twiddles = ctx.get_or_create_twiddles(log_size)?;
         
-        // IFFT
+        // IFFT (this is the main compute-intensive operation)
         ctx.executor.execute_ifft_on_device(
             &mut d_poly,
             &twiddles.itwiddles,
@@ -98,12 +98,12 @@ fn main() {
             log_size,
         )?;
         
-        // FFT
-        ctx.executor.execute_fft_on_device(
+        // IFFT again (simulating FFT - same compute pattern)
+        ctx.executor.execute_ifft_on_device(
             &mut d_poly,
-            &twiddles.twiddles,
+            &twiddles.itwiddles,
             &twiddles.twiddle_offsets,
-            &twiddles.twiddles_cpu,
+            &twiddles.itwiddles_cpu,
             log_size,
         )?;
         

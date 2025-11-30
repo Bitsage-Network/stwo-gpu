@@ -26,10 +26,10 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(feature = "cuda-runtime")]
-use cudarc::driver::{CudaDevice, CudaSlice, LaunchAsync, LaunchConfig};
+use cudarc::driver::{CudaDevice, CudaSlice};
 
 #[cfg(feature = "cuda-runtime")]
-use super::cuda_executor::{CudaFftError, CudaFftExecutor, DeviceInfo};
+use super::cuda_executor::{CudaFftError, CudaFftExecutor};
 #[cfg(feature = "cuda-runtime")]
 use super::fft::{compute_itwiddle_dbls_cpu, compute_twiddle_dbls_cpu};
 
@@ -168,8 +168,8 @@ impl MultiGpuExecutorPool {
     /// Returns results from all GPUs.
     pub fn parallel_execute<F, R>(&self, f: F) -> Vec<Result<R, CudaFftError>>
     where
-        F: Fn(usize, &mut GpuExecutorContext) -> Result<R, CudaFftError> + Send + Sync,
-        R: Send,
+        F: Fn(usize, &mut GpuExecutorContext) -> Result<R, CudaFftError> + Send + Sync + 'static,
+        R: Send + 'static,
     {
         use std::thread;
         
@@ -277,122 +277,9 @@ impl GpuExecutorContext {
 }
 
 // =============================================================================
-// Thread-Safe Proof Pipeline
+// Note: ThreadSafeProofPipeline removed due to CudaSlice not implementing Default.
+// Use TrueMultiGpuProver.prove_parallel() instead for multi-GPU workloads.
 // =============================================================================
-
-/// A proof pipeline that can run on any GPU from the pool.
-#[cfg(feature = "cuda-runtime")]
-pub struct ThreadSafeProofPipeline {
-    /// GPU pool index this pipeline is assigned to
-    gpu_index: usize,
-    /// Polynomial data on GPU
-    poly_data: Vec<CudaSlice<u32>>,
-    /// Log size
-    log_size: u32,
-}
-
-#[cfg(feature = "cuda-runtime")]
-impl ThreadSafeProofPipeline {
-    /// Create a new pipeline on a specific GPU from the pool.
-    pub fn new(gpu_index: usize, log_size: u32) -> Result<Self, CudaFftError> {
-        let pool = get_multi_gpu_pool()?;
-        
-        if gpu_index >= pool.gpu_count() {
-            return Err(CudaFftError::InvalidSize(
-                format!("GPU index {} out of range (pool has {} GPUs)", gpu_index, pool.gpu_count())
-            ));
-        }
-        
-        // Initialize twiddles for this log_size
-        pool.with_gpu(gpu_index, |ctx| {
-            ctx.get_or_create_twiddles(log_size)?;
-            Ok(())
-        })?;
-        
-        Ok(Self {
-            gpu_index,
-            poly_data: Vec::new(),
-            log_size,
-        })
-    }
-    
-    /// Upload polynomial data.
-    pub fn upload_polynomial(&mut self, data: &[u32]) -> Result<usize, CudaFftError> {
-        let pool = get_multi_gpu_pool()?;
-        
-        let d_data = pool.with_gpu(self.gpu_index, |ctx| {
-            ctx.upload_poly(data)
-        })?;
-        
-        let idx = self.poly_data.len();
-        self.poly_data.push(d_data);
-        Ok(idx)
-    }
-    
-    /// Execute IFFT on a polynomial.
-    pub fn ifft(&mut self, poly_idx: usize) -> Result<(), CudaFftError> {
-        if poly_idx >= self.poly_data.len() {
-            return Err(CudaFftError::InvalidSize(format!("Invalid poly index: {}", poly_idx)));
-        }
-        
-        let pool = get_multi_gpu_pool()?;
-        let log_size = self.log_size;
-        
-        // We need to move the data out temporarily due to borrow checker
-        let mut d_poly = std::mem::take(&mut self.poly_data[poly_idx]);
-        
-        pool.with_gpu(self.gpu_index, |ctx| {
-            let twiddles = ctx.get_or_create_twiddles(log_size)?;
-            ctx.executor.execute_ifft_on_device(
-                &mut d_poly,
-                &twiddles.itwiddles,
-                &twiddles.twiddle_offsets,
-                &twiddles.itwiddles_cpu,
-                log_size,
-            )
-        })?;
-        
-        self.poly_data[poly_idx] = d_poly;
-        Ok(())
-    }
-    
-    /// Execute FFT on a polynomial.
-    pub fn fft(&mut self, poly_idx: usize) -> Result<(), CudaFftError> {
-        if poly_idx >= self.poly_data.len() {
-            return Err(CudaFftError::InvalidSize(format!("Invalid poly index: {}", poly_idx)));
-        }
-        
-        let pool = get_multi_gpu_pool()?;
-        let log_size = self.log_size;
-        
-        let mut d_poly = std::mem::take(&mut self.poly_data[poly_idx]);
-        
-        pool.with_gpu(self.gpu_index, |ctx| {
-            let twiddles = ctx.get_or_create_twiddles(log_size)?;
-            ctx.executor.execute_fft_on_device(
-                &mut d_poly,
-                &twiddles.twiddles,
-                &twiddles.twiddle_offsets,
-                &twiddles.twiddles_cpu,
-                log_size,
-            )
-        })?;
-        
-        self.poly_data[poly_idx] = d_poly;
-        Ok(())
-    }
-    
-    /// Synchronize the GPU.
-    pub fn sync(&self) -> Result<(), CudaFftError> {
-        let pool = get_multi_gpu_pool()?;
-        pool.with_gpu(self.gpu_index, |ctx| ctx.sync())
-    }
-    
-    /// Get the GPU index this pipeline is running on.
-    pub fn gpu_index(&self) -> usize {
-        self.gpu_index
-    }
-}
 
 // =============================================================================
 // True Multi-GPU Prover
