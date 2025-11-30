@@ -230,6 +230,385 @@ impl GpuProofPipeline {
         executor.device.synchronize()
             .map_err(|e| CudaFftError::KernelExecution(format!("Sync failed: {:?}", e)))
     }
+    
+    // =========================================================================
+    // FRI Folding Operations (on persistent GPU memory)
+    // =========================================================================
+    
+    /// Execute FRI fold_line on GPU with persistent memory.
+    /// 
+    /// Folds a polynomial by factor of 2 using the FRI protocol.
+    /// Input and output stay on GPU.
+    /// 
+    /// # Arguments
+    /// * `input_idx` - Index of input polynomial (SecureField, 4 u32 per element)
+    /// * `itwiddles` - Inverse twiddles for folding
+    /// * `alpha` - FRI alpha challenge (4 u32 for SecureField)
+    /// 
+    /// # Returns
+    /// Index of the new folded polynomial (half the size)
+    pub fn fri_fold_line(
+        &mut self,
+        input_idx: usize,
+        itwiddles: &[u32],
+        alpha: &[u32; 4],
+    ) -> Result<usize, CudaFftError> {
+        if input_idx >= self.poly_data.len() {
+            return Err(CudaFftError::InvalidSize(
+                format!("Invalid polynomial index: {}", input_idx)
+            ));
+        }
+        
+        let executor = get_cuda_executor().map_err(|e| e.clone())?;
+        let n = 1usize << self.log_size;
+        let n_output = n / 2;
+        
+        // Upload twiddles and alpha
+        let d_itwiddles = executor.device.htod_sync_copy(itwiddles)
+            .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        let d_alpha = executor.device.htod_sync_copy(alpha)
+            .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        
+        // Allocate output on GPU
+        let mut d_output = unsafe {
+            executor.device.alloc::<u32>(n_output * 4)
+        }.map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        
+        // Launch kernel
+        let block_size = 256u32;
+        let grid_size = ((n_output as u32) + block_size - 1) / block_size;
+        let log_n = n.ilog2();
+        
+        let cfg = LaunchConfig {
+            grid_dim: (grid_size, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        
+        unsafe {
+            executor.kernels.fold_line.clone().launch(
+                cfg,
+                (&mut d_output, &self.poly_data[input_idx], &d_itwiddles, &d_alpha, n as u32, log_n),
+            ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
+        }
+        
+        executor.device.synchronize()
+            .map_err(|e| CudaFftError::KernelExecution(format!("Sync failed: {:?}", e)))?;
+        
+        // Store output as new polynomial
+        let output_idx = self.poly_data.len();
+        self.poly_data.push(d_output);
+        
+        Ok(output_idx)
+    }
+    
+    /// Execute FRI fold_circle_into_line on GPU with persistent memory.
+    /// 
+    /// Folds circle evaluation into line evaluation (accumulated).
+    /// Both input and output stay on GPU.
+    pub fn fri_fold_circle_into_line(
+        &mut self,
+        dst_idx: usize,
+        src_idx: usize,
+        itwiddles: &[u32],
+        alpha: &[u32; 4],
+    ) -> Result<(), CudaFftError> {
+        if dst_idx >= self.poly_data.len() || src_idx >= self.poly_data.len() {
+            return Err(CudaFftError::InvalidSize(
+                format!("Invalid polynomial indices: dst={}, src={}", dst_idx, src_idx)
+            ));
+        }
+        
+        let executor = get_cuda_executor().map_err(|e| e.clone())?;
+        let n = 1usize << self.log_size;
+        let n_dst = n / 2;
+        
+        // Upload twiddles and alpha
+        let d_itwiddles = executor.device.htod_sync_copy(itwiddles)
+            .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        let d_alpha = executor.device.htod_sync_copy(alpha)
+            .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        
+        // Launch kernel
+        let block_size = 256u32;
+        let grid_size = ((n_dst as u32) + block_size - 1) / block_size;
+        let log_n = n.ilog2();
+        
+        let cfg = LaunchConfig {
+            grid_dim: (grid_size, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        
+        unsafe {
+            executor.kernels.fold_circle_into_line.clone().launch(
+                cfg,
+                (&mut self.poly_data[dst_idx], &self.poly_data[src_idx], &d_itwiddles, &d_alpha, n as u32, log_n),
+            ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
+        }
+        
+        executor.device.synchronize()
+            .map_err(|e| CudaFftError::KernelExecution(format!("Sync failed: {:?}", e)))?;
+        
+        Ok(())
+    }
+    
+    // =========================================================================
+    // Quotient Accumulation Operations (on persistent GPU memory)
+    // =========================================================================
+    
+    /// Execute quotient accumulation on GPU with persistent memory.
+    /// 
+    /// Accumulates quotients for constraint evaluation.
+    /// 
+    /// # Returns
+    /// Index of the new quotient polynomial (SecureField)
+    pub fn accumulate_quotients(
+        &mut self,
+        column_indices: &[usize],
+        line_coeffs: &[[u32; 12]],
+        denom_inv: &[u32],
+        batch_sizes: &[usize],
+        col_indices: &[usize],
+        n_points: usize,
+    ) -> Result<usize, CudaFftError> {
+        let executor = get_cuda_executor().map_err(|e| e.clone())?;
+        
+        // Gather column data from GPU polynomials
+        let n_columns = column_indices.len();
+        
+        // Flatten columns from GPU memory (need to download temporarily)
+        // In a fully optimized version, this would stay on GPU
+        let mut flat_columns: Vec<u32> = Vec::new();
+        for &idx in column_indices {
+            if idx >= self.poly_data.len() {
+                return Err(CudaFftError::InvalidSize(
+                    format!("Invalid column index: {}", idx)
+                ));
+            }
+            let mut col_data = vec![0u32; 1 << self.log_size];
+            executor.device.dtoh_sync_copy_into(&self.poly_data[idx], &mut col_data)
+                .map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
+            flat_columns.extend_from_slice(&col_data);
+        }
+        
+        // Flatten line coefficients
+        let flat_line_coeffs: Vec<u32> = line_coeffs.iter()
+            .flat_map(|coeffs| coeffs.iter().copied())
+            .collect();
+        
+        // Convert to u32
+        let batch_sizes_u32: Vec<u32> = batch_sizes.iter().map(|&s| s as u32).collect();
+        let col_indices_u32: Vec<u32> = col_indices.iter().map(|&i| i as u32).collect();
+        let n_batches = batch_sizes.len();
+        
+        // Upload to GPU
+        let d_columns = executor.device.htod_sync_copy(&flat_columns)
+            .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        let d_line_coeffs = executor.device.htod_sync_copy(&flat_line_coeffs)
+            .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        let d_denom_inv = executor.device.htod_sync_copy(denom_inv)
+            .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        let d_batch_sizes = executor.device.htod_sync_copy(&batch_sizes_u32)
+            .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        let d_col_indices = executor.device.htod_sync_copy(&col_indices_u32)
+            .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        
+        // Allocate output
+        let mut d_output = unsafe {
+            executor.device.alloc::<u32>(n_points * 4)
+        }.map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        
+        // Launch kernel
+        let block_size = 256u32;
+        let grid_size = ((n_points as u32) + block_size - 1) / block_size;
+        
+        let cfg = LaunchConfig {
+            grid_dim: (grid_size, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        
+        unsafe {
+            executor.kernels.accumulate_quotients.clone().launch(
+                cfg,
+                (
+                    &mut d_output,
+                    &d_columns,
+                    &d_line_coeffs,
+                    &d_denom_inv,
+                    &d_batch_sizes,
+                    &d_col_indices,
+                    n_batches as u32,
+                    n_points as u32,
+                    n_columns as u32,
+                ),
+            ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
+        }
+        
+        executor.device.synchronize()
+            .map_err(|e| CudaFftError::KernelExecution(format!("Sync failed: {:?}", e)))?;
+        
+        // Store output as new polynomial
+        let output_idx = self.poly_data.len();
+        self.poly_data.push(d_output);
+        
+        Ok(output_idx)
+    }
+    
+    // =========================================================================
+    // Merkle Hashing Operations (on persistent GPU memory)
+    // =========================================================================
+    
+    /// Execute Blake2s Merkle hashing on GPU.
+    /// 
+    /// Hashes polynomial columns to create Merkle tree leaves.
+    /// 
+    /// # Arguments
+    /// * `column_indices` - Indices of polynomials to hash
+    /// * `n_hashes` - Number of hashes to compute
+    /// 
+    /// # Returns
+    /// Hash output as bytes (32 bytes per hash)
+    pub fn merkle_hash(
+        &self,
+        column_indices: &[usize],
+        n_hashes: usize,
+    ) -> Result<Vec<u8>, CudaFftError> {
+        let executor = get_cuda_executor().map_err(|e| e.clone())?;
+        
+        let n_columns = column_indices.len();
+        
+        // Gather column data from GPU
+        let mut flat_columns: Vec<u32> = Vec::new();
+        for &idx in column_indices {
+            if idx >= self.poly_data.len() {
+                return Err(CudaFftError::InvalidSize(
+                    format!("Invalid column index: {}", idx)
+                ));
+            }
+            let mut col_data = vec![0u32; 1 << self.log_size];
+            executor.device.dtoh_sync_copy_into(&self.poly_data[idx], &mut col_data)
+                .map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
+            flat_columns.extend_from_slice(&col_data);
+        }
+        
+        // Upload to GPU
+        let d_columns = executor.device.htod_sync_copy(&flat_columns)
+            .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        
+        // Allocate output (32 bytes per hash)
+        let mut d_output = unsafe {
+            executor.device.alloc::<u8>(n_hashes * 32)
+        }.map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        
+        // Launch kernel
+        let block_size = 256u32;
+        let grid_size = ((n_hashes as u32) + block_size - 1) / block_size;
+        
+        let cfg = LaunchConfig {
+            grid_dim: (grid_size, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        
+        // Dummy prev_layer buffer (not used for leaf hashing)
+        let dummy_prev = unsafe {
+            executor.device.alloc::<u8>(1)
+        }.map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        
+        unsafe {
+            executor.kernels.merkle_layer.clone().launch(
+                cfg,
+                (
+                    &mut d_output,
+                    &d_columns,
+                    &dummy_prev,
+                    n_columns as u32,
+                    n_hashes as u32,
+                    0u32, // has_prev_layer = false
+                ),
+            ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
+        }
+        
+        executor.device.synchronize()
+            .map_err(|e| CudaFftError::KernelExecution(format!("Sync failed: {:?}", e)))?;
+        
+        // Download results
+        let mut output = vec![0u8; n_hashes * 32];
+        executor.device.dtoh_sync_copy_into(&d_output, &mut output)
+            .map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
+        
+        Ok(output)
+    }
+    
+    /// Build a full Merkle tree layer from previous layer hashes.
+    /// 
+    /// # Arguments
+    /// * `prev_layer` - Previous layer hashes (32 bytes each)
+    /// 
+    /// # Returns
+    /// New layer hashes (half the count of prev_layer)
+    pub fn merkle_tree_layer(&self, prev_layer: &[u8]) -> Result<Vec<u8>, CudaFftError> {
+        let executor = get_cuda_executor().map_err(|e| e.clone())?;
+        
+        let n_prev = prev_layer.len() / 32;
+        let n_output = n_prev / 2;
+        
+        if n_output == 0 {
+            return Err(CudaFftError::InvalidSize(
+                "Previous layer must have at least 2 hashes".into()
+            ));
+        }
+        
+        // Upload previous layer
+        let d_prev = executor.device.htod_sync_copy(prev_layer)
+            .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        
+        // Allocate output
+        let mut d_output = unsafe {
+            executor.device.alloc::<u8>(n_output * 32)
+        }.map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        
+        // Launch kernel
+        let block_size = 256u32;
+        let grid_size = ((n_output as u32) + block_size - 1) / block_size;
+        
+        let cfg = LaunchConfig {
+            grid_dim: (grid_size, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        
+        // Dummy columns buffer (not used for internal nodes)
+        let dummy_cols = unsafe {
+            executor.device.alloc::<u32>(1)
+        }.map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        
+        unsafe {
+            executor.kernels.merkle_layer.clone().launch(
+                cfg,
+                (
+                    &mut d_output,
+                    &dummy_cols,
+                    &d_prev,
+                    0u32, // n_columns = 0
+                    n_output as u32,
+                    1u32, // has_prev_layer = true
+                ),
+            ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
+        }
+        
+        executor.device.synchronize()
+            .map_err(|e| CudaFftError::KernelExecution(format!("Sync failed: {:?}", e)))?;
+        
+        // Download results
+        let mut output = vec![0u8; n_output * 32];
+        executor.device.dtoh_sync_copy_into(&d_output, &mut output)
+            .map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
+        
+        Ok(output)
+    }
 }
 
 /// Benchmark helper: Run a full proof simulation on GPU pipeline.
@@ -300,6 +679,156 @@ pub fn benchmark_proof_pipeline(
         download_time,
         total_time,
     })
+}
+
+/// Benchmark a full proof pipeline including FFT, FRI folding, and Merkle hashing.
+#[cfg(feature = "cuda-runtime")]
+pub fn benchmark_full_proof_pipeline(
+    log_size: u32,
+    num_polynomials: usize,
+    num_fri_layers: usize,
+) -> Result<FullProofBenchmarkResult, CudaFftError> {
+    use std::time::Instant;
+    
+    let n = 1usize << log_size;
+    
+    // Generate test data (SecureField = 4 u32 per element)
+    let test_data: Vec<Vec<u32>> = (0..num_polynomials)
+        .map(|p| {
+            (0..n * 4)  // 4 u32 per SecureField element
+                .map(|i| ((i * 7 + p * 13 + 17) as u32) % ((1 << 31) - 1))
+                .collect()
+        })
+        .collect();
+    
+    // Generate FRI twiddles and alpha
+    let itwiddles: Vec<u32> = (0..n/2)
+        .map(|i| ((i * 11 + 3) as u32) % ((1 << 31) - 1))
+        .collect();
+    let alpha: [u32; 4] = [12345, 67890, 11111, 22222];
+    
+    // Create pipeline
+    let setup_start = Instant::now();
+    let mut pipeline = GpuProofPipeline::new(log_size)?;
+    let setup_time = setup_start.elapsed();
+    
+    // Upload all polynomials
+    let upload_start = Instant::now();
+    for data in &test_data {
+        pipeline.upload_polynomial(data)?;
+    }
+    pipeline.sync()?;
+    let upload_time = upload_start.elapsed();
+    
+    // Phase 1: FFT (commit phase)
+    let fft_start = Instant::now();
+    for poly_idx in 0..num_polynomials {
+        pipeline.ifft(poly_idx)?;
+        pipeline.fft(poly_idx)?;
+    }
+    pipeline.sync()?;
+    let fft_time = fft_start.elapsed();
+    
+    // Phase 2: FRI Folding
+    let fri_start = Instant::now();
+    for _layer in 0..num_fri_layers.min(log_size as usize - 4) {
+        // Fold each polynomial (simplified - in real FRI this is more complex)
+        for poly_idx in 0..num_polynomials {
+            let _ = pipeline.fri_fold_line(poly_idx, &itwiddles, &alpha)?;
+        }
+    }
+    pipeline.sync()?;
+    let fri_time = fri_start.elapsed();
+    
+    // Phase 3: Merkle Hashing
+    let merkle_start = Instant::now();
+    let column_indices: Vec<usize> = (0..num_polynomials).collect();
+    let n_hashes = n / 2;  // Simplified
+    let leaf_hashes = pipeline.merkle_hash(&column_indices, n_hashes)?;
+    
+    // Build tree layers
+    let mut current_layer = leaf_hashes;
+    while current_layer.len() > 64 {  // Until we have small root
+        current_layer = pipeline.merkle_tree_layer(&current_layer)?;
+    }
+    let merkle_time = merkle_start.elapsed();
+    
+    // Download final results (just the Merkle root in real proof)
+    let download_start = Instant::now();
+    // In real proof, we'd only download the Merkle root (32 bytes)
+    // Here we download one polynomial for comparison
+    let _result = pipeline.download_polynomial(0)?;
+    let download_time = download_start.elapsed();
+    
+    let total_time = setup_time + upload_time + fft_time + fri_time + merkle_time + download_time;
+    let compute_time = fft_time + fri_time + merkle_time;
+    
+    Ok(FullProofBenchmarkResult {
+        log_size,
+        num_polynomials,
+        num_fri_layers,
+        setup_time,
+        upload_time,
+        fft_time,
+        fri_time,
+        merkle_time,
+        download_time,
+        total_time,
+        compute_time,
+    })
+}
+
+/// Result of a full proof pipeline benchmark.
+#[derive(Debug)]
+pub struct FullProofBenchmarkResult {
+    pub log_size: u32,
+    pub num_polynomials: usize,
+    pub num_fri_layers: usize,
+    pub setup_time: std::time::Duration,
+    pub upload_time: std::time::Duration,
+    pub fft_time: std::time::Duration,
+    pub fri_time: std::time::Duration,
+    pub merkle_time: std::time::Duration,
+    pub download_time: std::time::Duration,
+    pub total_time: std::time::Duration,
+    pub compute_time: std::time::Duration,
+}
+
+impl FullProofBenchmarkResult {
+    /// Percentage of time spent on transfers.
+    pub fn transfer_overhead_percent(&self) -> f64 {
+        let transfer = self.upload_time + self.download_time;
+        transfer.as_secs_f64() / self.total_time.as_secs_f64() * 100.0
+    }
+    
+    /// Percentage of time spent on computation.
+    pub fn compute_percent(&self) -> f64 {
+        self.compute_time.as_secs_f64() / self.total_time.as_secs_f64() * 100.0
+    }
+}
+
+impl std::fmt::Display for FullProofBenchmarkResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Full GPU Proof Pipeline Results")?;
+        writeln!(f, "================================")?;
+        writeln!(f, "  Polynomial size:    2^{} = {} elements", self.log_size, 1usize << self.log_size)?;
+        writeln!(f, "  Polynomials:        {}", self.num_polynomials)?;
+        writeln!(f, "  FRI layers:         {}", self.num_fri_layers)?;
+        writeln!(f)?;
+        writeln!(f, "Timing Breakdown:")?;
+        writeln!(f, "  Setup:              {:?}", self.setup_time)?;
+        writeln!(f, "  Upload:             {:?}", self.upload_time)?;
+        writeln!(f, "  FFT (commit):       {:?}", self.fft_time)?;
+        writeln!(f, "  FRI folding:        {:?}", self.fri_time)?;
+        writeln!(f, "  Merkle hashing:     {:?}", self.merkle_time)?;
+        writeln!(f, "  Download:           {:?}", self.download_time)?;
+        writeln!(f, "  Total:              {:?}", self.total_time)?;
+        writeln!(f)?;
+        writeln!(f, "Performance:")?;
+        writeln!(f, "  Transfer overhead:  {:.1}%", self.transfer_overhead_percent())?;
+        writeln!(f, "  Compute time:       {:.1}%", self.compute_percent())?;
+        Ok(())
+    }
 }
 
 /// Result of a pipeline benchmark.
