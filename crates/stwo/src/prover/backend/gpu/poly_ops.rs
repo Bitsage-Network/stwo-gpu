@@ -283,6 +283,7 @@ fn gpu_evaluate(
 // =============================================================================
 
 #[cfg(feature = "gpu")]
+#[allow(unused_imports)]
 mod cuda_fft {
     use super::*;
     

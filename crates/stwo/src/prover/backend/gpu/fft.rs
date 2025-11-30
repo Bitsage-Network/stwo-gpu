@@ -478,7 +478,6 @@ impl GpuFftContext {
 
 #[cfg(feature = "gpu")]
 fn compute_twiddles_for_gpu(log_size: u32) -> GpuTwiddles {
-    use crate::core::circle::Coset;
     use crate::core::poly::circle::CanonicCoset;
     use crate::core::utils::bit_reverse;
     

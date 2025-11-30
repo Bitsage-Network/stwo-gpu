@@ -17,9 +17,7 @@
 use std::sync::{Arc, OnceLock};
 
 #[cfg(feature = "cuda-runtime")]
-use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, DevicePtr, LaunchAsync, LaunchConfig};
-#[cfg(feature = "cuda-runtime")]
-use cudarc::nvrtc::Ptx;
+use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, LaunchAsync, LaunchConfig};
 
 #[cfg(feature = "cuda-runtime")]
 use super::fft::CIRCLE_FFT_CUDA_KERNEL;
