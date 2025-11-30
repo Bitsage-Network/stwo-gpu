@@ -90,17 +90,8 @@ fn main() {
     
     // Define the processing function - Full FFT pipeline!
     let results = prover.prove_parallel(workloads, |gpu_idx, ctx, data, log_size| {
-        use std::time::Instant;
-        let start = Instant::now();
-        
         // Execute full proof pipeline: IFFT -> FFT
         let _result = ctx.execute_proof_pipeline(data, log_size)?;
-        
-        let elapsed = start.elapsed();
-        // Print per-proof timing (only first proof per GPU to avoid spam)
-        if data[0] % 4 == 0 {
-            println!("    GPU {}: proof completed in {:.2}ms", gpu_idx, elapsed.as_secs_f64() * 1000.0);
-        }
         
         // Return GPU index as proof of which GPU processed this
         Ok(gpu_idx)
