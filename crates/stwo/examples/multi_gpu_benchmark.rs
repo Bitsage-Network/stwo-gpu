@@ -104,7 +104,7 @@ fn main() {
                     
                     // Show sample results
                     println!("Sample Merkle roots:");
-                    for (i, result) in results.iter().take(3).enumerate() {
+                    for result in results.iter().take(3) {
                         println!("  Proof {}: {:02x}{:02x}{:02x}{:02x}...", 
                             result.workload_id,
                             result.merkle_root[0], result.merkle_root[1],
