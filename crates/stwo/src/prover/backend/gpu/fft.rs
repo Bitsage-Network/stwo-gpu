@@ -62,6 +62,14 @@ pub const M31_PRIME_DBL: u32 = 0xFFFFFFFE; // 2 * (2^31 - 1)
 /// - Multi-layer FFT with shared memory optimization
 pub const CIRCLE_FFT_CUDA_KERNEL: &str = r#"
 // =============================================================================
+// Type Definitions (CUDA-compatible)
+// =============================================================================
+
+// Use CUDA's built-in unsigned types instead of stdint.h
+typedef unsigned int uint32_t;
+typedef unsigned long long uint64_t;
+
+// =============================================================================
 // M31 Field Arithmetic
 // =============================================================================
 
