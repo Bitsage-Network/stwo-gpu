@@ -288,12 +288,7 @@ impl CudaFftExecutor {
             unsafe {
                 self.kernels.ifft_layer.clone().launch(
                     cfg,
-                    (
-                        d_data.as_mut_ptr(),
-                        d_twiddles.slice(twiddle_offset..).as_ptr(),
-                        layer,
-                        log_size,
-                    ),
+                    (d_data, &d_twiddles.slice(twiddle_offset..), layer, log_size),
                 ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
             }
         }
@@ -375,12 +370,7 @@ impl CudaFftExecutor {
             unsafe {
                 self.kernels.fft_layer.clone().launch(
                     cfg,
-                    (
-                        d_data.as_mut_ptr(),
-                        d_twiddles.slice(twiddle_offset..).as_ptr(),
-                        layer,
-                        log_size,
-                    ),
+                    (d_data, &d_twiddles.slice(twiddle_offset..), layer, log_size),
                 ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
             }
         }
@@ -419,7 +409,7 @@ impl CudaFftExecutor {
         unsafe {
             self.kernels.bit_reverse.clone().launch(
                 cfg,
-                (d_data.as_mut_ptr(), log_size),
+                (&mut d_data, log_size),
             ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
         }
         

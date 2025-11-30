@@ -487,7 +487,7 @@ fn compute_twiddles_for_gpu(log_size: u32) -> GpuTwiddles {
     let mut layer_offsets = Vec::new();
     
     let mut current_coset = coset;
-    for layer in 0..log_size {
+    for _layer in 0..log_size {
         layer_offsets.push(all_twiddles.len());
         
         let layer_twiddles: Vec<u32> = current_coset
