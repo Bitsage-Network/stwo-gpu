@@ -393,7 +393,7 @@ impl GpuProofPipeline {
             executor.device.alloc::<u32>(n_output * 4)
         }.map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
         
-        // Launch kernel
+        // Launch kernel with shared memory for alpha
         let block_size = 256u32;
         let grid_size = ((n_output as u32) + block_size - 1) / block_size;
         let log_n = n.ilog2();
@@ -401,7 +401,7 @@ impl GpuProofPipeline {
         let cfg = LaunchConfig {
             grid_dim: (grid_size, 1, 1),
             block_dim: (block_size, 1, 1),
-            shared_mem_bytes: 0,
+            shared_mem_bytes: 32, // Space for alpha (16 bytes) and alpha_sq (16 bytes)
         };
         
         unsafe {
@@ -413,6 +413,57 @@ impl GpuProofPipeline {
         
         executor.device.synchronize()
             .map_err(|e| CudaFftError::KernelExecution(format!("Sync failed: {:?}", e)))?;
+        
+        // Store output as new polynomial
+        let output_idx = self.poly_data.len();
+        self.poly_data.push(d_output);
+        
+        Ok(output_idx)
+    }
+    
+    /// Execute FRI fold_line with pre-uploaded twiddles and alpha (faster for multiple folds).
+    /// 
+    /// This version takes GPU-resident twiddles and alpha for reduced transfer overhead.
+    pub fn fri_fold_line_gpu(
+        &mut self,
+        input_idx: usize,
+        d_itwiddles: &CudaSlice<u32>,
+        d_alpha: &CudaSlice<u32>,
+        current_n: usize,
+    ) -> Result<usize, CudaFftError> {
+        if input_idx >= self.poly_data.len() {
+            return Err(CudaFftError::InvalidSize(
+                format!("Invalid polynomial index: {}", input_idx)
+            ));
+        }
+        
+        let executor = get_cuda_executor().map_err(|e| e.clone())?;
+        let n_output = current_n / 2;
+        
+        // Allocate output on GPU
+        let mut d_output = unsafe {
+            executor.device.alloc::<u32>(n_output * 4)
+        }.map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        
+        // Launch kernel
+        let block_size = 256u32;
+        let grid_size = ((n_output as u32) + block_size - 1) / block_size;
+        let log_n = current_n.ilog2();
+        
+        let cfg = LaunchConfig {
+            grid_dim: (grid_size, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: 32,
+        };
+        
+        unsafe {
+            executor.kernels.fold_line.clone().launch(
+                cfg,
+                (&mut d_output, &self.poly_data[input_idx], d_itwiddles, d_alpha, current_n as u32, log_n),
+            ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
+        }
+        
+        // No sync here - let caller batch multiple operations
         
         // Store output as new polynomial
         let output_idx = self.poly_data.len();
@@ -454,7 +505,7 @@ impl GpuProofPipeline {
         let d_alpha = executor.device.htod_sync_copy(alpha)
             .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
         
-        // Launch kernel
+        // Launch kernel with shared memory for alpha
         let block_size = 256u32;
         let grid_size = ((n_dst as u32) + block_size - 1) / block_size;
         let log_n = n.ilog2();
@@ -462,7 +513,7 @@ impl GpuProofPipeline {
         let cfg = LaunchConfig {
             grid_dim: (grid_size, 1, 1),
             block_dim: (block_size, 1, 1),
-            shared_mem_bytes: 0,
+            shared_mem_bytes: 32,
         };
         
         // Use split_at_mut to get non-overlapping mutable references
@@ -486,6 +537,55 @@ impl GpuProofPipeline {
             .map_err(|e| CudaFftError::KernelExecution(format!("Sync failed: {:?}", e)))?;
         
         Ok(())
+    }
+    
+    /// Execute multiple FRI fold layers without intermediate synchronization.
+    /// 
+    /// This batches multiple fold operations to reduce kernel launch overhead.
+    /// Twiddles and alpha are uploaded once and reused.
+    pub fn fri_fold_multi_layer(
+        &mut self,
+        input_idx: usize,
+        all_itwiddles: &[Vec<u32>],  // Twiddles for each layer
+        alpha: &[u32; 4],
+        num_layers: usize,
+    ) -> Result<usize, CudaFftError> {
+        if input_idx >= self.poly_data.len() {
+            return Err(CudaFftError::InvalidSize(
+                format!("Invalid polynomial index: {}", input_idx)
+            ));
+        }
+        
+        if all_itwiddles.len() < num_layers {
+            return Err(CudaFftError::InvalidSize(
+                format!("Not enough twiddles: have {}, need {}", all_itwiddles.len(), num_layers)
+            ));
+        }
+        
+        let executor = get_cuda_executor().map_err(|e| e.clone())?;
+        
+        // Upload alpha once
+        let d_alpha = executor.device.htod_sync_copy(alpha)
+            .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        
+        let mut current_idx = input_idx;
+        let mut current_n = 1usize << self.log_size;
+        
+        for layer in 0..num_layers {
+            // Upload twiddles for this layer
+            let d_itwiddles = executor.device.htod_sync_copy(&all_itwiddles[layer])
+                .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+            
+            // Fold
+            current_idx = self.fri_fold_line_gpu(current_idx, &d_itwiddles, &d_alpha, current_n)?;
+            current_n /= 2;
+        }
+        
+        // Single sync at the end
+        executor.device.synchronize()
+            .map_err(|e| CudaFftError::KernelExecution(format!("Sync failed: {:?}", e)))?;
+        
+        Ok(current_idx)
     }
     
     // =========================================================================
