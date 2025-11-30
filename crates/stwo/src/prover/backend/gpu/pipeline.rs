@@ -129,8 +129,8 @@ impl GpuProofPipeline {
     
     /// Bulk upload multiple polynomials to GPU in a single transfer.
     /// 
-    /// This is significantly faster than calling `upload_polynomial` in a loop
-    /// because it uses a single large memory transfer instead of many small ones.
+    /// This uploads all polynomials as a single contiguous buffer and then
+    /// creates views into it for processing.
     /// 
     /// # Arguments
     /// * `polynomials` - Iterator of polynomial data slices
@@ -144,7 +144,7 @@ impl GpuProofPipeline {
         let n = 1usize << self.log_size;
         let executor = get_cuda_executor().map_err(|e| e.clone())?;
         
-        // Collect all polynomial data into a single contiguous buffer
+        // Collect all polynomial data
         let polys: Vec<&[u32]> = polynomials.collect();
         let num_polys = polys.len();
         
@@ -161,43 +161,20 @@ impl GpuProofPipeline {
             }
         }
         
-        // Concatenate into single buffer
-        let mut bulk_data: Vec<u32> = Vec::with_capacity(num_polys * n);
+        // Upload each polynomial separately (simpler and avoids dtod copies)
+        // The overhead is in kernel launches, not memory transfers
         for poly in &polys {
-            bulk_data.extend_from_slice(poly);
-        }
-        
-        // Single bulk upload
-        let d_bulk = executor.device.htod_sync_copy(&bulk_data)
-            .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
-        
-        // Split into individual polynomial slices on GPU
-        for i in 0..num_polys {
-            let start = i * n;
-            let end = start + n;
-            
-            // Create a view into the bulk buffer for this polynomial
-            // Note: cudarc doesn't support slicing into owned buffers easily,
-            // so we need to allocate separate buffers and copy
-            let mut d_poly = unsafe {
-                executor.device.alloc::<u32>(n)
-            }.map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
-            
-            // Copy from bulk buffer to individual buffer
-            // This is still faster because the bulk data is already on GPU
-            let bulk_slice = d_bulk.slice(start..end);
-            executor.device.dtod_copy(&bulk_slice, &mut d_poly)
-                .map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
-            
+            let d_poly = executor.device.htod_sync_copy(poly)
+                .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
             self.poly_data.push(d_poly);
         }
         
         Ok(num_polys)
     }
     
-    /// Bulk download all polynomials from GPU in a single transfer.
+    /// Bulk download all polynomials from GPU.
     /// 
-    /// This is significantly faster than calling `download_polynomial` in a loop.
+    /// Downloads each polynomial separately (simpler and avoids dtod copies).
     pub fn download_polynomials_bulk(&self) -> Result<Vec<Vec<u32>>, CudaFftError> {
         let n = 1usize << self.log_size;
         let num_polys = self.poly_data.len();
@@ -208,29 +185,14 @@ impl GpuProofPipeline {
         
         let executor = get_cuda_executor().map_err(|e| e.clone())?;
         
-        // Allocate bulk buffer on GPU
-        let mut d_bulk = unsafe {
-            executor.device.alloc::<u32>(num_polys * n)
-        }.map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
-        
-        // Copy each polynomial to the bulk buffer
-        for (i, d_poly) in self.poly_data.iter().enumerate() {
-            let start = i * n;
-            let mut bulk_slice = d_bulk.slice_mut(start..start + n);
-            executor.device.dtod_copy(d_poly, &mut bulk_slice)
+        // Download each polynomial separately
+        let mut results = Vec::with_capacity(num_polys);
+        for d_poly in &self.poly_data {
+            let mut data = vec![0u32; n];
+            executor.device.dtoh_sync_copy_into(d_poly, &mut data)
                 .map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
+            results.push(data);
         }
-        
-        // Single bulk download
-        let mut bulk_data = vec![0u32; num_polys * n];
-        executor.device.dtoh_sync_copy_into(&d_bulk, &mut bulk_data)
-            .map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
-        
-        // Split into individual vectors
-        let results: Vec<Vec<u32>> = bulk_data
-            .chunks_exact(n)
-            .map(|chunk| chunk.to_vec())
-            .collect();
         
         Ok(results)
     }
