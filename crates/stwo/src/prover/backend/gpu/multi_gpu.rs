@@ -175,10 +175,10 @@ impl MultiGpuProver {
     fn new_with_manager(device_manager: GpuDeviceManager, log_size: u32) -> Result<Self, CudaFftError> {
         let mut pipelines = Vec::new();
         
-        for _device_id in device_manager.device_ids() {
-            // Each pipeline uses the global executor which manages device 0
-            // For true multi-GPU, we'd need per-device executors
-            let pipeline = GpuProofPipeline::new(log_size)?;
+        for &device_id in device_manager.device_ids() {
+            // Create a pipeline on each GPU device
+            let pipeline = GpuProofPipeline::new_on_device(log_size, device_id)?;
+            tracing::info!("Created pipeline on GPU {}", device_id);
             pipelines.push(Arc::new(Mutex::new(pipeline)));
         }
         

@@ -140,13 +140,21 @@ pub struct DeviceInfo {
 
 #[cfg(feature = "cuda-runtime")]
 impl CudaFftExecutor {
-    /// Create a new CUDA FFT executor.
+    /// Create a new CUDA FFT executor on GPU 0.
     /// 
     /// This initializes the CUDA context and compiles all FFT kernels.
     pub fn new() -> Result<Self, CudaFftError> {
+        Self::new_on_device(0)
+    }
+    
+    /// Create a new CUDA FFT executor on a specific GPU.
+    /// 
+    /// # Arguments
+    /// * `device_id` - The GPU device ID (0, 1, 2, etc.)
+    pub fn new_on_device(device_id: usize) -> Result<Self, CudaFftError> {
         // Initialize CUDA device (returns Arc<CudaDevice>)
-        let device = CudaDevice::new(0)
-            .map_err(|e| CudaFftError::DriverInit(format!("{:?}", e)))?;
+        let device = CudaDevice::new(device_id)
+            .map_err(|e| CudaFftError::DriverInit(format!("GPU {}: {:?}", device_id, e)))?;
         
         // Get device info
         let device_info = Self::get_device_info(&device)?;
