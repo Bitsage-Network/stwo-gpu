@@ -335,78 +335,37 @@ impl CudaFftExecutor {
             offset += tw.len();
         }
         
-        // Process layers in groups of 2 using fused kernel for better performance
-        let mut layer = 0;
-        while layer < num_layers {
-            let layers_remaining = num_layers - layer;
+        // Execute butterfly layers one at a time
+        // Note: Fused kernels don't work because __syncthreads() only syncs within a block,
+        // not across blocks. Each FFT layer needs all butterflies from the previous layer
+        // to complete before starting, which requires separate kernel launches.
+        for layer in 0..num_layers {
+            let n_twiddles = twiddles_dbl[layer].len() as u32;
+            let butterflies_per_twiddle = 1u32 << layer;
+            let total_butterflies = n_twiddles * butterflies_per_twiddle;
+            let grid_size = (total_butterflies + block_size - 1) / block_size;
             
-            if layers_remaining >= 2 {
-                // Use fused kernel for 2 layers
-                let n_twiddles_0 = twiddles_dbl[layer].len() as u32;
-                let n_twiddles_1 = twiddles_dbl[layer + 1].len() as u32;
-                
-                let butterflies_0 = n_twiddles_0 * (1u32 << layer);
-                let butterflies_1 = n_twiddles_1 * (1u32 << (layer + 1));
-                let max_butterflies = butterflies_0.max(butterflies_1);
-                let grid_size = (max_butterflies + block_size - 1) / block_size;
-                
-                let twiddle_view_0 = d_twiddles.slice(twiddle_offsets[layer]..);
-                let twiddle_view_1 = d_twiddles.slice(twiddle_offsets[layer + 1]..);
-                
-                let cfg = LaunchConfig {
-                    grid_dim: (grid_size, 1, 1),
-                    block_dim: (block_size, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                
-                unsafe {
-                    self.kernels.ifft_fused_2layer.clone().launch(
-                        cfg,
-                        (
-                            &mut *d_data,
-                            &twiddle_view_0,
-                            &twiddle_view_1,
-                            n_twiddles_0,
-                            n_twiddles_1,
-                            layer as u32,
-                            (layer + 1) as u32,
-                            log_size,
-                        ),
-                    ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
-                }
-                
-                layer += 2;
-            } else {
-                // Single layer - use simple kernel
-                let n_twiddles = twiddles_dbl[layer].len() as u32;
-                let butterflies_per_twiddle = 1u32 << layer;
-                let total_butterflies = n_twiddles * butterflies_per_twiddle;
-                let grid_size = (total_butterflies + block_size - 1) / block_size;
-                
-                let twiddle_offset = twiddle_offsets[layer];
-                
-                let cfg = LaunchConfig {
-                    grid_dim: (grid_size, 1, 1),
-                    block_dim: (block_size, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                
-                let twiddle_view = d_twiddles.slice(twiddle_offset..);
-                
-                unsafe {
-                    self.kernels.ifft_layer.clone().launch(
-                        cfg,
-                        (&mut *d_data, &twiddle_view, layer as u32, log_size, n_twiddles),
-                    ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
-                }
-                
-                layer += 1;
+            let twiddle_offset = twiddle_offsets[layer];
+            
+            let cfg = LaunchConfig {
+                grid_dim: (grid_size, 1, 1),
+                block_dim: (block_size, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            
+            let twiddle_view = d_twiddles.slice(twiddle_offset..);
+            
+            unsafe {
+                self.kernels.ifft_layer.clone().launch(
+                    cfg,
+                    (&mut *d_data, &twiddle_view, layer as u32, log_size, n_twiddles),
+                ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
             }
+            
+            // Synchronize after each layer to ensure all butterflies complete
+            self.device.synchronize()
+                .map_err(|e| CudaFftError::KernelExecution(format!("Layer sync failed: {:?}", e)))?;
         }
-        
-        // Synchronize
-        self.device.synchronize()
-            .map_err(|e| CudaFftError::KernelExecution(format!("Sync failed: {:?}", e)))?;
         
         Ok(())
     }
