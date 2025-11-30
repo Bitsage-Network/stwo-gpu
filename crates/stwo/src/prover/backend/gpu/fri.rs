@@ -303,7 +303,6 @@ fn u32s_to_secure_column(data: &[u32], n: usize) -> SecureColumnByCoords<GpuBack
     use crate::core::fields::cm31::CM31;
     use crate::core::fields::m31::M31;
     use crate::core::fields::qm31::QM31;
-    use crate::prover::backend::Column;
     
     // Create a SecureColumnByCoords with zeros, then fill it
     let mut result = SecureColumnByCoords::<GpuBackend>::zeros(n);

@@ -552,8 +552,9 @@ impl CudaFftExecutor {
         let d_alpha = self.device.htod_sync_copy(alpha)
             .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
         
-        let mut d_output = self.device.alloc::<u32>(n_output * 4)
-            .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        let mut d_output = unsafe {
+            self.device.alloc::<u32>(n_output * 4)
+        }.map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
         
         // Launch kernel
         let block_size = 256u32;
@@ -711,8 +712,9 @@ impl CudaFftExecutor {
         let d_col_indices = self.device.htod_sync_copy(&col_indices_u32)
             .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
         
-        let mut d_output = self.device.alloc::<u32>(n_points * 4)
-            .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        let mut d_output = unsafe {
+            self.device.alloc::<u32>(n_points * 4)
+        }.map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
         
         // Launch kernel
         let block_size = 256u32;
@@ -791,8 +793,9 @@ impl CudaFftExecutor {
         };
         
         // Allocate output (32 bytes per hash)
-        let mut d_output = self.device.alloc::<u8>(n_hashes * 32)
-            .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        let mut d_output = unsafe {
+            self.device.alloc::<u8>(n_hashes * 32)
+        }.map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
         
         // Launch kernel
         let block_size = 256u32;
@@ -827,8 +830,9 @@ impl CudaFftExecutor {
                 }
                 (Some(cols), None) => {
                     // Need a dummy buffer for prev_layer
-                    let dummy_prev = self.device.alloc::<u8>(1)
-                        .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+                    let dummy_prev = unsafe {
+                        self.device.alloc::<u8>(1)
+                    }.map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
                     self.kernels.merkle_layer.clone().launch(
                         cfg,
                         (
@@ -843,8 +847,9 @@ impl CudaFftExecutor {
                 }
                 (None, Some(prev)) => {
                     // Need a dummy buffer for columns
-                    let dummy_cols = self.device.alloc::<u32>(1)
-                        .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+                    let dummy_cols = unsafe {
+                        self.device.alloc::<u32>(1)
+                    }.map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
                     self.kernels.merkle_layer.clone().launch(
                         cfg,
                         (

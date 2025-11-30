@@ -79,8 +79,10 @@ impl<T: DeviceRepr + Clone + Default> GpuBuffer<T> {
         let device = executor.device.clone();
         
         // Allocate device memory
-        let slice = device.alloc::<T>(len)
-            .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        // Safety: We're allocating uninitialized memory that will be filled by the caller
+        let slice = unsafe {
+            device.alloc::<T>(len)
+        }.map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
         
         Ok(Self { slice, device, len })
     }
@@ -261,8 +263,10 @@ impl GpuBufferPool {
         }
         
         // Allocate new buffer
-        let buffer = self.device.alloc::<u32>(size)
-            .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        // Safety: We're allocating uninitialized memory for the pool
+        let buffer = unsafe {
+            self.device.alloc::<u32>(size)
+        }.map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
         
         self.total_allocated += size * std::mem::size_of::<u32>();
         
