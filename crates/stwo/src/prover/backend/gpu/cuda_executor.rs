@@ -116,6 +116,9 @@ pub struct CompiledKernels {
     pub fft_layer: CudaFunction,
     // Optimized shared memory FFT kernel
     pub ifft_shared_mem: CudaFunction,
+    // Denormalization kernels (fused post-FFT operation)
+    pub denormalize: CudaFunction,
+    pub denormalize_vec4: CudaFunction,
     // FRI folding kernels
     pub fold_line: CudaFunction,
     pub fold_circle_into_line: CudaFunction,
@@ -191,6 +194,8 @@ impl CudaFftExecutor {
             "ifft_layer_kernel",
             "fft_layer_kernel",
             "ifft_shared_mem_kernel",
+            "denormalize_kernel",
+            "denormalize_vec4_kernel",
         ]).map_err(|e| CudaFftError::KernelCompilation(format!("FFT load: {:?}", e)))?;
         
         // Compile FRI folding CUDA source to PTX
@@ -227,6 +232,13 @@ impl CudaFftExecutor {
         let ifft_shared_mem = device.get_func("circle_fft", "ifft_shared_mem_kernel")
             .ok_or_else(|| CudaFftError::KernelCompilation("ifft_shared_mem_kernel not found".into()))?;
         
+        // Get denormalization function handles
+        let denormalize = device.get_func("circle_fft", "denormalize_kernel")
+            .ok_or_else(|| CudaFftError::KernelCompilation("denormalize_kernel not found".into()))?;
+        
+        let denormalize_vec4 = device.get_func("circle_fft", "denormalize_vec4_kernel")
+            .ok_or_else(|| CudaFftError::KernelCompilation("denormalize_vec4_kernel not found".into()))?;
+        
         // Get FRI function handles
         let fold_line = device.get_func("fri_folding", "fold_line_kernel")
             .ok_or_else(|| CudaFftError::KernelCompilation("fold_line_kernel not found".into()))?;
@@ -259,6 +271,8 @@ impl CudaFftExecutor {
             ifft_layer,
             fft_layer,
             ifft_shared_mem,
+            denormalize,
+            denormalize_vec4,
             fold_line,
             fold_circle_into_line,
             accumulate_quotients,
@@ -713,6 +727,91 @@ impl CudaFftExecutor {
             self.device_info.total_memory_bytes / 2,  // Estimate
             self.device_info.total_memory_bytes,
         )
+    }
+    
+    // =========================================================================
+    // Denormalization Operations
+    // =========================================================================
+    
+    /// Execute denormalization on GPU memory.
+    /// 
+    /// After IFFT, we need to divide by the domain size to get correct coefficients.
+    /// This multiplies each element by the precomputed inverse of the domain size.
+    /// 
+    /// # Arguments
+    /// * `d_data` - Device memory containing the data (modified in place)
+    /// * `denorm_factor` - Precomputed 1/n mod P
+    /// * `n` - Number of elements
+    pub fn execute_denormalize_on_device(
+        &self,
+        d_data: &mut CudaSlice<u32>,
+        denorm_factor: u32,
+        n: u32,
+    ) -> Result<(), CudaFftError> {
+        let _span = tracing::span!(tracing::Level::DEBUG, "CUDA denormalize", n = n).entered();
+        
+        // Use vectorized kernel for large sizes (must be multiple of 4)
+        if n >= 1024 && n % 4 == 0 {
+            let block_size = 256u32;
+            let grid_size = (n / 4 + block_size - 1) / block_size;
+            
+            let cfg = LaunchConfig {
+                grid_dim: (grid_size, 1, 1),
+                block_dim: (block_size, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            
+            unsafe {
+                self.kernels.denormalize_vec4.clone().launch(
+                    cfg,
+                    (&mut *d_data, denorm_factor, n),
+                ).map_err(|e| CudaFftError::KernelExecution(format!("Denormalize vec4: {:?}", e)))?;
+            }
+        } else {
+            // Fall back to scalar kernel for small sizes or non-multiple-of-4
+            let block_size = 256u32;
+            let grid_size = (n + block_size - 1) / block_size;
+            
+            let cfg = LaunchConfig {
+                grid_dim: (grid_size, 1, 1),
+                block_dim: (block_size, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            
+            unsafe {
+                self.kernels.denormalize.clone().launch(
+                    cfg,
+                    (&mut *d_data, denorm_factor, n),
+                ).map_err(|e| CudaFftError::KernelExecution(format!("Denormalize: {:?}", e)))?;
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Execute denormalization on CPU data (transfers to/from GPU).
+    pub fn execute_denormalize(
+        &self,
+        data: &mut [u32],
+        denorm_factor: u32,
+    ) -> Result<(), CudaFftError> {
+        let n = data.len() as u32;
+        
+        // Allocate and copy
+        let mut d_data = self.device.htod_sync_copy(data)
+            .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        
+        // Execute on device
+        self.execute_denormalize_on_device(&mut d_data, denorm_factor, n)?;
+        
+        // Synchronize and copy back
+        self.device.synchronize()
+            .map_err(|e| CudaFftError::KernelExecution(format!("Sync failed: {:?}", e)))?;
+        
+        self.device.dtoh_sync_copy_into(&d_data, data)
+            .map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
+        
+        Ok(())
     }
     
     // =========================================================================

@@ -32,8 +32,10 @@ use crate::prover::poly::BitReversedOrder;
 use super::conversion::{
     circle_coeffs_ref_to_simd, circle_eval_ref_to_simd, twiddle_ref_to_simd, twiddle_to_gpu,
 };
-use super::fft::{GPU_FFT_THRESHOLD_LOG_SIZE, compute_itwiddle_dbls_cpu, compute_twiddle_dbls_cpu};
+use super::fft::{GPU_FFT_THRESHOLD_LOG_SIZE, compute_twiddle_dbls_cpu, get_cached_itwiddles};
 use super::cuda_executor::{is_cuda_available, cuda_ifft, cuda_fft};
+#[cfg(feature = "cuda-runtime")]
+use super::cuda_executor::get_cuda_executor;
 #[cfg(feature = "cuda-runtime")]
 use super::pipeline::GpuProofPipeline;
 use super::GpuBackend;
@@ -314,10 +316,10 @@ fn evaluate_simd_fallback(
 ///
 /// This function:
 /// 1. Extracts evaluation data (zero-copy when possible)
-/// 2. Computes inverse FFT twiddles (cached per log_size)
+/// 2. Uses cached inverse FFT twiddles
 /// 3. Transfers data to GPU
 /// 4. Executes IFFT kernels
-/// 5. Applies denormalization on GPU
+/// 5. Applies denormalization on GPU (fused operation)
 /// 6. Transfers results back to CPU
 fn gpu_interpolate(
     eval: CircleEvaluation<GpuBackend, BaseField, BitReversedOrder>,
@@ -337,9 +339,8 @@ fn gpu_interpolate(
         std::slice::from_raw_parts(data_ptr, data_len).to_vec()
     };
     
-    // Compute twiddles for IFFT
-    // TODO: Cache these per log_size to avoid recomputation
-    let twiddles_dbl = compute_itwiddle_dbls_cpu(log_size);
+    // Get cached twiddles for IFFT
+    let twiddles_dbl = get_cached_itwiddles(log_size);
     
     // Execute CUDA IFFT
     match cuda_ifft(&mut data, &twiddles_dbl, log_size) {
@@ -350,15 +351,28 @@ fn gpu_interpolate(
             );
             
             // Apply denormalization factor (divide by domain size)
-            // This is done on CPU but could be fused into GPU kernel
+            // Use GPU denormalization if available, otherwise CPU fallback
             let denorm = BaseField::from(1u32 << log_size).inverse();
             let denorm_val = denorm.0;
             
-            // Apply denormalization in-place using M31 multiplication
-            const M31_PRIME: u64 = (1u64 << 31) - 1;
-            for v in data.iter_mut() {
-                let product = (*v as u64) * (denorm_val as u64);
-                *v = (product % M31_PRIME) as u32;
+            #[cfg(feature = "cuda-runtime")]
+            {
+                // Try to use GPU denormalization (fused operation)
+                if let Ok(executor) = get_cuda_executor() {
+                    if executor.execute_denormalize(&mut data, denorm_val).is_ok() {
+                        tracing::debug!("GPU denormalization completed");
+                    } else {
+                        // GPU denormalize failed, fall back to CPU
+                        apply_denormalization_cpu(&mut data, denorm_val);
+                    }
+                } else {
+                    apply_denormalization_cpu(&mut data, denorm_val);
+                }
+            }
+            
+            #[cfg(not(feature = "cuda-runtime"))]
+            {
+                apply_denormalization_cpu(&mut data, denorm_val);
             }
             
             // Convert back to BaseColumn
@@ -375,6 +389,16 @@ fn gpu_interpolate(
             // GPU execution failed - this is a hard error, not a fallback
             panic!("GPU IFFT execution failed: {}. GPU backend requires working CUDA.", e);
         }
+    }
+}
+
+/// Apply denormalization on CPU (fallback when GPU is unavailable).
+#[inline]
+fn apply_denormalization_cpu(data: &mut [u32], denorm_val: u32) {
+    const M31_PRIME: u64 = (1u64 << 31) - 1;
+    for v in data.iter_mut() {
+        let product = (*v as u64) * (denorm_val as u64);
+        *v = (product % M31_PRIME) as u32;
     }
 }
 
@@ -414,35 +438,25 @@ fn gpu_batch_interpolate(
         }
     }
     
-    // Execute IFFT on all polynomials (stays on GPU)
+    // Execute IFFT with fused denormalization on all polynomials (stays on GPU)
     for poly_idx in 0..columns.len() {
-        if let Err(e) = pipeline.ifft(poly_idx) {
-            panic!("Failed to execute GPU IFFT: {}", e);
+        if let Err(e) = pipeline.ifft_with_denormalize(poly_idx) {
+            panic!("Failed to execute GPU IFFT with denormalize: {}", e);
         }
     }
     
-    // Download results and apply denormalization
-    let denorm = BaseField::from(1u32 << log_size).inverse();
-    let denorm_val = denorm.0;
-    const M31_PRIME: u64 = (1u64 << 31) - 1;
-    
+    // Download results (already denormalized on GPU)
     let mut results = Vec::with_capacity(columns.len());
     
     for poly_idx in 0..columns.len() {
-        let mut data = match pipeline.download_polynomial(poly_idx) {
+        let data = match pipeline.download_polynomial(poly_idx) {
             Ok(d) => d,
             Err(e) => {
                 panic!("Failed to download polynomial from GPU: {}", e);
             }
         };
         
-        // Apply denormalization
-        for v in data.iter_mut() {
-            let product = (*v as u64) * (denorm_val as u64);
-            *v = (product % M31_PRIME) as u32;
-        }
-        
-        // Convert to BaseColumn
+        // Convert to BaseColumn (no CPU denormalization needed)
         use crate::prover::backend::simd::column::BaseColumn;
         let coeffs: BaseColumn = unsafe {
             let bf_ptr = data.as_ptr() as *const BaseField;

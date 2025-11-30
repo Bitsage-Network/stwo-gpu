@@ -81,40 +81,79 @@ impl GpuBackend {
     /// Check if GPU acceleration is available.
     ///
     /// Returns `true` if:
-    /// - CUDA/ROCm runtime is installed
+    /// - CUDA runtime is installed and functional
     /// - A compatible GPU is detected
-    /// - The GPU has sufficient memory
+    /// - Kernels can be compiled
     pub fn is_available() -> bool {
-        // TODO: Implement actual GPU detection
-        #[cfg(feature = "gpu")]
+        #[cfg(feature = "cuda-runtime")]
         {
-            gpu_context::is_initialized()
+            cuda_executor::is_cuda_available()
         }
-        #[cfg(not(feature = "gpu"))]
+        #[cfg(not(feature = "cuda-runtime"))]
         {
-            false
+            // Without cuda-runtime, check if gpu feature is enabled
+            #[cfg(feature = "gpu")]
+            {
+                gpu_context::is_initialized()
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                false
+            }
         }
     }
     
     /// Get the name of the GPU device.
     pub fn device_name() -> Option<String> {
-        #[cfg(feature = "gpu")]
+        #[cfg(feature = "cuda-runtime")]
         {
-            gpu_context::device_name()
+            cuda_executor::get_cuda_executor()
+                .ok()
+                .map(|e| e.device_info.name.clone())
         }
-        #[cfg(not(feature = "gpu"))]
+        #[cfg(not(feature = "cuda-runtime"))]
         {
-            None
+            #[cfg(feature = "gpu")]
+            {
+                gpu_context::device_name()
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                None
+            }
         }
     }
     
     /// Get available GPU memory in bytes.
     pub fn available_memory() -> Option<usize> {
-        #[cfg(feature = "gpu")]
+        #[cfg(feature = "cuda-runtime")]
         {
-            gpu_context::available_memory()
+            cuda_executor::get_cuda_executor()
+                .ok()
+                .map(|e| e.device_info.total_memory_bytes)
         }
-        #[cfg(not(feature = "gpu"))]
+        #[cfg(not(feature = "cuda-runtime"))]
+        {
+            #[cfg(feature = "gpu")]
+            {
+                gpu_context::available_memory()
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                None
+            }
+        }
+    }
+    
+    /// Get compute capability of the GPU.
+    pub fn compute_capability() -> Option<(u32, u32)> {
+        #[cfg(feature = "cuda-runtime")]
+        {
+            cuda_executor::get_cuda_executor()
+                .ok()
+                .map(|e| e.device_info.compute_capability)
+        }
+        #[cfg(not(feature = "cuda-runtime"))]
         {
             None
         }
@@ -131,27 +170,27 @@ impl BackendForChannel<Blake2sM31MerkleChannel> for GpuBackend {}
 /// Global GPU context management.
 ///
 /// This module handles GPU initialization, memory management, and
-/// kernel execution. It uses a lazy-initialized global context
-/// to avoid repeated initialization overhead.
-#[cfg(feature = "gpu")]
+/// kernel execution. When `cuda-runtime` feature is enabled, this
+/// delegates to the actual CUDA executor. Otherwise, it provides
+/// a stub implementation.
+#[cfg(all(feature = "gpu", not(feature = "cuda-runtime")))]
 pub mod gpu_context {
     use std::sync::OnceLock;
     
-    /// Global GPU context
+    /// Global GPU context (stub when cuda-runtime is not enabled)
     static GPU_CONTEXT: OnceLock<GpuContextInner> = OnceLock::new();
     
     struct GpuContextInner {
         device_name: String,
         total_memory: usize,
-        // Add CUDA/ROCm handles here
     }
     
     /// Initialize the GPU context.
     pub fn initialize() -> bool {
         GPU_CONTEXT.get_or_init(|| {
-            // TODO: Initialize CUDA/ROCm
+            // Stub implementation - real GPU init requires cuda-runtime
             GpuContextInner {
-                device_name: "Unknown".to_string(),
+                device_name: "GPU (stub)".to_string(),
                 total_memory: 0,
             }
         });
@@ -171,6 +210,35 @@ pub mod gpu_context {
     /// Get available memory.
     pub fn available_memory() -> Option<usize> {
         GPU_CONTEXT.get().map(|ctx| ctx.total_memory)
+    }
+}
+
+#[cfg(feature = "cuda-runtime")]
+pub mod gpu_context {
+    use super::cuda_executor;
+    
+    /// Initialize the GPU context using CUDA.
+    pub fn initialize() -> bool {
+        cuda_executor::is_cuda_available()
+    }
+    
+    /// Check if GPU context is initialized.
+    pub fn is_initialized() -> bool {
+        cuda_executor::is_cuda_available()
+    }
+    
+    /// Get device name.
+    pub fn device_name() -> Option<String> {
+        cuda_executor::get_cuda_executor()
+            .ok()
+            .map(|e| e.device_info.name.clone())
+    }
+    
+    /// Get available memory.
+    pub fn available_memory() -> Option<usize> {
+        cuda_executor::get_cuda_executor()
+            .ok()
+            .map(|e| e.device_info.total_memory_bytes)
     }
 }
 

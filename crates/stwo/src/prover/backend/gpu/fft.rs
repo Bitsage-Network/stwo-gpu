@@ -382,6 +382,59 @@ extern "C" __global__ void ifft_shared_mem_kernel(
     }
 }
 
+// =============================================================================
+// Denormalization Kernel
+// =============================================================================
+//
+// After IFFT, we need to divide by the domain size to get correct coefficients.
+// This kernel multiplies each element by the precomputed inverse of the domain size.
+//
+// Fusing this into the FFT kernel would require modifying the last layer,
+// but a separate kernel is cleaner and the overhead is minimal for large sizes.
+
+extern "C" __global__ void denormalize_kernel(
+    uint32_t* data,
+    uint32_t denorm_factor,  // Precomputed 1/n mod P
+    uint32_t n
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx >= n) return;
+    
+    // Multiply by denormalization factor
+    data[idx] = m31_mul(data[idx], denorm_factor);
+}
+
+// Vectorized denormalization - each thread handles 4 elements
+extern "C" __global__ void denormalize_vec4_kernel(
+    uint32_t* data,
+    uint32_t denorm_factor,  // Precomputed 1/n mod P
+    uint32_t n
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t base = idx * 4;
+    
+    if (base + 3 >= n) return;
+    
+    // Load 4 elements
+    uint32_t v0 = data[base + 0];
+    uint32_t v1 = data[base + 1];
+    uint32_t v2 = data[base + 2];
+    uint32_t v3 = data[base + 3];
+    
+    // Multiply by denormalization factor
+    v0 = m31_mul(v0, denorm_factor);
+    v1 = m31_mul(v1, denorm_factor);
+    v2 = m31_mul(v2, denorm_factor);
+    v3 = m31_mul(v3, denorm_factor);
+    
+    // Store back
+    data[base + 0] = v0;
+    data[base + 1] = v1;
+    data[base + 2] = v2;
+    data[base + 3] = v3;
+}
+
 "#;
 
 // =============================================================================
@@ -589,6 +642,23 @@ fn compute_itwiddle_dbls_cpu_uncached(log_size: u32) -> Vec<Vec<u32>> {
     result.extend(line_twiddles);
     
     result
+}
+
+/// Get cached inverse twiddles for a given log_size.
+/// 
+/// This is a convenience function that returns a reference to the cached twiddles
+/// if they exist, or computes and caches them if they don't.
+/// 
+/// Returns a clone of the cached twiddles (the cache itself stores the data).
+#[inline]
+pub fn get_cached_itwiddles(log_size: u32) -> Vec<Vec<u32>> {
+    compute_itwiddle_dbls_cpu(log_size)
+}
+
+/// Get cached forward twiddles for a given log_size.
+#[inline]
+pub fn get_cached_twiddles(log_size: u32) -> Vec<Vec<u32>> {
+    compute_twiddle_dbls_cpu(log_size)
 }
 
 /// Compute forward twiddles (doubled) on CPU for GPU FFT.
