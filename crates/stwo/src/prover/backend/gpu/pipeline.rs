@@ -1258,7 +1258,6 @@ impl std::fmt::Display for BatchProofBenchmarkResult {
 /// Stream 2 (Download): [Download 0]  [Download 1]  [Download 2]  ...
 /// ```
 #[cfg(feature = "cuda-runtime")]
-#[allow(dead_code)]  // Fields are used for future stream-based async operations
 pub struct GpuStreamingPipeline {
     /// Double-buffered polynomial data on GPU
     buffers: [Vec<CudaSlice<u32>>; 2],
@@ -1428,8 +1427,88 @@ impl GpuStreamingPipeline {
     /// Synchronize all streams.
     pub fn sync(&self) -> Result<(), CudaFftError> {
         let executor = get_cuda_executor().map_err(|e| e.clone())?;
+        
+        // Synchronize compute stream if available
+        if let Some(ref stream) = self.compute_stream {
+            executor.device.wait_for(stream)
+                .map_err(|e| CudaFftError::KernelExecution(format!("Compute stream sync failed: {:?}", e)))?;
+        }
+        
+        // Synchronize transfer stream if available
+        if let Some(ref stream) = self.transfer_stream {
+            executor.device.wait_for(stream)
+                .map_err(|e| CudaFftError::KernelExecution(format!("Transfer stream sync failed: {:?}", e)))?;
+        }
+        
+        // Final device sync
         executor.device.synchronize()
-            .map_err(|e| CudaFftError::KernelExecution(format!("Sync failed: {:?}", e)))
+            .map_err(|e| CudaFftError::KernelExecution(format!("Device sync failed: {:?}", e)))
+    }
+    
+    /// Execute forward FFT on current buffer.
+    pub fn compute_fft(&mut self, poly_idx: usize) -> Result<(), CudaFftError> {
+        if poly_idx >= self.buffers[self.current_buffer].len() {
+            return Err(CudaFftError::InvalidSize(
+                format!("Invalid polynomial index: {}", poly_idx)
+            ));
+        }
+        
+        let executor = get_cuda_executor().map_err(|e| e.clone())?;
+        let block_size = 256u32;
+        let num_layers = self.twiddles_cpu.len();
+        
+        // Calculate twiddle offsets
+        let mut twiddle_offsets: Vec<usize> = Vec::new();
+        let mut offset = 0usize;
+        for tw in &self.twiddles_cpu {
+            twiddle_offsets.push(offset);
+            offset += tw.len();
+        }
+        
+        // Execute layers in reverse order for forward FFT
+        for layer in (0..num_layers).rev() {
+            let n_twiddles = self.twiddles_cpu[layer].len() as u32;
+            let butterflies_per_twiddle = 1u32 << layer;
+            let total_butterflies = n_twiddles * butterflies_per_twiddle;
+            let grid_size = (total_butterflies + block_size - 1) / block_size;
+            
+            let twiddle_offset = twiddle_offsets[layer];
+            
+            let cfg = LaunchConfig {
+                grid_dim: (grid_size, 1, 1),
+                block_dim: (block_size, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            
+            let twiddle_view = self.twiddles.slice(twiddle_offset..);
+            
+            unsafe {
+                executor.kernels.fft_layer.clone().launch(
+                    cfg,
+                    (&mut self.buffers[self.current_buffer][poly_idx], &twiddle_view, layer as u32, self.log_size, n_twiddles),
+                ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
+            }
+        }
+        
+        executor.device.synchronize()
+            .map_err(|e| CudaFftError::KernelExecution(format!("Sync failed: {:?}", e)))?;
+        
+        Ok(())
+    }
+    
+    /// Check if streams are available for async operations.
+    pub fn has_streams(&self) -> bool {
+        self.compute_stream.is_some() && self.transfer_stream.is_some()
+    }
+    
+    /// Get the log size of polynomials in this pipeline.
+    pub fn log_size(&self) -> u32 {
+        self.log_size
+    }
+    
+    /// Get the number of polynomials in the current buffer.
+    pub fn num_polynomials(&self) -> usize {
+        self.buffers[self.current_buffer].len()
     }
     
     /// Process a batch of polynomials with overlapped transfers.
