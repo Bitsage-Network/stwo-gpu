@@ -8,8 +8,6 @@ use bytemuck::Zeroable;
 use itertools::Itertools;
 use num_traits::One;
 #[cfg(feature = "parallel")]
-use num_traits::Zero;
-#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use tracing::{span, Level};
 
