@@ -38,10 +38,7 @@
 //! This achieves 50-100x speedup over naive per-operation transfers.
 
 #[cfg(feature = "cuda-runtime")]
-use std::sync::Arc;
-
-#[cfg(feature = "cuda-runtime")]
-use cudarc::driver::{CudaSlice, LaunchConfig};
+use cudarc::driver::{CudaSlice, LaunchConfig, LaunchAsync};
 
 #[cfg(feature = "cuda-runtime")]
 use super::cuda_executor::{CudaFftExecutor, CudaFftError, get_cuda_executor};
@@ -55,16 +52,13 @@ use super::fft::{compute_itwiddle_dbls_cpu, compute_twiddle_dbls_cpu};
 /// operations, eliminating transfer overhead.
 #[cfg(feature = "cuda-runtime")]
 pub struct GpuProofPipeline {
-    /// Reference to the CUDA executor
-    executor: Arc<CudaFftExecutor>,
-    
     /// Polynomial data on GPU (multiple polynomials)
     poly_data: Vec<CudaSlice<u32>>,
     
     /// Twiddles on GPU (cached per log_size)
-    itwiddles: Option<CudaSlice<u32>>,
-    twiddles: Option<CudaSlice<u32>>,
-    twiddle_offsets: Option<CudaSlice<u32>>,
+    itwiddles: CudaSlice<u32>,
+    twiddles: CudaSlice<u32>,
+    twiddle_offsets: CudaSlice<u32>,
     
     /// Current polynomial log size
     log_size: u32,
@@ -78,7 +72,7 @@ pub struct GpuProofPipeline {
 impl GpuProofPipeline {
     /// Create a new GPU proof pipeline for polynomials of the given size.
     pub fn new(log_size: u32) -> Result<Self, CudaFftError> {
-        let executor = get_cuda_executor()?.clone();
+        let executor = get_cuda_executor().map_err(|e| e.clone())?;
         
         // Precompute and cache twiddles
         let itwiddles_cpu = compute_itwiddle_dbls_cpu(log_size);
@@ -104,11 +98,10 @@ impl GpuProofPipeline {
             .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
         
         Ok(Self {
-            executor,
             poly_data: Vec::new(),
-            itwiddles: Some(itwiddles),
-            twiddles: Some(twiddles),
-            twiddle_offsets: Some(twiddle_offsets),
+            itwiddles,
+            twiddles,
+            twiddle_offsets,
             log_size,
             itwiddles_cpu,
             twiddles_cpu,
@@ -125,7 +118,8 @@ impl GpuProofPipeline {
             ));
         }
         
-        let d_data = self.executor.device.htod_sync_copy(data)
+        let executor = get_cuda_executor().map_err(|e| e.clone())?;
+        let d_data = executor.device.htod_sync_copy(data)
             .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
         
         let idx = self.poly_data.len();
@@ -141,15 +135,12 @@ impl GpuProofPipeline {
             ));
         }
         
-        let itwiddles = self.itwiddles.as_ref()
-            .ok_or_else(|| CudaFftError::InvalidSize("Twiddles not initialized".into()))?;
-        let twiddle_offsets = self.twiddle_offsets.as_ref()
-            .ok_or_else(|| CudaFftError::InvalidSize("Twiddle offsets not initialized".into()))?;
+        let executor = get_cuda_executor().map_err(|e| e.clone())?;
         
-        self.executor.execute_ifft_on_device(
+        executor.execute_ifft_on_device(
             &mut self.poly_data[poly_idx],
-            itwiddles,
-            twiddle_offsets,
+            &self.itwiddles,
+            &self.twiddle_offsets,
             &self.itwiddles_cpu,
             self.log_size,
         )
@@ -163,18 +154,7 @@ impl GpuProofPipeline {
             ));
         }
         
-        let twiddles = self.twiddles.as_ref()
-            .ok_or_else(|| CudaFftError::InvalidSize("Twiddles not initialized".into()))?;
-        
-        // Execute FFT layers on device
-        self.execute_fft_on_device(poly_idx, twiddles)
-    }
-    
-    fn execute_fft_on_device(
-        &mut self,
-        poly_idx: usize,
-        d_twiddles: &CudaSlice<u32>,
-    ) -> Result<(), CudaFftError> {
+        let executor = get_cuda_executor().map_err(|e| e.clone())?;
         let block_size = 256u32;
         let num_layers = self.twiddles_cpu.len();
         
@@ -201,17 +181,17 @@ impl GpuProofPipeline {
                 shared_mem_bytes: 0,
             };
             
-            let twiddle_view = d_twiddles.slice(twiddle_offset..);
+            let twiddle_view = self.twiddles.slice(twiddle_offset..);
             
             unsafe {
-                self.executor.kernels.fft_layer.clone().launch(
+                executor.kernels.fft_layer.clone().launch(
                     cfg,
                     (&mut self.poly_data[poly_idx], &twiddle_view, layer as u32, self.log_size, n_twiddles),
                 ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
             }
         }
         
-        self.executor.device.synchronize()
+        executor.device.synchronize()
             .map_err(|e| CudaFftError::KernelExecution(format!("Sync failed: {:?}", e)))?;
         
         Ok(())
@@ -225,9 +205,10 @@ impl GpuProofPipeline {
             ));
         }
         
+        let executor = get_cuda_executor().map_err(|e| e.clone())?;
         let n = 1usize << self.log_size;
         let mut result = vec![0u32; n];
-        self.executor.device.dtoh_sync_copy_into(&self.poly_data[poly_idx], &mut result)
+        executor.device.dtoh_sync_copy_into(&self.poly_data[poly_idx], &mut result)
             .map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
         
         Ok(result)
@@ -245,7 +226,8 @@ impl GpuProofPipeline {
     
     /// Synchronize GPU operations.
     pub fn sync(&self) -> Result<(), CudaFftError> {
-        self.executor.device.synchronize()
+        let executor = get_cuda_executor().map_err(|e| e.clone())?;
+        executor.device.synchronize()
             .map_err(|e| CudaFftError::KernelExecution(format!("Sync failed: {:?}", e)))
     }
 }
