@@ -32,6 +32,8 @@ use super::conversion::{
 };
 use super::fft::{GPU_FFT_THRESHOLD_LOG_SIZE, compute_itwiddle_dbls_cpu, compute_twiddle_dbls_cpu};
 use super::cuda_executor::{is_cuda_available, cuda_ifft, cuda_fft};
+#[cfg(feature = "cuda-runtime")]
+use super::pipeline::GpuProofPipeline;
 use super::GpuBackend;
 
 impl PolyOps for GpuBackend {
@@ -70,6 +72,57 @@ impl PolyOps for GpuBackend {
             1u64 << log_size, log_size
         );
         gpu_interpolate(eval, twiddles, log_size)
+    }
+    
+    /// Batch interpolate multiple columns using GPU pipeline.
+    /// This is significantly faster than interpolating one at a time.
+    #[cfg(feature = "cuda-runtime")]
+    fn interpolate_columns(
+        columns: impl IntoIterator<Item = CircleEvaluation<Self, BaseField, BitReversedOrder>>,
+        twiddles: &TwiddleTree<Self>,
+    ) -> Vec<CircleCoefficients<Self>> {
+        let columns: Vec<_> = columns.into_iter().collect();
+        
+        if columns.is_empty() {
+            return Vec::new();
+        }
+        
+        let log_size = columns[0].domain.log_size();
+        let num_columns = columns.len();
+        
+        // Small polynomials or few columns: use sequential approach
+        if log_size < GPU_FFT_THRESHOLD_LOG_SIZE || num_columns < 2 {
+            return columns
+                .into_iter()
+                .map(|eval| eval.interpolate_with_twiddles(twiddles))
+                .collect();
+        }
+        
+        // Large polynomials with multiple columns: use GPU pipeline for batch processing
+        if !is_cuda_available() {
+            panic!(
+                "GpuBackend::interpolate_columns called with log_size={} but CUDA is not available.",
+                log_size
+            );
+        }
+        
+        tracing::info!(
+            "GPU batch interpolate: {} columns × {} elements (log_size={})",
+            num_columns, 1u64 << log_size, log_size
+        );
+        
+        gpu_batch_interpolate(columns, log_size)
+    }
+    
+    #[cfg(not(feature = "cuda-runtime"))]
+    fn interpolate_columns(
+        columns: impl IntoIterator<Item = CircleEvaluation<Self, BaseField, BitReversedOrder>>,
+        twiddles: &TwiddleTree<Self>,
+    ) -> Vec<CircleCoefficients<Self>> {
+        columns
+            .into_iter()
+            .map(|eval| eval.interpolate_with_twiddles(twiddles))
+            .collect()
     }
     
     fn eval_at_point(
@@ -271,6 +324,88 @@ fn gpu_interpolate(
             panic!("GPU IFFT execution failed: {}. GPU backend requires working CUDA.", e);
         }
     }
+}
+
+/// GPU-accelerated batch polynomial interpolation.
+/// 
+/// This function processes multiple polynomials using the GPU pipeline,
+/// keeping data on GPU between operations for maximum throughput.
+#[cfg(feature = "cuda-runtime")]
+fn gpu_batch_interpolate(
+    columns: Vec<CircleEvaluation<GpuBackend, BaseField, BitReversedOrder>>,
+    log_size: u32,
+) -> Vec<CircleCoefficients<GpuBackend>> {
+    let _span = span!(Level::INFO, "GPU batch interpolate", 
+                      num_columns = columns.len(), 
+                      size = 1u64 << log_size).entered();
+    
+    // Create GPU pipeline
+    let mut pipeline = match GpuProofPipeline::new(log_size) {
+        Ok(p) => p,
+        Err(e) => {
+            panic!("Failed to create GPU pipeline: {}", e);
+        }
+    };
+    
+    // Upload all columns to GPU
+    for eval in &columns {
+        let values_slice = eval.values.as_slice();
+        let data_ptr = values_slice.as_ptr() as *const u32;
+        let data_len = values_slice.len();
+        
+        let data: Vec<u32> = unsafe {
+            std::slice::from_raw_parts(data_ptr, data_len).to_vec()
+        };
+        
+        if let Err(e) = pipeline.upload_polynomial(&data) {
+            panic!("Failed to upload polynomial to GPU: {}", e);
+        }
+    }
+    
+    // Execute IFFT on all polynomials (stays on GPU)
+    for poly_idx in 0..columns.len() {
+        if let Err(e) = pipeline.ifft(poly_idx) {
+            panic!("Failed to execute GPU IFFT: {}", e);
+        }
+    }
+    
+    // Download results and apply denormalization
+    let denorm = BaseField::from(1u32 << log_size).inverse();
+    let denorm_val = denorm.0;
+    const M31_PRIME: u64 = (1u64 << 31) - 1;
+    
+    let mut results = Vec::with_capacity(columns.len());
+    
+    for poly_idx in 0..columns.len() {
+        let mut data = match pipeline.download_polynomial(poly_idx) {
+            Ok(d) => d,
+            Err(e) => {
+                panic!("Failed to download polynomial from GPU: {}", e);
+            }
+        };
+        
+        // Apply denormalization
+        for v in data.iter_mut() {
+            let product = (*v as u64) * (denorm_val as u64);
+            *v = (product % M31_PRIME) as u32;
+        }
+        
+        // Convert to BaseColumn
+        use crate::prover::backend::simd::column::BaseColumn;
+        let coeffs: BaseColumn = unsafe {
+            let bf_ptr = data.as_ptr() as *const BaseField;
+            std::slice::from_raw_parts(bf_ptr, data.len()).iter().copied().collect()
+        };
+        
+        results.push(CircleCoefficients::new(coeffs));
+    }
+    
+    tracing::info!(
+        "GPU batch interpolate completed: {} columns",
+        results.len()
+    );
+    
+    results
 }
 
 /// GPU-accelerated polynomial evaluation (forward FFT).
