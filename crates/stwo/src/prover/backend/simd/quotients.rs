@@ -156,21 +156,24 @@ fn accumulate_quotients_on_subdomain(
     };
 
     #[cfg(not(feature = "parallel"))]
-    let iter = {
+    {
         // OBELYSK FIX: Replace unstable array_chunks with stable collect+chunks_exact
-        // Note: quad_row indices start from 0 and increment by 1 for each group of 4 points
+        // Process quad_rows in groups of 4, matching the original array_chunks behavior
         let quad_rows_vec: Vec<_> = quad_rows.collect();
-        quad_rows_vec
+        let values_chunks: Vec<_> = values.chunks_mut(4).collect();
+        
+        for (quad_row, (points_chunk, vals)) in quad_rows_vec
             .chunks_exact(4)
-            .zip(values.chunks_mut(4))
+            .zip(values_chunks)
             .enumerate()
-            .map(|(quad_row, (chunk, vals))| (quad_row, ([chunk[0], chunk[1], chunk[2], chunk[3]], vals)))
-            .collect::<Vec<_>>()
-            .into_iter()
-    };
+        {
+            let points = [points_chunk[0], points_chunk[1], points_chunk[2], points_chunk[3]];
+            accumulate((quad_row, (points, vals)));
+        }
+    }
 
     #[cfg(feature = "parallel")]
-    let iter = {
+    {
         const CHUNK_SIZE: usize = 1 << 12;
         values
             .par_chunks_mut(CHUNK_SIZE)
@@ -194,9 +197,8 @@ fn accumulate_quotients_on_subdomain(
                 };
                 (vec_offset / 4..).zip(quad_rows.into_iter().zip(values_dst))
             })
-    };
-
-    iter.for_each(accumulate);
+            .for_each(accumulate);
+    }
 
     span.exit();
     let span = span!(
