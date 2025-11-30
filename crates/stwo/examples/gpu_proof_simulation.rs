@@ -57,7 +57,7 @@ fn main() {
 
     // Precompute twiddles (cached, so this is fast after first call)
     let itwiddles = compute_itwiddle_dbls_cpu(log_size);
-    let twiddles = compute_twiddle_dbls_cpu(log_size);
+    let _twiddles = compute_twiddle_dbls_cpu(log_size);
 
     println!("┌────────────────────────────────────────────────────────────────────┐");
     println!("│ Benchmark 1: Current Approach (Transfer Every Time)               │");
