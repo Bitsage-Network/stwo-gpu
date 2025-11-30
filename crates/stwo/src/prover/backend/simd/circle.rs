@@ -412,7 +412,7 @@ impl PolyOps for SimdBackend {
     ) -> SecureField {
         #[cfg(not(feature = "parallel"))]
         return (0..evals.domain.size().div_ceil(N_LANES))
-            .fold(PackedSecureField::zero(), |acc, i| {
+            .fold(PackedSecureField::zeroed(), |acc, i| {
                 acc + (weights.data[i] * evals.values.data[i])
             })
             .pointwise_sum();
@@ -421,7 +421,7 @@ impl PolyOps for SimdBackend {
         return (0..evals.domain.size().div_ceil(N_LANES))
             .into_par_iter()
             .fold(
-                PackedSecureField::zero,
+                PackedSecureField::zeroed,
                 |acc: PackedSecureField, i: usize| acc + (weights.data[i] * evals.values.data[i]),
             )
             .sum::<PackedSecureField>()

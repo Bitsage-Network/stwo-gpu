@@ -139,18 +139,21 @@ pub mod poseidon252 {
     impl GrindOps<Poseidon252Channel> for SimdBackend {
         fn grind(channel: &Poseidon252Channel, pow_bits: u32) -> u64 {
             let digest = channel.digest();
-            let prefixed_digest = poseidon_hash_many(&[
-                Poseidon252Channel::POW_PREFIX.into(),
-                digest,
-                pow_bits.into(),
-            ]);
+            
             #[cfg(not(feature = "parallel"))]
             let res = (0..)
                 .find_map(|hi| grind_poseidon(digest, hi, pow_bits))
                 .expect("Grind failed to find a solution.");
 
             #[cfg(feature = "parallel")]
-            let res = parallel_grind(prefixed_digest, pow_bits, grind_poseidon);
+            let res = {
+                let prefixed_digest = poseidon_hash_many(&[
+                    Poseidon252Channel::POW_PREFIX.into(),
+                    digest,
+                    pow_bits.into(),
+                ]);
+                parallel_grind(prefixed_digest, pow_bits, grind_poseidon)
+            };
             res
         }
     }
