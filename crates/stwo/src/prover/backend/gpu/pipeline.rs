@@ -152,12 +152,14 @@ impl GpuProofPipeline {
     }
     
     /// Get a reference to the executor for this pipeline.
-    fn get_executor(&self) -> Result<&CudaFftExecutor, CudaFftError> {
-        if let Some(ref exec) = self.executor {
-            Ok(exec.as_ref())
-        } else {
-            get_cuda_executor().map_err(|e| e.clone())
-        }
+    /// 
+    /// Note: Currently always returns the global executor (GPU 0).
+    /// True multi-GPU support requires architectural changes to avoid borrow conflicts.
+    fn get_executor(&self) -> Result<&'static CudaFftExecutor, CudaFftError> {
+        // For now, always use the global executor
+        // TODO: For true multi-GPU, we need to restructure to avoid borrow conflicts
+        // when mutating self.poly_data while holding executor reference
+        get_cuda_executor().map_err(|e| e.clone())
     }
     
     /// Upload polynomial data to GPU.

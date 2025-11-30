@@ -175,10 +175,14 @@ impl MultiGpuProver {
     fn new_with_manager(device_manager: GpuDeviceManager, log_size: u32) -> Result<Self, CudaFftError> {
         let mut pipelines = Vec::new();
         
-        for &device_id in device_manager.device_ids() {
-            // Create a pipeline on each GPU device
+        // Note: Due to Rust borrow checker constraints, all pipelines currently use GPU 0.
+        // True multi-GPU parallelism requires architectural changes to the executor model.
+        // The multi-GPU benefit comes from thread-level parallelism, not GPU-level yet.
+        // TODO: Implement per-GPU executors with interior mutability for true multi-GPU.
+        for (idx, &device_id) in device_manager.device_ids().iter().enumerate() {
+            // Create a pipeline (currently all use GPU 0 due to borrow constraints)
             let pipeline = GpuProofPipeline::new_on_device(log_size, device_id)?;
-            tracing::info!("Created pipeline on GPU {}", device_id);
+            tracing::info!("Created pipeline {} (requested GPU {})", idx, device_id);
             pipelines.push(Arc::new(Mutex::new(pipeline)));
         }
         
