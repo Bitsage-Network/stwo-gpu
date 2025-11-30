@@ -40,16 +40,29 @@ fn main() {
     println!("│ Step 1: CUDA Environment Check                          │");
     println!("└──────────────────────────────────────────────────────────┘");
     
+    // First, try to get the executor to see the actual error
+    match get_cuda_executor() {
+        Ok(_) => {
+            println!("✅ CUDA executor initialized successfully!");
+        }
+        Err(e) => {
+            println!("❌ CUDA initialization failed with error:");
+            println!("   {}", e);
+            println!();
+            println!("Possible causes:");
+            println!("  1. No NVIDIA GPU detected");
+            println!("  2. CUDA drivers not installed");
+            println!("  3. CUDA toolkit not in PATH");
+            println!("  4. Kernel compilation failed");
+            println!();
+            println!("On Brev, make sure you created a GPU instance:");
+            println!("  brev create my-instance --gpu a100");
+            return;
+        }
+    }
+    
     if !is_cuda_available() {
-        println!("❌ CUDA is NOT available!");
-        println!();
-        println!("Possible causes:");
-        println!("  1. No NVIDIA GPU detected");
-        println!("  2. CUDA drivers not installed");
-        println!("  3. CUDA toolkit not in PATH");
-        println!();
-        println!("On Brev, make sure you created a GPU instance:");
-        println!("  brev create my-instance --gpu a100");
+        println!("❌ CUDA is NOT available (unexpected after executor success)!");
         return;
     }
     
