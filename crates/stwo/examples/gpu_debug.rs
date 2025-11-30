@@ -10,7 +10,7 @@
 fn main() {
     use stwo::core::fields::m31::BaseField;
     use stwo::core::poly::circle::CanonicCoset;
-    use stwo::prover::backend::gpu::cuda_executor::{get_cuda_executor, is_cuda_available};
+    use stwo::prover::backend::gpu::cuda_executor::{get_cuda_executor, is_cuda_available, cuda_ifft};
     use stwo::prover::backend::gpu::fft::compute_itwiddle_dbls_cpu;
     use stwo::prover::backend::gpu::GpuBackend;
     use stwo::prover::backend::simd::column::BaseColumn;
@@ -39,47 +39,64 @@ fn main() {
     println!();
 
     // ==========================================================================
-    // Test 1: Very small FFT (2^4 = 16 elements)
+    // Test 1: Direct GPU IFFT test (bypassing threshold)
     // ==========================================================================
     
     println!("┌────────────────────────────────────────────────────────────────┐");
-    println!("│ Test 1: Small FFT (2^4 = 16 elements)                          │");
+    println!("│ Test 1: Direct GPU IFFT (2^6 = 64 elements)                    │");
     println!("└────────────────────────────────────────────────────────────────┘");
     
-    let log_size = 4u32;
+    let log_size = 6u32;
     let size = 1usize << log_size;
     
     // Simple sequential input
-    let data: BaseColumn = (0..size)
-        .map(|i| BaseField::from(i as u32))
+    let mut data: Vec<u32> = (0..size).map(|i| i as u32).collect();
+    let original_data = data.clone();
+    
+    println!("Input data (first 8): {:?}", &data[..8]);
+    
+    // Compute twiddles
+    let twiddles = compute_itwiddle_dbls_cpu(log_size);
+    println!("Twiddle layers: {}", twiddles.len());
+    for (i, t) in twiddles.iter().enumerate() {
+        println!("  Layer {}: {} twiddles, first 4: {:?}", i, t.len(), t.iter().take(4).collect::<Vec<_>>());
+    }
+    
+    // Run GPU IFFT directly
+    println!("\nRunning GPU IFFT...");
+    match cuda_ifft(&mut data, &twiddles, log_size) {
+        Ok(()) => {
+            println!("✅ GPU IFFT completed");
+            println!("Output (first 8): {:?}", &data[..8]);
+            println!("Output (last 8):  {:?}", &data[size-8..]);
+        }
+        Err(e) => {
+            println!("❌ GPU IFFT failed: {}", e);
+        }
+    }
+    
+    // Now compare with SIMD
+    println!("\nComparing with SIMD...");
+    let simd_data: BaseColumn = original_data.iter()
+        .map(|&v| BaseField::from(v))
         .collect();
     
-    println!("Input data: {:?}", data.as_slice().iter().take(16).map(|x| x.0).collect::<Vec<_>>());
-    
     let domain = CanonicCoset::new(log_size).circle_domain();
-    
-    // SIMD computation
     let simd_twiddles = SimdBackend::precompute_twiddles(domain.half_coset);
-    let simd_eval = CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(domain, data.clone());
+    let simd_eval = CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(domain, simd_data);
     let simd_result = SimdBackend::interpolate(simd_eval, &simd_twiddles);
     
-    println!("SIMD result: {:?}", simd_result.coeffs.as_slice().iter().take(16).map(|x| x.0).collect::<Vec<_>>());
-    
-    // GPU computation
-    let gpu_twiddles = GpuBackend::precompute_twiddles(domain.half_coset);
-    let gpu_eval = CircleEvaluation::<GpuBackend, BaseField, BitReversedOrder>::new(domain, data.clone());
-    let gpu_result = GpuBackend::interpolate(gpu_eval, &gpu_twiddles);
-    
-    println!("GPU result:  {:?}", gpu_result.coeffs.as_slice().iter().take(16).map(|x| x.0).collect::<Vec<_>>());
+    let simd_coeffs: Vec<u32> = simd_result.coeffs.as_slice().iter().map(|x| x.0).collect();
+    println!("SIMD output (first 8): {:?}", &simd_coeffs[..8]);
+    println!("SIMD output (last 8):  {:?}", &simd_coeffs[size-8..]);
     
     // Compare
-    let simd_coeffs = simd_result.coeffs.as_slice();
-    let gpu_coeffs = gpu_result.coeffs.as_slice();
-    
     let mut mismatches = 0;
-    for (i, (s, g)) in simd_coeffs.iter().zip(gpu_coeffs.iter()).enumerate() {
+    for (i, (&s, &g)) in simd_coeffs.iter().zip(data.iter()).enumerate() {
         if s != g {
-            println!("  Mismatch at {}: SIMD={}, GPU={}", i, s.0, g.0);
+            if mismatches < 5 {
+                println!("  Mismatch at {}: SIMD={}, GPU={}", i, s, g);
+            }
             mismatches += 1;
         }
     }
@@ -87,7 +104,7 @@ fn main() {
     if mismatches == 0 {
         println!("✅ All {} values match!", size);
     } else {
-        println!("❌ {} mismatches out of {}", mismatches, size);
+        println!("❌ {} mismatches out of {} ({:.1}%)", mismatches, size, 100.0 * mismatches as f64 / size as f64);
     }
     println!();
 
