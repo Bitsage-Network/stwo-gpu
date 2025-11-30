@@ -59,7 +59,7 @@ fn main() {
         
         // Precompute twiddles
         let simd_twiddles = SimdBackend::precompute_twiddles(domain.half_coset);
-        let gpu_itwiddles = compute_itwiddle_dbls_cpu(domain.half_coset);
+        let gpu_itwiddles = compute_itwiddle_dbls_cpu(log_size);
 
         // Warmup
         for _ in 0..warmup_runs {
