@@ -905,12 +905,315 @@ impl std::fmt::Display for PipelineBenchmarkResult {
     }
 }
 
+/// Batch proof processor - processes multiple independent proofs in parallel.
+#[cfg(feature = "cuda-runtime")]
+pub struct BatchProofProcessor {
+    /// Multiple pipelines for parallel proof generation
+    pipelines: Vec<GpuProofPipeline>,
+}
+
+#[cfg(feature = "cuda-runtime")]
+impl BatchProofProcessor {
+    /// Create a batch processor for multiple proofs of the same size.
+    pub fn new(log_size: u32, num_proofs: usize) -> Result<Self, CudaFftError> {
+        let mut pipelines = Vec::with_capacity(num_proofs);
+        for _ in 0..num_proofs {
+            pipelines.push(GpuProofPipeline::new(log_size)?);
+        }
+        Ok(Self { pipelines })
+    }
+    
+    /// Upload polynomials for a specific proof.
+    pub fn upload_polynomial(&mut self, proof_idx: usize, data: &[u32]) -> Result<usize, CudaFftError> {
+        if proof_idx >= self.pipelines.len() {
+            return Err(CudaFftError::InvalidSize(
+                format!("Invalid proof index: {}", proof_idx)
+            ));
+        }
+        self.pipelines[proof_idx].upload_polynomial(data)
+    }
+    
+    /// Execute IFFT on all proofs in batch.
+    pub fn batch_ifft(&mut self, poly_idx: usize) -> Result<(), CudaFftError> {
+        for pipeline in &mut self.pipelines {
+            pipeline.ifft(poly_idx)?;
+        }
+        Ok(())
+    }
+    
+    /// Execute FFT on all proofs in batch.
+    pub fn batch_fft(&mut self, poly_idx: usize) -> Result<(), CudaFftError> {
+        for pipeline in &mut self.pipelines {
+            pipeline.fft(poly_idx)?;
+        }
+        Ok(())
+    }
+    
+    /// Synchronize all pipelines.
+    pub fn sync(&self) -> Result<(), CudaFftError> {
+        for pipeline in &self.pipelines {
+            pipeline.sync()?;
+        }
+        Ok(())
+    }
+    
+    /// Get number of proofs being processed.
+    pub fn num_proofs(&self) -> usize {
+        self.pipelines.len()
+    }
+    
+    /// Get a specific pipeline.
+    pub fn pipeline(&self, idx: usize) -> Option<&GpuProofPipeline> {
+        self.pipelines.get(idx)
+    }
+    
+    /// Get a mutable reference to a specific pipeline.
+    pub fn pipeline_mut(&mut self, idx: usize) -> Option<&mut GpuProofPipeline> {
+        self.pipelines.get_mut(idx)
+    }
+}
+
+/// Benchmark larger proofs to demonstrate scaling benefits.
+#[cfg(feature = "cuda-runtime")]
+pub fn benchmark_large_proof(
+    log_size: u32,
+    num_polynomials: usize,
+    num_fft_rounds: usize,
+) -> Result<LargeProofBenchmarkResult, CudaFftError> {
+    use std::time::Instant;
+    
+    let n = 1usize << log_size;
+    
+    // Generate test data
+    let test_data: Vec<Vec<u32>> = (0..num_polynomials)
+        .map(|p| {
+            (0..n)
+                .map(|i| ((i * 7 + p * 13 + 17) as u32) % ((1 << 31) - 1))
+                .collect()
+        })
+        .collect();
+    
+    // Create pipeline
+    let setup_start = Instant::now();
+    let mut pipeline = GpuProofPipeline::new(log_size)?;
+    let setup_time = setup_start.elapsed();
+    
+    // Upload all polynomials
+    let upload_start = Instant::now();
+    for data in &test_data {
+        pipeline.upload_polynomial(data)?;
+    }
+    pipeline.sync()?;
+    let upload_time = upload_start.elapsed();
+    
+    // Run FFT rounds (simulating proof generation)
+    let compute_start = Instant::now();
+    for _round in 0..num_fft_rounds {
+        for poly_idx in 0..num_polynomials {
+            pipeline.ifft(poly_idx)?;
+        }
+        for poly_idx in 0..num_polynomials {
+            pipeline.fft(poly_idx)?;
+        }
+    }
+    pipeline.sync()?;
+    let compute_time = compute_start.elapsed();
+    
+    // Download results
+    let download_start = Instant::now();
+    let mut _results = Vec::new();
+    for poly_idx in 0..num_polynomials {
+        _results.push(pipeline.download_polynomial(poly_idx)?);
+    }
+    let download_time = download_start.elapsed();
+    
+    let total_time = setup_time + upload_time + compute_time + download_time;
+    let total_ffts = num_polynomials * num_fft_rounds * 2;
+    let elements_processed = (n * total_ffts) as u64;
+    let throughput_gflops = (elements_processed as f64 * log_size as f64 * 5.0) / 
+                            compute_time.as_secs_f64() / 1e9;
+    
+    Ok(LargeProofBenchmarkResult {
+        log_size,
+        num_polynomials,
+        num_fft_rounds,
+        total_ffts,
+        elements_processed,
+        setup_time,
+        upload_time,
+        compute_time,
+        download_time,
+        total_time,
+        throughput_gflops,
+    })
+}
+
+/// Result of a large proof benchmark.
+#[derive(Debug)]
+pub struct LargeProofBenchmarkResult {
+    pub log_size: u32,
+    pub num_polynomials: usize,
+    pub num_fft_rounds: usize,
+    pub total_ffts: usize,
+    pub elements_processed: u64,
+    pub setup_time: std::time::Duration,
+    pub upload_time: std::time::Duration,
+    pub compute_time: std::time::Duration,
+    pub download_time: std::time::Duration,
+    pub total_time: std::time::Duration,
+    pub throughput_gflops: f64,
+}
+
+impl std::fmt::Display for LargeProofBenchmarkResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Large Proof Benchmark Results")?;
+        writeln!(f, "=============================")?;
+        writeln!(f, "  Polynomial size:    2^{} = {} elements", self.log_size, 1usize << self.log_size)?;
+        writeln!(f, "  Polynomials:        {}", self.num_polynomials)?;
+        writeln!(f, "  FFT rounds:         {}", self.num_fft_rounds)?;
+        writeln!(f, "  Total FFTs:         {}", self.total_ffts)?;
+        writeln!(f, "  Elements processed: {:.2}M", self.elements_processed as f64 / 1e6)?;
+        writeln!(f)?;
+        writeln!(f, "Timing:")?;
+        writeln!(f, "  Setup:              {:?}", self.setup_time)?;
+        writeln!(f, "  Upload:             {:?}", self.upload_time)?;
+        writeln!(f, "  Compute:            {:?}", self.compute_time)?;
+        writeln!(f, "  Download:           {:?}", self.download_time)?;
+        writeln!(f, "  Total:              {:?}", self.total_time)?;
+        writeln!(f)?;
+        writeln!(f, "Performance:")?;
+        writeln!(f, "  Throughput:         {:.2} GFLOPS", self.throughput_gflops)?;
+        writeln!(f, "  Time per FFT:       {:?}", self.compute_time / self.total_ffts as u32)?;
+        let compute_pct = self.compute_time.as_secs_f64() / self.total_time.as_secs_f64() * 100.0;
+        writeln!(f, "  Compute efficiency: {:.1}%", compute_pct)?;
+        Ok(())
+    }
+}
+
+/// Benchmark batch proof processing.
+#[cfg(feature = "cuda-runtime")]
+pub fn benchmark_batch_proofs(
+    log_size: u32,
+    num_proofs: usize,
+    num_polynomials_per_proof: usize,
+    num_fft_rounds: usize,
+) -> Result<BatchProofBenchmarkResult, CudaFftError> {
+    use std::time::Instant;
+    
+    let n = 1usize << log_size;
+    
+    // Create batch processor
+    let setup_start = Instant::now();
+    let mut batch = BatchProofProcessor::new(log_size, num_proofs)?;
+    let setup_time = setup_start.elapsed();
+    
+    // Generate and upload test data for all proofs
+    let upload_start = Instant::now();
+    for proof_idx in 0..num_proofs {
+        for poly_idx in 0..num_polynomials_per_proof {
+            let data: Vec<u32> = (0..n)
+                .map(|i| ((i * 7 + poly_idx * 13 + proof_idx * 17 + 23) as u32) % ((1 << 31) - 1))
+                .collect();
+            batch.upload_polynomial(proof_idx, &data)?;
+        }
+    }
+    batch.sync()?;
+    let upload_time = upload_start.elapsed();
+    
+    // Run FFT rounds on all proofs
+    let compute_start = Instant::now();
+    for _round in 0..num_fft_rounds {
+        for poly_idx in 0..num_polynomials_per_proof {
+            batch.batch_ifft(poly_idx)?;
+        }
+        for poly_idx in 0..num_polynomials_per_proof {
+            batch.batch_fft(poly_idx)?;
+        }
+    }
+    batch.sync()?;
+    let compute_time = compute_start.elapsed();
+    
+    let total_time = setup_time + upload_time + compute_time;
+    let total_ffts = num_proofs * num_polynomials_per_proof * num_fft_rounds * 2;
+    
+    Ok(BatchProofBenchmarkResult {
+        log_size,
+        num_proofs,
+        num_polynomials_per_proof,
+        num_fft_rounds,
+        total_ffts,
+        setup_time,
+        upload_time,
+        compute_time,
+        total_time,
+    })
+}
+
+/// Result of a batch proof benchmark.
+#[derive(Debug)]
+pub struct BatchProofBenchmarkResult {
+    pub log_size: u32,
+    pub num_proofs: usize,
+    pub num_polynomials_per_proof: usize,
+    pub num_fft_rounds: usize,
+    pub total_ffts: usize,
+    pub setup_time: std::time::Duration,
+    pub upload_time: std::time::Duration,
+    pub compute_time: std::time::Duration,
+    pub total_time: std::time::Duration,
+}
+
+impl BatchProofBenchmarkResult {
+    pub fn time_per_proof(&self) -> std::time::Duration {
+        self.compute_time / self.num_proofs as u32
+    }
+    
+    pub fn time_per_fft(&self) -> std::time::Duration {
+        self.compute_time / self.total_ffts as u32
+    }
+}
+
+impl std::fmt::Display for BatchProofBenchmarkResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Batch Proof Benchmark Results")?;
+        writeln!(f, "==============================")?;
+        writeln!(f, "  Polynomial size:    2^{} = {} elements", self.log_size, 1usize << self.log_size)?;
+        writeln!(f, "  Proofs in batch:    {}", self.num_proofs)?;
+        writeln!(f, "  Polys per proof:    {}", self.num_polynomials_per_proof)?;
+        writeln!(f, "  FFT rounds:         {}", self.num_fft_rounds)?;
+        writeln!(f, "  Total FFTs:         {}", self.total_ffts)?;
+        writeln!(f)?;
+        writeln!(f, "Timing:")?;
+        writeln!(f, "  Setup:              {:?}", self.setup_time)?;
+        writeln!(f, "  Upload:             {:?}", self.upload_time)?;
+        writeln!(f, "  Compute:            {:?}", self.compute_time)?;
+        writeln!(f, "  Total:              {:?}", self.total_time)?;
+        writeln!(f)?;
+        writeln!(f, "Performance:")?;
+        writeln!(f, "  Time per proof:     {:?}", self.time_per_proof())?;
+        writeln!(f, "  Time per FFT:       {:?}", self.time_per_fft())?;
+        let compute_pct = self.compute_time.as_secs_f64() / self.total_time.as_secs_f64() * 100.0;
+        writeln!(f, "  Compute efficiency: {:.1}%", compute_pct)?;
+        Ok(())
+    }
+}
+
 #[cfg(not(feature = "cuda-runtime"))]
 pub struct GpuProofPipeline;
 
 #[cfg(not(feature = "cuda-runtime"))]
 impl GpuProofPipeline {
     pub fn new(_log_size: u32) -> Result<Self, String> {
+        Err("CUDA runtime not available".into())
+    }
+}
+
+#[cfg(not(feature = "cuda-runtime"))]
+pub struct BatchProofProcessor;
+
+#[cfg(not(feature = "cuda-runtime"))]
+impl BatchProofProcessor {
+    pub fn new(_log_size: u32, _num_proofs: usize) -> Result<Self, String> {
         Err("CUDA runtime not available".into())
     }
 }
