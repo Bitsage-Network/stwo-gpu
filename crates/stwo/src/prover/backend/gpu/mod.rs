@@ -63,6 +63,7 @@ pub mod grind;
 pub mod cuda_executor;
 pub mod memory;
 pub mod pipeline;
+pub mod secure_session;
 
 /// GPU Backend for hardware-accelerated proof generation.
 ///
