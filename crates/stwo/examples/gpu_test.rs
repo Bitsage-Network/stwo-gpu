@@ -22,6 +22,7 @@ fn main() {
     use stwo::prover::backend::gpu::GpuBackend;
     use stwo::prover::backend::simd::column::BaseColumn;
     use stwo::prover::backend::simd::SimdBackend;
+    #[allow(unused_imports)]
     use stwo::prover::backend::Column;
     use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
     use stwo::prover::poly::BitReversedOrder;
