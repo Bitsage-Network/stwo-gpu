@@ -101,27 +101,28 @@ impl std::error::Error for CudaFftError {}
 pub struct CudaFftExecutor {
     /// CUDA device handle (public for memory management)
     pub device: Arc<CudaDevice>,
-    /// Compiled kernels
-    kernels: CompiledKernels,
+    /// Compiled kernels (public for pipeline access)
+    pub kernels: CompiledKernels,
     /// Device info
     pub device_info: DeviceInfo,
 }
 
+/// Compiled CUDA kernels for proof operations.
 #[cfg(feature = "cuda-runtime")]
-struct CompiledKernels {
+pub struct CompiledKernels {
     // FFT kernels
-    bit_reverse: CudaFunction,
-    ifft_layer: CudaFunction,
-    fft_layer: CudaFunction,
+    pub bit_reverse: CudaFunction,
+    pub ifft_layer: CudaFunction,
+    pub fft_layer: CudaFunction,
     // Optimized shared memory FFT kernel
-    ifft_shared_mem: CudaFunction,
+    pub ifft_shared_mem: CudaFunction,
     // FRI folding kernels
-    fold_line: CudaFunction,
-    fold_circle_into_line: CudaFunction,
+    pub fold_line: CudaFunction,
+    pub fold_circle_into_line: CudaFunction,
     // Quotient accumulation kernel
-    accumulate_quotients: CudaFunction,
+    pub accumulate_quotients: CudaFunction,
     // Merkle hashing kernel
-    merkle_layer: CudaFunction,
+    pub merkle_layer: CudaFunction,
 }
 
 /// Information about the CUDA device.
