@@ -156,33 +156,20 @@ fn accumulate_quotients_on_subdomain(
     };
 
     #[cfg(not(feature = "parallel"))]
-    {
-        // OBELYSK FIX: Replace unstable array_chunks with stable collect+chunks_exact
-        // Process quad_rows in groups of 4, matching the original array_chunks behavior
-        let quad_rows_vec: Vec<_> = quad_rows.collect();
-        let values_chunks: Vec<_> = values.chunks_mut(4).collect();
-        
-        for (quad_row, (points_chunk, vals)) in quad_rows_vec
-            .chunks_exact(4)
-            .zip(values_chunks)
-            .enumerate()
-        {
-            let points = [points_chunk[0], points_chunk[1], points_chunk[2], points_chunk[3]];
-            accumulate((quad_row, (points, vals)));
-        }
-    }
+    let iter = quad_rows
+        .array_chunks::<4>()
+        .zip(values.chunks_mut(4))
+        .enumerate();
 
     #[cfg(feature = "parallel")]
-    {
+    let iter = {
         const CHUNK_SIZE: usize = 1 << 12;
         values
             .par_chunks_mut(CHUNK_SIZE)
             .enumerate()
             .flat_map_iter(|(chunk_idx, values_dst)| {
                 let vec_offset = chunk_idx * CHUNK_SIZE;
-                // OBELYSK FIX: Replace unstable array_chunks with stable collect+chunks_exact
-                let quad_rows_vec: Vec<_> = quad_rows.start_at(vec_offset).take(CHUNK_SIZE).collect();
-                let quad_rows: Vec<_> = quad_rows_vec.chunks_exact(4).map(|chunk| [chunk[0], chunk[1], chunk[2], chunk[3]]).collect();
+                let quad_rows = quad_rows.start_at(vec_offset).array_chunks::<4>();
                 let values_dst = {
                     let [a, b, c, d] = values_dst.0.map(|x| x.0);
                     izip!(
@@ -195,10 +182,11 @@ fn accumulate_quotients_on_subdomain(
                         SecureColumnByCoordsMutSlice::from_coordinates_unchecked([a, b, c, d])
                     })
                 };
-                (vec_offset / 4..).zip(quad_rows.into_iter().zip(values_dst))
+                (vec_offset / 4..).zip(quad_rows.zip(values_dst))
             })
-            .for_each(accumulate);
-    }
+    };
+
+    iter.for_each(accumulate);
 
     span.exit();
     let span = span!(

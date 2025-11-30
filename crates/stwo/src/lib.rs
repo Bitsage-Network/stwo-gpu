@@ -6,9 +6,8 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(
     feature = "prover",
-    feature(portable_simd, slice_ptr_get)
+    feature(portable_simd, slice_ptr_get, array_chunks, iter_array_chunks)
 )]
-// Removed: array_chunks, iter_array_chunks (now using chunks_exact)
 pub mod core;
 
 #[cfg(feature = "prover")]

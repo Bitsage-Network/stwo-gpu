@@ -281,8 +281,7 @@ impl PolyOps for SimdBackend {
                                  offset: usize| {
             let mut sum = PackedSecureField::zeroed();
             let mut twiddle_high = Self::twiddle_at(&mappings, offset * N_LANES);
-            // OBELYSK FIX: Replace unstable array_chunks with stable chunks_exact
-            for (i, coeff_chunk) in coeff_chunk.chunks_exact(N_LANES).enumerate() {
+            for (i, coeff_chunk) in coeff_chunk.array_chunks::<N_LANES>().enumerate() {
                 // For every chunk of 2 ^ 4 * 2 ^ 4 = 2 ^ 8 elements, the twiddle high is the same.
                 // Multiply it by every mid twiddle factor to get the factors for the current chunk.
                 let high_twiddle_factors =
