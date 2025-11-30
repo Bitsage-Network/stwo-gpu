@@ -329,7 +329,7 @@ pub type GpuM31Buffer = GpuBuffer<u32>;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::GpuBuffer;
     
     #[test]
     #[cfg(not(feature = "cuda-runtime"))]

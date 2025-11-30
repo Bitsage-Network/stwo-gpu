@@ -335,7 +335,6 @@ mod tests {
         use crate::core::fields::cm31::CM31;
         use crate::core::fields::m31::M31;
         use crate::core::fields::qm31::QM31;
-        use crate::prover::backend::Column;
         
         let val = QM31(
             CM31(M31(1), M31(2)),
