@@ -70,8 +70,10 @@ pub struct GpuProofPipeline {
     itwiddles_cpu: Vec<Vec<u32>>,
     twiddles_cpu: Vec<Vec<u32>>,
     
-    /// Optional per-pipeline executor (for multi-GPU support)
+    /// Optional per-pipeline executor (for future multi-GPU support)
     /// If None, uses the global executor (GPU 0)
+    /// Currently unused due to borrow checker constraints - reserved for future use
+    #[allow(dead_code)]
     executor: Option<Arc<CudaFftExecutor>>,
     
     /// Device ID this pipeline is running on
