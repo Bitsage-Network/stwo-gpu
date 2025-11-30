@@ -341,7 +341,7 @@ impl GpuExecutorContext {
             unsafe {
                 self.executor.kernels.fft_layer.clone().launch(
                     cfg,
-                    (d_poly, &twiddle_view, layer as u32, log_size, n_twiddles as u32),
+                    (&mut *d_poly, &twiddle_view, layer as u32, log_size, n_twiddles as u32),
                 )
             }.map_err(|e| CudaFftError::KernelExecution(format!("FFT layer {} failed: {:?}", layer, e)))?;
         }
