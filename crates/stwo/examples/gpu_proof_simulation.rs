@@ -101,61 +101,16 @@ fn main() {
     // Execute all FFTs on GPU without intermediate transfers
     let kernel_start = Instant::now();
     
-    // Shared memory kernel config
-    const SHMEM_ELEMENTS: u32 = 1024;
-    const SHMEM_BLOCK_SIZE: u32 = 256;
-    let shared_mem_layers = std::cmp::min(log_size, 10);
-    let n = 1u32 << log_size;
-    let num_blocks = n / SHMEM_ELEMENTS;
-    
-    use cudarc::driver::LaunchConfig;
-    
     for _ in 0..num_ffts {
-        // Launch shared memory kernel for first 10 layers
-        let cfg = LaunchConfig {
-            grid_dim: (num_blocks, 1, 1),
-            block_dim: (SHMEM_BLOCK_SIZE, 1, 1),
-            shared_mem_bytes: SHMEM_ELEMENTS * 4,
-        };
-        
-        unsafe {
-            executor.kernels.ifft_shared_mem.clone().launch(
-                cfg,
-                (
-                    &mut d_data,
-                    &d_itwiddles,
-                    &d_twiddle_offsets,
-                    shared_mem_layers,
-                    log_size,
-                ),
-            ).unwrap();
-        }
-        
-        // Remaining layers
-        for layer in (shared_mem_layers as usize)..(log_size as usize) {
-            let n_twiddles = itwiddles[layer].len() as u32;
-            let butterflies_per_twiddle = 1u32 << layer;
-            let total_butterflies = n_twiddles * butterflies_per_twiddle;
-            let grid_size = (total_butterflies + 255) / 256;
-            
-            let twiddle_offset = twiddle_offsets[layer] as usize;
-            let cfg = LaunchConfig {
-                grid_dim: (grid_size, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            
-            let twiddle_view = d_itwiddles.slice(twiddle_offset..);
-            
-            unsafe {
-                executor.kernels.ifft_layer.clone().launch(
-                    cfg,
-                    (&mut d_data, &twiddle_view, layer as u32, log_size, n_twiddles),
-                ).unwrap();
-            }
-        }
+        // Use the public method for executing IFFT on persistent GPU memory
+        executor.execute_ifft_on_device(
+            &mut d_data,
+            &d_itwiddles,
+            &d_twiddle_offsets,
+            &itwiddles,
+            log_size,
+        ).unwrap();
     }
-    executor.device.synchronize().unwrap();
     let kernel_time = kernel_start.elapsed();
     
     // One-time transfer back

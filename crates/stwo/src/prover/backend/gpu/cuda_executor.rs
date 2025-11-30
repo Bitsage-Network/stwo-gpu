@@ -437,6 +437,136 @@ impl CudaFftExecutor {
         Ok(())
     }
     
+    /// Execute IFFT on GPU memory that's already allocated.
+    /// 
+    /// This is the high-performance path for persistent GPU memory.
+    /// Data stays on GPU between calls, avoiding transfer overhead.
+    /// 
+    /// # Arguments
+    /// * `d_data` - Device memory containing the data (modified in place)
+    /// * `d_twiddles` - Device memory containing flattened twiddles
+    /// * `d_twiddle_offsets` - Device memory containing twiddle offsets per layer
+    /// * `twiddles_dbl` - CPU twiddles (for layer size info)
+    /// * `log_size` - log2 of data size
+    pub fn execute_ifft_on_device(
+        &self,
+        d_data: &mut CudaSlice<u32>,
+        d_twiddles: &CudaSlice<u32>,
+        d_twiddle_offsets: &CudaSlice<u32>,
+        twiddles_dbl: &[Vec<u32>],
+        log_size: u32,
+    ) -> Result<(), CudaFftError> {
+        self.execute_ifft_layers_with_offsets(d_data, d_twiddles, d_twiddle_offsets, log_size, twiddles_dbl)
+    }
+    
+    fn execute_ifft_layers_with_offsets(
+        &self,
+        d_data: &mut CudaSlice<u32>,
+        d_twiddles: &CudaSlice<u32>,
+        d_twiddle_offsets: &CudaSlice<u32>,
+        log_size: u32,
+        twiddles_dbl: &[Vec<u32>],
+    ) -> Result<(), CudaFftError> {
+        let block_size = 256u32;
+        let num_layers = twiddles_dbl.len();
+        
+        // Shared memory kernel configuration
+        const SHMEM_ELEMENTS: u32 = 1024;
+        const SHMEM_LOG_ELEMENTS: u32 = 10;
+        const SHMEM_BLOCK_SIZE: u32 = 256;
+        
+        let shared_mem_layers = std::cmp::min(log_size, SHMEM_LOG_ELEMENTS);
+        let n = 1u32 << log_size;
+        
+        // Calculate twiddle offsets for per-layer kernels
+        let mut twiddle_offsets_cpu: Vec<u32> = Vec::new();
+        let mut offset = 0u32;
+        for tw in twiddles_dbl {
+            twiddle_offsets_cpu.push(offset);
+            offset += tw.len() as u32;
+        }
+        
+        if shared_mem_layers > 0 && n >= SHMEM_ELEMENTS {
+            // Launch shared memory kernel for first layers
+            let num_blocks = n / SHMEM_ELEMENTS;
+            
+            let cfg = LaunchConfig {
+                grid_dim: (num_blocks, 1, 1),
+                block_dim: (SHMEM_BLOCK_SIZE, 1, 1),
+                shared_mem_bytes: SHMEM_ELEMENTS * 4,
+            };
+            
+            unsafe {
+                self.kernels.ifft_shared_mem.clone().launch(
+                    cfg,
+                    (
+                        &mut *d_data,
+                        d_twiddles,
+                        d_twiddle_offsets,
+                        shared_mem_layers,
+                        log_size,
+                    ),
+                ).map_err(|e| CudaFftError::KernelExecution(format!("Shared mem kernel: {:?}", e)))?;
+            }
+            
+            // Process remaining layers with per-layer kernels
+            for layer in (shared_mem_layers as usize)..num_layers {
+                let n_twiddles = twiddles_dbl[layer].len() as u32;
+                let butterflies_per_twiddle = 1u32 << layer;
+                let total_butterflies = n_twiddles * butterflies_per_twiddle;
+                let grid_size = (total_butterflies + block_size - 1) / block_size;
+                
+                let twiddle_offset = twiddle_offsets_cpu[layer] as usize;
+                
+                let cfg = LaunchConfig {
+                    grid_dim: (grid_size, 1, 1),
+                    block_dim: (block_size, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                
+                let twiddle_view = d_twiddles.slice(twiddle_offset..);
+                
+                unsafe {
+                    self.kernels.ifft_layer.clone().launch(
+                        cfg,
+                        (&mut *d_data, &twiddle_view, layer as u32, log_size, n_twiddles),
+                    ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
+                }
+            }
+        } else {
+            // Small FFT: use per-layer kernels only
+            for layer in 0..num_layers {
+                let n_twiddles = twiddles_dbl[layer].len() as u32;
+                let butterflies_per_twiddle = 1u32 << layer;
+                let total_butterflies = n_twiddles * butterflies_per_twiddle;
+                let grid_size = (total_butterflies + block_size - 1) / block_size;
+                
+                let twiddle_offset = twiddle_offsets_cpu[layer] as usize;
+                
+                let cfg = LaunchConfig {
+                    grid_dim: (grid_size, 1, 1),
+                    block_dim: (block_size, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                
+                let twiddle_view = d_twiddles.slice(twiddle_offset..);
+                
+                unsafe {
+                    self.kernels.ifft_layer.clone().launch(
+                        cfg,
+                        (&mut *d_data, &twiddle_view, layer as u32, log_size, n_twiddles),
+                    ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
+                }
+            }
+        }
+        
+        // Sync at the end
+        self.device.synchronize()
+            .map_err(|e| CudaFftError::KernelExecution(format!("Final sync failed: {:?}", e)))?;
+        
+        Ok(())
+    }
+    
     /// Execute forward FFT on GPU.
     pub fn execute_fft(
         &self,
