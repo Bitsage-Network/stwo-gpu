@@ -22,8 +22,9 @@ fn main() {
     
     // Get GPU info
     if let Ok(executor) = stwo::prover::backend::gpu::cuda_executor::get_cuda_executor() {
-        let (sms, mem_gb) = executor.device_info;
-        println!("Device: NVIDIA GPU ({} SMs, {:.1} GB)", sms, mem_gb);
+        let info = &executor.device_info;
+        let mem_gb = info.total_memory_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        println!("Device: {} ({} SMs, {:.1} GB)", info.name, info.multiprocessor_count, mem_gb);
     }
     println!();
     
