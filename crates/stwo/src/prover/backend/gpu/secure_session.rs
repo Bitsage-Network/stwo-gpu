@@ -884,14 +884,19 @@ impl SessionManager {
         // Clean up expired sessions first
         self.cleanup_expired();
         
-        // Check if session exists and is usable
-        if let Some(session) = self.sessions.get_mut(&user_id) {
-            if session.state.is_usable() || session.state.is_active() {
-                return Ok(session);
-            } else {
-                // Session expired, remove it
-                self.sessions.remove(&user_id);
-            }
+        // Check if session exists and determine if we need to remove it
+        let should_remove = self.sessions.get(&user_id)
+            .map(|s| !s.state.is_usable() && !s.state.is_active())
+            .unwrap_or(false);
+        
+        if should_remove {
+            // Session expired, remove it
+            self.sessions.remove(&user_id);
+        }
+        
+        // Check if session exists and is usable (after potential removal)
+        if self.sessions.contains_key(&user_id) {
+            return Ok(self.sessions.get_mut(&user_id).unwrap());
         }
         
         // Check capacity
