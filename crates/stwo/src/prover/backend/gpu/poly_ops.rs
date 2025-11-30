@@ -140,6 +140,8 @@ impl PolyOps for GpuBackend {
         
         // Small polynomials or few columns: use sequential approach
         if log_size < GPU_FFT_THRESHOLD_LOG_SIZE || num_columns < 2 {
+            eprintln!("[GPU] interpolate_columns: SEQUENTIAL path (log_size={}, num_columns={}, threshold={})", 
+                     log_size, num_columns, GPU_FFT_THRESHOLD_LOG_SIZE);
             return columns
                 .into_iter()
                 .map(|eval| eval.interpolate_with_twiddles(twiddles))
@@ -154,10 +156,7 @@ impl PolyOps for GpuBackend {
             );
         }
         
-        tracing::info!(
-            "GPU batch interpolate: {} columns × {} elements (log_size={})",
-            num_columns, 1u64 << log_size, log_size
-        );
+        eprintln!("[GPU] interpolate_columns: BATCH path (log_size={}, num_columns={})", log_size, num_columns);
         
         gpu_batch_interpolate(columns, log_size)
     }
@@ -195,6 +194,8 @@ impl PolyOps for GpuBackend {
         
         // Small polynomials or few: use sequential approach
         if log_size < GPU_FFT_THRESHOLD_LOG_SIZE || num_polys < 2 {
+            eprintln!("[GPU] evaluate_columns: SEQUENTIAL path (log_size={}, num_polys={}, threshold={})", 
+                     log_size, num_polys, GPU_FFT_THRESHOLD_LOG_SIZE);
             return polynomials
                 .into_iter()
                 .map(|poly| poly.evaluate_with_twiddles(domain, twiddles))
@@ -209,10 +210,8 @@ impl PolyOps for GpuBackend {
             );
         }
         
-        tracing::info!(
-            "GPU batch evaluate_columns: {} polynomials × {} elements → {} domain",
-            num_polys, 1u64 << log_size, 1u64 << domain_log_size
-        );
+        eprintln!("[GPU] evaluate_columns: BATCH path (log_size={}, num_polys={}, domain_log_size={})", 
+                 log_size, num_polys, domain_log_size);
         
         gpu_batch_evaluate_columns(polynomials, domain, domain_log_size)
     }
