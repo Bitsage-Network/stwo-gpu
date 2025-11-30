@@ -21,6 +21,7 @@ use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, DevicePtr, LaunchAsync
 #[cfg(feature = "cuda-runtime")]
 use cudarc::nvrtc::Ptx;
 
+#[cfg(feature = "cuda-runtime")]
 use super::fft::{CIRCLE_FFT_CUDA_KERNEL, GPU_FFT_THRESHOLD_LOG_SIZE, M31_PRIME};
 
 // =============================================================================

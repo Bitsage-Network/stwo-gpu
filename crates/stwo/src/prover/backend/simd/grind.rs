@@ -128,6 +128,7 @@ where
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod poseidon252 {
+    #[cfg(feature = "parallel")]
     use starknet_crypto::poseidon_hash_many;
     use starknet_ff::FieldElement as FieldElement252;
 

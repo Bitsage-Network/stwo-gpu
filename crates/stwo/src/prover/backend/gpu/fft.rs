@@ -31,6 +31,7 @@
 //! 2. **Radix-8 layers**: Process 8 elements per thread for memory coalescing
 //! 3. **Transpose**: Reorganize data between stages for optimal access patterns
 
+#[cfg(feature = "gpu")]
 use std::sync::OnceLock;
 
 #[cfg(feature = "gpu")]
