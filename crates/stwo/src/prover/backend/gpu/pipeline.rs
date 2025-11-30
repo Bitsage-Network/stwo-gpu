@@ -633,12 +633,10 @@ impl GpuProofPipeline {
         
         // Copy polynomial data on GPU (device-to-device copy)
         for (i, &idx) in column_indices.iter().enumerate() {
-            unsafe {
-                executor.device.dtod_copy(
-                    &self.poly_data[idx],
-                    &mut d_columns.slice_mut(i * n..(i + 1) * n),
-                ).map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
-            }
+            executor.device.dtod_copy(
+                &self.poly_data[idx],
+                &mut d_columns.slice_mut(i * n..(i + 1) * n),
+            ).map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
         }
         
         // Allocate output (32 bytes per hash)
@@ -723,12 +721,10 @@ impl GpuProofPipeline {
         
         // Copy polynomial data on GPU (device-to-device copy)
         for (i, &idx) in column_indices.iter().enumerate() {
-            unsafe {
-                executor.device.dtod_copy(
-                    &self.poly_data[idx],
-                    &mut d_columns.slice_mut(i * n..(i + 1) * n),
-                ).map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
-            }
+            executor.device.dtod_copy(
+                &self.poly_data[idx],
+                &mut d_columns.slice_mut(i * n..(i + 1) * n),
+            ).map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
         }
         
         // Allocate two buffers for ping-pong between layers
