@@ -25,6 +25,7 @@ slow-tests = []
 tracing = []
 gpu = []  # GPU acceleration (kernel source only, no runtime dependency)
 cuda-runtime = ["gpu", "cudarc"]  # Actual CUDA execution (requires CUDA toolkit)
+multi-gpu = ["cuda-runtime"]  # Multi-GPU support for distributed proving
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
