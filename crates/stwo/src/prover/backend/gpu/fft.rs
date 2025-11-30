@@ -498,7 +498,39 @@ fn compute_twiddles_for_gpu(log_size: u32) -> GpuTwiddles {
 /// # Returns
 /// A vector of vectors, where each inner vector contains the doubled inverse
 /// twiddles for that layer, in bit-reversed order.
+/// 
+/// Note: Results are cached per log_size to avoid recomputation.
 pub fn compute_itwiddle_dbls_cpu(log_size: u32) -> Vec<Vec<u32>> {
+    use std::sync::OnceLock;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    
+    // Cache for computed twiddles
+    static ITWIDDLE_CACHE: OnceLock<Mutex<HashMap<u32, Vec<Vec<u32>>>>> = OnceLock::new();
+    
+    let cache = ITWIDDLE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    
+    // Check cache first
+    {
+        let cache_guard = cache.lock().unwrap();
+        if let Some(cached) = cache_guard.get(&log_size) {
+            return cached.clone();
+        }
+    }
+    
+    // Compute and cache
+    let result = compute_itwiddle_dbls_cpu_uncached(log_size);
+    
+    {
+        let mut cache_guard = cache.lock().unwrap();
+        cache_guard.insert(log_size, result.clone());
+    }
+    
+    result
+}
+
+/// Internal function that actually computes the twiddles (uncached).
+fn compute_itwiddle_dbls_cpu_uncached(log_size: u32) -> Vec<Vec<u32>> {
     use crate::core::poly::circle::CanonicCoset;
     use crate::core::utils::bit_reverse;
     use crate::core::fields::m31::BaseField;
@@ -563,7 +595,39 @@ pub fn compute_itwiddle_dbls_cpu(log_size: u32) -> Vec<Vec<u32>> {
 /// 
 /// Uses the EXACT same structure as `compute_itwiddle_dbls_cpu` but with
 /// non-inverted x-coordinates.
+/// 
+/// Note: Results are cached per log_size to avoid recomputation.
 pub fn compute_twiddle_dbls_cpu(log_size: u32) -> Vec<Vec<u32>> {
+    use std::sync::OnceLock;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    
+    // Cache for computed twiddles
+    static TWIDDLE_CACHE: OnceLock<Mutex<HashMap<u32, Vec<Vec<u32>>>>> = OnceLock::new();
+    
+    let cache = TWIDDLE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    
+    // Check cache first
+    {
+        let cache_guard = cache.lock().unwrap();
+        if let Some(cached) = cache_guard.get(&log_size) {
+            return cached.clone();
+        }
+    }
+    
+    // Compute and cache
+    let result = compute_twiddle_dbls_cpu_uncached(log_size);
+    
+    {
+        let mut cache_guard = cache.lock().unwrap();
+        cache_guard.insert(log_size, result.clone());
+    }
+    
+    result
+}
+
+/// Internal function that actually computes the forward twiddles (uncached).
+fn compute_twiddle_dbls_cpu_uncached(log_size: u32) -> Vec<Vec<u32>> {
     use crate::core::poly::circle::CanonicCoset;
     use crate::core::utils::bit_reverse;
     use crate::core::fields::m31::BaseField;
