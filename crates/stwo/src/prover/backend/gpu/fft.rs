@@ -338,109 +338,190 @@ extern "C" __global__ void ifft_radix8_kernel(
 }
 
 // =============================================================================
-// Shared Memory Optimized Kernel (for first 5 layers)
+// Optimized Fused IFFT Kernel with Shared Memory
 // =============================================================================
 
-#define SHARED_MEM_SIZE 1024  // 32 elements per warp * 32 warps
+// Process all layers in a single kernel using shared memory for small blocks
+// This dramatically reduces kernel launch overhead and memory traffic
 
-extern "C" __global__ void ifft_vecwise_kernel(
+#define BLOCK_SIZE 256
+#define ELEMENTS_PER_BLOCK 512  // 2 elements per thread
+
+// Fused kernel that processes all layers for a chunk of data
+// Uses shared memory for the first several layers, then global memory
+extern "C" __global__ void ifft_fused_kernel(
     uint32_t* data,
-    const uint32_t* twiddles_dbl,  // Flattened twiddle arrays for all 5 layers
+    const uint32_t* all_twiddles,      // All twiddles flattened
+    const uint32_t* layer_offsets,     // Offset into all_twiddles for each layer
+    const uint32_t* layer_n_twiddles,  // Number of twiddles per layer
+    uint32_t n_layers,
     uint32_t log_n
 ) {
-    __shared__ uint32_t shared_data[SHARED_MEM_SIZE];
+    __shared__ uint32_t shared_data[ELEMENTS_PER_BLOCK];
     
     uint32_t tid = threadIdx.x;
-    uint32_t block_offset = blockIdx.x * SHARED_MEM_SIZE;
+    uint32_t block_id = blockIdx.x;
+    uint32_t n = 1u << log_n;
     
-    // Load to shared memory
-    if (block_offset + tid < (1u << log_n)) {
-        shared_data[tid] = data[block_offset + tid];
-    }
+    // Each block processes ELEMENTS_PER_BLOCK elements
+    uint32_t base_idx = block_id * ELEMENTS_PER_BLOCK;
+    
+    // Load data to shared memory (each thread loads 2 elements)
+    uint32_t load_idx0 = base_idx + tid;
+    uint32_t load_idx1 = base_idx + tid + BLOCK_SIZE;
+    
+    if (load_idx0 < n) shared_data[tid] = data[load_idx0];
+    if (load_idx1 < n) shared_data[tid + BLOCK_SIZE] = data[load_idx1];
     __syncthreads();
     
-    // Process 5 layers in shared memory
-    for (uint32_t layer = 0; layer < 5 && layer < log_n; layer++) {
-        uint32_t half_block = 1u << layer;
-        uint32_t block_size = half_block << 1;
+    // Process layers that fit in shared memory
+    // For ELEMENTS_PER_BLOCK = 512, we can do up to 9 layers in shared memory
+    uint32_t shared_layers = min(n_layers, (uint32_t)9);
+    
+    for (uint32_t layer = 0; layer < shared_layers; layer++) {
+        uint32_t butterflies_per_twiddle = 1u << layer;
+        uint32_t n_twiddles_layer = layer_n_twiddles[layer];
+        uint32_t twiddle_offset = layer_offsets[layer];
         
-        if (tid < SHARED_MEM_SIZE / 2) {
-            uint32_t block_idx = tid / half_block;
-            uint32_t local_idx = tid % half_block;
+        // Calculate which butterflies this block handles
+        uint32_t total_butterflies = n_twiddles_layer * butterflies_per_twiddle;
+        uint32_t butterflies_per_block = ELEMENTS_PER_BLOCK / 2;
+        
+        // Each thread handles one butterfly within the block
+        if (tid < butterflies_per_block) {
+            // Global butterfly index for this thread
+            uint32_t global_butterfly = block_id * butterflies_per_block + tid;
             
-            uint32_t i = block_idx * block_size + local_idx;
-            uint32_t j = i + half_block;
-            
-            if (j < SHARED_MEM_SIZE) {
-                // Get twiddle (simplified indexing for shared memory version)
-                uint32_t twiddle_offset = (1u << (log_n - 1 - layer)) - 1;
-                uint32_t twiddle_idx = (block_offset / block_size + block_idx) % (1u << (log_n - 1 - layer));
-                uint32_t twiddle_dbl = twiddles_dbl[twiddle_offset + twiddle_idx];
+            if (global_butterfly < total_butterflies) {
+                // Calculate h (twiddle index) and l (position within twiddle group)
+                uint32_t h = global_butterfly / butterflies_per_twiddle;
+                uint32_t l = global_butterfly % butterflies_per_twiddle;
                 
-                uint32_t a = shared_data[i];
-                uint32_t b = shared_data[j];
+                // Global indices
+                uint32_t global_idx0 = (h << (layer + 1)) + l;
+                uint32_t global_idx1 = global_idx0 + (1u << layer);
                 
-                ibutterfly(&a, &b, twiddle_dbl);
+                // Convert to shared memory indices
+                uint32_t local_idx0 = global_idx0 - base_idx;
+                uint32_t local_idx1 = global_idx1 - base_idx;
                 
-                shared_data[i] = a;
-                shared_data[j] = b;
+                // Only process if both indices are in our shared memory range
+                if (local_idx0 < ELEMENTS_PER_BLOCK && local_idx1 < ELEMENTS_PER_BLOCK) {
+                    uint32_t twiddle_dbl = all_twiddles[twiddle_offset + h];
+                    
+                    uint32_t a = shared_data[local_idx0];
+                    uint32_t b = shared_data[local_idx1];
+                    
+                    ibutterfly(&a, &b, twiddle_dbl);
+                    
+                    shared_data[local_idx0] = a;
+                    shared_data[local_idx1] = b;
+                }
             }
         }
         __syncthreads();
     }
     
     // Store back to global memory
-    if (block_offset + tid < (1u << log_n)) {
-        data[block_offset + tid] = shared_data[tid];
-    }
+    if (load_idx0 < n) data[load_idx0] = shared_data[tid];
+    if (load_idx1 < n) data[load_idx1] = shared_data[tid + BLOCK_SIZE];
 }
 
-// =============================================================================
-// Complete IFFT Kernel (combines all stages)
-// =============================================================================
-
-// This is the main entry point for IFFT
-// It orchestrates the multi-stage IFFT algorithm
-extern "C" __global__ void ifft_complete_kernel(
+// Simple fused kernel for remaining layers (global memory only)
+// Processes 3 layers at a time to reduce kernel launches
+extern "C" __global__ void ifft_fused_global_kernel(
     uint32_t* data,
-    const uint32_t* twiddles_dbl,
+    const uint32_t* twiddles_0,
+    const uint32_t* twiddles_1,
+    const uint32_t* twiddles_2,
+    uint32_t n_twiddles_0,
+    uint32_t n_twiddles_1,
+    uint32_t n_twiddles_2,
+    uint32_t layer_0,
+    uint32_t layer_1,
+    uint32_t layer_2,
     uint32_t log_n,
-    uint32_t layer_start,
-    uint32_t layer_end
+    uint32_t do_layer_1,  // Boolean flags
+    uint32_t do_layer_2
 ) {
-    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t n = 1u << log_n;
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     
-    for (uint32_t layer = layer_start; layer < layer_end; layer++) {
-        uint32_t half_block = 1u << layer;
-        uint32_t block_size = half_block << 1;
+    // Layer 0
+    {
+        uint32_t butterflies_per_twiddle = 1u << layer_0;
+        uint32_t total_butterflies = n_twiddles_0 * butterflies_per_twiddle;
         
-        if (idx < n / 2) {
-            uint32_t block_idx = idx / half_block;
-            uint32_t local_idx = idx % half_block;
+        if (tid < total_butterflies) {
+            uint32_t h = tid / butterflies_per_twiddle;
+            uint32_t l = tid % butterflies_per_twiddle;
             
-            uint32_t i = block_idx * block_size + local_idx;
-            uint32_t j = i + half_block;
+            uint32_t idx0 = (h << (layer_0 + 1)) + l;
+            uint32_t idx1 = idx0 + (1u << layer_0);
             
-            // Calculate twiddle index
-            uint32_t twiddle_base = 0;
-            for (uint32_t l = 0; l < layer; l++) {
-                twiddle_base += 1u << (log_n - 1 - l);
-            }
-            uint32_t twiddle_idx = local_idx;
-            uint32_t twiddle_dbl = twiddles_dbl[twiddle_base + twiddle_idx];
+            uint32_t twiddle_dbl = twiddles_0[h];
             
-            uint32_t a = data[i];
-            uint32_t b = data[j];
+            uint32_t a = data[idx0];
+            uint32_t b = data[idx1];
             
             ibutterfly(&a, &b, twiddle_dbl);
             
-            data[i] = a;
-            data[j] = b;
+            data[idx0] = a;
+            data[idx1] = b;
+        }
+    }
+    
+    __threadfence();
+    __syncthreads();
+    
+    // Layer 1 (if requested)
+    if (do_layer_1) {
+        uint32_t butterflies_per_twiddle = 1u << layer_1;
+        uint32_t total_butterflies = n_twiddles_1 * butterflies_per_twiddle;
+        
+        if (tid < total_butterflies) {
+            uint32_t h = tid / butterflies_per_twiddle;
+            uint32_t l = tid % butterflies_per_twiddle;
+            
+            uint32_t idx0 = (h << (layer_1 + 1)) + l;
+            uint32_t idx1 = idx0 + (1u << layer_1);
+            
+            uint32_t twiddle_dbl = twiddles_1[h];
+            
+            uint32_t a = data[idx0];
+            uint32_t b = data[idx1];
+            
+            ibutterfly(&a, &b, twiddle_dbl);
+            
+            data[idx0] = a;
+            data[idx1] = b;
         }
         
-        // Synchronize between layers
         __threadfence();
+        __syncthreads();
+    }
+    
+    // Layer 2 (if requested)
+    if (do_layer_2) {
+        uint32_t butterflies_per_twiddle = 1u << layer_2;
+        uint32_t total_butterflies = n_twiddles_2 * butterflies_per_twiddle;
+        
+        if (tid < total_butterflies) {
+            uint32_t h = tid / butterflies_per_twiddle;
+            uint32_t l = tid % butterflies_per_twiddle;
+            
+            uint32_t idx0 = (h << (layer_2 + 1)) + l;
+            uint32_t idx1 = idx0 + (1u << layer_2);
+            
+            uint32_t twiddle_dbl = twiddles_2[h];
+            
+            uint32_t a = data[idx0];
+            uint32_t b = data[idx1];
+            
+            ibutterfly(&a, &b, twiddle_dbl);
+            
+            data[idx0] = a;
+            data[idx1] = b;
+        }
     }
 }
 "#;

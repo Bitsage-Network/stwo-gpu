@@ -113,6 +113,8 @@ struct CompiledKernels {
     bit_reverse: CudaFunction,
     ifft_layer: CudaFunction,
     fft_layer: CudaFunction,
+    // Optimized fused FFT kernels
+    ifft_fused_global: CudaFunction,
     // FRI folding kernels
     fold_line: CudaFunction,
     fold_circle_into_line: CudaFunction,
@@ -187,6 +189,7 @@ impl CudaFftExecutor {
             "bit_reverse_kernel",
             "ifft_layer_kernel",
             "fft_layer_kernel",
+            "ifft_fused_global_kernel",
         ]).map_err(|e| CudaFftError::KernelCompilation(format!("FFT load: {:?}", e)))?;
         
         // Compile FRI folding CUDA source to PTX
@@ -220,6 +223,9 @@ impl CudaFftExecutor {
         let fft_layer = device.get_func("circle_fft", "fft_layer_kernel")
             .ok_or_else(|| CudaFftError::KernelCompilation("fft_layer_kernel not found".into()))?;
         
+        let ifft_fused_global = device.get_func("circle_fft", "ifft_fused_global_kernel")
+            .ok_or_else(|| CudaFftError::KernelCompilation("ifft_fused_global_kernel not found".into()))?;
+        
         // Get FRI function handles
         let fold_line = device.get_func("fri_folding", "fold_line_kernel")
             .ok_or_else(|| CudaFftError::KernelCompilation("fold_line_kernel not found".into()))?;
@@ -251,6 +257,7 @@ impl CudaFftExecutor {
             bit_reverse,
             ifft_layer,
             fft_layer,
+            ifft_fused_global,
             fold_line,
             fold_circle_into_line,
             accumulate_quotients,
@@ -313,9 +320,6 @@ impl CudaFftExecutor {
         let num_layers = twiddles_dbl.len();
         
         // Validate we have the expected number of twiddle layers
-        // For a domain of size 2^log_size, we need log_size layers of twiddles:
-        // - Layer 0: circle layer (n/4 twiddles, derived from layer 1)
-        // - Layers 1 to log_size-1: line layers
         if num_layers != log_size as usize {
             return Err(CudaFftError::InvalidSize(format!(
                 "Expected {} twiddle layers for log_size={}, got {}",
@@ -331,33 +335,124 @@ impl CudaFftExecutor {
             offset += tw.len();
         }
         
-        // Execute butterfly layers
-        // Each layer has n_twiddles twiddles, and each twiddle handles (1 << layer) butterflies
-        // Total butterflies per layer = n_twiddles * (1 << layer)
-        for layer in 0..num_layers {
-            let n_twiddles = twiddles_dbl[layer].len() as u32;
-            let butterflies_per_twiddle = 1u32 << layer;
-            let total_butterflies = n_twiddles * butterflies_per_twiddle;
-            let grid_size = (total_butterflies + block_size - 1) / block_size;
+        // Process layers in groups of 3 using fused kernel for better performance
+        let mut layer = 0;
+        while layer < num_layers {
+            let layers_remaining = num_layers - layer;
             
-            let twiddle_offset = twiddle_offsets[layer];
-            
-            // Launch kernel
-            let cfg = LaunchConfig {
-                grid_dim: (grid_size, 1, 1),
-                block_dim: (block_size, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            
-            // Create a twiddle view for this layer
-            let twiddle_view = d_twiddles.slice(twiddle_offset..);
-            
-            unsafe {
-                // Reborrow d_data each iteration to avoid move in loop
-                self.kernels.ifft_layer.clone().launch(
-                    cfg,
-                    (&mut *d_data, &twiddle_view, layer as u32, log_size, n_twiddles),
-                ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
+            if layers_remaining >= 3 {
+                // Use fused kernel for 3 layers
+                let n_twiddles_0 = twiddles_dbl[layer].len() as u32;
+                let n_twiddles_1 = twiddles_dbl[layer + 1].len() as u32;
+                let n_twiddles_2 = twiddles_dbl[layer + 2].len() as u32;
+                
+                // Calculate max butterflies across all 3 layers
+                let butterflies_0 = n_twiddles_0 * (1u32 << layer);
+                let butterflies_1 = n_twiddles_1 * (1u32 << (layer + 1));
+                let butterflies_2 = n_twiddles_2 * (1u32 << (layer + 2));
+                let max_butterflies = butterflies_0.max(butterflies_1).max(butterflies_2);
+                let grid_size = (max_butterflies + block_size - 1) / block_size;
+                
+                let twiddle_view_0 = d_twiddles.slice(twiddle_offsets[layer]..);
+                let twiddle_view_1 = d_twiddles.slice(twiddle_offsets[layer + 1]..);
+                let twiddle_view_2 = d_twiddles.slice(twiddle_offsets[layer + 2]..);
+                
+                let cfg = LaunchConfig {
+                    grid_dim: (grid_size, 1, 1),
+                    block_dim: (block_size, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                
+                unsafe {
+                    self.kernels.ifft_fused_global.clone().launch(
+                        cfg,
+                        (
+                            &mut *d_data,
+                            &twiddle_view_0,
+                            &twiddle_view_1,
+                            &twiddle_view_2,
+                            n_twiddles_0,
+                            n_twiddles_1,
+                            n_twiddles_2,
+                            layer as u32,
+                            (layer + 1) as u32,
+                            (layer + 2) as u32,
+                            log_size,
+                            1u32,  // do_layer_1 = true
+                            1u32,  // do_layer_2 = true
+                        ),
+                    ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
+                }
+                
+                layer += 3;
+            } else if layers_remaining == 2 {
+                // Use fused kernel for 2 layers
+                let n_twiddles_0 = twiddles_dbl[layer].len() as u32;
+                let n_twiddles_1 = twiddles_dbl[layer + 1].len() as u32;
+                
+                let butterflies_0 = n_twiddles_0 * (1u32 << layer);
+                let butterflies_1 = n_twiddles_1 * (1u32 << (layer + 1));
+                let max_butterflies = butterflies_0.max(butterflies_1);
+                let grid_size = (max_butterflies + block_size - 1) / block_size;
+                
+                let twiddle_view_0 = d_twiddles.slice(twiddle_offsets[layer]..);
+                let twiddle_view_1 = d_twiddles.slice(twiddle_offsets[layer + 1]..);
+                // Dummy twiddle view for layer 2 (not used)
+                let twiddle_view_2 = d_twiddles.slice(twiddle_offsets[layer]..);
+                
+                let cfg = LaunchConfig {
+                    grid_dim: (grid_size, 1, 1),
+                    block_dim: (block_size, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                
+                unsafe {
+                    self.kernels.ifft_fused_global.clone().launch(
+                        cfg,
+                        (
+                            &mut *d_data,
+                            &twiddle_view_0,
+                            &twiddle_view_1,
+                            &twiddle_view_2,
+                            n_twiddles_0,
+                            n_twiddles_1,
+                            1u32,  // dummy
+                            layer as u32,
+                            (layer + 1) as u32,
+                            0u32,  // dummy
+                            log_size,
+                            1u32,  // do_layer_1 = true
+                            0u32,  // do_layer_2 = false
+                        ),
+                    ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
+                }
+                
+                layer += 2;
+            } else {
+                // Single layer - use simple kernel
+                let n_twiddles = twiddles_dbl[layer].len() as u32;
+                let butterflies_per_twiddle = 1u32 << layer;
+                let total_butterflies = n_twiddles * butterflies_per_twiddle;
+                let grid_size = (total_butterflies + block_size - 1) / block_size;
+                
+                let twiddle_offset = twiddle_offsets[layer];
+                
+                let cfg = LaunchConfig {
+                    grid_dim: (grid_size, 1, 1),
+                    block_dim: (block_size, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                
+                let twiddle_view = d_twiddles.slice(twiddle_offset..);
+                
+                unsafe {
+                    self.kernels.ifft_layer.clone().launch(
+                        cfg,
+                        (&mut *d_data, &twiddle_view, layer as u32, log_size, n_twiddles),
+                    ).map_err(|e| CudaFftError::KernelExecution(format!("{:?}", e)))?;
+                }
+                
+                layer += 1;
             }
         }
         
