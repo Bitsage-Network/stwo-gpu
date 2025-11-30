@@ -75,6 +75,15 @@ fn main() {
         }
     };
     
+    // Pre-initialize twiddles on all GPUs (warm up)
+    println!("Pre-initializing twiddles on all GPUs...");
+    for gpu_idx in 0..num_gpus {
+        pool.with_gpu(gpu_idx, |ctx| {
+            ctx.ensure_twiddles(log_size)
+        }).expect("Failed to initialize twiddles");
+    }
+    println!("✓ All GPUs warmed up\n");
+    
     println!("Processing {} proofs in parallel across {} GPUs...\n", num_proofs, num_gpus);
     
     let start = Instant::now();
