@@ -41,7 +41,7 @@
 use cudarc::driver::{CudaSlice, LaunchConfig, LaunchAsync};
 
 #[cfg(feature = "cuda-runtime")]
-use super::cuda_executor::{CudaFftExecutor, CudaFftError, get_cuda_executor};
+use super::cuda_executor::{CudaFftError, get_cuda_executor};
 
 #[cfg(feature = "cuda-runtime")]
 use super::fft::{compute_itwiddle_dbls_cpu, compute_twiddle_dbls_cpu};
