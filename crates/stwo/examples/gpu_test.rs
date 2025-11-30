@@ -11,6 +11,7 @@
 //!   - 2^18 (256K): ~30x speedup
 //!   - 2^20 (1M): ~60x speedup
 
+#[cfg(all(feature = "cuda-runtime", feature = "prover"))]
 use std::time::Instant;
 
 #[cfg(all(feature = "cuda-runtime", feature = "prover"))]
@@ -221,6 +222,7 @@ fn main() {
     println!("╚══════════════════════════════════════════════════════════╝");
 }
 
+#[cfg(all(feature = "cuda-runtime", feature = "prover"))]
 fn format_size(n: usize) -> String {
     if n >= 1_000_000 {
         format!("{}M", n / 1_000_000)
