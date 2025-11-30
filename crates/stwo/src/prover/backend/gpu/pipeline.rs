@@ -105,7 +105,7 @@ impl GpuProofPipeline {
         let device = if let Some(ref exec) = executor {
             &exec.device
         } else {
-            &self.get_executor()?.device
+            &get_cuda_executor().map_err(|e| e.clone())?.device
         };
         
         // Precompute and cache twiddles
@@ -1684,7 +1684,7 @@ pub struct GpuStreamingPipeline {
 impl GpuStreamingPipeline {
     /// Create a new streaming pipeline with double-buffering.
     pub fn new(log_size: u32) -> Result<Self, CudaFftError> {
-        let executor = self.get_executor()?;
+        let executor = get_cuda_executor().map_err(|e| e.clone())?;
         
         // Precompute and cache twiddles
         let itwiddles_cpu = compute_itwiddle_dbls_cpu(log_size);
@@ -1734,7 +1734,7 @@ impl GpuStreamingPipeline {
     
     /// Pre-allocate buffers for a batch of polynomials.
     pub fn preallocate(&mut self, num_polynomials: usize) -> Result<(), CudaFftError> {
-        let executor = self.get_executor()?;
+        let executor = get_cuda_executor().map_err(|e| e.clone())?;
         let n = 1usize << self.log_size;
         
         // Allocate both buffers
@@ -1768,7 +1768,7 @@ impl GpuStreamingPipeline {
             ));
         }
         
-        let executor = self.get_executor()?;
+        let executor = get_cuda_executor().map_err(|e| e.clone())?;
         
         // Use transfer stream if available, otherwise sync copy
         // Note: cudarc's htod_sync_copy_into doesn't support streams directly,
@@ -1787,7 +1787,7 @@ impl GpuStreamingPipeline {
             ));
         }
         
-        let executor = self.get_executor()?;
+        let executor = get_cuda_executor().map_err(|e| e.clone())?;
         
         // Execute IFFT on current buffer
         executor.execute_ifft_on_device(
@@ -1807,7 +1807,7 @@ impl GpuStreamingPipeline {
             ));
         }
         
-        let executor = self.get_executor()?;
+        let executor = get_cuda_executor().map_err(|e| e.clone())?;
         let n = 1usize << self.log_size;
         let mut result = vec![0u32; n];
         
@@ -1824,7 +1824,7 @@ impl GpuStreamingPipeline {
     
     /// Synchronize all streams.
     pub fn sync(&self) -> Result<(), CudaFftError> {
-        let executor = self.get_executor()?;
+        let executor = get_cuda_executor().map_err(|e| e.clone())?;
         
         // Synchronize compute stream if available
         if let Some(ref stream) = self.compute_stream {
@@ -1851,7 +1851,7 @@ impl GpuStreamingPipeline {
             ));
         }
         
-        let executor = self.get_executor()?;
+        let executor = get_cuda_executor().map_err(|e| e.clone())?;
         let block_size = 256u32;
         let num_layers = self.twiddles_cpu.len();
         
