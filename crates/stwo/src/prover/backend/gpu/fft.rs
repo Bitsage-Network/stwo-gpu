@@ -529,15 +529,27 @@ pub fn compute_itwiddle_dbls_cpu(log_size: u32) -> Vec<Vec<u32>> {
     let mut result = Vec::new();
     
     let mut current_coset = coset;
-    for _ in 0..log_size {
+    // Only iterate while we have enough elements to form pairs
+    for layer in 0..log_size {
+        let layer_size = current_coset.size() / 2;
+        
+        // Skip empty layers (can happen at the end of the iteration)
+        if layer_size == 0 {
+            tracing::trace!("Skipping empty layer {} in twiddle computation", layer);
+            break;
+        }
+        
         let layer_twiddles: Vec<u32> = current_coset
             .iter()
-            .take(current_coset.size() / 2)
+            .take(layer_size)
             .map(|p| p.x.inverse().0 * 2)
             .collect();
         
+        // Only bit-reverse if we have more than 1 element
         let mut reversed = layer_twiddles;
-        bit_reverse(&mut reversed);
+        if reversed.len() > 1 {
+            bit_reverse(&mut reversed);
+        }
         
         result.push(reversed);
         current_coset = current_coset.double();
