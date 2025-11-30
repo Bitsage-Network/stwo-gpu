@@ -16,7 +16,6 @@ fn main() {
         benchmark_full_proof_pipeline,
     };
     use stwo::prover::backend::gpu::cuda_executor::get_cuda_executor;
-    use stwo::core::fields::m31::BaseField;
 
     println!("╔══════════════════════════════════════════════════════════════════════════════╗");
     println!("║          GPU STARK Integration Test - Real Prover Workloads                  ║");
@@ -130,7 +129,6 @@ fn main() {
         match benchmark_full_proof_pipeline(log_size, num_polys, num_fri_layers) {
             Ok(result) => {
                 // Calculate estimated SIMD time for comparison
-                let n = 1usize << log_size;
                 let simd_per_fft_us = 4000.0;  // ~4ms per FFT for 1M elements
                 let total_fft_ops = num_polys * 2;  // IFFT + FFT
                 let simd_fft_time_ms = (simd_per_fft_us * total_fft_ops as f64) / 1000.0;
