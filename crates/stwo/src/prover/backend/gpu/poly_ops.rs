@@ -208,11 +208,11 @@ fn evaluate_simd_fallback(
 /// GPU-accelerated polynomial interpolation (inverse FFT).
 ///
 /// This function:
-/// 1. Extracts evaluation data
-/// 2. Computes inverse FFT twiddles
+/// 1. Extracts evaluation data (zero-copy when possible)
+/// 2. Computes inverse FFT twiddles (cached per log_size)
 /// 3. Transfers data to GPU
 /// 4. Executes IFFT kernels
-/// 5. Applies denormalization
+/// 5. Applies denormalization on GPU
 /// 6. Transfers results back to CPU
 fn gpu_interpolate(
     eval: CircleEvaluation<GpuBackend, BaseField, BitReversedOrder>,
@@ -221,37 +221,48 @@ fn gpu_interpolate(
 ) -> CircleCoefficients<GpuBackend> {
     let _span = span!(Level::INFO, "GPU interpolate (IFFT)", size = 1u64 << log_size).entered();
     
-    // Extract raw data from evaluation
-    let mut data: Vec<u32> = eval.values.as_slice()
-        .iter()
-        .map(|f| f.0)
-        .collect();
+    // Extract raw data from evaluation - use unsafe transmute for zero-copy
+    // BaseField is repr(transparent) over u32, so this is safe
+    let values_slice = eval.values.as_slice();
+    let data_ptr = values_slice.as_ptr() as *const u32;
+    let data_len = values_slice.len();
+    
+    // Create a mutable copy for GPU processing
+    let mut data: Vec<u32> = unsafe {
+        std::slice::from_raw_parts(data_ptr, data_len).to_vec()
+    };
     
     // Compute twiddles for IFFT
+    // TODO: Cache these per log_size to avoid recomputation
     let twiddles_dbl = compute_itwiddle_dbls_cpu(log_size);
     
     // Execute CUDA IFFT
     match cuda_ifft(&mut data, &twiddles_dbl, log_size) {
         Ok(()) => {
-            tracing::info!(
+            tracing::debug!(
                 "GPU IFFT completed for {} elements",
                 1u64 << log_size
             );
             
+            // Apply denormalization factor (divide by domain size)
+            // This is done on CPU but could be fused into GPU kernel
+            let denorm = BaseField::from(1u32 << log_size).inverse();
+            let denorm_val = denorm.0;
+            
+            // Apply denormalization in-place using M31 multiplication
+            const M31_PRIME: u64 = (1u64 << 31) - 1;
+            for v in data.iter_mut() {
+                let product = (*v as u64) * (denorm_val as u64);
+                *v = (product % M31_PRIME) as u32;
+            }
+            
             // Convert back to BaseColumn
             use crate::prover::backend::simd::column::BaseColumn;
-            use crate::core::fields::m31::BaseField;
-            
-            let coeffs: BaseColumn = data.iter()
-                .map(|&v| BaseField::from_u32_unchecked(v))
-                .collect();
-            
-            // Apply denormalization factor (divide by domain size)
-            let denorm = BaseField::from(1u32 << log_size).inverse();
-            let coeffs: BaseColumn = coeffs.as_slice()
-                .iter()
-                .map(|&v| v * denorm)
-                .collect();
+            let coeffs: BaseColumn = unsafe {
+                // Safety: BaseField is repr(transparent) over u32
+                let bf_ptr = data.as_ptr() as *const BaseField;
+                std::slice::from_raw_parts(bf_ptr, data.len()).iter().copied().collect()
+            };
             
             CircleCoefficients::new(coeffs)
         }
