@@ -199,7 +199,7 @@ impl MultiGpuProver {
     /// Each workload is assigned to a GPU in round-robin fashion.
     pub fn prove_batch(&self, workloads: &[ProofWorkload]) -> Result<Vec<ProofResult>, CudaFftError> {
         let num_gpus = self.gpu_count();
-        let mut results: Vec<Option<ProofResult>> = (0..workloads.len()).map(|_| None).collect();
+        let results: Vec<Option<ProofResult>> = (0..workloads.len()).map(|_| None).collect();
         
         // Group workloads by GPU
         let mut gpu_workloads: Vec<Vec<(usize, &ProofWorkload)>> = vec![Vec::new(); num_gpus];
