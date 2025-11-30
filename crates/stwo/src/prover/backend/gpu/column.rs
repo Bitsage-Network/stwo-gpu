@@ -119,8 +119,9 @@ impl GpuColumnOps<SecureField> for SecureColumn {
 
 /// Handle to column data in GPU memory.
 #[cfg(feature = "gpu")]
+#[allow(dead_code)]
 pub struct GpuColumnHandle {
-    ptr: *mut u8,
+    ptr: *mut u8,  // Device pointer for future GPU memory management
     len: usize,
 }
 

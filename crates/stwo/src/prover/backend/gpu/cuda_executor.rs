@@ -22,7 +22,10 @@ use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, DevicePtr, LaunchAsync
 use cudarc::nvrtc::Ptx;
 
 #[cfg(feature = "cuda-runtime")]
-use super::fft::{CIRCLE_FFT_CUDA_KERNEL, GPU_FFT_THRESHOLD_LOG_SIZE, M31_PRIME};
+use super::fft::CIRCLE_FFT_CUDA_KERNEL;
+#[allow(unused_imports)]
+#[cfg(feature = "cuda-runtime")]
+use super::fft::{GPU_FFT_THRESHOLD_LOG_SIZE, M31_PRIME};
 
 // =============================================================================
 // Global CUDA Context
@@ -107,11 +110,12 @@ pub struct CudaFftExecutor {
 }
 
 #[cfg(feature = "cuda-runtime")]
+#[allow(dead_code)]
 struct CompiledKernels {
     bit_reverse: CudaFunction,
     ifft_layer: CudaFunction,
-    ifft_radix8: CudaFunction,
-    ifft_vecwise: CudaFunction,
+    ifft_radix8: CudaFunction,  // Reserved for future radix-8 optimization
+    ifft_vecwise: CudaFunction, // Reserved for future vectorized optimization
     fft_layer: CudaFunction,
 }
 

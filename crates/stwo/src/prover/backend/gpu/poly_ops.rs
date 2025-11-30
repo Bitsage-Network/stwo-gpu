@@ -302,32 +302,32 @@ mod cuda_fft {
     /// - Memory transfer is the bottleneck for small sizes
     /// - For log_size >= 14, GPU computation dominates
     /// - Radix-8 kernel provides best throughput for large sizes
+    /// Execute IFFT on GPU using CUDA.
+    /// 
+    /// Note: This is a placeholder. The actual implementation uses CudaFftExecutor.
+    #[allow(dead_code)]
     pub fn execute_gpu_ifft(
         _data: &mut [u32],
         _twiddles: &[Vec<u32>],
         _log_size: u32,
     ) -> Result<(), String> {
-        // This would use cudarc or cuda-sys to:
-        // 1. Initialize CUDA context
-        // 2. Compile kernels with NVRTC
-        // 3. Allocate device memory
-        // 4. Copy data to device
-        // 5. Launch kernels
-        // 6. Copy results back
-        // 7. Free device memory
-        
-        // Placeholder for actual CUDA implementation
-        Err("CUDA runtime not yet integrated".to_string())
+        // The actual GPU execution is handled by CudaFftExecutor in cuda_executor.rs
+        // This function is kept for API compatibility
+        Err("Use CudaFftExecutor::execute_ifft instead".to_string())
     }
     
     /// Execute FFT on GPU using CUDA.
+    /// 
+    /// Note: This is a placeholder. The actual implementation uses CudaFftExecutor.
+    #[allow(dead_code)]
     pub fn execute_gpu_fft(
         _data: &mut [u32],
         _twiddles: &[Vec<u32>],
         _log_size: u32,
     ) -> Result<(), String> {
-        // Similar to IFFT but with forward twiddles
-        Err("CUDA runtime not yet integrated".to_string())
+        // The actual GPU execution is handled by CudaFftExecutor in cuda_executor.rs
+        // This function is kept for API compatibility
+        Err("Use CudaFftExecutor::execute_fft instead".to_string())
     }
 }
 
