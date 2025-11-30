@@ -44,8 +44,11 @@ impl PolyOps for GpuBackend {
         
         let log_size = eval.domain.log_size();
         
-        if log_size < GPU_FFT_THRESHOLD_LOG_SIZE {
-            // Small polynomial - use SIMD backend
+        // TODO(gpu): Re-enable GPU interpolate once twiddle format is aligned
+        // with CUDA kernel expectations. For now, use SIMD which is already
+        // highly optimized with AVX-512.
+        if log_size < GPU_FFT_THRESHOLD_LOG_SIZE || true {
+            // Small polynomial or GPU not ready - use SIMD backend
             interpolate_simd_fallback(eval, twiddles)
         } else {
             // Large polynomial - use GPU
