@@ -78,6 +78,25 @@ pub trait PolyOps: ColumnOps<BaseField> + ColumnOps<SecureField> + Sized {
         twiddles: &TwiddleTree<Self>,
     ) -> CircleEvaluation<Self, BaseField, BitReversedOrder>;
 
+    /// Batch evaluate multiple polynomials on the same domain.
+    /// 
+    /// This is significantly faster than calling `evaluate` in a loop because:
+    /// - GPU backends can keep data on device across all evaluations
+    /// - Twiddles are computed/transferred once
+    /// - Memory transfers are batched
+    /// 
+    /// Default implementation calls `evaluate` in a loop.
+    fn evaluate_columns(
+        polynomials: impl IntoIterator<Item = CircleCoefficients<Self>>,
+        domain: CircleDomain,
+        twiddles: &TwiddleTree<Self>,
+    ) -> Vec<CircleEvaluation<Self, BaseField, BitReversedOrder>> {
+        polynomials
+            .into_iter()
+            .map(|poly| poly.evaluate_with_twiddles(domain, twiddles))
+            .collect()
+    }
+
     fn evaluate_polynomials(
         polynomials: ColumnVec<CircleCoefficients<Self>>,
         log_blowup_factor: u32,

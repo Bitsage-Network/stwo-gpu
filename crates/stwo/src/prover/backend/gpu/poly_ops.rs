@@ -173,6 +173,62 @@ impl PolyOps for GpuBackend {
             .collect()
     }
     
+    /// Batch evaluate multiple polynomials on the same domain using GPU pipeline.
+    /// 
+    /// This is significantly faster than calling `evaluate` in a loop because
+    /// data stays on GPU across all evaluations.
+    #[cfg(feature = "cuda-runtime")]
+    fn evaluate_columns(
+        polynomials: impl IntoIterator<Item = CircleCoefficients<Self>>,
+        domain: CircleDomain,
+        twiddles: &TwiddleTree<Self>,
+    ) -> Vec<CircleEvaluation<Self, BaseField, BitReversedOrder>> {
+        let polynomials: Vec<_> = polynomials.into_iter().collect();
+        
+        if polynomials.is_empty() {
+            return Vec::new();
+        }
+        
+        let log_size = polynomials[0].log_size();
+        let num_polys = polynomials.len();
+        let domain_log_size = domain.log_size();
+        
+        // Small polynomials or few: use sequential approach
+        if log_size < GPU_FFT_THRESHOLD_LOG_SIZE || num_polys < 2 {
+            return polynomials
+                .into_iter()
+                .map(|poly| poly.evaluate_with_twiddles(domain, twiddles))
+                .collect();
+        }
+        
+        // Large polynomials: use GPU batch evaluation
+        if !is_cuda_available() {
+            panic!(
+                "GpuBackend::evaluate_columns called with log_size={} but CUDA is not available.",
+                log_size
+            );
+        }
+        
+        tracing::info!(
+            "GPU batch evaluate_columns: {} polynomials × {} elements → {} domain",
+            num_polys, 1u64 << log_size, 1u64 << domain_log_size
+        );
+        
+        gpu_batch_evaluate_columns(polynomials, domain, domain_log_size)
+    }
+    
+    #[cfg(not(feature = "cuda-runtime"))]
+    fn evaluate_columns(
+        polynomials: impl IntoIterator<Item = CircleCoefficients<Self>>,
+        domain: CircleDomain,
+        twiddles: &TwiddleTree<Self>,
+    ) -> Vec<CircleEvaluation<Self, BaseField, BitReversedOrder>> {
+        polynomials
+            .into_iter()
+            .map(|poly| poly.evaluate_with_twiddles(domain, twiddles))
+            .collect()
+    }
+    
     /// Batch evaluate multiple polynomials using GPU pipeline.
     #[cfg(feature = "cuda-runtime")]
     fn evaluate_polynomials(
@@ -613,6 +669,87 @@ fn gpu_batch_evaluate(
         
         tracing::info!(
             "GPU batch evaluate completed: {} polynomials (pipeline reused)",
+            results.len()
+        );
+        
+        results
+    })
+}
+
+/// GPU-accelerated batch polynomial evaluation on a specific domain.
+/// 
+/// This function processes multiple polynomials using the GPU pipeline,
+/// evaluating them all on the same domain with minimal transfer overhead.
+#[cfg(feature = "cuda-runtime")]
+fn gpu_batch_evaluate_columns(
+    polynomials: Vec<CircleCoefficients<GpuBackend>>,
+    domain: CircleDomain,
+    domain_log_size: u32,
+) -> Vec<CircleEvaluation<GpuBackend, BaseField, BitReversedOrder>> {
+    use crate::prover::backend::simd::column::BaseColumn;
+    
+    let _span = span!(Level::INFO, "GPU batch evaluate_columns", 
+                      num_polys = polynomials.len(), 
+                      domain_size = 1u64 << domain_log_size).entered();
+    
+    // Ensure pipeline is cached for the domain size
+    if let Err(e) = get_or_create_pipeline(domain_log_size) {
+        panic!("Failed to create/get GPU pipeline: {}", e);
+    }
+    
+    // Use the cached pipeline
+    PIPELINE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let pipeline = cache.get_mut(&domain_log_size).expect("Pipeline should exist after get_or_create");
+        
+        // Clear any existing polynomials from previous batch
+        pipeline.clear_polynomials();
+        
+        // Upload all polynomials to GPU (with zero-padding to domain size)
+        let domain_size = 1usize << domain_log_size;
+        for poly in &polynomials {
+            let mut data: Vec<u32> = poly.coeffs.as_slice()
+                .iter()
+                .map(|f| f.0)
+                .collect();
+            
+            // Zero-pad to domain size
+            data.resize(domain_size, 0);
+            
+            if let Err(e) = pipeline.upload_polynomial(&data) {
+                panic!("Failed to upload polynomial to GPU: {}", e);
+            }
+        }
+        
+        // Execute FFT on all polynomials (stays on GPU)
+        for poly_idx in 0..polynomials.len() {
+            if let Err(e) = pipeline.fft(poly_idx) {
+                panic!("Failed to execute GPU FFT: {}", e);
+            }
+        }
+        
+        // Download results
+        let mut results = Vec::with_capacity(polynomials.len());
+        
+        for poly_idx in 0..polynomials.len() {
+            let data = match pipeline.download_polynomial(poly_idx) {
+                Ok(d) => d,
+                Err(e) => {
+                    panic!("Failed to download polynomial from GPU: {}", e);
+                }
+            };
+            
+            // Convert to BaseColumn
+            let values: BaseColumn = unsafe {
+                let bf_ptr = data.as_ptr() as *const BaseField;
+                std::slice::from_raw_parts(bf_ptr, data.len()).iter().copied().collect()
+            };
+            
+            results.push(CircleEvaluation::new(domain, values));
+        }
+        
+        tracing::info!(
+            "GPU batch evaluate_columns completed: {} polynomials (pipeline reused)",
             results.len()
         );
         

@@ -99,11 +99,13 @@ fn main() {
             CanonicCoset::new(extended_log_size).half_coset()
         );
 
+        // Use batch evaluation for GPU efficiency!
         let eval_start = Instant::now();
-        let _extended_evals: Vec<_> = polynomials
-            .iter()
-            .map(|poly| GpuBackend::evaluate(poly, extended_domain, &extended_twiddles))
-            .collect();
+        let _extended_evals = GpuBackend::evaluate_columns(
+            polynomials.into_iter(),
+            extended_domain,
+            &extended_twiddles,
+        );
         let eval_time = eval_start.elapsed();
 
         let total_time = trace_time + twiddles_time + interp_time + eval_time;
