@@ -53,48 +53,56 @@ struct CachedTwiddles {
     itwiddles: Vec<u32>,
 }
 
+/// Unique key for a coset: (log_size, initial_index)
+/// Different cosets of the same size but different positions need different twiddles!
+#[derive(Hash, Eq, PartialEq, Clone, Copy)]
+struct CosetKey {
+    log_size: u32,
+    initial_index: usize,  // CirclePointIndex.0 is usize
+}
+
+impl CosetKey {
+    fn from_coset(coset: &Coset) -> Self {
+        Self {
+            log_size: coset.log_size,
+            initial_index: coset.initial_index.0,
+        }
+    }
+}
+
 /// Global twiddle cache keyed by (log_size, initial_index)
-/// Using a simple Vec-based approach since log_size is bounded (typically < 32)
+/// Different cosets need different twiddles even if they have the same size!
 struct TwiddleCache {
-    // Indexed by log_size, then by initial_index within that size
+    // Map from CosetKey to cached twiddles
     // We use RwLock for concurrent read access during proof generation
-    entries: RwLock<Vec<Option<CachedTwiddles>>>,
+    // Using OnceLock to lazily initialize the HashMap
+    entries: RwLock<Option<std::collections::HashMap<CosetKey, CachedTwiddles>>>,
 }
 
 impl TwiddleCache {
     const fn new() -> Self {
         Self {
-            entries: RwLock::new(Vec::new()),
+            entries: RwLock::new(None),
         }
     }
     
     /// Try to get cached twiddles for the given coset
     fn get(&self, coset: &Coset) -> Option<(Vec<u32>, Vec<u32>)> {
-        let log_size = coset.log_size as usize;
+        let key = CosetKey::from_coset(coset);
         let entries = self.entries.read().ok()?;
         
-        if log_size >= entries.len() {
-            return None;
-        }
-        
-        entries.get(log_size).and_then(|entry| {
-            entry.as_ref().map(|cached| {
-                (cached.twiddles.clone(), cached.itwiddles.clone())
-            })
+        entries.as_ref()?.get(&key).map(|cached| {
+            (cached.twiddles.clone(), cached.itwiddles.clone())
         })
     }
     
     /// Store computed twiddles in the cache
     fn insert(&self, coset: &Coset, twiddles: Vec<u32>, itwiddles: Vec<u32>) {
-        let log_size = coset.log_size as usize;
+        let key = CosetKey::from_coset(coset);
         
         if let Ok(mut entries) = self.entries.write() {
-            // Extend the vector if needed
-            while entries.len() <= log_size {
-                entries.push(None);
-            }
-            
-            entries[log_size] = Some(CachedTwiddles { twiddles, itwiddles });
+            let map = entries.get_or_insert_with(std::collections::HashMap::new);
+            map.insert(key, CachedTwiddles { twiddles, itwiddles });
         }
     }
     
@@ -102,7 +110,7 @@ impl TwiddleCache {
     #[allow(dead_code)]
     pub fn clear(&self) {
         if let Ok(mut entries) = self.entries.write() {
-            entries.clear();
+            *entries = None;
         }
     }
 }

@@ -84,13 +84,12 @@ impl QuotientOps for SimdBackend {
         // Extend the evaluation to the full domain.
         // TODO(Ohad): Try to optimize out all these copies.
         for (ci, &c) in subdomain_shifts.iter().enumerate() {
-            let subdomain = subdomain.shift(c);
+            let shifted_subdomain = subdomain.shift(c);
 
-            let twiddles = SimdBackend::precompute_twiddles(subdomain.half_coset);
+            let twiddles = SimdBackend::precompute_twiddles(shifted_subdomain.half_coset);
             #[allow(clippy::needless_range_loop)]
             for i in 0..SECURE_EXTENSION_DEGREE {
-                // Sanity check.
-                let eval = subeval_polys[i].evaluate_with_twiddles(subdomain, &twiddles);
+                let eval = subeval_polys[i].evaluate_with_twiddles(shifted_subdomain, &twiddles);
                 extended_eval.columns[i].data[(ci * eval.data.len())..((ci + 1) * eval.data.len())]
                     .copy_from_slice(&eval.data);
             }

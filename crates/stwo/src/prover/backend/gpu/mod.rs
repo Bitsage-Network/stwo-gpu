@@ -51,6 +51,7 @@ use super::{Backend, BackendForChannel};
 use crate::core::vcs::blake2_merkle::{Blake2sM31MerkleChannel, Blake2sMerkleChannel};
 
 pub mod column;
+pub mod conversion;
 pub mod fft;
 pub mod fri;
 pub mod poly_ops;
@@ -60,6 +61,7 @@ pub mod merkle;
 pub mod gkr;
 pub mod grind;
 pub mod cuda_executor;
+pub mod memory;
 
 /// GPU Backend for hardware-accelerated proof generation.
 ///

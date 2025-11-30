@@ -27,8 +27,11 @@ use crate::prover::poly::circle::{CircleCoefficients, CircleEvaluation, PolyOps}
 use crate::prover::poly::twiddles::TwiddleTree;
 use crate::prover::poly::BitReversedOrder;
 
-use super::fft::{GPU_FFT_THRESHOLD_LOG_SIZE, compute_itwiddle_dbls_cpu};
-use super::cuda_executor::{is_cuda_available, cuda_ifft};
+use super::conversion::{
+    circle_coeffs_ref_to_simd, circle_eval_ref_to_simd, twiddle_ref_to_simd, twiddle_to_gpu,
+};
+use super::fft::{GPU_FFT_THRESHOLD_LOG_SIZE, compute_itwiddle_dbls_cpu, compute_twiddle_dbls_cpu};
+use super::cuda_executor::{is_cuda_available, cuda_ifft, cuda_fft};
 use super::GpuBackend;
 
 impl PolyOps for GpuBackend {
@@ -44,16 +47,29 @@ impl PolyOps for GpuBackend {
         
         let log_size = eval.domain.log_size();
         
-        // TODO(gpu): Re-enable GPU interpolate once twiddle format is aligned
-        // with CUDA kernel expectations. For now, use SIMD which is already
-        // highly optimized with AVX-512.
-        if log_size < GPU_FFT_THRESHOLD_LOG_SIZE || true {
-            // Small polynomial or GPU not ready - use SIMD backend
-            interpolate_simd_fallback(eval, twiddles)
-        } else {
-            // Large polynomial - use GPU
-            gpu_interpolate(eval, twiddles, log_size)
+        // Small polynomials: use SIMD (GPU overhead not worth it)
+        if log_size < GPU_FFT_THRESHOLD_LOG_SIZE {
+            tracing::debug!(
+                "GPU interpolate: using SIMD for small size (log_size={} < threshold={})",
+                log_size, GPU_FFT_THRESHOLD_LOG_SIZE
+            );
+            return interpolate_simd_fallback(eval, twiddles);
         }
+        
+        // Large polynomials: require GPU
+        if !is_cuda_available() {
+            panic!(
+                "GpuBackend::interpolate called with log_size={} but CUDA is not available. \
+                 Use SimdBackend for CPU-only execution.",
+                log_size
+            );
+        }
+        
+        tracing::info!(
+            "GPU interpolate: using CUDA for {} elements (log_size={})",
+            1u64 << log_size, log_size
+        );
+        gpu_interpolate(eval, twiddles, log_size)
     }
     
     fn eval_at_point(
@@ -61,10 +77,8 @@ impl PolyOps for GpuBackend {
         point: CirclePoint<SecureField>,
     ) -> SecureField {
         // Point evaluation is memory-bound, not compute-bound
-        // GPU doesn't help much here, use SIMD
-        let simd_poly = unsafe {
-            std::mem::transmute::<&CircleCoefficients<GpuBackend>, &CircleCoefficients<SimdBackend>>(poly)
-        };
+        // GPU doesn't help much here, use SIMD via conversion
+        let simd_poly = circle_coeffs_ref_to_simd(poly);
         SimdBackend::eval_at_point(simd_poly, point)
     }
     
@@ -80,12 +94,7 @@ impl PolyOps for GpuBackend {
         evals: &CircleEvaluation<Self, BaseField, BitReversedOrder>,
         weights: &Col<Self, SecureField>,
     ) -> SecureField {
-        let simd_evals = unsafe {
-            std::mem::transmute::<
-                &CircleEvaluation<GpuBackend, BaseField, BitReversedOrder>,
-                &CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>
-            >(evals)
-        };
+        let simd_evals = circle_eval_ref_to_simd(evals);
         SimdBackend::barycentric_eval_at_point(simd_evals, weights)
     }
     
@@ -94,22 +103,13 @@ impl PolyOps for GpuBackend {
         point: CirclePoint<SecureField>,
         twiddles: &TwiddleTree<Self>,
     ) -> SecureField {
-        let simd_evals = unsafe {
-            std::mem::transmute::<
-                &CircleEvaluation<GpuBackend, BaseField, BitReversedOrder>,
-                &CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>
-            >(evals)
-        };
-        let simd_twiddles = unsafe {
-            std::mem::transmute::<&TwiddleTree<GpuBackend>, &TwiddleTree<SimdBackend>>(twiddles)
-        };
+        let simd_evals = circle_eval_ref_to_simd(evals);
+        let simd_twiddles = twiddle_ref_to_simd(twiddles);
         SimdBackend::eval_at_point_by_folding(simd_evals, point, simd_twiddles)
     }
     
     fn extend(poly: &CircleCoefficients<Self>, log_size: u32) -> CircleCoefficients<Self> {
-        let simd_poly = unsafe {
-            std::mem::transmute::<&CircleCoefficients<GpuBackend>, &CircleCoefficients<SimdBackend>>(poly)
-        };
+        let simd_poly = circle_coeffs_ref_to_simd(poly);
         let result = SimdBackend::extend(simd_poly, log_size);
         CircleCoefficients::new(result.coeffs)
     }
@@ -123,13 +123,29 @@ impl PolyOps for GpuBackend {
         
         let log_size = domain.log_size();
         
+        // Small polynomials: use SIMD (GPU overhead not worth it)
         if log_size < GPU_FFT_THRESHOLD_LOG_SIZE {
-            // Small polynomial - use SIMD backend
-            evaluate_simd_fallback(poly, domain, twiddles)
-        } else {
-            // Large polynomial - use GPU
-            gpu_evaluate(poly, domain, twiddles, log_size)
+            tracing::debug!(
+                "GPU evaluate: using SIMD for small size (log_size={} < threshold={})",
+                log_size, GPU_FFT_THRESHOLD_LOG_SIZE
+            );
+            return evaluate_simd_fallback(poly, domain, twiddles);
         }
+        
+        // Large polynomials: require GPU
+        if !is_cuda_available() {
+            panic!(
+                "GpuBackend::evaluate called with log_size={} but CUDA is not available. \
+                 Use SimdBackend for CPU-only execution.",
+                log_size
+            );
+        }
+        
+        tracing::info!(
+            "GPU evaluate: using CUDA for {} elements (log_size={})",
+            1u64 << log_size, log_size
+        );
+        gpu_evaluate(poly, domain, twiddles, log_size)
     }
     
     fn precompute_twiddles(coset: Coset) -> TwiddleTree<Self> {
@@ -141,10 +157,7 @@ impl PolyOps for GpuBackend {
         let simd_twiddles = SimdBackend::precompute_twiddles(coset);
         
         // Convert to GpuBackend's TwiddleTree
-        // Safety: The layout is identical
-        unsafe {
-            std::mem::transmute::<TwiddleTree<SimdBackend>, TwiddleTree<GpuBackend>>(simd_twiddles)
-        }
+        twiddle_to_gpu(simd_twiddles)
     }
     
     fn split_at_mid(
@@ -172,9 +185,7 @@ fn interpolate_simd_fallback(
         eval.domain,
         eval.values,
     );
-    let simd_twiddles = unsafe {
-        std::mem::transmute::<&TwiddleTree<GpuBackend>, &TwiddleTree<SimdBackend>>(twiddles)
-    };
+    let simd_twiddles = twiddle_ref_to_simd(twiddles);
     let result = SimdBackend::interpolate(simd_eval, simd_twiddles);
     CircleCoefficients::new(result.coeffs)
 }
@@ -184,12 +195,8 @@ fn evaluate_simd_fallback(
     domain: CircleDomain,
     twiddles: &TwiddleTree<GpuBackend>,
 ) -> CircleEvaluation<GpuBackend, BaseField, BitReversedOrder> {
-    let simd_poly = unsafe {
-        std::mem::transmute::<&CircleCoefficients<GpuBackend>, &CircleCoefficients<SimdBackend>>(poly)
-    };
-    let simd_twiddles = unsafe {
-        std::mem::transmute::<&TwiddleTree<GpuBackend>, &TwiddleTree<SimdBackend>>(twiddles)
-    };
+    let simd_poly = circle_coeffs_ref_to_simd(poly);
+    let simd_twiddles = twiddle_ref_to_simd(twiddles);
     let result = SimdBackend::evaluate(simd_poly, domain, simd_twiddles);
     CircleEvaluation::new(domain, result.values)
 }
@@ -201,21 +208,18 @@ fn evaluate_simd_fallback(
 /// GPU-accelerated polynomial interpolation (inverse FFT).
 ///
 /// This function:
-/// 1. Transfers data to GPU
-/// 2. Executes IFFT kernels
-/// 3. Transfers results back to CPU
+/// 1. Extracts evaluation data
+/// 2. Computes inverse FFT twiddles
+/// 3. Transfers data to GPU
+/// 4. Executes IFFT kernels
+/// 5. Applies denormalization
+/// 6. Transfers results back to CPU
 fn gpu_interpolate(
     eval: CircleEvaluation<GpuBackend, BaseField, BitReversedOrder>,
-    twiddles: &TwiddleTree<GpuBackend>,
+    _twiddles: &TwiddleTree<GpuBackend>,
     log_size: u32,
 ) -> CircleCoefficients<GpuBackend> {
-    let _span = span!(Level::INFO, "GPU interpolate", size = 1u64 << log_size).entered();
-    
-    // Check if CUDA is available
-    if !is_cuda_available() {
-        tracing::debug!("CUDA not available, falling back to SIMD");
-        return interpolate_simd_fallback(eval, twiddles);
-    }
+    let _span = span!(Level::INFO, "GPU interpolate (IFFT)", size = 1u64 << log_size).entered();
     
     // Extract raw data from evaluation
     let mut data: Vec<u32> = eval.values.as_slice()
@@ -242,8 +246,8 @@ fn gpu_interpolate(
                 .map(|&v| BaseField::from_u32_unchecked(v))
                 .collect();
             
-            // Apply denormalization factor
-            let denorm = BaseField::from(1u32 << log_size);
+            // Apply denormalization factor (divide by domain size)
+            let denorm = BaseField::from(1u32 << log_size).inverse();
             let coeffs: BaseColumn = coeffs.as_slice()
                 .iter()
                 .map(|&v| v * denorm)
@@ -252,86 +256,65 @@ fn gpu_interpolate(
             CircleCoefficients::new(coeffs)
         }
         Err(e) => {
-            tracing::warn!("CUDA IFFT failed: {}, falling back to SIMD", e);
-            interpolate_simd_fallback(eval, twiddles)
+            // GPU execution failed - this is a hard error, not a fallback
+            panic!("GPU IFFT execution failed: {}. GPU backend requires working CUDA.", e);
         }
     }
 }
 
 /// GPU-accelerated polynomial evaluation (forward FFT).
+///
+/// This function:
+/// 1. Extracts coefficient data
+/// 2. Computes forward FFT twiddles
+/// 3. Transfers data to GPU
+/// 4. Executes FFT kernels
+/// 5. Transfers results back to CPU
 fn gpu_evaluate(
     poly: &CircleCoefficients<GpuBackend>,
     domain: CircleDomain,
-    twiddles: &TwiddleTree<GpuBackend>,
+    _twiddles: &TwiddleTree<GpuBackend>,
     log_size: u32,
 ) -> CircleEvaluation<GpuBackend, BaseField, BitReversedOrder> {
-    let _span = span!(Level::INFO, "GPU evaluate", size = 1u64 << log_size).entered();
+    let _span = span!(Level::INFO, "GPU evaluate (FFT)", size = 1u64 << log_size).entered();
     
-    // Check if CUDA is available
-    if !is_cuda_available() {
-        tracing::debug!("CUDA not available, falling back to SIMD");
-        return evaluate_simd_fallback(poly, domain, twiddles);
+    // Extract raw data from coefficients
+    let mut data: Vec<u32> = poly.coeffs.as_slice()
+        .iter()
+        .map(|f| f.0)
+        .collect();
+    
+    // Pad to domain size if needed
+    let domain_size = 1usize << log_size;
+    if data.len() < domain_size {
+        data.resize(domain_size, 0);
     }
     
-    // For forward FFT, we use the SIMD implementation for now
-    // The forward FFT is less critical than IFFT for proof generation
-    // TODO: Implement CUDA forward FFT
-    tracing::debug!("GPU FFT: using SIMD for forward FFT (IFFT is GPU-accelerated)");
+    // Compute twiddles for forward FFT
+    let twiddles_dbl = compute_twiddle_dbls_cpu(log_size);
     
-    evaluate_simd_fallback(poly, domain, twiddles)
-}
-
-// =============================================================================
-// GPU FFT Execution (when CUDA runtime is available)
-// =============================================================================
-
-#[cfg(feature = "gpu")]
-#[allow(unused_imports)]
-mod cuda_fft {
-    use super::*;
-    
-    /// Execute IFFT on GPU using CUDA.
-    /// 
-    /// # Algorithm
-    /// 
-    /// 1. Allocate GPU memory for data and twiddles
-    /// 2. Copy data to GPU
-    /// 3. Execute IFFT layers:
-    ///    - First 5 layers: Use shared memory kernel (vecwise)
-    ///    - Remaining layers: Use radix-8 or single-layer kernels
-    /// 4. Copy results back to CPU
-    /// 
-    /// # Performance Notes
-    /// 
-    /// - Memory transfer is the bottleneck for small sizes
-    /// - For log_size >= 14, GPU computation dominates
-    /// - Radix-8 kernel provides best throughput for large sizes
-    /// Execute IFFT on GPU using CUDA.
-    /// 
-    /// Note: This is a placeholder. The actual implementation uses CudaFftExecutor.
-    #[allow(dead_code)]
-    pub fn execute_gpu_ifft(
-        _data: &mut [u32],
-        _twiddles: &[Vec<u32>],
-        _log_size: u32,
-    ) -> Result<(), String> {
-        // The actual GPU execution is handled by CudaFftExecutor in cuda_executor.rs
-        // This function is kept for API compatibility
-        Err("Use CudaFftExecutor::execute_ifft instead".to_string())
-    }
-    
-    /// Execute FFT on GPU using CUDA.
-    /// 
-    /// Note: This is a placeholder. The actual implementation uses CudaFftExecutor.
-    #[allow(dead_code)]
-    pub fn execute_gpu_fft(
-        _data: &mut [u32],
-        _twiddles: &[Vec<u32>],
-        _log_size: u32,
-    ) -> Result<(), String> {
-        // The actual GPU execution is handled by CudaFftExecutor in cuda_executor.rs
-        // This function is kept for API compatibility
-        Err("Use CudaFftExecutor::execute_fft instead".to_string())
+    // Execute CUDA FFT
+    match cuda_fft(&mut data, &twiddles_dbl, log_size) {
+        Ok(()) => {
+            tracing::info!(
+                "GPU FFT completed for {} elements",
+                1u64 << log_size
+            );
+            
+            // Convert back to BaseColumn
+            use crate::prover::backend::simd::column::BaseColumn;
+            use crate::core::fields::m31::BaseField;
+            
+            let values: BaseColumn = data.iter()
+                .map(|&v| BaseField::from_u32_unchecked(v))
+                .collect();
+            
+            CircleEvaluation::new(domain, values)
+        }
+        Err(e) => {
+            // GPU execution failed - this is a hard error, not a fallback
+            panic!("GPU FFT execution failed: {}. GPU backend requires working CUDA.", e);
+        }
     }
 }
 
