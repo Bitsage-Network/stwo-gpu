@@ -66,6 +66,8 @@ pub mod pipeline;
 pub mod secure_session;
 pub mod multi_gpu;
 pub mod multi_gpu_executor;
+pub mod cuda_streams;
+pub mod large_proofs;
 
 /// GPU Backend for hardware-accelerated proof generation.
 ///
