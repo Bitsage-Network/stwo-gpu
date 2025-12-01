@@ -29,9 +29,6 @@
 //! 3. Combine results using the FFT's linearity property
 
 #[cfg(feature = "cuda-runtime")]
-use cudarc::driver::CudaSlice;
-
-#[cfg(feature = "cuda-runtime")]
 use super::cuda_executor::{CudaFftError, get_cuda_executor};
 
 #[cfg(feature = "cuda-runtime")]

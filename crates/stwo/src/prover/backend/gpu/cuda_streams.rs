@@ -520,6 +520,8 @@ pub struct AsyncProofPipeline {
     /// Statistics
     proofs_generated: usize,
     total_compute_time_ns: u128,
+    /// Reserved for future transfer time tracking
+    #[allow(dead_code)]
     total_transfer_time_ns: u128,
 }
 
