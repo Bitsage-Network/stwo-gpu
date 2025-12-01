@@ -9,8 +9,6 @@
 //! cargo run --example large_proof_benchmark --release --features cuda-runtime
 //! ```
 
-use std::time::Instant;
-
 fn main() {
     println!("╔══════════════════════════════════════════════════════════════════╗");
     println!("║           Large Proof Benchmark - Obelysk GPU                    ║");
