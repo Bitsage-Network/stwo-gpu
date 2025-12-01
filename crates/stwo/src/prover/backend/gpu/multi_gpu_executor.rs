@@ -468,11 +468,11 @@ impl TrueMultiGpuProver {
 }
 
 #[cfg(test)]
+#[cfg(feature = "cuda-runtime")]
 mod tests {
     use super::*;
     
     #[test]
-    #[cfg(feature = "cuda-runtime")]
     fn test_multi_gpu_pool_creation() {
         // This test will only pass on a system with CUDA GPUs
         if let Ok(pool) = MultiGpuExecutorPool::new_all_gpus() {

@@ -744,11 +744,5 @@ impl AsyncProofPipeline {
     }
 }
 
-#[cfg(not(feature = "cuda-runtime"))]
-#[derive(Debug, Clone, Copy)]
-pub enum PipelineOperation {
-    Ifft,
-    Fft,
-    IfftThenFft,
-}
+// PipelineOperation is defined above and works for both cuda-runtime and non-cuda-runtime builds
 

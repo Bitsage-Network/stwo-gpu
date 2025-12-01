@@ -8,6 +8,7 @@
 //! cargo run --example cuda_streams_benchmark --release --features cuda-runtime
 //! ```
 
+#[cfg(feature = "cuda-runtime")]
 use std::time::Instant;
 
 fn main() {
