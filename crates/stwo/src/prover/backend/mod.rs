@@ -14,6 +14,8 @@ use crate::prover::{AccumulationOps, QuotientOps};
 
 pub mod cpu;
 pub mod simd;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 
 pub trait Backend:
     Copy
