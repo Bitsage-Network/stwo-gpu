@@ -4,6 +4,11 @@
     feature(stdarch_x86_avx512)
 )]
 #![cfg_attr(not(feature = "std"), no_std)]
+// Nightly features required for prover:
+// - array_chunks: slice iteration by fixed-size arrays
+// - iter_array_chunks: Iterator::array_chunks
+// - portable_simd: std::simd support
+// - slice_ptr_get: slice pointer utilities
 #![cfg_attr(
     feature = "prover",
     feature(array_chunks, iter_array_chunks, portable_simd, slice_ptr_get)

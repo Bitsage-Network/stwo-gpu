@@ -8,6 +8,9 @@ default = ["std"]
 std = ["stwo/std", "itertools/use_std", "tracing/std", "num-traits/std", "std-shims/std"]
 parallel = ["dep:rayon", "stwo/parallel"]
 prover = ["stwo/prover", "std"]
+# GPU acceleration for constraint evaluation
+gpu = ["stwo/gpu"]
+cuda-runtime = ["gpu", "stwo/cuda-runtime"]
 
 [dependencies]
 rayon = { workspace = true, optional = true }
