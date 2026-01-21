@@ -67,10 +67,10 @@ getrandom = { version = "0.2", optional = true }
 # The gpu feature alone provides the kernel source and fallback logic
 # The cuda-runtime feature enables actual CUDA execution
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
-cudarc = { version = "0.12", features = ["driver", "nvrtc", "cuda-version-from-build-system"], optional = true }
+cudarc = { version = "0.11", features = ["driver", "nvrtc"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-cudarc = { version = "0.12", features = ["driver", "nvrtc"], optional = true }
+cudarc = { version = "0.11", features = ["driver", "nvrtc"], optional = true }
 
 [dev-dependencies]
 aligned = "0.4.2"
