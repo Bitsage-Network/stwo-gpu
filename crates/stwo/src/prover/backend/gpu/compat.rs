@@ -71,6 +71,7 @@ extern "C" {
 /// We use raw pointers for node types to avoid depending on CUgraphNode being exported.
 #[cfg(feature = "cuda-runtime")]
 #[repr(C)]
+#[allow(non_snake_case)]
 pub struct CUgraphExecUpdateResultInfo {
     pub result: CUgraphExecUpdateResult,
     pub errorNode: *mut std::ffi::c_void,
