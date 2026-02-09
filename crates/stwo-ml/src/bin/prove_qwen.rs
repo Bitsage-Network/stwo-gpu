@@ -50,7 +50,13 @@ impl Qwen3Config {
 
 /// Build a computation graph for N transformer blocks.
 ///
-/// Each block: LayerNorm → Attention(Q,K,V,O matmuls) → LayerNorm → MLP(gate→act→down)
+/// Simplified sequential block:
+///   LayerNorm → Q_proj(h→h) → O_proj(h→h) → LayerNorm → gate_proj(h→inter) → GELU → down_proj(inter→h)
+///
+/// Note: K/V projections are omitted because GQA uses smaller dim (num_kv_heads × head_dim = 1024)
+/// which doesn't chain sequentially with the 5120-dim Q projection. The full attention
+/// computation (score matmuls, softmax) is also omitted — this proves the linear projections
+/// and MLP which dominate the parameter count and computation.
 fn build_qwen3_graph(config: &Qwen3Config, num_blocks: usize, seq_len: usize) -> ComputationGraph {
     let batch = seq_len; // seq_len tokens, each hidden_size
     let h = config.hidden_size;
@@ -62,25 +68,21 @@ fn build_qwen3_graph(config: &Qwen3Config, num_blocks: usize, seq_len: usize) ->
         // === Pre-attention RMSNorm ===
         builder.layer_norm();
 
-        // === Self-Attention (simplified as matmul projections) ===
-        // Q projection: (batch, hidden) → (batch, hidden)
+        // === Self-Attention projections (Q and O only for sequential proof chain) ===
+        // Q projection: (batch, h) → (batch, h)
         builder.linear(h);
-        // K projection: (batch, hidden) → (batch, num_kv_heads * head_dim)
-        // For simplicity, project to full hidden_size then reduce
-        // In practice, GQA uses smaller K/V but we prove the full matmul
-        builder.linear(h);
-        // Output projection (after attention computation)
+        // Output projection: (batch, h) → (batch, h)
         builder.linear(h);
 
         // === Post-attention RMSNorm ===
         builder.layer_norm();
 
         // === MLP (SwiGLU simplified) ===
-        // gate_proj: (batch, hidden) → (batch, intermediate)
+        // gate_proj: (batch, h) → (batch, intermediate)
         builder.linear(inter);
         // SiLU activation on gate
         builder.activation(ActivationType::GELU); // Closest to SiLU we have
-        // down_proj: (batch, intermediate) → (batch, hidden)
+        // down_proj: (batch, intermediate) → (batch, h)
         builder.linear(h);
     }
 
@@ -113,19 +115,15 @@ fn load_qwen3_block_weights(
 
     println!("  Found {} safetensors files", st_files.len());
 
-    // Tensor name mappings for Qwen3 architecture
+    // Tensor name mappings for Qwen3 architecture (4 matmuls per block)
+    // Graph: layernorm → q_proj → o_proj → layernorm → gate_proj → gelu → down_proj
+    // MatMul nodes: q_proj, o_proj, gate_proj, down_proj
     let weight_names = [
         format!("model.layers.{block_idx}.self_attn.q_proj.weight"),
-        format!("model.layers.{block_idx}.self_attn.k_proj.weight"),
         format!("model.layers.{block_idx}.self_attn.o_proj.weight"),
         format!("model.layers.{block_idx}.mlp.gate_proj.weight"),
-        // skip activation node (index 4 in block)
         format!("model.layers.{block_idx}.mlp.down_proj.weight"),
     ];
-
-    // Map graph node indices to weight names
-    // Block structure: layernorm, q_proj, k_proj, o_proj, layernorm, gate_proj, gelu, down_proj
-    // MatMul nodes are at indices: 1, 2, 3, 5, 7 (0-indexed within block)
     let matmul_node_indices: Vec<usize> = graph.nodes.iter()
         .enumerate()
         .filter(|(_, n)| matches!(n.op, GraphOp::MatMul { .. }))
@@ -153,9 +151,27 @@ fn load_qwen3_block_weights(
                     .map_err(|e| format!("Cannot parse {}: {e}", st_file.display()))?;
 
                 if let Ok(tensor) = tensors.tensor(target_name) {
-                    let data = tensor_to_f32(tensor.data(), tensor.dtype());
-                    println!("    Loaded {} ({} floats) → node {} ({}x{})",
-                             target_name, data.len(), node_idx, k, n);
+                    let raw = tensor_to_f32(tensor.data(), tensor.dtype());
+                    let shape = tensor.shape();
+                    // SafeTensors stores (out_dim, in_dim); matmul needs (k=in_dim, n=out_dim)
+                    let (st_rows, st_cols) = (shape[0], shape[1]);
+                    println!("    Loaded {} shape=({},{}) → node {} needs ({}x{})",
+                             target_name, st_rows, st_cols, node_idx, k, n);
+
+                    // Transpose from (out_dim, in_dim) to (in_dim, out_dim) = (k, n)
+                    let data = if st_rows == *n && st_cols == *k {
+                        // Need transpose: (n, k) → (k, n)
+                        let mut transposed = vec![0.0f32; raw.len()];
+                        for i in 0..st_rows {
+                            for j in 0..st_cols {
+                                transposed[j * st_rows + i] = raw[i * st_cols + j];
+                            }
+                        }
+                        transposed
+                    } else {
+                        // Already correct shape or square
+                        raw
+                    };
 
                     let (matrix, _) = quantize_weight_matrix(
                         &data, *k, *n, QuantStrategy::Direct,
