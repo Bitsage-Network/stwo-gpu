@@ -26,6 +26,7 @@ pub mod tee;
 pub mod cairo_serde;
 pub mod receipt;
 pub mod crypto;
+pub mod pipeline;
 
 /// Re-export core STWO types used throughout stwo-ml.
 pub mod prelude {
@@ -66,6 +67,13 @@ pub mod prelude {
         pad_matrix_pow2, estimate_sumcheck_memory,
     };
     pub use crate::starknet::compute_io_commitment;
+    pub use crate::pipeline::types::{ModelPipelineProof, PipelineConfig, commit_matrix};
+    pub use crate::pipeline::prover::prove_model_pipeline;
+    #[cfg(feature = "safetensors")]
+    pub use crate::pipeline::prover::prove_model_pipeline_streaming;
+    #[cfg(feature = "safetensors")]
+    pub use crate::compiler::safetensors::LazyWeights;
+    pub use crate::pipeline::verifier::{verify_pipeline_proof, VerificationResult};
 
     // Dual-track f32 inference + M31 proving
     pub use crate::components::f32_ops::{
