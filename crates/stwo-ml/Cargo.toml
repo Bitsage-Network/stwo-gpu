@@ -9,8 +9,8 @@ repository = "https://github.com/Bitsage-Network/stwo-ml"
 [features]
 default = ["std"]
 std = ["stwo/std"]
-gpu = ["stwo/gpu"]
-cuda-runtime = ["gpu", "stwo/cuda-runtime"]
+gpu = ["stwo/gpu", "stwo-constraint-framework/gpu"]
+cuda-runtime = ["gpu", "stwo/cuda-runtime", "stwo-constraint-framework/cuda-runtime"]
 multi-gpu = ["cuda-runtime"]
 tee = ["cuda-runtime"]
 onnx = ["dep:tract-onnx"]
@@ -19,7 +19,7 @@ model-loading = ["onnx", "safetensors"]
 
 [dependencies]
 stwo = { path = "../stwo", features = ["prover"] }
-stwo-constraint-framework = { path = "../constraint-framework", features = ["prover"] }
+stwo-constraint-framework = { path = "../constraint-framework", features = ["prover", "parallel"] }
 tracing = "0.1"
 thiserror = "2"
 itertools = "0.12"
