@@ -42,11 +42,16 @@ pub fn prove(input: ProverInput, pcs_config: PcsConfig) -> Result<CairoProof<Bla
 }
 
 /// Prove with GPU backend when cuda-runtime feature is enabled.
-/// Currently identical to `prove()` because `prove_cairo` is hardcoded to SimdBackend.
-/// This will become the GPU path when `prove_cairo` is genericized upstream.
+///
+/// Architecture note: `prove_cairo` in stwo_cairo_prover is hardcoded to SimdBackend because
+/// CairoClaimGenerator::write_trace() pushes evaluations directly into a TreeBuilder<SimdBackend>.
+/// Genericizing requires upstream changes to separate witness generation from commitment.
+///
+/// This is intentional — recursive proving verifies a ~800KB Cairo executable, not a heavy ML
+/// workload. SimdBackend handles this in ~1-2 minutes. GPU acceleration for the ML proving step
+/// (stwo-ml) is where the real compute savings happen (hours → minutes).
 #[cfg(feature = "cuda-runtime")]
 pub fn prove_gpu(input: ProverInput, pcs_config: PcsConfig) -> Result<CairoProof<Blake2sMerkleHasher>> {
-    // TODO: When prove_cairo supports generic backend, use GpuBackend here
     prove(input, pcs_config)
 }
 

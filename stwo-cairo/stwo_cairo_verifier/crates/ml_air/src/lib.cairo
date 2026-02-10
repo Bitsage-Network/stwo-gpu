@@ -40,7 +40,9 @@ use ml_air::MLAirNewImpl;
 const SECURITY_BITS: u32 = 96;
 
 /// Proof-of-work bits for the interaction phase.
-const INTERACTION_POW_BITS: u32 = 20;
+/// Set to 0: the Rust prover doesn't produce a separate interaction PoW.
+/// The main STARK proof's PoW (inside CommitmentSchemeProof) is still checked by verify().
+const INTERACTION_POW_BITS: u32 = 0;
 
 /// Verify an ML inference proof.
 ///

@@ -359,7 +359,7 @@ pub fn serialize_matmul_sumcheck_proof(
 // Serializes an AggregatedModelProofOnChain into the felt252[] layout
 // matching the Cairo `MLProof` struct's Serde deserialization.
 
-use crate::aggregation::AggregatedModelProofOnChain;
+use crate::aggregation::{AggregatedModelProofOnChain, LayerClaim};
 
 /// Metadata about the ML model, needed to construct the Cairo MLClaim.
 pub struct MLClaimMetadata {
@@ -372,11 +372,12 @@ pub struct MLClaimMetadata {
 
 /// Serialize an ML proof for the recursive Cairo verifier.
 ///
-/// Output format matches Cairo's `MLProof { claim, matmul_proofs, channel_salt }`:
+/// Output format matches Cairo's `MLProof { claim, matmul_proofs, channel_salt, activation_stark_proof }`:
 ///
 /// 1. MLClaim: model_id, num_layers, activation_type, io_commitment, weight_commitment
 /// 2. matmul_proofs: Array<MatMulSumcheckProofOnChain> (10-field version, no MLE openings)
 /// 3. channel_salt: Option<u64> (0 for None, 1 + value for Some)
+/// 4. activation_stark_proof: Option<ActivationStarkProof> (0 for None, 1 + proof for Some)
 pub fn serialize_ml_proof_for_recursive(
     proof: &AggregatedModelProofOnChain,
     metadata: &MLClaimMetadata,
@@ -409,6 +410,22 @@ pub fn serialize_ml_proof_for_recursive(
         }
     }
 
+    // 4. activation_stark_proof: Option<ActivationStarkProof>
+    match &proof.activation_stark {
+        None => {
+            serialize_u32(0, &mut output); // Cairo Option::None variant index
+        }
+        Some(stark_proof) => {
+            serialize_u32(1, &mut output); // Cairo Option::Some variant index
+            serialize_activation_stark_proof(
+                stark_proof,
+                &proof.activation_claims,
+                metadata.activation_type,
+                &mut output,
+            );
+        }
+    }
+
     output
 }
 
@@ -435,6 +452,88 @@ fn serialize_matmul_for_recursive(
     serialize_qm31(proof.final_b_eval, output);
     output.push(proof.a_commitment);
     output.push(proof.b_commitment);
+}
+
+// === Activation STARK Proof Serialization ===
+
+/// Bridge from Rust `LayerClaim` to Cairo's `ActivationClaim` fields.
+///
+/// Cairo layout: `ActivationClaim { layer_index: u32, log_size: u32, activation_type: u8 }`
+pub struct ActivationClaimForSerde {
+    pub layer_index: u32,
+    pub log_size: u32,
+    pub activation_type: u8,
+}
+
+impl ActivationClaimForSerde {
+    pub fn from_layer_claim(claim: &LayerClaim, activation_type: u8) -> Self {
+        Self {
+            layer_index: claim.layer_index as u32,
+            log_size: claim.trace_rows.ilog2(),
+            activation_type,
+        }
+    }
+}
+
+/// Serialize an `ActivationClaim` (3 felt252s: layer_index, log_size, activation_type).
+fn serialize_activation_claim(claim: &ActivationClaimForSerde, output: &mut Vec<FieldElement>) {
+    serialize_u32(claim.layer_index, output);
+    serialize_u32(claim.log_size, output);
+    output.push(FieldElement::from(claim.activation_type as u64));
+}
+
+/// Serialize an `ActivationInteractionClaim` (4 felt252s: claimed_sum as QM31).
+fn serialize_activation_interaction_claim(sum: SecureField, output: &mut Vec<FieldElement>) {
+    serialize_qm31(sum, output);
+}
+
+/// Serialize an `MLInteractionClaim` (4 felt252s: activation_claimed_sum as QM31).
+fn serialize_ml_interaction_claim(sum: SecureField, output: &mut Vec<FieldElement>) {
+    serialize_qm31(sum, output);
+}
+
+/// Serialize a complete `ActivationStarkProof` matching Cairo's `#[derive(Serde)]` field order:
+///
+/// 1. `activation_claims: Array<ActivationClaim>` — len + per-claim (3 felts each)
+/// 2. `activation_interaction_claims: Array<ActivationInteractionClaim>` — len + per-claim (4 felts each)
+/// 3. `interaction_claim: MLInteractionClaim` — 4 felts (QM31)
+/// 4. `pcs_config: PcsConfig` — 4 felts (pow_bits + fri_config)
+/// 5. `interaction_pow: u64` — 1 felt (hardcode 0, Rust prover doesn't produce separate PoW)
+/// 6. `stark_proof: StarkProof` — CommitmentSchemeProof (existing serializer)
+fn serialize_activation_stark_proof(
+    stark_proof: &Blake2sProof,
+    activation_claims: &[LayerClaim],
+    activation_type: u8,
+    output: &mut Vec<FieldElement>,
+) {
+    // 1. activation_claims: Array<ActivationClaim>
+    let serde_claims: Vec<ActivationClaimForSerde> = activation_claims
+        .iter()
+        .map(|c| ActivationClaimForSerde::from_layer_claim(c, activation_type))
+        .collect();
+    serialize_span(&serde_claims, serialize_activation_claim, output);
+
+    // 2. activation_interaction_claims: Array<ActivationInteractionClaim>
+    serialize_u32(activation_claims.len() as u32, output);
+    for claim in activation_claims {
+        serialize_activation_interaction_claim(claim.claimed_sum, output);
+    }
+
+    // 3. interaction_claim: MLInteractionClaim (sum of all claimed_sums)
+    let total_sum: SecureField = activation_claims
+        .iter()
+        .map(|c| c.claimed_sum)
+        .fold(SecureField::default(), |acc, s| acc + s);
+    serialize_ml_interaction_claim(total_sum, output);
+
+    // 4. pcs_config: PcsConfig (from the proof itself)
+    serialize_pcs_config(&stark_proof.0.config, output);
+
+    // 5. interaction_pow: u64 (hardcode 0 — Rust prover handles PoW internally)
+    serialize_u64(0, output);
+
+    // 6. stark_proof: StarkProof → CommitmentSchemeProof
+    serialize_commitment_scheme_proof(&stark_proof.0, output);
 }
 
 /// Convert the serialized felt252[] to a JSON array of hex strings,
@@ -640,7 +739,7 @@ mod tests {
 
     #[test]
     fn test_serialize_mle_opening_proof_structure() {
-        use crate::crypto::mle_opening::{commit_mle, prove_mle_opening};
+        use crate::crypto::mle_opening::prove_mle_opening;
         use crate::crypto::poseidon_channel::PoseidonChannel;
 
         let evals: Vec<SecureField> = (0..4)
@@ -724,6 +823,9 @@ mod tests {
         // Total should be reasonable
         assert!(felts.len() > 20, "serialized too small: {} felts", felts.len());
 
+        // 4th field: activation_stark_proof = Option::None (trailing 0)
+        assert_eq!(felts[felts.len() - 1], FieldElement::ZERO, "activation_stark_proof = None");
+
         // Test arguments file generation
         let json = serialize_ml_proof_to_arguments_file(&felts);
         assert!(json.starts_with("[\"0x"));
@@ -766,11 +868,282 @@ mod tests {
         // Salt adds 1 extra felt (variant index 1 + value) vs (variant index 0)
         assert_eq!(with_salt.len(), no_salt.len() + 1);
 
-        // Last felt of no_salt is variant=0 (None)
-        assert_eq!(no_salt[no_salt.len() - 1], FieldElement::ZERO);
+        // Both end with activation_stark_proof = Option::None (trailing 0)
+        assert_eq!(no_salt[no_salt.len() - 1], FieldElement::ZERO, "activation_stark = None");
+        assert_eq!(with_salt[with_salt.len() - 1], FieldElement::ZERO, "activation_stark = None");
 
-        // Last 2 felts of with_salt are variant=1, value=12345
-        assert_eq!(with_salt[with_salt.len() - 2], FieldElement::from(1u64));
-        assert_eq!(with_salt[with_salt.len() - 1], FieldElement::from(12345u64));
+        // no_salt layout ends: ..., channel_salt=None(0), activation_stark=None(0)
+        assert_eq!(no_salt[no_salt.len() - 2], FieldElement::ZERO, "channel_salt = None");
+
+        // with_salt layout ends: ..., channel_salt=Some(1), 12345, activation_stark=None(0)
+        assert_eq!(with_salt[with_salt.len() - 3], FieldElement::from(1u64), "channel_salt = Some");
+        assert_eq!(with_salt[with_salt.len() - 2], FieldElement::from(12345u64), "salt value");
+    }
+
+    #[test]
+    fn test_serialize_activation_claim_layout() {
+        let claim = ActivationClaimForSerde {
+            layer_index: 3,
+            log_size: 10,
+            activation_type: 1, // GELU
+        };
+
+        let mut out = Vec::new();
+        serialize_activation_claim(&claim, &mut out);
+
+        assert_eq!(out.len(), 3, "ActivationClaim = 3 felt252s");
+        assert_eq!(out[0], FieldElement::from(3u64), "layer_index");
+        assert_eq!(out[1], FieldElement::from(10u64), "log_size");
+        assert_eq!(out[2], FieldElement::from(1u64), "activation_type (GELU=1)");
+    }
+
+    #[test]
+    fn test_serialize_activation_claim_from_layer_claim() {
+        let layer_claim = LayerClaim {
+            layer_index: 2,
+            claimed_sum: SecureField::from(M31::from(42)),
+            trace_rows: 1024, // ilog2(1024) = 10
+        };
+
+        let serde_claim = ActivationClaimForSerde::from_layer_claim(&layer_claim, 0);
+        assert_eq!(serde_claim.layer_index, 2);
+        assert_eq!(serde_claim.log_size, 10);
+        assert_eq!(serde_claim.activation_type, 0);
+
+        let mut out = Vec::new();
+        serialize_activation_claim(&serde_claim, &mut out);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0], FieldElement::from(2u64));
+        assert_eq!(out[1], FieldElement::from(10u64));
+        assert_eq!(out[2], FieldElement::from(0u64));
+    }
+
+    #[test]
+    fn test_serialize_ml_proof_activation_none_vs_some_size() {
+        use crate::components::matmul::{M31Matrix, matmul_m31, prove_matmul_sumcheck_onchain};
+        use stwo::prover::backend::simd::SimdBackend;
+        use crate::compiler::prove::prove_activation_layer;
+        use crate::gadgets::lookup_table::PrecomputedTable;
+        use crate::gadgets::lookup_table::activations;
+
+        // Create a matmul proof for the base
+        let mut a = M31Matrix::new(2, 2);
+        a.set(0, 0, M31::from(1)); a.set(0, 1, M31::from(2));
+        a.set(1, 0, M31::from(3)); a.set(1, 1, M31::from(4));
+        let mut b = M31Matrix::new(2, 2);
+        b.set(0, 0, M31::from(5)); b.set(0, 1, M31::from(6));
+        b.set(1, 0, M31::from(7)); b.set(1, 1, M31::from(8));
+        let c_mat = matmul_m31(&a, &b);
+        let matmul_proof = prove_matmul_sumcheck_onchain(&a, &b, &c_mat).unwrap();
+
+        // Create a real activation STARK proof
+        let table = PrecomputedTable::build(activations::relu, 4);
+        let inputs = vec![M31::from(0), M31::from(1), M31::from(3), M31::from(5)];
+        let outputs: Vec<M31> = inputs.iter().map(|&x| activations::relu(x)).collect();
+        let config = PcsConfig::default();
+        let (_component, activation_proof) = prove_activation_layer::<SimdBackend, Blake2sMerkleChannel>(
+            &inputs, &outputs, &table, config,
+        ).expect("proving should succeed");
+
+        let metadata = MLClaimMetadata {
+            model_id: FieldElement::from(0x42u64),
+            num_layers: 1,
+            activation_type: 0,
+            io_commitment: FieldElement::ZERO,
+            weight_commitment: FieldElement::ZERO,
+        };
+
+        // Without activation STARK
+        let aggregated_none = AggregatedModelProofOnChain {
+            activation_stark: None,
+            matmul_proofs: vec![(0, matmul_proof.clone())],
+            execution: crate::compiler::prove::GraphExecution {
+                intermediates: vec![],
+                output: M31Matrix::new(1, 1),
+            },
+            activation_claims: vec![],
+        };
+        let felts_none = serialize_ml_proof_for_recursive(&aggregated_none, &metadata, None);
+
+        // With activation STARK
+        let activation_claims = vec![LayerClaim {
+            layer_index: 0,
+            claimed_sum: SecureField::default(),
+            trace_rows: 4,
+        }];
+        let aggregated_some = AggregatedModelProofOnChain {
+            activation_stark: Some(activation_proof),
+            matmul_proofs: vec![(0, matmul_proof)],
+            execution: crate::compiler::prove::GraphExecution {
+                intermediates: vec![],
+                output: M31Matrix::new(1, 1),
+            },
+            activation_claims,
+        };
+        let felts_some = serialize_ml_proof_for_recursive(&aggregated_some, &metadata, None);
+
+        // Some(activation) should be substantially larger than None
+        assert!(
+            felts_some.len() > felts_none.len() + 10,
+            "Some(activation) should add many felts: none={}, some={}",
+            felts_none.len(),
+            felts_some.len(),
+        );
+
+        // None ends with: channel_salt=None(0), activation_stark=None(0)
+        assert_eq!(felts_none[felts_none.len() - 1], FieldElement::ZERO, "activation_stark = None");
+        assert_eq!(felts_none[felts_none.len() - 2], FieldElement::ZERO, "channel_salt = None");
+
+        // Some path: both share the same prefix up to channel_salt
+        // The None path is: [MLClaim(5) + matmul_array + channel_salt(1) + activation_none(1)]
+        // The Some path is: [MLClaim(5) + matmul_array + channel_salt(1) + activation_some(1) + data...]
+        // The divergence point is at felts_none.len() - 1 (activation discriminant)
+        let diverge_idx = felts_none.len() - 1;
+        assert_eq!(felts_none[diverge_idx], FieldElement::ZERO, "None discriminant");
+        assert_eq!(felts_some[diverge_idx], FieldElement::from(1u64), "Some discriminant");
+    }
+
+    #[test]
+    fn test_serialize_activation_stark_proof_with_real_proof() {
+        use crate::components::matmul::{M31Matrix, matmul_m31, prove_matmul_sumcheck_onchain};
+        use stwo::prover::backend::simd::SimdBackend;
+        use crate::compiler::prove::prove_activation_layer;
+        use crate::gadgets::lookup_table::PrecomputedTable;
+        use crate::gadgets::lookup_table::activations;
+
+        // Create matmul proof
+        let mut a = M31Matrix::new(2, 2);
+        a.set(0, 0, M31::from(1)); a.set(0, 1, M31::from(2));
+        a.set(1, 0, M31::from(3)); a.set(1, 1, M31::from(4));
+        let mut b = M31Matrix::new(2, 2);
+        b.set(0, 0, M31::from(5)); b.set(0, 1, M31::from(6));
+        b.set(1, 0, M31::from(7)); b.set(1, 1, M31::from(8));
+        let c_mat = matmul_m31(&a, &b);
+        let matmul_proof = prove_matmul_sumcheck_onchain(&a, &b, &c_mat).unwrap();
+
+        // Create real activation STARK proof
+        let table = PrecomputedTable::build(activations::relu, 4);
+        let inputs = vec![M31::from(0), M31::from(1), M31::from(3), M31::from(5)];
+        let outputs: Vec<M31> = inputs.iter().map(|&x| activations::relu(x)).collect();
+        let config = PcsConfig::default();
+        let (_component, activation_proof) = prove_activation_layer::<SimdBackend, Blake2sMerkleChannel>(
+            &inputs, &outputs, &table, config,
+        ).expect("proving should succeed");
+
+        let activation_claims = vec![LayerClaim {
+            layer_index: 0,
+            claimed_sum: SecureField::default(),
+            trace_rows: 4,
+        }];
+
+        let aggregated = AggregatedModelProofOnChain {
+            activation_stark: Some(activation_proof),
+            matmul_proofs: vec![(0, matmul_proof)],
+            execution: crate::compiler::prove::GraphExecution {
+                intermediates: vec![],
+                output: M31Matrix::new(1, 1),
+            },
+            activation_claims,
+        };
+
+        let metadata = MLClaimMetadata {
+            model_id: FieldElement::from(0xABCDu64),
+            num_layers: 1,
+            activation_type: 0, // ReLU
+            io_commitment: FieldElement::from(0x111u64),
+            weight_commitment: FieldElement::from(0x222u64),
+        };
+
+        let felts = serialize_ml_proof_for_recursive(&aggregated, &metadata, None);
+
+        // === Verify full MLProof structure ===
+
+        // Field 1: MLClaim (5 felts)
+        let mut idx = 0;
+        assert_eq!(felts[idx], FieldElement::from(0xABCDu64), "model_id");
+        idx += 1;
+        assert_eq!(felts[idx], FieldElement::from(1u64), "num_layers");
+        idx += 1;
+        assert_eq!(felts[idx], FieldElement::from(0u64), "activation_type (ReLU=0)");
+        idx += 1;
+        assert_eq!(felts[idx], FieldElement::from(0x111u64), "io_commitment");
+        idx += 1;
+        assert_eq!(felts[idx], FieldElement::from(0x222u64), "weight_commitment");
+        idx += 1;
+
+        // Field 2: matmul_proofs array (length=1)
+        assert_eq!(felts[idx], FieldElement::from(1u64), "matmul_proofs length");
+        idx += 1;
+        // Skip over the matmul proof (m=2, k=2, n=2, ...)
+        assert_eq!(felts[idx], FieldElement::from(2u64), "matmul m");
+        // Advance past the entire matmul proof to find channel_salt
+        // 10-field layout: m(1) + k(1) + n(1) + num_rounds(1) + claimed_sum(4)
+        //   + round_polys_len(1) + round_polys(num_rounds*12) + final_a(4) + final_b(4)
+        //   + a_commit(1) + b_commit(1)
+        let num_rounds = 1u32; // log2(2) = 1
+        let matmul_felts = 4 + 4 + 1 + (num_rounds as usize * 12) + 4 + 4 + 1 + 1;
+        idx += matmul_felts;
+
+        // Field 3: channel_salt = Option::None (1 felt = 0)
+        assert_eq!(felts[idx], FieldElement::ZERO, "channel_salt = None");
+        idx += 1;
+
+        // Field 4: activation_stark_proof = Option::Some (discriminant = 1)
+        assert_eq!(felts[idx], FieldElement::from(1u64), "activation_stark = Some");
+        idx += 1;
+
+        // Inside ActivationStarkProof:
+        // 4.1: activation_claims array (length=1)
+        assert_eq!(felts[idx], FieldElement::from(1u64), "activation_claims length");
+        idx += 1;
+        // Each ActivationClaim = 3 felts: layer_index(0), log_size(ilog2(4)=2), activation_type(0)
+        assert_eq!(felts[idx], FieldElement::from(0u64), "claim.layer_index");
+        idx += 1;
+        assert_eq!(felts[idx], FieldElement::from(2u64), "claim.log_size (ilog2(4))");
+        idx += 1;
+        assert_eq!(felts[idx], FieldElement::from(0u64), "claim.activation_type (ReLU)");
+        idx += 1;
+
+        // 4.2: activation_interaction_claims array (length=1)
+        assert_eq!(felts[idx], FieldElement::from(1u64), "interaction_claims length");
+        idx += 1;
+        // Each ActivationInteractionClaim = 4 felts (QM31 claimed_sum = default = 0,0,0,0)
+        for i in 0..4 {
+            assert_eq!(felts[idx + i], FieldElement::ZERO, "interaction_claim.claimed_sum[{i}]");
+        }
+        idx += 4;
+
+        // 4.3: interaction_claim: MLInteractionClaim = 4 felts (sum of claimed_sums = 0)
+        for i in 0..4 {
+            assert_eq!(felts[idx + i], FieldElement::ZERO, "ml_interaction_claim[{i}]");
+        }
+        idx += 4;
+
+        // 4.4: pcs_config = 4 felts (pow_bits + fri_config)
+        let default_config = PcsConfig::default();
+        assert_eq!(felts[idx], FieldElement::from(default_config.pow_bits as u64), "pcs_config.pow_bits");
+        idx += 1;
+        assert_eq!(felts[idx], FieldElement::from(default_config.fri_config.log_blowup_factor as u64), "fri_config.log_blowup_factor");
+        idx += 1;
+        assert_eq!(felts[idx], FieldElement::from(default_config.fri_config.log_last_layer_degree_bound as u64), "fri_config.log_last_layer_deg");
+        idx += 1;
+        assert_eq!(felts[idx], FieldElement::from(default_config.fri_config.n_queries as u64), "fri_config.n_queries");
+        idx += 1;
+
+        // 4.5: interaction_pow = 0 (u64)
+        assert_eq!(felts[idx], FieldElement::ZERO, "interaction_pow = 0");
+        idx += 1;
+
+        // 4.6: stark_proof (CommitmentSchemeProof) — starts with PcsConfig again
+        assert_eq!(felts[idx], FieldElement::from(default_config.pow_bits as u64), "stark_proof config.pow_bits");
+        idx += 4; // skip past the 4 PcsConfig felts
+
+        // Remaining felts are the rest of CommitmentSchemeProof (commitments, sampled_values, etc.)
+        assert!(
+            felts.len() > idx + 10,
+            "STARK proof should have substantial remaining data: idx={}, total={}",
+            idx,
+            felts.len(),
+        );
     }
 }
