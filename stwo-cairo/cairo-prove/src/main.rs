@@ -65,7 +65,7 @@ fn handle_prove(
 
     let elapsed = start.elapsed();
 
-    serialize_proof_to_file::<Blake2sMerkleChannel>(&cairo_proof, proof.into(), proof_format)
+    serialize_proof_to_file::<Blake2sMerkleHasher>(&cairo_proof, proof.into(), proof_format)
         .map_err(|e| CairoProveError::ProofSerialization(format!("{:?}", e)))?;
 
     info!("Proof saved to: {:?}", proof);
@@ -90,7 +90,7 @@ fn handle_verify(proof: &Path, with_pedersen: bool) -> Result<()> {
         false => PreProcessedTraceVariant::CanonicalWithoutPedersen,
     };
 
-    verify_cairo::<Blake2sMerkleChannel>(cairo_proof, secure_pcs_config(), preprocessed_trace)
+    verify_cairo::<Blake2sMerkleChannel>(cairo_proof, preprocessed_trace)
         .map_err(|e| CairoProveError::Verification(format!("{:?}", e)))?;
 
     info!("Verification successful");
@@ -157,7 +157,7 @@ fn handle_prove_ml(
     info!("Recursive STARK proof generated in {:.2?}.", prove_start.elapsed());
 
     // Step 5: Save the proof
-    serialize_proof_to_file::<Blake2sMerkleChannel>(&cairo_proof, output.into(), proof_format)
+    serialize_proof_to_file::<Blake2sMerkleHasher>(&cairo_proof, output.into(), proof_format)
         .map_err(|e| CairoProveError::ProofSerialization(format!("{:?}", e)))?;
 
     let elapsed = start.elapsed();
@@ -223,9 +223,8 @@ mod tests {
         let args = vec![Arg::Value(Felt252::from(BigInt::from(100)))];
         let proof = execute_and_prove(target_path, args, PcsConfig::default())
             .expect("Proof generation failed");
-        let pcs_config = PcsConfig::default();
         let preprocessed_trace = PreProcessedTraceVariant::CanonicalWithoutPedersen;
-        let result = verify_cairo::<Blake2sMerkleChannel>(proof, pcs_config, preprocessed_trace);
+        let result = verify_cairo::<Blake2sMerkleChannel>(proof, preprocessed_trace);
         assert!(result.is_ok());
     }
 }
