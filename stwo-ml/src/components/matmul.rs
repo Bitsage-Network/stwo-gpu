@@ -420,15 +420,19 @@ pub fn prove_matmul_sumcheck(
         ));
     }
 
+    // Auto-pad to power-of-2 dimensions if needed (sumcheck requires boolean hypercube)
+    let a = &pad_matrix_pow2(a);
+    let b = &pad_matrix_pow2(b);
+    let c = &pad_matrix_pow2(c);
+
     let m = a.rows;
     let k = a.cols;
     let n = b.cols;
 
-    for (name, val) in [("m", m), ("k", k), ("n", n)] {
-        if !val.is_power_of_two() {
-            return Err(MatMulError::NonPowerOfTwo(format!("{name}={val}")));
-        }
-    }
+    // After padding, dimensions are guaranteed to be powers of 2
+    debug_assert!(m.is_power_of_two());
+    debug_assert!(k.is_power_of_two());
+    debug_assert!(n.is_power_of_two());
 
     let log_m = m.ilog2() as usize;
     let _log_k = k.ilog2() as usize;
@@ -631,15 +635,19 @@ pub fn prove_matmul_sumcheck_onchain(
         ));
     }
 
+    // Auto-pad to power-of-2 dimensions if needed (sumcheck requires boolean hypercube)
+    let a = &pad_matrix_pow2(a);
+    let b = &pad_matrix_pow2(b);
+    let c = &pad_matrix_pow2(c);
+
     let m = a.rows;
     let k = a.cols;
     let n = b.cols;
 
-    for (name, val) in [("m", m), ("k", k), ("n", n)] {
-        if !val.is_power_of_two() {
-            return Err(MatMulError::NonPowerOfTwo(format!("{name}={val}")));
-        }
-    }
+    // After padding, dimensions are guaranteed to be powers of 2
+    debug_assert!(m.is_power_of_two());
+    debug_assert!(k.is_power_of_two());
+    debug_assert!(n.is_power_of_two());
 
     let log_m = m.ilog2() as usize;
     let log_k = k.ilog2() as usize;

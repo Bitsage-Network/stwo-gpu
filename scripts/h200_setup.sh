@@ -130,6 +130,12 @@ if [ "$SKIP_DEPS" = false ]; then
     pip3 install --quiet --upgrade huggingface_hub 2>/dev/null || \
         pip3 install --quiet --upgrade --user huggingface_hub 2>/dev/null || true
     echo -e "  ${GREEN}huggingface_hub installed${NC}"
+
+    # Install PyTorch + Transformers for model validation and chat
+    echo "  Installing torch + transformers (for model validation)..."
+    pip3 install --quiet torch transformers accelerate 2>/dev/null || \
+        pip3 install --quiet --user torch transformers accelerate 2>/dev/null || true
+    echo -e "  ${GREEN}torch + transformers installed${NC}"
 else
     echo -e "${YELLOW}[1/7] Skipping system dependencies (--skip-deps)${NC}"
 fi
