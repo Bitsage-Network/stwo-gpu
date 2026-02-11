@@ -70,7 +70,7 @@ pub fn load_weights(
 }
 
 /// Convert raw tensor bytes to f32 based on dtype.
-fn tensor_to_f32(data: &[u8], dtype: safetensors::Dtype) -> Vec<f32> {
+pub fn tensor_to_f32(data: &[u8], dtype: safetensors::Dtype) -> Vec<f32> {
     match dtype {
         safetensors::Dtype::F32 => {
             data.chunks_exact(4)

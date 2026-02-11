@@ -6,12 +6,14 @@
 //!
 //! Builds a [`ComputationGraph`] from config.json and loads weights from SafeTensors.
 
+use std::collections::HashMap;
 use std::path::Path;
 
-use crate::compiler::graph::{ComputationGraph, GraphBuilder};
+use crate::compiler::graph::{ComputationGraph, GraphBuilder, GraphOp, GraphWeights};
 use crate::compiler::onnx::{OnnxModel, OnnxError, ModelMetadata, TransformerConfig};
+use crate::compiler::quantize_weights::quantize_weight_matrix;
+use crate::compiler::safetensors::{discover_shards, list_tensors_sharded, tensor_to_f32};
 use crate::components::activation::ActivationType;
-use crate::compiler::safetensors::{discover_shards, load_weights_sharded, list_tensors_sharded};
 use crate::gadgets::quantize::QuantStrategy;
 
 /// Parsed HuggingFace config.json.
@@ -169,22 +171,29 @@ pub fn load_hf_model(
     eprintln!("  Loading weights from {} shards...", shard_paths.len());
 
     // List tensors for diagnostics
-    if let Ok(all_tensors) = list_tensors_sharded(&shard_paths) {
-        eprintln!("  Total tensors across shards: {}", all_tensors.len());
+    let all_tensor_names: Vec<(String, usize)> = list_tensors_sharded(&shard_paths)
+        .map_err(|e| OnnxError::WeightError(format!("Cannot list tensors: {e}")))?;
+    eprintln!("  Total tensors across shards: {}", all_tensor_names.len());
+
+    // Build name mapping: graph node index → HuggingFace tensor name
+    let name_map = build_weight_name_map(&graph, layers, &all_tensor_names);
+    eprintln!("  Weight name mapping: {} entries", name_map.len());
+    for (idx, name) in &name_map {
+        eprintln!("    node {} → {}", idx, name);
     }
 
-    let weights = load_weights_sharded(&shard_paths, &graph, QuantStrategy::Symmetric8)
-        .map_err(|e| OnnxError::WeightError(format!("Cannot load weights: {e}")))?;
+    let weights = load_weights_from_shards(
+        &shard_paths, &graph, &name_map, QuantStrategy::Symmetric8,
+    ).map_err(|e| OnnxError::WeightError(format!("Cannot load weights: {e}")))?;
 
     let loaded_count = graph.nodes.iter().enumerate()
         .filter(|(idx, _)| weights.get_weight(*idx).is_some())
         .count();
+    let matmul_count = graph.nodes.iter()
+        .filter(|n| matches!(n.op, GraphOp::MatMul { .. }))
+        .count();
 
-    eprintln!(
-        "  Loaded weights for {}/{} MatMul layers",
-        loaded_count,
-        graph.nodes.iter().filter(|n| matches!(n.op, crate::compiler::graph::GraphOp::MatMul { .. })).count()
-    );
+    eprintln!("  Loaded weights for {}/{} MatMul layers", loaded_count, matmul_count);
 
     let num_parameters = crate::compiler::onnx::count_matmul_params(&graph);
 
@@ -237,6 +246,184 @@ fn build_hf_transformer_graph(
     builder.layer_norm();
 
     builder.build()
+}
+
+/// Build a mapping from graph node indices to HuggingFace tensor names.
+///
+/// For each transformer block, the graph has 7 nodes:
+///   0: LayerNorm (pre-attention)
+///   1: MatMul    (Q projection)    → model.layers.{L}.self_attn.q_proj.weight
+///   2: MatMul    (O projection)    → model.layers.{L}.self_attn.o_proj.weight
+///   3: LayerNorm (post-attention)
+///   4: MatMul    (FFN up)          → model.layers.{L}.mlp.up_proj.weight (or gate_proj)
+///   5: Activation
+///   6: MatMul    (FFN down)        → model.layers.{L}.mlp.down_proj.weight
+///
+/// Plus a final LayerNorm at the end.
+fn build_weight_name_map(
+    graph: &ComputationGraph,
+    num_layers: usize,
+    available_tensors: &[(String, usize)],
+) -> HashMap<usize, String> {
+    let mut map = HashMap::new();
+    let tensor_set: std::collections::HashSet<&str> = available_tensors
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+
+    // Each block has 7 nodes. MatMul nodes are at offsets 1, 2, 4, 6 within a block.
+    let nodes_per_block = 7;
+
+    for layer_idx in 0..num_layers {
+        let block_start = layer_idx * nodes_per_block;
+
+        // Node offset 1: Q projection
+        let q_node = block_start + 1;
+        // Node offset 2: O projection
+        let o_node = block_start + 2;
+        // Node offset 4: FFN up
+        let up_node = block_start + 4;
+        // Node offset 6: FFN down
+        let down_node = block_start + 6;
+
+        // Try common HuggingFace naming patterns for the Q projection
+        let q_candidates = [
+            format!("model.layers.{layer_idx}.self_attn.q_proj.weight"),
+            format!("model.layers.{layer_idx}.attention.wq.weight"),
+            format!("transformer.h.{layer_idx}.attn.q_proj.weight"),
+        ];
+        for name in &q_candidates {
+            if tensor_set.contains(name.as_str()) {
+                map.insert(q_node, name.clone());
+                break;
+            }
+        }
+
+        // O projection
+        let o_candidates = [
+            format!("model.layers.{layer_idx}.self_attn.o_proj.weight"),
+            format!("model.layers.{layer_idx}.attention.wo.weight"),
+            format!("transformer.h.{layer_idx}.attn.o_proj.weight"),
+        ];
+        for name in &o_candidates {
+            if tensor_set.contains(name.as_str()) {
+                map.insert(o_node, name.clone());
+                break;
+            }
+        }
+
+        // FFN up projection (some models use gate_proj, some use up_proj)
+        let up_candidates = [
+            format!("model.layers.{layer_idx}.mlp.up_proj.weight"),
+            format!("model.layers.{layer_idx}.mlp.gate_proj.weight"),
+            format!("model.layers.{layer_idx}.feed_forward.w1.weight"),
+            format!("transformer.h.{layer_idx}.mlp.up_proj.weight"),
+        ];
+        for name in &up_candidates {
+            if tensor_set.contains(name.as_str()) {
+                map.insert(up_node, name.clone());
+                break;
+            }
+        }
+
+        // FFN down projection
+        let down_candidates = [
+            format!("model.layers.{layer_idx}.mlp.down_proj.weight"),
+            format!("model.layers.{layer_idx}.feed_forward.w2.weight"),
+            format!("transformer.h.{layer_idx}.mlp.down_proj.weight"),
+        ];
+        for name in &down_candidates {
+            if tensor_set.contains(name.as_str()) {
+                map.insert(down_node, name.clone());
+                break;
+            }
+        }
+    }
+
+    map
+}
+
+/// Load weights from multiple SafeTensors shards using an explicit name mapping.
+fn load_weights_from_shards(
+    shard_paths: &[std::path::PathBuf],
+    graph: &ComputationGraph,
+    name_map: &HashMap<usize, String>,
+    strategy: QuantStrategy,
+) -> Result<GraphWeights, crate::compiler::quantize_weights::WeightError> {
+    use crate::compiler::quantize_weights::WeightError;
+
+    // Memory-map all shards
+    let mut shard_data: Vec<(std::fs::File, memmap2::Mmap)> = Vec::new();
+    for path in shard_paths {
+        let file = std::fs::File::open(path)
+            .map_err(|e| WeightError::IoError(e.to_string()))?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }
+            .map_err(|e| WeightError::IoError(e.to_string()))?;
+        shard_data.push((file, mmap));
+    }
+
+    let mut weights = GraphWeights::new();
+
+    for (idx, node) in graph.nodes.iter().enumerate() {
+        if let GraphOp::MatMul { dims: (_m, k, n) } = &node.op {
+            if let Some(tensor_name) = name_map.get(&idx) {
+                // Search through shards for this tensor
+                let mut found = false;
+                for (_file, mmap) in &shard_data {
+                    let tensors = safetensors::SafeTensors::deserialize(mmap)
+                        .map_err(|e| WeightError::IoError(e.to_string()))?;
+
+                    if let Ok(tensor) = tensors.tensor(tensor_name) {
+                        let data = tensor_to_f32(tensor.data(), tensor.dtype());
+                        // HuggingFace stores weights as (out_features, in_features)
+                        // Our MatMul expects (k, n) = (in_features, out_features)
+                        // So we may need to transpose
+                        let shape = tensor.shape();
+                        let (weight_data, wk, wn) = if shape.len() == 2 {
+                            let rows = shape[0]; // out_features
+                            let cols = shape[1]; // in_features
+                            if rows == *n && cols == *k {
+                                // Already (out, in) — transpose to (in, out) = (k, n)
+                                let mut transposed = vec![0.0f32; data.len()];
+                                for r in 0..rows {
+                                    for c in 0..cols {
+                                        transposed[c * rows + r] = data[r * cols + c];
+                                    }
+                                }
+                                (transposed, *k, *n)
+                            } else if rows == *k && cols == *n {
+                                // Already (k, n)
+                                (data, *k, *n)
+                            } else {
+                                eprintln!(
+                                    "    WARNING: tensor {} shape ({}, {}) doesn't match expected ({}, {}), using as-is",
+                                    tensor_name, rows, cols, k, n
+                                );
+                                (data, *k, *n)
+                            }
+                        } else {
+                            (data, *k, *n)
+                        };
+
+                        let (matrix, _params) = quantize_weight_matrix(
+                            &weight_data, wk, wn, strategy,
+                        );
+                        weights.add_weight(idx, matrix);
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    eprintln!(
+                        "    WARNING: tensor '{}' not found in any shard for node {}",
+                        tensor_name, idx
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(weights)
 }
 
 #[cfg(test)]
