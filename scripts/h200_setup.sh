@@ -72,7 +72,8 @@ done
 
 # Auto-derive MODEL_DIR from HuggingFace model ID if not explicitly set
 if [ -z "$MODEL_DIR" ]; then
-    MODEL_SLUG=$(echo "${MODEL_HF}" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
+    # Use the model name part (after /) lowercased, e.g. Qwen/Qwen3-14B → qwen3-14b
+    MODEL_SLUG=$(echo "${MODEL_HF}" | awk -F'/' '{print $NF}' | tr '[:upper:]' '[:lower:]')
     MODEL_DIR="$HOME/models/${MODEL_SLUG}"
 fi
 
@@ -363,25 +364,36 @@ if [ "$SKIP_BUILD" = false ]; then
     # 6a: Build stwo-ml with GPU + model loading + CLI
     # rust-toolchain.toml in stwo-ml/ pins the correct nightly automatically
     echo "  [6a] Building stwo-ml (GPU + CLI)..."
+    GPU_BUILD_LOG="${INSTALL_DIR}/gpu_build.log"
     (
         cd stwo-ml
         cargo build --release \
             --bin prove-model \
             --features "cuda-runtime,cli" \
-            2>&1 | tail -20
-    ) && echo -e "  ${GREEN}stwo-ml built${NC}" || {
-        echo -e "  ${RED}stwo-ml GPU build failed${NC}"
-        echo "  Trying without GPU (CPU-only)..."
+            2>&1 | tee "${GPU_BUILD_LOG}" | tail -5
+    ) && {
+        echo -e "  ${GREEN}stwo-ml built (GPU mode)${NC}"
+        GPU_MODE=true
+    } || {
+        GPU_ERRORS=$(grep -c "^error" "${GPU_BUILD_LOG}" 2>/dev/null || echo "?")
+        echo -e "  ${RED}GPU build failed (${GPU_ERRORS} errors). Full log: ${GPU_BUILD_LOG}${NC}"
+        echo ""
+        echo "  Falling back to CPU-only build..."
         (
             cd stwo-ml
             cargo build --release \
                 --bin prove-model \
                 --features "cli" \
-                2>&1 | tail -20
-        ) && echo -e "  ${YELLOW}Built in CPU-only mode${NC}" || {
-            echo -e "  ${RED}CPU build also failed. Printing full error:${NC}"
+                2>&1 | tail -5
+        ) && {
+            echo -e "  ${YELLOW}Built in CPU-only mode${NC}"
+            echo -e "  ${YELLOW}To debug GPU errors: cat ${GPU_BUILD_LOG}${NC}"
+            GPU_MODE=false
+        } || {
+            echo -e "  ${RED}CPU build also failed:${NC}"
             cd stwo-ml
             cargo build --release --bin prove-model --features "cli" 2>&1
+            exit 1
         }
     }
 
@@ -539,7 +551,8 @@ try:
     gpu_ok = torch.cuda.is_available()
     if gpu_ok:
         gpu_name = torch.cuda.get_device_name(0)
-        gpu_mem = torch.cuda.get_device_properties(0).total_mem / 1e9
+        props = torch.cuda.get_device_properties(0)
+        gpu_mem = getattr(props, 'total_memory', getattr(props, 'total_mem', 0)) / 1e9
         check('CUDA GPU available', True, f'{gpu_name}, {gpu_mem:.0f} GB')
     else:
         check('CUDA GPU available', False, 'torch.cuda.is_available() = False')
