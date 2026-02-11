@@ -28,6 +28,8 @@ pub mod prove;
 pub mod inspect;
 #[cfg(feature = "safetensors")]
 pub mod safetensors;
+#[cfg(feature = "cli")]
+pub mod hf_loader;
 pub mod quantize_weights;
 pub mod dual;
 pub mod checkpoint;

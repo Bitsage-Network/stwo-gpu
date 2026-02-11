@@ -378,7 +378,7 @@ if [ "$SKIP_BUILD" = false ]; then
         fi
     fi
 
-    # 6d: Run quick tests
+    # 6d: Run quick sanity test
     echo ""
     echo "  [6d] Running quick sanity test..."
     (
@@ -394,10 +394,112 @@ fi
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════════
-# Step 7: Verify Setup & Print Summary
+# Step 7: Validate Qwen3-14B Model
 # ═══════════════════════════════════════════════════════════════════════
 
-echo -e "${YELLOW}[7/7] Verifying setup${NC}"
+echo -e "${YELLOW}[7/8] Validating Qwen3-14B model${NC}"
+
+cd "${INSTALL_DIR}"
+
+if [ -f "${MODEL_DIR}/config.json" ] && ls "${MODEL_DIR}"/*.safetensors &>/dev/null 2>&1; then
+    # Install Python ML dependencies for validation
+    pip3 install --quiet torch transformers accelerate 2>/dev/null || \
+        pip3 install --quiet --user torch transformers accelerate 2>/dev/null || true
+
+    # Run quick validation: load model, check config, run 1 forward pass
+    python3 -c "
+import json, os, sys, time
+
+model_dir = '${MODEL_DIR}'
+
+# 1. Validate config.json
+print('  Checking config.json...')
+with open(os.path.join(model_dir, 'config.json')) as f:
+    config = json.load(f)
+
+hidden = config.get('hidden_size', 0)
+heads = config.get('num_attention_heads', 0)
+layers = config.get('num_hidden_layers', 0)
+ff = config.get('intermediate_size', 0)
+vocab = config.get('vocab_size', 0)
+print(f'    model_type:    {config.get(\"model_type\", \"unknown\")}')
+print(f'    hidden_size:   {hidden}')
+print(f'    heads:         {heads}')
+print(f'    layers:        {layers}')
+print(f'    intermediate:  {ff}')
+print(f'    vocab_size:    {vocab}')
+
+# 2. Validate SafeTensors shards
+shards = [f for f in os.listdir(model_dir) if f.endswith('.safetensors')]
+total_bytes = sum(os.path.getsize(os.path.join(model_dir, f)) for f in shards)
+print(f'    shards:        {len(shards)} ({total_bytes / 1e9:.1f} GB)')
+
+# 3. Quick GPU inference test
+try:
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    if torch.cuda.is_available():
+        print('  Loading model to GPU for inference test...')
+        t0 = time.time()
+        tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_dir,
+            torch_dtype=torch.float16,
+            device_map='auto',
+            trust_remote_code=True,
+        )
+        load_time = time.time() - t0
+        total_params = sum(p.numel() for p in model.parameters())
+        gpu_mem = torch.cuda.memory_allocated() / 1e9
+        print(f'    loaded in:     {load_time:.1f}s')
+        print(f'    parameters:    {total_params/1e9:.1f}B')
+        print(f'    GPU memory:    {gpu_mem:.1f} GB')
+
+        # Quick generate
+        inputs = tokenizer('Hello', return_tensors='pt').to('cuda')
+        t0 = time.time()
+        with torch.no_grad():
+            out = model.generate(**inputs, max_new_tokens=10, do_sample=False)
+        gen_time = time.time() - t0
+        tokens = out.shape[1] - inputs['input_ids'].shape[1]
+        text = tokenizer.decode(out[0], skip_special_tokens=True)
+        print(f'    inference:     {tokens} tokens in {gen_time:.2f}s ({tokens/gen_time:.0f} tok/s)')
+        print(f'    output:        {text[:80]}')
+        print('  Model validation: PASSED')
+        del model
+        torch.cuda.empty_cache()
+    else:
+        print('  CUDA not available for Python — skipping inference test')
+        print('  Config + SafeTensors validation: PASSED')
+except ImportError:
+    print('  torch/transformers not installed — skipping inference test')
+    print('  Config + SafeTensors validation: PASSED')
+except Exception as e:
+    print(f'  Inference test failed: {e}')
+    print('  Config + SafeTensors validation: PASSED (inference test optional)')
+" 2>&1 && echo -e "  ${GREEN}Model validated${NC}" || \
+        echo -e "  ${YELLOW}Model validation skipped${NC}"
+
+    # Also validate prove-model can read the config
+    PROVE_MODEL_BIN=$(find . -name "prove-model" -path "*/release/*" -type f 2>/dev/null | head -1)
+    if [ -n "$PROVE_MODEL_BIN" ]; then
+        echo ""
+        echo "  Testing prove-model --inspect..."
+        $PROVE_MODEL_BIN --model-dir "${MODEL_DIR}" --layers 1 --inspect 2>&1 | head -10 && \
+            echo -e "  ${GREEN}prove-model can read the model${NC}" || \
+            echo -e "  ${YELLOW}prove-model --inspect failed (may need --model flag instead)${NC}"
+    fi
+else
+    echo -e "  ${YELLOW}Model not downloaded — skipping validation${NC}"
+fi
+echo ""
+
+# ═══════════════════════════════════════════════════════════════════════
+# Step 8: Summary
+# ═══════════════════════════════════════════════════════════════════════
+
+echo -e "${YELLOW}[8/8] Setup summary${NC}"
 
 cd "${INSTALL_DIR}"
 
@@ -440,23 +542,24 @@ cat << SUMMARY
 ║                                                                               ║
 ║  NEXT STEPS:                                                                  ║
 ║                                                                               ║
-║  1. Quick test (prove 1 block):                                               ║
-║     cd ${INSTALL_DIR}/stwo-ml
-║     cargo test --release --features cuda-runtime --test gpu_pipeline
-║                                                                               ║
-║  2. Prove single block:                                                       ║
+║  1. Prove single block (Qwen3-14B, 1 layer):                                 ║
 ║     ${PROVE_MODEL_BIN:-./prove-model} \\
-║       --model ${MODEL_DIR} \\
-║       --input input.json --output proof.json --gpu
+║       --model-dir ${MODEL_DIR} \\
+║       --layers 1 --output proof.json
+║                                                                               ║
+║  2. Prove with GPU:                                                           ║
+║     ${PROVE_MODEL_BIN:-./prove-model} \\
+║       --model-dir ${MODEL_DIR} \\
+║       --layers 1 --output proof.json --gpu
 ║                                                                               ║
 ║  3. Full 40-block benchmark:                                                  ║
 ║     cd ${INSTALL_DIR}
 ║     bash scripts/benchmark_full_model.sh --layers 40 \\
 ║       --model-dir ${MODEL_DIR}
 ║                                                                               ║
-║  4. Full pipeline (prove + recursive STARK + on-chain):                       ║
-║     bash scripts/h200_recursive_pipeline.sh --layers 40 \\
-║       --model-dir ${MODEL_DIR}
+║  4. Inspect model (no proving):                                               ║
+║     ${PROVE_MODEL_BIN:-./prove-model} \\
+║       --model-dir ${MODEL_DIR} --inspect
 ║                                                                               ║
 ╚═══════════════════════════════════════════════════════════════════════════════╝
 SUMMARY

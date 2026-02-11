@@ -24,9 +24,22 @@ impl AccumulationOps for GpuBackend {
         let simd_other = secure_col_coords_ref_to_simd(other);
         SimdBackend::accumulate(simd_column, simd_other);
     }
-    
+
     fn generate_secure_powers(felt: SecureField, n_powers: usize) -> Vec<SecureField> {
         // Power generation is sequential, no GPU benefit
         SimdBackend::generate_secure_powers(felt, n_powers)
+    }
+
+    fn lift_and_accumulate(
+        cols: Vec<SecureColumnByCoords<Self>>,
+    ) -> Option<SecureColumnByCoords<Self>> {
+        // GpuBackend and SimdBackend share the same column layout (BaseColumn = Vec<PackedM31>),
+        // so we can safely reinterpret the columns between backends.
+        let simd_cols: Vec<SecureColumnByCoords<SimdBackend>> = cols
+            .into_iter()
+            .map(|col| SecureColumnByCoords { columns: col.columns })
+            .collect();
+        let result = SimdBackend::lift_and_accumulate(simd_cols)?;
+        Some(SecureColumnByCoords { columns: result.columns })
     }
 }

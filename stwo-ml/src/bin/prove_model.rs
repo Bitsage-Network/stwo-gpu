@@ -1,23 +1,30 @@
 //! `prove-model` CLI binary.
 //!
-//! Standalone tool that takes an ONNX model + JSON input and produces
-//! a serialized proof ready for `cairo-prove prove-ml`.
+//! Standalone tool that takes an ONNX model (or HuggingFace model directory)
+//! and JSON input, and produces a serialized proof ready for `cairo-prove prove-ml`.
 //!
 //! ```text
+//! # ONNX mode:
 //! prove-model \
 //!   --model model.onnx \
 //!   --input input.json \
 //!   --output proof.json \
 //!   --format cairo_serde \
-//!   --model-id 0x1 \
-//!   --gpu \
-//!   --inspect
+//!   --gpu
+//!
+//! # HuggingFace directory mode:
+//! prove-model \
+//!   --model-dir /path/to/qwen3-14b \
+//!   --layers 1 \
+//!   --output proof.json \
+//!   --gpu
 //! ```
 
 #![feature(portable_simd)]
 
 use std::path::PathBuf;
 use std::process;
+use std::time::Instant;
 
 use clap::Parser;
 use starknet_ff::FieldElement;
@@ -28,7 +35,7 @@ use stwo_ml::cairo_serde::{
     serialize_ml_proof_to_arguments_file,
 };
 use stwo_ml::compiler::inspect::summarize_model;
-use stwo_ml::compiler::onnx::load_onnx;
+use stwo_ml::compiler::onnx::{load_onnx, OnnxModel};
 use stwo_ml::components::matmul::M31Matrix;
 use stwo_ml::gadgets::quantize::{QuantStrategy, quantize_tensor};
 use stwo_ml::json_serde;
@@ -54,16 +61,28 @@ impl std::str::FromStr for OutputFormat {
 
 /// stwo-ml prove-model: generic ZKML prover CLI.
 ///
-/// Takes an ONNX model and JSON input, produces a proof for on-chain verification.
+/// Takes an ONNX model (or HuggingFace model directory) and produces a proof.
 #[derive(Parser, Debug)]
 #[command(name = "prove-model", version, about)]
 struct Cli {
     /// Path to ONNX model file.
+    /// Use --model for .onnx files, or --model-dir for HuggingFace directories.
+    #[arg(long, group = "model_source")]
+    model: Option<PathBuf>,
+
+    /// Path to a HuggingFace model directory (with config.json + *.safetensors).
+    /// Alternative to --model for loading directly from SafeTensors.
+    #[arg(long, group = "model_source")]
+    model_dir: Option<PathBuf>,
+
+    /// Number of transformer layers to prove (default: all from config.json).
+    /// Only used with --model-dir.
     #[arg(long)]
-    model: PathBuf,
+    layers: Option<usize>,
 
     /// Path to JSON input file (array of f32 values).
-    /// Not required if --inspect is used.
+    /// Not required if --inspect is used. If omitted with --model-dir, a random
+    /// input of the correct shape is generated.
     #[arg(long)]
     input: Option<PathBuf>,
 
@@ -119,9 +138,6 @@ fn load_input_json(path: &PathBuf) -> Vec<f32> {
 }
 
 /// Quantize f32 input values to M31 field elements.
-///
-/// Uses symmetric INT8 quantization (scale + zero_point) from the
-/// `gadgets::quantize` module for deterministic, invertible mapping.
 fn quantize_input(values: &[f32], rows: usize, cols: usize) -> M31Matrix {
     let (quantized, _params) = quantize_tensor(values, QuantStrategy::Symmetric8);
     let mut matrix = M31Matrix::new(rows, cols);
@@ -131,15 +147,42 @@ fn quantize_input(values: &[f32], rows: usize, cols: usize) -> M31Matrix {
     matrix
 }
 
+/// Generate a deterministic random input for a given shape.
+fn generate_random_input(rows: usize, cols: usize) -> M31Matrix {
+    let mut matrix = M31Matrix::new(rows, cols);
+    for i in 0..(rows * cols) {
+        // Simple deterministic pseudo-random values
+        matrix.data[i] = M31::from((i as u32 * 7 + 13) % (1 << 20));
+    }
+    matrix
+}
+
+fn load_model(cli: &Cli) -> OnnxModel {
+    if let Some(ref model_dir) = cli.model_dir {
+        // HuggingFace directory mode
+        eprintln!("Loading HuggingFace model from: {}", model_dir.display());
+        stwo_ml::compiler::hf_loader::load_hf_model(model_dir, cli.layers)
+            .unwrap_or_else(|e| {
+                eprintln!("Error loading model directory: {e}");
+                process::exit(1);
+            })
+    } else if let Some(ref model_path) = cli.model {
+        // ONNX mode
+        eprintln!("Loading ONNX model: {}", model_path.display());
+        load_onnx(model_path).unwrap_or_else(|e| {
+            eprintln!("Error loading ONNX model: {e}");
+            process::exit(1);
+        })
+    } else {
+        eprintln!("Error: specify either --model (ONNX file) or --model-dir (HuggingFace directory)");
+        process::exit(1);
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
-    // Load ONNX model
-    eprintln!("Loading model: {}", cli.model.display());
-    let model = load_onnx(&cli.model).unwrap_or_else(|e| {
-        eprintln!("Error loading ONNX model: {e}");
-        process::exit(1);
-    });
+    let model = load_model(&cli);
 
     // --inspect: print summary and exit
     if cli.inspect {
@@ -148,28 +191,30 @@ fn main() {
         return;
     }
 
-    // Require --input for proving
-    let input_path = cli.input.unwrap_or_else(|| {
-        eprintln!("Error: --input is required for proving (use --inspect for model summary)");
-        process::exit(1);
-    });
-
-    // Load and quantize input
-    eprintln!("Loading input: {}", input_path.display());
-    let input_f32 = load_input_json(&input_path);
-    let (in_rows, in_cols) = model.input_shape;
-    let expected_len = in_rows * in_cols;
-    if input_f32.len() != expected_len {
-        eprintln!(
-            "Error: input has {} values but model expects {} ({} x {})",
-            input_f32.len(),
-            expected_len,
-            in_rows,
-            in_cols,
-        );
-        process::exit(1);
-    }
-    let input = quantize_input(&input_f32, in_rows, in_cols);
+    // Build input
+    let input = if let Some(ref input_path) = cli.input {
+        // Load from JSON
+        eprintln!("Loading input: {}", input_path.display());
+        let input_f32 = load_input_json(input_path);
+        let (in_rows, in_cols) = model.input_shape;
+        let expected_len = in_rows * in_cols;
+        if input_f32.len() != expected_len {
+            eprintln!(
+                "Error: input has {} values but model expects {} ({} x {})",
+                input_f32.len(),
+                expected_len,
+                in_rows,
+                in_cols,
+            );
+            process::exit(1);
+        }
+        quantize_input(&input_f32, in_rows, in_cols)
+    } else {
+        // Generate random input for --model-dir mode
+        let (in_rows, in_cols) = model.input_shape;
+        eprintln!("Generating random input: {} x {}", in_rows, in_cols);
+        generate_random_input(in_rows, in_cols)
+    };
 
     // Prove
     eprintln!(
@@ -177,6 +222,8 @@ fn main() {
         model.graph.num_layers(),
         cli.gpu,
     );
+
+    let t0 = Instant::now();
 
     let proof = if cli.gpu {
         stwo_ml::aggregation::prove_model_aggregated_onchain_auto(
@@ -192,10 +239,14 @@ fn main() {
         )
     };
 
+    let prove_elapsed = t0.elapsed();
+
     let proof = proof.unwrap_or_else(|e| {
         eprintln!("Error: proving failed: {e}");
         process::exit(1);
     });
+
+    eprintln!("Proving completed in {:.2}s", prove_elapsed.as_secs_f64());
 
     // Build metadata
     let io_commitment = compute_io_commitment(&input, &proof.execution.output);
@@ -265,5 +316,11 @@ fn main() {
         "  matmul_proofs: {}, activation_claims: {}",
         proof.matmul_proofs.len(),
         proof.activation_claims.len(),
+    );
+    eprintln!(
+        "  prove_time: {:.2}s, model: {}, layers: {}",
+        prove_elapsed.as_secs_f64(),
+        model.metadata.name,
+        model.metadata.num_layers,
     );
 }
