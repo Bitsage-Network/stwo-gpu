@@ -279,11 +279,24 @@ if [ "$SKIP_MODEL" = false ]; then
         echo "  This is ~28GB and may take 10-20 minutes depending on bandwidth."
         echo ""
 
-        # Use huggingface-cli if available, otherwise git lfs
+        # Download ALL model files needed for inference + proving
+        # Includes: weights, config, tokenizer, shard index, generation config
+        INCLUDE_PATTERNS=(
+            "*.safetensors"
+            "*.json"
+            "tokenizer.model"
+            "*.tiktoken"
+            "*.txt"
+        )
+        INCLUDE_ARGS=""
+        for pat in "${INCLUDE_PATTERNS[@]}"; do
+            INCLUDE_ARGS="${INCLUDE_ARGS} --include ${pat}"
+        done
+
         if command -v huggingface-cli &>/dev/null; then
             huggingface-cli download "${MODEL_HF}" \
                 --local-dir "${MODEL_DIR}" \
-                --include "*.safetensors" "config.json" "tokenizer.json" "tokenizer_config.json" \
+                ${INCLUDE_ARGS} \
                 --quiet
         elif python3 -c "from huggingface_hub import snapshot_download" 2>/dev/null; then
             python3 -c "
@@ -291,7 +304,7 @@ from huggingface_hub import snapshot_download
 snapshot_download(
     '${MODEL_HF}',
     local_dir='${MODEL_DIR}',
-    allow_patterns=['*.safetensors', 'config.json', 'tokenizer.json', 'tokenizer_config.json'],
+    allow_patterns=['*.safetensors', '*.json', 'tokenizer.model', '*.tiktoken', '*.txt'],
 )
 print('Download complete')
 "
@@ -449,12 +462,12 @@ try:
         print('  Loading model to GPU for inference test...')
         t0 = time.time()
         tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_dir,
-            torch_dtype=torch.float16,
-            device_map='auto',
-            trust_remote_code=True,
-        )
+        # Use dtype (not torch_dtype) for transformers >= 5.x
+        load_kwargs = dict(device_map='auto', trust_remote_code=True)
+        try:
+            model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float16, **load_kwargs)
+        except TypeError:
+            model = AutoModelForCausalLM.from_pretrained(model_dir, torch_dtype=torch.float16, **load_kwargs)
         load_time = time.time() - t0
         total_params = sum(p.numel() for p in model.parameters())
         gpu_mem = torch.cuda.memory_allocated() / 1e9
