@@ -358,6 +358,9 @@ if [ "$SKIP_RECURSIVE" = false ] && [ -n "$CAIRO_PROVE_BIN" ]; then
 
     if [ -f "$CAIRO_SERDE_PROOF" ]; then
         EXECUTABLE="${REPO_DIR}/stwo-cairo/stwo_cairo_verifier/target/dev/obelysk_ml_verifier.executable.json"
+        if [ ! -f "$EXECUTABLE" ] && [ -f "${REPO_DIR}/artifacts/obelysk_ml_verifier.executable.json" ]; then
+            EXECUTABLE="${REPO_DIR}/artifacts/obelysk_ml_verifier.executable.json"
+        fi
 
         if [ -f "$EXECUTABLE" ]; then
             RECURSIVE_START=$(date +%s%N)

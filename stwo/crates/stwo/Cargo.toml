@@ -27,7 +27,7 @@ slow-tests = []
 tracing = []
 # GPU Acceleration Features
 gpu = []  # GPU acceleration (kernel source only, no runtime dependency)
-cuda-runtime = ["gpu", "cudarc", "aes-gcm", "getrandom"]  # Actual CUDA execution (requires CUDA toolkit)
+cuda-runtime = ["gpu", "parallel", "cudarc", "aes-gcm", "getrandom"]  # Actual CUDA execution (requires CUDA toolkit)
 multi-gpu = ["cuda-runtime"]  # Multi-GPU support for distributed proving
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

@@ -208,11 +208,16 @@ echo ""
 # Step 2: Check/Build Cairo ML verifier executable
 # ----------------------------------------------------------------
 EXECUTABLE="${REPO_DIR}/stwo-cairo/stwo_cairo_verifier/target/dev/obelysk_ml_verifier.executable.json"
+EXECUTABLE_ARTIFACT="${REPO_DIR}/artifacts/obelysk_ml_verifier.executable.json"
 
 echo -e "${YELLOW}[Step 2] Cairo ML verifier executable${NC}"
 if [ -f "$EXECUTABLE" ]; then
     echo "  Found: ${EXECUTABLE}"
     echo "  Size: $(du -h "$EXECUTABLE" | cut -f1)"
+elif [ -f "$EXECUTABLE_ARTIFACT" ]; then
+    echo "  Found pre-built artifact: ${EXECUTABLE_ARTIFACT}"
+    echo "  Size: $(du -h "$EXECUTABLE_ARTIFACT" | cut -f1)"
+    EXECUTABLE="$EXECUTABLE_ARTIFACT"
 else
     echo "  Not found. Building with scarb..."
     if command -v scarb &>/dev/null; then
@@ -228,7 +233,8 @@ else
             exit 1
         fi
     else
-        echo -e "${RED}  ERROR: scarb not available. Install: curl -L https://docs.swmansion.com/scarb/install.sh | sh${NC}"
+        echo -e "${RED}  ERROR: scarb not available and no pre-built artifact found${NC}"
+        echo "  Either install scarb or copy the artifact to: ${EXECUTABLE_ARTIFACT}"
         exit 1
     fi
 fi
