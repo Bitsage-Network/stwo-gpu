@@ -369,17 +369,26 @@ RECURSIVE_PROOF_SIZE="N/A"
 
 if [ "$SKIP_RECURSIVE" = false ] && [ -n "$CAIRO_PROVE_BIN" ]; then
     echo -e "${YELLOW}[RECURSIVE] Generating recursive Circle STARK${NC}"
+    echo ""
 
-    # First re-prove the full model in cairo_serde format for recursive consumption
+    # Re-prove in cairo_serde format for recursive consumption
     CAIRO_SERDE_PROOF="benchmarks/ml_proof_cairo_serde.json"
-    echo "  Generating cairo_serde proof for recursive pipeline..."
+    CAIRO_SERDE_LOG="benchmarks/cairo_serde_prove.log"
+    echo -e "  ${YELLOW}Step 1/2: Re-proving model in cairo_serde format...${NC}"
+    SERDE_START=$(date +%s%N)
 
     ${PROVE_BIN} \
         --model-dir "${MODEL_DIR}" \
         --layers "${NUM_LAYERS}" \
         --output "${CAIRO_SERDE_PROOF}" \
         --format cairo_serde \
-        --gpu 2>/dev/null || true
+        --gpu 2>&1 | tee "${CAIRO_SERDE_LOG}" || true
+
+    SERDE_END=$(date +%s%N)
+    SERDE_MS=$(( (SERDE_END - SERDE_START) / 1000000 ))
+    SERDE_SEC=$(echo "scale=3; ${SERDE_MS}/1000" | bc)
+    echo -e "  ${GREEN}cairo_serde proof generated in ${SERDE_SEC}s${NC}"
+    echo ""
 
     if [ -f "$CAIRO_SERDE_PROOF" ]; then
         EXECUTABLE="${REPO_DIR}/stwo-cairo/stwo_cairo_verifier/target/dev/obelysk_ml_verifier.executable.json"
@@ -388,12 +397,13 @@ if [ "$SKIP_RECURSIVE" = false ] && [ -n "$CAIRO_PROVE_BIN" ]; then
         fi
 
         if [ -f "$EXECUTABLE" ]; then
+            echo -e "  ${YELLOW}Step 2/2: Running recursive STARK prover (cairo-prove)...${NC}"
             RECURSIVE_START=$(date +%s%N)
 
             ${CAIRO_PROVE_BIN} prove-ml \
                 --verifier-executable "${EXECUTABLE}" \
                 --ml-proof "${CAIRO_SERDE_PROOF}" \
-                --output "benchmarks/recursive_proof.json" 2>&1 | tail -10
+                --output "benchmarks/recursive_proof.json" 2>&1 | tee "benchmarks/recursive_prove.log" || true
 
             RECURSIVE_END=$(date +%s%N)
             RECURSIVE_MS=$(( (RECURSIVE_END - RECURSIVE_START) / 1000000 ))
