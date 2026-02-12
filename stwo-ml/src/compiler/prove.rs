@@ -661,35 +661,56 @@ where
 }
 
 /// Element-wise addition of two matrices.
+/// Parallelized with rayon for arrays >= 4096 elements.
 pub fn elementwise_add(lhs: &M31Matrix, rhs: &M31Matrix) -> M31Matrix {
+    use rayon::prelude::*;
+
     let rows = lhs.rows.max(rhs.rows);
     let cols = lhs.cols.max(rhs.cols);
-    let mut output = M31Matrix::new(rows, cols);
     let len = lhs.data.len().min(rhs.data.len());
-    for i in 0..len {
-        output.data[i] = lhs.data[i] + rhs.data[i];
+
+    let mut data = if len >= 4096 {
+        lhs.data[..len].par_iter()
+            .zip(rhs.data[..len].par_iter())
+            .map(|(&a, &b)| a + b)
+            .collect::<Vec<_>>()
+    } else {
+        (0..len).map(|i| lhs.data[i] + rhs.data[i]).collect::<Vec<_>>()
+    };
+
+    // Pad to full output size + copy remaining from lhs
+    data.resize(rows * cols, M31::from(0));
+    for i in len..lhs.data.len().min(data.len()) {
+        data[i] = lhs.data[i];
     }
-    // Copy remaining from whichever is larger
-    for i in len..lhs.data.len().min(output.data.len()) {
-        output.data[i] = lhs.data[i];
-    }
-    output
+
+    M31Matrix { rows, cols, data }
 }
 
 /// Element-wise multiplication of two matrices.
+/// Parallelized with rayon for arrays >= 4096 elements.
 pub fn elementwise_mul(lhs: &M31Matrix, rhs: &M31Matrix) -> M31Matrix {
+    use rayon::prelude::*;
+
     let rows = lhs.rows.max(rhs.rows);
     let cols = lhs.cols.max(rhs.cols);
-    let mut output = M31Matrix::new(rows, cols);
     let len = lhs.data.len().min(rhs.data.len());
-    for i in 0..len {
-        output.data[i] = lhs.data[i] * rhs.data[i];
-    }
-    output
+
+    let mut data = if len >= 4096 {
+        lhs.data[..len].par_iter()
+            .zip(rhs.data[..len].par_iter())
+            .map(|(&a, &b)| a * b)
+            .collect::<Vec<_>>()
+    } else {
+        (0..len).map(|i| lhs.data[i] * rhs.data[i]).collect::<Vec<_>>()
+    };
+
+    data.resize(rows * cols, M31::from(0));
+    M31Matrix { rows, cols, data }
 }
 
 /// Apply an activation function element-wise to a matrix (public for aggregation).
-pub fn apply_activation_pub(input: &M31Matrix, f: &dyn Fn(M31) -> M31) -> M31Matrix {
+pub fn apply_activation_pub(input: &M31Matrix, f: &(dyn Fn(M31) -> M31 + Sync)) -> M31Matrix {
     apply_activation(input, f)
 }
 
@@ -699,12 +720,17 @@ pub fn apply_layernorm_pub(input: &M31Matrix, dim: usize) -> M31Matrix {
 }
 
 /// Apply an activation function element-wise to a matrix.
-fn apply_activation(input: &M31Matrix, f: &dyn Fn(M31) -> M31) -> M31Matrix {
-    let mut output = M31Matrix::new(input.rows, input.cols);
-    for i in 0..input.data.len() {
-        output.data[i] = f(input.data[i]);
-    }
-    output
+/// Parallelized with rayon for arrays >= 4096 elements.
+fn apply_activation(input: &M31Matrix, f: &(dyn Fn(M31) -> M31 + Sync)) -> M31Matrix {
+    use rayon::prelude::*;
+
+    let data = if input.data.len() >= 4096 {
+        input.data.par_iter().map(|&v| f(v)).collect()
+    } else {
+        input.data.iter().map(|&v| f(v)).collect()
+    };
+
+    M31Matrix { rows: input.rows, cols: input.cols, data }
 }
 
 /// LayerNorm intermediates for proving.
@@ -724,60 +750,88 @@ pub(crate) struct LayerNormIntermediates {
 /// Division by n uses modular inverse (Fermat's little theorem).
 /// Reciprocal sqrt looked up in precomputed table.
 pub(crate) fn apply_layernorm_detailed(input: &M31Matrix, dim: usize) -> LayerNormIntermediates {
+    use rayon::prelude::*;
+
     let rsqrt_table = build_rsqrt_table(LayerNormConfig::new(dim).rsqrt_table_log_size);
-    let mut output = M31Matrix::new(input.rows, input.cols);
     let n = dim.min(input.cols);
     let inv_n = m31_mod_inverse(n as u32);
+    let cols = input.cols;
 
-    let total = input.data.len();
-    let mut all_inputs = Vec::with_capacity(total);
-    let mut all_means = Vec::with_capacity(total);
-    let mut all_variances = Vec::with_capacity(total);
-    let mut all_rsqrt = Vec::with_capacity(total);
-    let mut all_outputs = Vec::with_capacity(total);
+    // Each row is independent: compute per-row results in parallel, then flatten.
+    let process_row = |row: usize| -> (Vec<M31>, Vec<M31>, Vec<M31>, Vec<M31>, Vec<M31>, Vec<M31>) {
+        let row_start = row * cols;
 
-    for row in 0..input.rows {
         // Mean: sum(x) / n
         let mut sum = M31::from(0);
         for col in 0..n {
-            sum += input.data[row * input.cols + col];
+            sum += input.data[row_start + col];
         }
         let mean = sum * inv_n;
 
         // Variance: sum((x - mean)^2) / n
         let mut var_sum = M31::from(0);
         for col in 0..n {
-            let diff = input.data[row * input.cols + col] - mean;
+            let diff = input.data[row_start + col] - mean;
             var_sum += diff * diff;
         }
         let variance = var_sum * inv_n;
 
-        // rsqrt(variance) from lookup table. Fallback to scale=1.0 (2^16).
         let rsqrt = rsqrt_table
             .lookup(variance)
             .unwrap_or(M31::from(1u32 << 16));
 
-        // Output: (x - mean) * rsqrt
-        for col in 0..n {
-            let centered = input.data[row * input.cols + col] - mean;
-            let out_val = centered * rsqrt;
-            output.data[row * input.cols + col] = out_val;
+        let mut row_out = Vec::with_capacity(cols);
+        let mut row_inputs = Vec::with_capacity(cols);
+        let mut row_means = Vec::with_capacity(cols);
+        let mut row_vars = Vec::with_capacity(cols);
+        let mut row_rsqrt = Vec::with_capacity(cols);
+        let mut row_outputs = Vec::with_capacity(cols);
 
-            all_inputs.push(input.data[row * input.cols + col]);
-            all_means.push(mean);
-            all_variances.push(variance);
-            all_rsqrt.push(rsqrt);
-            all_outputs.push(out_val);
+        for col in 0..n {
+            let x = input.data[row_start + col];
+            let centered = x - mean;
+            let out_val = centered * rsqrt;
+            row_out.push(out_val);
+            row_inputs.push(x);
+            row_means.push(mean);
+            row_vars.push(variance);
+            row_rsqrt.push(rsqrt);
+            row_outputs.push(out_val);
         }
-        // Pass through any columns beyond the normalization dimension
-        for col in n..input.cols {
-            output.data[row * input.cols + col] = input.data[row * input.cols + col];
-            all_inputs.push(input.data[row * input.cols + col]);
-            all_means.push(M31::from(0));
-            all_variances.push(M31::from(0));
-            all_rsqrt.push(M31::from(1u32 << 16));
-            all_outputs.push(input.data[row * input.cols + col]);
+        for col in n..cols {
+            let x = input.data[row_start + col];
+            row_out.push(x);
+            row_inputs.push(x);
+            row_means.push(M31::from(0));
+            row_vars.push(M31::from(0));
+            row_rsqrt.push(M31::from(1u32 << 16));
+            row_outputs.push(x);
         }
+
+        (row_out, row_inputs, row_means, row_vars, row_rsqrt, row_outputs)
+    };
+
+    let row_results: Vec<_> = if input.rows >= 64 {
+        (0..input.rows).into_par_iter().map(process_row).collect()
+    } else {
+        (0..input.rows).map(process_row).collect()
+    };
+
+    let total = input.rows * cols;
+    let mut out_data = Vec::with_capacity(total);
+    let mut all_inputs = Vec::with_capacity(total);
+    let mut all_means = Vec::with_capacity(total);
+    let mut all_variances = Vec::with_capacity(total);
+    let mut all_rsqrt = Vec::with_capacity(total);
+    let mut all_outputs = Vec::with_capacity(total);
+
+    for (row_out, ri, rm, rv, rr, ro) in row_results {
+        out_data.extend(row_out);
+        all_inputs.extend(ri);
+        all_means.extend(rm);
+        all_variances.extend(rv);
+        all_rsqrt.extend(rr);
+        all_outputs.extend(ro);
     }
 
     LayerNormIntermediates {
@@ -786,7 +840,7 @@ pub(crate) fn apply_layernorm_detailed(input: &M31Matrix, dim: usize) -> LayerNo
         variances: all_variances,
         rsqrt_vals: all_rsqrt,
         outputs: all_outputs,
-        output_matrix: output,
+        output_matrix: M31Matrix { rows: input.rows, cols, data: out_data },
     }
 }
 

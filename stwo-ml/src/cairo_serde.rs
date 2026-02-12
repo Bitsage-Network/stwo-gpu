@@ -752,6 +752,39 @@ pub fn serialize_ml_proof_to_arguments_file(
     format!("[{}]", hex_strings.join(","))
 }
 
+/// Stream-write the serialized felt252[] directly to a file as a JSON hex array.
+///
+/// Avoids building the full String in memory — writes each felt directly via BufWriter.
+/// For 100k+ felts, this saves ~10 MB of intermediate allocations and the O(n) join.
+pub fn serialize_ml_proof_to_file(
+    felts: &[FieldElement],
+    path: &std::path::Path,
+) -> std::io::Result<usize> {
+    use std::io::Write;
+
+    let file = std::fs::File::create(path)?;
+    let mut writer = std::io::BufWriter::with_capacity(1 << 20, file); // 1 MB buffer
+
+    writer.write_all(b"[")?;
+    let mut bytes_written = 1;
+
+    for (i, f) in felts.iter().enumerate() {
+        if i > 0 {
+            writer.write_all(b",")?;
+            bytes_written += 1;
+        }
+        let hex = format!("\"0x{:x}\"", f);
+        writer.write_all(hex.as_bytes())?;
+        bytes_written += hex.len();
+    }
+
+    writer.write_all(b"]")?;
+    bytes_written += 1;
+    writer.flush()?;
+
+    Ok(bytes_written)
+}
+
 // === Deserialization (Cairo felt252[] → Rust types) ===
 
 // === Tiled MatMul Proof Serialization ===

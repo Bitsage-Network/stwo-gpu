@@ -41,7 +41,7 @@ use stwo::core::fields::m31::M31;
 
 use stwo_ml::cairo_serde::{
     MLClaimMetadata, serialize_ml_proof_for_recursive,
-    serialize_ml_proof_to_arguments_file,
+    serialize_ml_proof_to_file,
 };
 use stwo_ml::compiler::inspect::summarize_model;
 use stwo_ml::compiler::onnx::{load_onnx, OnnxModel};
@@ -431,26 +431,32 @@ fn main() {
     // Serialize
     eprintln!("Serializing proof (format={:?})...", cli.format);
     let t_ser = Instant::now();
-    let output_str = match cli.format {
+    let output_bytes = match cli.format {
         OutputFormat::CairoSerde => {
             let felts = serialize_ml_proof_for_recursive(&proof, &metadata, cli.salt);
-            eprintln!("  {} felt252 values, converting to hex...", felts.len());
-            serialize_ml_proof_to_arguments_file(&felts)
+            eprintln!("  {} felt252 values, streaming to file...", felts.len());
+            serialize_ml_proof_to_file(&felts, &cli.output).unwrap_or_else(|e| {
+                eprintln!("Error writing output to '{}': {e}", cli.output.display());
+                process::exit(1);
+            })
         }
-        OutputFormat::Json => json_serde::proof_to_json(&proof, &metadata),
+        OutputFormat::Json => {
+            let output_str = json_serde::proof_to_json(&proof, &metadata);
+            let len = output_str.len();
+            std::fs::write(&cli.output, &output_str).unwrap_or_else(|e| {
+                eprintln!("Error writing output to '{}': {e}", cli.output.display());
+                process::exit(1);
+            });
+            len
+        }
     };
 
     let ser_elapsed = t_ser.elapsed();
 
-    std::fs::write(&cli.output, &output_str).unwrap_or_else(|e| {
-        eprintln!("Error writing output to '{}': {e}", cli.output.display());
-        process::exit(1);
-    });
-
     eprintln!(
         "Proof written to {} ({} bytes, format={:?}, serialize={:.2}s)",
         cli.output.display(),
-        output_str.len(),
+        output_bytes,
         cli.format,
         ser_elapsed.as_secs_f64(),
     );

@@ -60,7 +60,7 @@ impl ActivationType {
     }
 
     /// Build the activation function as a closure.
-    pub fn as_fn(&self) -> Box<dyn Fn(M31) -> M31> {
+    pub fn as_fn(&self) -> Box<dyn Fn(M31) -> M31 + Sync> {
         use crate::gadgets::lookup_table::activations;
         match self {
             ActivationType::ReLU => Box::new(activations::relu),
