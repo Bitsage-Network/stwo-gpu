@@ -1511,39 +1511,35 @@ where
             {
                 use rayon::prelude::*;
 
-                eprintln!("    Preparing {} batch entries (chunked parallel MLE + commitment)...", indices.len());
+                eprintln!("    Preparing {} batch entries (sequential, memory-safe)...", indices.len());
                 let t_prep = std::time::Instant::now();
 
-                // Process in chunks of 4 to limit peak memory.
-                // Large weight matrices (5120x17408 padded to 8192x32768) need ~5.4 GB
-                // temp each for MLE construction. 4 concurrent = ~22 GB peak.
-                // After each chunk, free the original A/B/C matrices we no longer need.
-                let chunk_size = 4;
+                // Sequential: one entry at a time to minimize peak memory.
+                // Each entry temporarily allocates ~1-5 GB for padded weight MLE,
+                // freed immediately after restriction to k elements (~128 KB).
+                // Peak: ~37 GB weights + ~5 GB temp = ~42 GB.
                 let mut entries: Vec<crate::gpu_sumcheck::BatchEntry> = Vec::with_capacity(indices.len());
-                for chunk in indices.chunks(chunk_size) {
-                    let chunk_entries: Vec<crate::gpu_sumcheck::BatchEntry> = chunk.par_iter().map(|&idx| {
-                        let dm = &matmul_data[idx];
-                        let weight_b = weights.get_weight(dm.node_id).expect("weight exists");
-                        crate::gpu_sumcheck::prepare_batch_entry(
-                            dm.node_id, &dm.a, weight_b, &dm.c,
-                        ).map_err(|e| ModelError::ProvingError {
-                            layer: dm.node_id,
-                            message: format!("Batch prep: {e}"),
-                        })
-                    }).collect::<Result<Vec<_>, ModelError>>()?;
-                    entries.extend(chunk_entries);
+                for (i, &idx) in indices.iter().enumerate() {
+                    let dm = &matmul_data[idx];
+                    let weight_b = weights.get_weight(dm.node_id).expect("weight exists");
+                    let entry = crate::gpu_sumcheck::prepare_batch_entry(
+                        dm.node_id, &dm.a, weight_b, &dm.c,
+                    ).map_err(|e| ModelError::ProvingError {
+                        layer: dm.node_id,
+                        message: format!("Batch prep: {e}"),
+                    })?;
+                    entries.push(entry);
 
-                    // Free A/C matrices after prep — BatchEntry holds only restricted
-                    // f_a/f_b (k elements). B is looked up from GraphWeights (not cloned).
-                    for &idx in chunk {
-                        matmul_data[idx].a = M31Matrix::new(0, 0);
-                        matmul_data[idx].c = M31Matrix::new(0, 0);
+                    // Free A/C after prep (B looked up from GraphWeights, not cloned)
+                    matmul_data[idx].a = M31Matrix::new(0, 0);
+                    matmul_data[idx].c = M31Matrix::new(0, 0);
+
+                    if (i + 1) % 10 == 0 || i + 1 == indices.len() {
+                        eprintln!(
+                            "      [{}/{}] entries prepared ({:.1}s)",
+                            i + 1, indices.len(), t_prep.elapsed().as_secs_f64(),
+                        );
                     }
-
-                    eprintln!(
-                        "      [{}/{}] entries prepared ({:.1}s)",
-                        entries.len(), indices.len(), t_prep.elapsed().as_secs_f64(),
-                    );
                 }
                 eprintln!("    Prep done in {:.1}s", t_prep.elapsed().as_secs_f64());
 
