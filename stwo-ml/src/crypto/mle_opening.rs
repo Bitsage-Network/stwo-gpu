@@ -54,8 +54,24 @@ pub struct MleQueryRoundData {
 /// Returns (root, tree).
 pub fn commit_mle(evals: &[SecureField]) -> (FieldElement, PoseidonMerkleTree) {
     let leaves: Vec<FieldElement> = evals.iter().map(|&sf| securefield_to_felt(sf)).collect();
-    let tree = PoseidonMerkleTree::build(leaves);
+    let tree = PoseidonMerkleTree::build_parallel(leaves);
     (tree.root(), tree)
+}
+
+/// Compute only the MLE commitment root without storing the full tree.
+///
+/// Uses parallel leaf conversion (rayon) and parallel Merkle hashing.
+/// More efficient than `commit_mle` when only the root is needed
+/// (e.g., in batch entry preparation where the tree is discarded).
+pub fn commit_mle_root_only(evals: &[SecureField]) -> FieldElement {
+    use rayon::prelude::*;
+
+    let leaves: Vec<FieldElement> = if evals.len() >= 256 {
+        evals.par_iter().map(|&sf| securefield_to_felt(sf)).collect()
+    } else {
+        evals.iter().map(|&sf| securefield_to_felt(sf)).collect()
+    };
+    PoseidonMerkleTree::root_only_parallel(leaves)
 }
 
 /// Generate an MLE opening proof.

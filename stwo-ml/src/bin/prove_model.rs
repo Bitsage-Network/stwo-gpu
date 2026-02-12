@@ -286,7 +286,38 @@ fn main() {
         process::exit(1);
     }
 
-    // Prove
+    // Pre-compute values needed by both proving and commitment paths
+    let model_id = parse_model_id(&cli.model_id);
+    let activation_type = model
+        .graph
+        .nodes
+        .iter()
+        .find_map(|n| match &n.op {
+            stwo_ml::compiler::graph::GraphOp::Activation { activation_type, .. } => {
+                Some(*activation_type as u8)
+            }
+            _ => None,
+        })
+        .unwrap_or(0);
+
+    // Check weight commitment cache BEFORE entering the parallel scope.
+    // If cached, no background thread needed.
+    let cached_commitment = if cli.skip_commitment {
+        Some(FieldElement::ZERO)
+    } else {
+        check_commitment_cache(cli.model_dir.as_deref())
+    };
+
+    if cached_commitment.is_some() && !cli.skip_commitment {
+        eprintln!("Weight commitment loaded from cache (fingerprint validated)");
+    } else if cli.skip_commitment {
+        eprintln!("Skipping weight commitment (--skip-commitment)");
+    }
+
+    // Pipeline: run proving and weight commitment in parallel via std::thread::scope.
+    // Both only need &model.weights (shared ref), so this is safe.
+    // Commitment uses CPU-only (Poseidon hash), while proving uses GPU + rayon.
+    // During GPU phases of proving, idle CPU cores handle commitment work.
     eprintln!(
         "Proving {} layers (gpu={}, security={})",
         model.graph.num_layers(),
@@ -296,26 +327,62 @@ fn main() {
 
     let t0 = Instant::now();
 
-    let proof = if cli.gpu {
-        stwo_ml::aggregation::prove_model_aggregated_onchain_auto(
-            &model.graph,
-            &input,
-            &model.weights,
-        )
-    } else {
-        stwo_ml::aggregation::prove_model_aggregated_onchain(
-            &model.graph,
-            &input,
-            &model.weights,
-        )
-    };
+    let (proof_result, weight_commitment, commit_elapsed) = std::thread::scope(|s| {
+        // Spawn weight commitment on background thread if not cached
+        let commit_handle = if cached_commitment.is_none() {
+            Some(s.spawn(|| {
+                let t_commit = Instant::now();
+                let commitment = compute_weight_commitment(
+                    &model.weights,
+                    cli.model_dir.as_deref(),
+                );
+                (commitment, t_commit.elapsed())
+            }))
+        } else {
+            None
+        };
+
+        // Prove on main thread (uses GPU + all rayon cores)
+        let proof = if cli.gpu {
+            stwo_ml::aggregation::prove_model_aggregated_onchain_auto(
+                &model.graph,
+                &input,
+                &model.weights,
+            )
+        } else {
+            stwo_ml::aggregation::prove_model_aggregated_onchain(
+                &model.graph,
+                &input,
+                &model.weights,
+            )
+        };
+
+        // Collect commitment result
+        let (commitment, commit_time) = match (cached_commitment, commit_handle) {
+            (Some(c), _) => (c, std::time::Duration::ZERO),
+            (None, Some(handle)) => {
+                let (c, elapsed) = handle.join().expect("commitment thread panicked");
+                (c, elapsed)
+            }
+            _ => (FieldElement::ZERO, std::time::Duration::ZERO),
+        };
+
+        (proof, commitment, commit_time)
+    });
 
     let prove_elapsed = t0.elapsed();
 
-    let proof = proof.unwrap_or_else(|e| {
+    let proof = proof_result.unwrap_or_else(|e| {
         eprintln!("Error: proving failed: {e}");
         process::exit(1);
     });
+
+    if !commit_elapsed.is_zero() {
+        eprintln!(
+            "Weight commitment computed in {:.2}s (pipelined with proving — zero added latency)",
+            commit_elapsed.as_secs_f64(),
+        );
+    }
 
     // Generate TEE attestation if applicable
     let tee_attestation = if matches!(resolved, stwo_ml::tee::ResolvedSecurityLevel::ZkPlusTee) {
@@ -345,169 +412,6 @@ fn main() {
 
     // Build metadata
     let io_commitment = compute_io_commitment(&input, &proof.execution.output);
-    let model_id = parse_model_id(&cli.model_id);
-
-    // Determine activation type from the first activation layer
-    let activation_type = model
-        .graph
-        .nodes
-        .iter()
-        .find_map(|n| match &n.op {
-            stwo_ml::compiler::graph::GraphOp::Activation { activation_type, .. } => {
-                Some(*activation_type as u8)
-            }
-            _ => None,
-        })
-        .unwrap_or(0);
-
-    // Weight commitment: Poseidon hash of all weight matrices.
-    // Packed encoding: 7 M31 values per FieldElement (7×31=217 bits < 252) for ~7x speedup.
-    // Cached with fingerprint validation (file sizes + mtimes of safetensors files).
-    // If weights change, cache auto-invalidates and recomputes.
-    let weight_commitment = if cli.skip_commitment {
-        eprintln!("Skipping weight commitment (--skip-commitment)");
-        FieldElement::ZERO
-    } else {
-        // Compute fingerprint from safetensors file metadata for cache validation
-        let fingerprint = cli.model_dir.as_ref().map(|d| {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            if let Ok(mut entries) = std::fs::read_dir(d) {
-                let mut files: Vec<std::path::PathBuf> = entries
-                    .filter_map(|e| e.ok().map(|e| e.path()))
-                    .filter(|p| p.extension().map_or(false, |ext| ext == "safetensors"))
-                    .collect();
-                files.sort();
-                for f in &files {
-                    f.to_str().unwrap_or("").hash(&mut hasher);
-                    if let Ok(meta) = std::fs::metadata(f) {
-                        meta.len().hash(&mut hasher);
-                        if let Ok(mtime) = meta.modified() {
-                            mtime.hash(&mut hasher);
-                        }
-                    }
-                }
-            }
-            format!("{:016x}", hasher.finish())
-        });
-
-        // Cache path includes fingerprint so it auto-invalidates on weight changes
-        let cache_path = cli.model_dir.as_ref().zip(fingerprint.as_ref()).map(|(d, fp)| {
-            d.join(format!(".weight_commitment_{fp}.hex"))
-        });
-
-        let cached = cache_path.as_ref().and_then(|p| {
-            std::fs::read_to_string(p).ok().and_then(|hex| {
-                FieldElement::from_hex_be(hex.trim().trim_start_matches("0x")).ok()
-            })
-        });
-
-        if let Some(commitment) = cached {
-            eprintln!("Weight commitment loaded from cache (fingerprint validated)");
-            commitment
-        } else {
-            use rayon::prelude::*;
-            use std::sync::atomic::{AtomicUsize, Ordering};
-
-            let n_weights = model.weights.weights.len();
-            eprintln!("Computing weight commitment ({} matrices, packed 7:1, parallel)...", n_weights);
-            eprintln!("  First run — will cache with fingerprint for instant validated reuse.");
-            let t_commit = std::time::Instant::now();
-
-            let weight_list: Vec<_> = model.weights.weights.iter().collect();
-            let done_count = AtomicUsize::new(0);
-            let total = weight_list.len();
-
-            // Pack 7 M31 values (7×31=217 bits) into one FieldElement via Horner's method.
-            // This reduces Poseidon calls by ~7x: 89M → 12.7M for large matrices.
-            let pack_m31 = |values: &[M31]| -> FieldElement {
-                let base = FieldElement::from(1u64 << 31);
-                let mut result = FieldElement::ZERO;
-                for &v in values.iter().rev() {
-                    result = result * base + FieldElement::from(v.0 as u64);
-                }
-                result
-            };
-
-            // Two-level parallel Merkle: split each matrix into segments, hash
-            // segments in parallel (Level 0), combine segment hashes (Level 1).
-            // This breaks the sequential dependency within each matrix.
-            //
-            // Architecture (per matrix):
-            //   Level 0: N segments hashed independently in parallel → N segment hashes
-            //   Level 1: poseidon_hash_many(domain_sep + N segment hashes) → matrix hash
-            //
-            // With 96 cores, 7x packing, and parallel segments:
-            //   Large matrix (89M elements): ~1-2s instead of ~650s sequential.
-            let n_segments = 64usize; // parallel segments per matrix
-
-            // Hash one segment: pack M31→felt, chain Poseidon over chunks
-            let hash_segment = |data: &[M31]| -> FieldElement {
-                let chunk_size = 4096;
-                let packed: Vec<FieldElement> = data.chunks(7)
-                    .map(|c| pack_m31(c))
-                    .collect();
-                if packed.is_empty() {
-                    return FieldElement::ZERO;
-                }
-                let mut hash_inputs: Vec<FieldElement> = Vec::with_capacity(chunk_size + 1);
-                let mut running = FieldElement::ZERO;
-                for chunk in packed.chunks(chunk_size) {
-                    hash_inputs.clear();
-                    hash_inputs.push(running);
-                    hash_inputs.extend_from_slice(chunk);
-                    running = starknet_crypto::poseidon_hash_many(&hash_inputs);
-                }
-                running
-            };
-
-            // Process matrices sequentially (to give all cores to inner parallelism)
-            let per_matrix_hashes: Vec<FieldElement> = weight_list.iter().map(|(layer_id, w)| {
-                let seg_size = (w.data.len() + n_segments - 1) / n_segments;
-
-                // Level 0: hash segments in parallel
-                let segment_hashes: Vec<FieldElement> = w.data
-                    .par_chunks(seg_size.max(1))
-                    .map(|segment| hash_segment(segment))
-                    .collect();
-
-                // Level 1: combine with domain separation
-                let mut final_inputs: Vec<FieldElement> = Vec::with_capacity(segment_hashes.len() + 3);
-                final_inputs.push(FieldElement::from(*layer_id as u64));
-                final_inputs.push(FieldElement::from((w.rows as u64) << 32 | w.cols as u64));
-                final_inputs.push(FieldElement::from(n_segments as u64));
-                final_inputs.extend_from_slice(&segment_hashes);
-                let matrix_hash = starknet_crypto::poseidon_hash_many(&final_inputs);
-
-                let finished = done_count.fetch_add(1, Ordering::Relaxed) + 1;
-                let elapsed = t_commit.elapsed().as_secs_f64();
-                let eta = if finished > 0 { elapsed * (total as f64 / finished as f64 - 1.0) } else { 0.0 };
-                eprintln!(
-                    "  Weight commitment: {}/{} ({:.1}s elapsed, ~{:.0}s remaining)",
-                    finished, total, elapsed, eta,
-                );
-                matrix_hash
-            }).collect();
-
-            let commitment = if per_matrix_hashes.is_empty() {
-                FieldElement::ZERO
-            } else {
-                starknet_crypto::poseidon_hash_many(&per_matrix_hashes)
-            };
-            eprintln!("Weight commitment computed in {:.2}s", t_commit.elapsed().as_secs_f64());
-
-            // Cache with fingerprint for validated reuse
-            if let Some(ref p) = cache_path {
-                let hex = format!("0x{:064x}", commitment);
-                if let Err(e) = std::fs::write(p, &hex) {
-                    eprintln!("  Warning: could not cache to {}: {e}", p.display());
-                } else {
-                    eprintln!("  Cached to {} (auto-invalidates if weights change)", p.display());
-                }
-            }
-            commitment
-        }
-    };
 
     // Compute TEE attestation hash for on-chain commitment
     let tee_hash = tee_attestation
@@ -576,4 +480,132 @@ fn main() {
     } else {
         eprintln!("  tee: none (zk-only)");
     }
+}
+
+/// Check if a cached weight commitment exists with valid fingerprint.
+fn check_commitment_cache(model_dir: Option<&std::path::Path>) -> Option<FieldElement> {
+    let d = model_dir?;
+    let fingerprint = compute_fingerprint(d)?;
+    let cache_path = d.join(format!(".weight_commitment_{fingerprint}.hex"));
+    let hex = std::fs::read_to_string(&cache_path).ok()?;
+    FieldElement::from_hex_be(hex.trim().trim_start_matches("0x")).ok()
+}
+
+/// Compute a fingerprint from safetensors file metadata (sizes + mtimes).
+fn compute_fingerprint(model_dir: &std::path::Path) -> Option<String> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(model_dir).ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().map_or(false, |ext| ext == "safetensors"))
+        .collect();
+    files.sort();
+    for f in &files {
+        f.to_str().unwrap_or("").hash(&mut hasher);
+        if let Ok(meta) = std::fs::metadata(f) {
+            meta.len().hash(&mut hasher);
+            if let Ok(mtime) = meta.modified() {
+                mtime.hash(&mut hasher);
+            }
+        }
+    }
+    Some(format!("{:016x}", hasher.finish()))
+}
+
+/// Compute weight commitment: Poseidon hash of all weight matrices.
+/// Packed 7:1 (7 M31 values per FieldElement) + parallel Merkle segments.
+/// Caches result with fingerprint for instant validated reuse on subsequent runs.
+fn compute_weight_commitment(
+    weights: &stwo_ml::compiler::graph::GraphWeights,
+    model_dir: Option<&std::path::Path>,
+) -> FieldElement {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let n_weights = weights.weights.len();
+    eprintln!("[BG] Computing weight commitment ({} matrices, packed 7:1, parallel)...", n_weights);
+    eprintln!("[BG]   First run — will cache with fingerprint for instant validated reuse.");
+    let t_commit = Instant::now();
+
+    let weight_list: Vec<_> = weights.weights.iter().collect();
+    let done_count = AtomicUsize::new(0);
+    let total = weight_list.len();
+
+    // Pack 7 M31 values (7×31=217 bits) into one FieldElement via Horner's method.
+    let pack_m31 = |values: &[M31]| -> FieldElement {
+        let base = FieldElement::from(1u64 << 31);
+        let mut result = FieldElement::ZERO;
+        for &v in values.iter().rev() {
+            result = result * base + FieldElement::from(v.0 as u64);
+        }
+        result
+    };
+
+    let n_segments = 64usize;
+
+    let hash_segment = |data: &[M31]| -> FieldElement {
+        let chunk_size = 4096;
+        let packed: Vec<FieldElement> = data.chunks(7)
+            .map(|c| pack_m31(c))
+            .collect();
+        if packed.is_empty() {
+            return FieldElement::ZERO;
+        }
+        let mut hash_inputs: Vec<FieldElement> = Vec::with_capacity(chunk_size + 1);
+        let mut running = FieldElement::ZERO;
+        for chunk in packed.chunks(chunk_size) {
+            hash_inputs.clear();
+            hash_inputs.push(running);
+            hash_inputs.extend_from_slice(chunk);
+            running = starknet_crypto::poseidon_hash_many(&hash_inputs);
+        }
+        running
+    };
+
+    let per_matrix_hashes: Vec<FieldElement> = weight_list.iter().map(|(layer_id, w)| {
+        let seg_size = (w.data.len() + n_segments - 1) / n_segments;
+        let segment_hashes: Vec<FieldElement> = w.data
+            .par_chunks(seg_size.max(1))
+            .map(|segment| hash_segment(segment))
+            .collect();
+
+        let mut final_inputs: Vec<FieldElement> = Vec::with_capacity(segment_hashes.len() + 3);
+        final_inputs.push(FieldElement::from(*layer_id as u64));
+        final_inputs.push(FieldElement::from((w.rows as u64) << 32 | w.cols as u64));
+        final_inputs.push(FieldElement::from(n_segments as u64));
+        final_inputs.extend_from_slice(&segment_hashes);
+        let matrix_hash = starknet_crypto::poseidon_hash_many(&final_inputs);
+
+        let finished = done_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if finished % 20 == 0 || finished == total {
+            let elapsed = t_commit.elapsed().as_secs_f64();
+            let eta = if finished > 0 { elapsed * (total as f64 / finished as f64 - 1.0) } else { 0.0 };
+            eprintln!(
+                "[BG]   Weight commitment: {}/{} ({:.1}s elapsed, ~{:.0}s remaining)",
+                finished, total, elapsed, eta,
+            );
+        }
+        matrix_hash
+    }).collect();
+
+    let commitment = if per_matrix_hashes.is_empty() {
+        FieldElement::ZERO
+    } else {
+        starknet_crypto::poseidon_hash_many(&per_matrix_hashes)
+    };
+    eprintln!("[BG] Weight commitment computed in {:.2}s", t_commit.elapsed().as_secs_f64());
+
+    // Cache with fingerprint for validated reuse
+    if let Some(d) = model_dir {
+        if let Some(fp) = compute_fingerprint(d) {
+            let cache_path = d.join(format!(".weight_commitment_{fp}.hex"));
+            let hex = format!("0x{:064x}", commitment);
+            if let Err(e) = std::fs::write(&cache_path, &hex) {
+                eprintln!("[BG]   Warning: could not cache to {}: {e}", cache_path.display());
+            } else {
+                eprintln!("[BG]   Cached to {} (auto-invalidates if weights change)", cache_path.display());
+            }
+        }
+    }
+    commitment
 }

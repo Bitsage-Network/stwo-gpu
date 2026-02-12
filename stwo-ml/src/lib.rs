@@ -60,7 +60,7 @@ pub mod prelude {
     pub use crate::backend::BackendInfo;
     pub use crate::gpu::GpuModelProver;
     pub use crate::crypto::poseidon_channel::PoseidonChannel;
-    pub use crate::crypto::mle_opening::{MleOpeningProof, commit_mle, prove_mle_opening};
+    pub use crate::crypto::mle_opening::{MleOpeningProof, commit_mle, commit_mle_root_only, prove_mle_opening};
     pub use crate::components::matmul::{
         MatMulSumcheckProofOnChain, RoundPoly,
         prove_matmul_sumcheck_onchain, prove_matmul_sumcheck_onchain_auto,

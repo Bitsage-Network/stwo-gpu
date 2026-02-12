@@ -35,6 +35,9 @@ memmap2 = { version = "0.9", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 cudarc = { version = "0.11", features = ["driver", "nvrtc", "cuda-12050"], optional = true }
 

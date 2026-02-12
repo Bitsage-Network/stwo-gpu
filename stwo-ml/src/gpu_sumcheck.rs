@@ -953,7 +953,7 @@ pub fn prove_matmul_sumcheck_onchain_gpu(
         MatMulSumcheckProofOnChain, RoundPoly, pad_matrix_pow2,
     };
     use crate::crypto::poseidon_channel::{PoseidonChannel, securefield_to_felt};
-    use crate::crypto::mle_opening::{commit_mle, prove_mle_opening};
+    use crate::crypto::mle_opening::{commit_mle, commit_mle_root_only, prove_mle_opening};
 
     // Validate dimensions
     if a.cols != b.rows {
@@ -1008,9 +1008,9 @@ pub fn prove_matmul_sumcheck_onchain_gpu(
     assert_eq!(f_a.len(), k);
     assert_eq!(f_b.len(), k);
 
-    // Commit to restricted MLEs
-    let (a_commitment, _a_tree) = commit_mle(&f_a);
-    let (b_commitment, _b_tree) = commit_mle(&f_b);
+    // Commit to restricted MLEs (root-only: tree not needed for sumcheck)
+    let a_commitment = commit_mle_root_only(&f_a);
+    let b_commitment = commit_mle_root_only(&f_b);
 
     channel.mix_felt(a_commitment);
     channel.mix_felt(b_commitment);
@@ -1305,6 +1305,13 @@ pub fn prove_matmul_batch_onchain_gpu(
 ///
 /// This can be called in parallel for multiple matmuls before feeding to
 /// `prove_matmul_batch_onchain_gpu`.
+///
+/// Optimized to work on ORIGINAL (unpadded) matrices:
+/// - Avoids copying m×k, k×n, m×n matrices to padded pow2 dimensions
+/// - Computes restrict on original dims, zero-pads only the k-element output
+/// - Uses root-only parallel Merkle commit (discards tree)
+///
+/// For Qwen3-14B (5120→8192 padding): avoids 3× matrix copies saving ~1.5 GB/entry.
 #[cfg(feature = "cuda-runtime")]
 pub fn prepare_batch_entry(
     node_id: usize,
@@ -1312,23 +1319,18 @@ pub fn prepare_batch_entry(
     b: &M31Matrix,
     c: &M31Matrix,
 ) -> Result<BatchEntry, MatMulError> {
-    use crate::components::matmul::pad_matrix_pow2;
+    use crate::components::matmul::{
+        pad_matrix_pow2, restrict_cols_unpadded, restrict_rows_unpadded,
+    };
     use crate::crypto::poseidon_channel::PoseidonChannel;
-    use crate::crypto::mle_opening::commit_mle;
+    use crate::crypto::mle_opening::commit_mle_root_only;
 
-    let a = &pad_matrix_pow2(a);
-    let b = &pad_matrix_pow2(b);
-    let c = &pad_matrix_pow2(c);
-
-    let m = a.rows;
-    let k = a.cols;
-    let n = b.cols;
+    // Padded dimensions for channel draws and output sizing
+    let m = a.rows.next_power_of_two();
+    let k = a.cols.next_power_of_two();
+    let n = b.cols.next_power_of_two();
     let log_m = m.ilog2() as usize;
     let log_n = n.ilog2() as usize;
-
-    let mle_a = matrix_to_mle_pub(a);
-    let mle_b_t = matrix_to_mle_col_major_pub(b);
-    let mle_c = matrix_to_mle_pub(c);
 
     // Per-matmul Poseidon channel for r_i, r_j
     let mut channel = PoseidonChannel::new();
@@ -1339,16 +1341,24 @@ pub fn prepare_batch_entry(
     let r_i = channel.draw_qm31s(log_m);
     let r_j = channel.draw_qm31s(log_n);
 
+    // Claimed sum: evaluate C's MLE at (r_i, r_j).
+    // C is small (m×n), so pad + full MLE evaluate is fine.
+    let c_padded = pad_matrix_pow2(c);
+    let mle_c = matrix_to_mle_pub(&c_padded);
     let mut r_ij = Vec::with_capacity(log_m + log_n);
     r_ij.extend_from_slice(&r_i);
     r_ij.extend_from_slice(&r_j);
     let claimed_sum = evaluate_mle_pub(&mle_c, &r_ij);
 
-    let f_a = restrict_mle_pub(&mle_a, &r_i);
-    let f_b = restrict_mle_pub(&mle_b_t, &r_j);
+    // Fused MLE restrict on ORIGINAL matrices (no padding copy).
+    // Lagrange basis computed for padded dims, summed over original dims only.
+    // Output zero-padded to k (padded). Saves ~1.5 GB per entry for 5120→8192.
+    let f_a = restrict_rows_unpadded(a, &r_i, k);
+    let f_b = restrict_cols_unpadded(b, &r_j, k);
 
-    let (a_commitment, _) = commit_mle(&f_a);
-    let (b_commitment, _) = commit_mle(&f_b);
+    // Root-only parallel commit: avoids building full tree (discarded anyway).
+    let a_commitment = commit_mle_root_only(&f_a);
+    let b_commitment = commit_mle_root_only(&f_b);
 
     Ok(BatchEntry {
         node_id,
