@@ -1509,22 +1509,30 @@ where
             // Prepare batch entries and GPU batch prove (all behind cuda-runtime gate)
             #[cfg(feature = "cuda-runtime")]
             {
-                eprintln!("    Preparing {} batch entries (MLE restriction + commitment)...", indices.len());
+                use rayon::prelude::*;
+                use std::sync::atomic::{AtomicUsize, Ordering};
+
+                eprintln!("    Preparing {} batch entries (parallel MLE + commitment)...", indices.len());
                 let t_prep = std::time::Instant::now();
-                let mut entries = Vec::with_capacity(indices.len());
-                for (i, &idx) in indices.iter().enumerate() {
+                let prep_done = AtomicUsize::new(0);
+                let prep_total = indices.len();
+
+                // Parallel batch entry preparation: each entry builds MLEs,
+                // restricts them, and computes Poseidon commitments independently.
+                let entries: Vec<crate::gpu_sumcheck::BatchEntry> = indices.par_iter().map(|&idx| {
                     let dm = &matmul_data[idx];
-                    if (i + 1) % 20 == 0 || i + 1 == indices.len() {
-                        eprintln!("      [{}/{}] node {}", i + 1, indices.len(), dm.node_id);
-                    }
                     let entry = crate::gpu_sumcheck::prepare_batch_entry(
                         dm.node_id, &dm.a, &dm.b, &dm.c,
                     ).map_err(|e| ModelError::ProvingError {
                         layer: dm.node_id,
                         message: format!("Batch prep: {e}"),
                     })?;
-                    entries.push(entry);
-                }
+                    let finished = prep_done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if finished % 20 == 0 || finished == prep_total {
+                        eprintln!("      [{}/{}] entries prepared", finished, prep_total);
+                    }
+                    Ok(entry)
+                }).collect::<Result<Vec<_>, ModelError>>()?;
                 eprintln!("    Prep done in {:.1}s", t_prep.elapsed().as_secs_f64());
 
                 // GPU batch prove
