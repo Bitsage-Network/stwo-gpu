@@ -134,14 +134,27 @@ fn evaluate_mle(evals: &[SecureField], point: &[SecureField]) -> SecureField {
 /// Fix the first `assignments.len()` variables of an MLE, returning
 /// the reduced evaluations over the remaining variables.
 ///
-/// Uses in-place folding to minimize memory allocation.
+/// Uses in-place folding. Parallelized with rayon when mid >= 8192
+/// (each fold level is embarrassingly parallel: current[i] and current[mid+i]
+/// are independent across different i).
 fn restrict_mle(evals: &[SecureField], assignments: &[SecureField]) -> Vec<SecureField> {
+    use rayon::prelude::*;
     let mut current: Vec<SecureField> = evals.to_vec();
     let mut size = current.len();
     for &r in assignments.iter() {
         let mid = size / 2;
-        for i in 0..mid {
-            current[i] = current[i] + r * (current[mid + i] - current[i]);
+        if mid >= 8192 {
+            // Parallel: split into non-overlapping lo/hi halves
+            let (lo, hi) = current[..size].split_at_mut(mid);
+            let hi = &*hi; // reborrow as shared for parallel read
+            lo.par_iter_mut().enumerate().for_each(|(i, val)| {
+                *val = *val + r * (hi[i] - *val);
+            });
+        } else {
+            // Sequential: rayon overhead not worth it for small sizes
+            for i in 0..mid {
+                current[i] = current[i] + r * (current[mid + i] - current[i]);
+            }
         }
         size = mid;
     }
@@ -153,10 +166,16 @@ fn restrict_mle(evals: &[SecureField], assignments: &[SecureField]) -> Vec<Secur
 /// Convert a row-major M31Matrix into MLE evaluations (SecureField).
 /// Layout: A[i][j] at index i*cols + j.
 /// Requires rows*cols to be a power of 2.
+/// Parallelized with rayon for large matrices (>= 65536 elements).
 fn matrix_to_mle(matrix: &M31Matrix) -> Vec<SecureField> {
+    use rayon::prelude::*;
     let n = matrix.rows * matrix.cols;
     assert!(n.is_power_of_two(), "matrix size must be power of 2");
-    matrix.data.iter().map(|&v| SecureField::from(v)).collect()
+    if n >= 65536 {
+        matrix.data.par_iter().map(|&v| SecureField::from(v)).collect()
+    } else {
+        matrix.data.iter().map(|&v| SecureField::from(v)).collect()
+    }
 }
 
 /// Convert an M31Matrix into an MLE with transposed variable ordering.
