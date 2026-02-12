@@ -520,9 +520,6 @@ pub fn load_hf_model(
 
     let name_map = build_weight_name_map(&graph, layers, &all_tensor_names);
     eprintln!("  Weight name mapping: {} entries", name_map.len());
-    for (idx, name) in &name_map {
-        eprintln!("    node {} → {}", idx, name);
-    }
 
     let weights = load_weights_from_shards(
         &shard_paths, &graph, &name_map, QuantStrategy::Symmetric8,
@@ -734,10 +731,20 @@ fn load_weights_from_shards(
     }
 
     let mut weights = GraphWeights::new();
+    let total_weights = name_map.len();
+    let mut loaded_count = 0usize;
+    let t_load_start = std::time::Instant::now();
 
     for (idx, node) in graph.nodes.iter().enumerate() {
         if let GraphOp::MatMul { dims: (_m, k, n) } = &node.op {
             if let Some(tensor_name) = name_map.get(&idx) {
+                loaded_count += 1;
+                if loaded_count <= 3 || loaded_count % 20 == 0 || loaded_count == total_weights {
+                    eprintln!(
+                        "  Loading weight [{}/{}] node {} ({}x{}) — {}",
+                        loaded_count, total_weights, idx, k, n, tensor_name,
+                    );
+                }
                 // Search through shards for this tensor
                 let mut found = false;
                 for (_file, mmap) in &shard_data {
@@ -793,6 +800,11 @@ fn load_weights_from_shards(
             }
         }
     }
+
+    eprintln!(
+        "  All {} weights loaded in {:.1}s",
+        loaded_count, t_load_start.elapsed().as_secs_f64(),
+    );
 
     Ok(weights)
 }
