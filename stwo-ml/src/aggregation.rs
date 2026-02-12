@@ -202,10 +202,11 @@ pub struct BatchedMatMulEntryOnChain {
 }
 
 /// Deferred matmul data: forward pass computed, proving deferred to Phase 2.
+/// Weight matrix (B) is NOT cloned — looked up from GraphWeights during Phase 2
+/// to avoid duplicating ~37 GB of weight data in memory.
 struct DeferredMatMul {
     node_id: usize,
     a: M31Matrix,
-    b: M31Matrix,
     c: M31Matrix,
     dims: (usize, usize, usize),
 }
@@ -1225,7 +1226,6 @@ where
                 matmul_data.push(DeferredMatMul {
                     node_id: node.id,
                     a: current.clone(),
-                    b: weight.clone(),
                     c: output.clone(),
                     dims: (m, k, n),
                 });
@@ -1514,22 +1514,32 @@ where
                 eprintln!("    Preparing {} batch entries (chunked parallel MLE + commitment)...", indices.len());
                 let t_prep = std::time::Instant::now();
 
-                // Process in chunks of 16 to limit peak memory.
-                // Each entry temporarily allocates ~1.3 GB for padded weight MLE,
-                // so 16 concurrent = ~21 GB peak (safe on H200's 188 GB system RAM).
-                let chunk_size = 16;
+                // Process in chunks of 4 to limit peak memory.
+                // Large weight matrices (5120x17408 padded to 8192x32768) need ~5.4 GB
+                // temp each for MLE construction. 4 concurrent = ~22 GB peak.
+                // After each chunk, free the original A/B/C matrices we no longer need.
+                let chunk_size = 4;
                 let mut entries: Vec<crate::gpu_sumcheck::BatchEntry> = Vec::with_capacity(indices.len());
-                for (chunk_idx, chunk) in indices.chunks(chunk_size).enumerate() {
+                for chunk in indices.chunks(chunk_size) {
                     let chunk_entries: Vec<crate::gpu_sumcheck::BatchEntry> = chunk.par_iter().map(|&idx| {
                         let dm = &matmul_data[idx];
+                        let weight_b = weights.get_weight(dm.node_id).expect("weight exists");
                         crate::gpu_sumcheck::prepare_batch_entry(
-                            dm.node_id, &dm.a, &dm.b, &dm.c,
+                            dm.node_id, &dm.a, weight_b, &dm.c,
                         ).map_err(|e| ModelError::ProvingError {
                             layer: dm.node_id,
                             message: format!("Batch prep: {e}"),
                         })
                     }).collect::<Result<Vec<_>, ModelError>>()?;
                     entries.extend(chunk_entries);
+
+                    // Free A/C matrices after prep — BatchEntry holds only restricted
+                    // f_a/f_b (k elements). B is looked up from GraphWeights (not cloned).
+                    for &idx in chunk {
+                        matmul_data[idx].a = M31Matrix::new(0, 0);
+                        matmul_data[idx].c = M31Matrix::new(0, 0);
+                    }
+
                     eprintln!(
                         "      [{}/{}] entries prepared ({:.1}s)",
                         entries.len(), indices.len(), t_prep.elapsed().as_secs_f64(),
@@ -1607,18 +1617,19 @@ where
 
             let (_, estimated_mem) = estimate_sumcheck_memory(m, k, n);
 
+            let weight_b = weights.get_weight(dm.node_id).expect("weight exists");
             let proof = if estimated_mem > TILED_MEMORY_BUDGET {
                 let config = TiledMatMulConfig::from_memory_budget(
                     m, k, n, TILED_MEMORY_BUDGET,
                 );
-                let tiled = prove_tiled_matmul(&dm.a, &dm.b, &dm.c, &config)
+                let tiled = prove_tiled_matmul(&dm.a, weight_b, &dm.c, &config)
                     .map_err(|e| ModelError::ProvingError {
                         layer: dm.node_id,
                         message: format!("Tiled matmul: {e}"),
                     })?;
                 compose_tiled_proof(&tiled)
             } else {
-                prove_matmul_sumcheck_onchain_auto(&dm.a, &dm.b, &dm.c)
+                prove_matmul_sumcheck_onchain_auto(&dm.a, weight_b, &dm.c)
                     .map_err(|e| ModelError::ProvingError {
                         layer: dm.node_id,
                         message: format!("MatMul sumcheck (on-chain): {e}"),
