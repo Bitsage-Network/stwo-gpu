@@ -360,57 +360,84 @@ fn main() {
         })
         .unwrap_or(0);
 
-    // Compute weight commitment using rayon-parallel streaming Poseidon hash.
-    // Each matrix is hashed independently in parallel, then all hashes are combined.
-    // For Qwen3-14B: 160 matrices × ~9B elements → takes minutes.
-    // Use --skip-commitment for fast benchmarks; compute separately for on-chain.
+    // Weight commitment: Poseidon hash of all weight matrices.
+    // Cached to <model_dir>/.weight_commitment.hex (weights are immutable per model).
+    // First run: ~10 min for Qwen3-14B (9B elements). Subsequent runs: instant.
     let weight_commitment = if cli.skip_commitment {
         eprintln!("Skipping weight commitment (--skip-commitment)");
         FieldElement::ZERO
     } else {
-        use rayon::prelude::*;
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Try loading cached commitment
+        let cache_path = cli.model_dir.as_ref().map(|d| d.join(".weight_commitment.hex"));
+        let cached = cache_path.as_ref().and_then(|p| {
+            std::fs::read_to_string(p).ok().and_then(|hex| {
+                FieldElement::from_hex_be(hex.trim().trim_start_matches("0x")).ok()
+            })
+        });
 
-        let n_weights = model.weights.weights.len();
-        eprintln!("Computing weight commitment ({} matrices, parallel)...", n_weights);
-        let t_commit = std::time::Instant::now();
-
-        let weight_list: Vec<_> = model.weights.weights.iter().collect();
-        let done_count = AtomicUsize::new(0);
-        let total = weight_list.len();
-
-        let per_matrix_hashes: Vec<FieldElement> = weight_list.par_iter().map(|(layer_id, w)| {
-            let chunk_size = 4096;
-            let mut layer_hash_inputs: Vec<FieldElement> = Vec::with_capacity(chunk_size + 2);
-            layer_hash_inputs.push(FieldElement::from(*layer_id as u64));
-            layer_hash_inputs.push(FieldElement::from((w.rows as u64) << 32 | w.cols as u64));
-
-            let mut running_hash = starknet_crypto::poseidon_hash_many(&layer_hash_inputs);
-            layer_hash_inputs.clear();
-
-            for chunk in w.data.chunks(chunk_size) {
-                layer_hash_inputs.clear();
-                layer_hash_inputs.push(running_hash);
-                for &v in chunk {
-                    layer_hash_inputs.push(FieldElement::from(v.0 as u64));
-                }
-                running_hash = starknet_crypto::poseidon_hash_many(&layer_hash_inputs);
-            }
-
-            let finished = done_count.fetch_add(1, Ordering::Relaxed) + 1;
-            if finished % 10 == 0 || finished == total {
-                eprintln!("  Weight commitment: {}/{} matrices hashed", finished, total);
-            }
-            running_hash
-        }).collect();
-
-        let commitment = if per_matrix_hashes.is_empty() {
-            FieldElement::ZERO
+        if let Some(commitment) = cached {
+            eprintln!("Weight commitment loaded from cache (instant)");
+            commitment
         } else {
-            starknet_crypto::poseidon_hash_many(&per_matrix_hashes)
-        };
-        eprintln!("Weight commitment computed in {:.2}s", t_commit.elapsed().as_secs_f64());
-        commitment
+            use rayon::prelude::*;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            let n_weights = model.weights.weights.len();
+            eprintln!("Computing weight commitment ({} matrices, parallel)...", n_weights);
+            eprintln!("  First run for this model — will cache for instant reuse.");
+            let t_commit = std::time::Instant::now();
+
+            let weight_list: Vec<_> = model.weights.weights.iter().collect();
+            let done_count = AtomicUsize::new(0);
+            let total = weight_list.len();
+
+            let per_matrix_hashes: Vec<FieldElement> = weight_list.par_iter().map(|(layer_id, w)| {
+                let chunk_size = 4096;
+                let mut layer_hash_inputs: Vec<FieldElement> = Vec::with_capacity(chunk_size + 2);
+                layer_hash_inputs.push(FieldElement::from(*layer_id as u64));
+                layer_hash_inputs.push(FieldElement::from((w.rows as u64) << 32 | w.cols as u64));
+
+                let mut running_hash = starknet_crypto::poseidon_hash_many(&layer_hash_inputs);
+                layer_hash_inputs.clear();
+
+                for chunk in w.data.chunks(chunk_size) {
+                    layer_hash_inputs.clear();
+                    layer_hash_inputs.push(running_hash);
+                    for &v in chunk {
+                        layer_hash_inputs.push(FieldElement::from(v.0 as u64));
+                    }
+                    running_hash = starknet_crypto::poseidon_hash_many(&layer_hash_inputs);
+                }
+
+                let finished = done_count.fetch_add(1, Ordering::Relaxed) + 1;
+                // Report every matrix (not every 10) — large matrices take minutes each
+                let elapsed = t_commit.elapsed().as_secs_f64();
+                let eta = if finished > 0 { elapsed * (total as f64 / finished as f64 - 1.0) } else { 0.0 };
+                eprintln!(
+                    "  Weight commitment: {}/{} matrices hashed ({:.0}s elapsed, ~{:.0}s remaining)",
+                    finished, total, elapsed, eta,
+                );
+                running_hash
+            }).collect();
+
+            let commitment = if per_matrix_hashes.is_empty() {
+                FieldElement::ZERO
+            } else {
+                starknet_crypto::poseidon_hash_many(&per_matrix_hashes)
+            };
+            eprintln!("Weight commitment computed in {:.2}s", t_commit.elapsed().as_secs_f64());
+
+            // Cache to disk for instant reuse
+            if let Some(ref p) = cache_path {
+                let hex = format!("0x{:064x}", commitment);
+                if let Err(e) = std::fs::write(p, &hex) {
+                    eprintln!("  Warning: could not cache commitment to {}: {e}", p.display());
+                } else {
+                    eprintln!("  Cached to {} for instant reuse", p.display());
+                }
+            }
+            commitment
+        }
     };
 
     // Compute TEE attestation hash for on-chain commitment
