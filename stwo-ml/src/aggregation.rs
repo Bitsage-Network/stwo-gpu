@@ -165,6 +165,15 @@ pub enum AggregationError {
     VerificationFailed(String),
 }
 
+/// Deferred matmul data: forward pass computed, proving deferred to Phase 2.
+struct DeferredMatMul {
+    node_id: usize,
+    a: M31Matrix,
+    b: M31Matrix,
+    c: M31Matrix,
+    dims: (usize, usize, usize),
+}
+
 /// Collected activation layer data for aggregation.
 struct ActivationLayerData {
     node_id: usize,
@@ -1086,11 +1095,32 @@ where
         backend = std::any::type_name::<B>(),
         "Proving unified STARK (on-chain aggregation, Blake2sMerkleChannel)"
     );
+
+    // Print GPU status banner
+    let gpu_active = crate::backend::gpu_is_available();
+    let backend_name = std::any::type_name::<B>();
+    let is_gpu_backend = backend_name.contains("Gpu");
+    eprintln!("=== Proving Pipeline ===");
+    eprintln!("  Backend: {} {}", backend_name,
+        if is_gpu_backend { "[GPU]" } else { "[CPU/SIMD]" });
+    eprintln!("  Sumcheck: {} {}",
+        if gpu_active { "GPU-accelerated" } else { "CPU" },
+        if gpu_active { "[GPU]" } else { "[CPU]" });
+    if let Some(dev) = crate::backend::gpu_device_name() {
+        if let Some(mem) = crate::backend::gpu_available_memory() {
+            eprintln!("  Device: {} ({:.1} GB)", dev, mem as f64 / 1e9);
+        } else {
+            eprintln!("  Device: {}", dev);
+        }
+    }
+    eprintln!("========================");
+
     let config = PcsConfig::default();
     let mut intermediates: Vec<(usize, M31Matrix)> = Vec::new();
     let mut node_outputs: HashMap<usize, M31Matrix> = HashMap::new();
     let mut current = input.clone();
 
+    let mut matmul_data: Vec<DeferredMatMul> = Vec::new();
     let mut matmul_proofs: Vec<(usize, MatMulSumcheckProofOnChain)> = Vec::new();
     let mut activation_layers: Vec<ActivationLayerData> = Vec::new();
     let mut add_layers: Vec<AddLayerData> = Vec::new();
@@ -1099,12 +1129,15 @@ where
     let mut attention_layers: Vec<AttentionLayerData> = Vec::new();
     let mut embedding_layers: Vec<EmbeddingLayerData> = Vec::new();
 
-    // Memory budget for tiled matmul auto-dispatch (4GB default)
-    const TILED_MEMORY_BUDGET: usize = 4 * 1024 * 1024 * 1024;
+    // Memory budget for tiled matmul auto-dispatch.
+    // 64GB — conservative for H200 (143GB). A 5120x17408 sumcheck needs ~4.6GB,
+    // well within GPU memory. Only tile truly massive matmuls.
+    const TILED_MEMORY_BUDGET: usize = 64 * 1024 * 1024 * 1024;
 
     let topo = graph.topological_order();
     let total_nodes = topo.len();
     let t_start = std::time::Instant::now();
+    eprintln!("Phase 1/3: Forward pass ({} nodes)...", total_nodes);
     for (step, &node_id) in topo.iter().enumerate() {
         let node = &graph.nodes[node_id];
 
@@ -1119,10 +1152,9 @@ where
             GraphOp::MatMul { dims } => {
                 let (m, k, n) = *dims;
                 eprintln!(
-                    "[{}/{}] Node {} MatMul {}x{}x{} — proving sumcheck...",
+                    "  [{}/{}] Node {} MatMul {}x{}x{} — forward pass",
                     step + 1, total_nodes, node.id, m, k, n,
                 );
-                let t_node = std::time::Instant::now();
 
                 let weight = weights.get_weight(node.id).ok_or(
                     ModelError::MissingWeight(node.id)
@@ -1130,40 +1162,16 @@ where
 
                 let output = matmul_m31(&current, weight);
 
-                // Auto-dispatch: use tiled proving for large matmuls
-                let (_, estimated_mem) = estimate_sumcheck_memory(m, k, n);
-
-                let proof = if estimated_mem > TILED_MEMORY_BUDGET {
-                    eprintln!(
-                        "  -> tiled matmul (est. {:.1} GB exceeds budget)",
-                        estimated_mem as f64 / 1e9,
-                    );
-                    let config = TiledMatMulConfig::from_memory_budget(
-                        m, k, n, TILED_MEMORY_BUDGET,
-                    );
-                    let tiled = prove_tiled_matmul(&current, weight, &output, &config)
-                        .map_err(|e| ModelError::ProvingError {
-                            layer: node.id,
-                            message: format!("Tiled matmul: {e}"),
-                        })?;
-                    compose_tiled_proof(&tiled)
-                } else {
-                    // Use standard on-chain proving
-                    prove_matmul_sumcheck_onchain_auto(&current, weight, &output)
-                        .map_err(|e| ModelError::ProvingError {
-                            layer: node.id,
-                            message: format!("MatMul sumcheck (on-chain): {e}"),
-                        })?
-                };
-
-                eprintln!(
-                    "  -> done in {:.2}s (elapsed: {:.1}s)",
-                    t_node.elapsed().as_secs_f64(),
-                    t_start.elapsed().as_secs_f64(),
-                );
+                // Collect for deferred proving (Phase 2)
+                matmul_data.push(DeferredMatMul {
+                    node_id: node.id,
+                    a: current.clone(),
+                    b: weight.clone(),
+                    c: output.clone(),
+                    dims: (m, k, n),
+                });
 
                 intermediates.push((node.id, current.clone()));
-                matmul_proofs.push((node.id, proof));
                 node_outputs.insert(node.id, output.clone());
                 current = output;
             }
@@ -1278,9 +1286,10 @@ where
             }
 
             GraphOp::Attention { config: attn_config } => {
+                let tag = if gpu_active { "[GPU]" } else { "[CPU]" };
                 eprintln!(
-                    "[{}/{}] Node {} Attention (heads={}, d_model={})",
-                    step + 1, total_nodes, node.id,
+                    "{} [{}/{}] Node {} Attention (heads={}, d_model={})",
+                    tag, step + 1, total_nodes, node.id,
                     attn_config.num_heads, attn_config.d_model,
                 );
                 let t_node = std::time::Instant::now();
@@ -1306,8 +1315,8 @@ where
                     node_outputs.insert(node.id, inter.final_output.clone());
                     current = inter.final_output;
                     eprintln!(
-                        "  -> done in {:.2}s (elapsed: {:.1}s)",
-                        t_node.elapsed().as_secs_f64(),
+                        "  -> {} done in {:.2}s (elapsed: {:.1}s)",
+                        tag, t_node.elapsed().as_secs_f64(),
                         t_start.elapsed().as_secs_f64(),
                     );
                 } else {
@@ -1347,9 +1356,10 @@ where
             }
 
             GraphOp::Conv2D { in_channels, out_channels, kernel_size, stride, padding } => {
+                let tag = if gpu_active { "[GPU]" } else { "[CPU]" };
                 eprintln!(
-                    "[{}/{}] Node {} Conv2D ({}->{}ch, k={}, s={}, p={})",
-                    step + 1, total_nodes, node.id,
+                    "{} [{}/{}] Node {} Conv2D ({}->{}ch, k={}, s={}, p={})",
+                    tag, step + 1, total_nodes, node.id,
                     in_channels, out_channels, kernel_size, stride, padding,
                 );
                 let t_node = std::time::Instant::now();
@@ -1393,21 +1403,80 @@ where
     }
 
     eprintln!(
-        "Forward pass + sumcheck proving complete ({} nodes in {:.1}s)",
+        "Phase 1 complete: forward pass ({} nodes in {:.1}s)",
         total_nodes, t_start.elapsed().as_secs_f64(),
     );
     eprintln!(
-        "  MatMul proofs: {}, Activations: {}, Attention: {}, Add: {}, Mul: {}, LayerNorm: {}",
-        matmul_proofs.len(), activation_layers.len(), attention_layers.len(),
+        "  Deferred: {} matmuls, {} attention, {} activations, {} add, {} mul, {} layernorm",
+        matmul_data.len(), attention_layers.len(), activation_layers.len(),
         add_layers.len(), mul_layers.len(), layernorm_layers.len(),
     );
 
-    // Prove attention layers (on-chain format)
+    // =====================================================================
+    // Phase 2: Prove all matmul sumchecks (GPU, cached executor)
+    // =====================================================================
+    let tag = if gpu_active { "[GPU]" } else { "[CPU]" };
+    eprintln!(
+        "Phase 2/3: {} Proving {} matmul sumchecks...",
+        tag, matmul_data.len(),
+    );
+    let t_phase2 = std::time::Instant::now();
+
+    for (i, dm) in matmul_data.iter().enumerate() {
+        let (m, k, n) = dm.dims;
+        eprintln!(
+            "  {} [{}/{}] Node {} MatMul {}x{}x{}",
+            tag, i + 1, matmul_data.len(), dm.node_id, m, k, n,
+        );
+        let t_node = std::time::Instant::now();
+
+        let (_, estimated_mem) = estimate_sumcheck_memory(m, k, n);
+
+        let proof = if estimated_mem > TILED_MEMORY_BUDGET {
+            eprintln!(
+                "    -> tiled (est. {:.1} GB exceeds {:.0} GB budget)",
+                estimated_mem as f64 / 1e9,
+                TILED_MEMORY_BUDGET as f64 / 1e9,
+            );
+            let config = TiledMatMulConfig::from_memory_budget(
+                m, k, n, TILED_MEMORY_BUDGET,
+            );
+            let tiled = prove_tiled_matmul(&dm.a, &dm.b, &dm.c, &config)
+                .map_err(|e| ModelError::ProvingError {
+                    layer: dm.node_id,
+                    message: format!("Tiled matmul: {e}"),
+                })?;
+            compose_tiled_proof(&tiled)
+        } else {
+            prove_matmul_sumcheck_onchain_auto(&dm.a, &dm.b, &dm.c)
+                .map_err(|e| ModelError::ProvingError {
+                    layer: dm.node_id,
+                    message: format!("MatMul sumcheck (on-chain): {e}"),
+                })?
+        };
+
+        eprintln!(
+            "    -> {} done in {:.2}s (elapsed: {:.1}s)",
+            tag, t_node.elapsed().as_secs_f64(), t_start.elapsed().as_secs_f64(),
+        );
+
+        matmul_proofs.push((dm.node_id, proof));
+    }
+
+    eprintln!(
+        "Phase 2 complete: {} matmul proofs in {:.1}s",
+        matmul_proofs.len(), t_phase2.elapsed().as_secs_f64(),
+    );
+
+    // =====================================================================
+    // Phase 2b: Prove attention layers (on-chain format, GPU sumchecks)
+    // =====================================================================
+    let attn_tag = if gpu_active { "[GPU]" } else { "[CPU]" };
     let mut attention_proofs = Vec::new();
     for (i, layer) in attention_layers.iter().enumerate() {
         eprintln!(
-            "Proving attention sumchecks [{}/{}] (node {})...",
-            i + 1, attention_layers.len(), layer.node_id,
+            "{} Proving attention sumchecks [{}/{}] (node {}, 6 matmuls)...",
+            attn_tag, i + 1, attention_layers.len(), layer.node_id,
         );
         let t_attn = std::time::Instant::now();
         let proof = prove_attention_onchain(
@@ -1416,8 +1485,8 @@ where
             format!("Attention node {} (on-chain): {e}", layer.node_id),
         ))?;
         eprintln!(
-            "  -> attention node {} proved in {:.2}s (elapsed: {:.1}s)",
-            layer.node_id, t_attn.elapsed().as_secs_f64(), t_start.elapsed().as_secs_f64(),
+            "  -> {} attention node {} proved in {:.2}s (elapsed: {:.1}s)",
+            attn_tag, layer.node_id, t_attn.elapsed().as_secs_f64(), t_start.elapsed().as_secs_f64(),
         );
         attention_proofs.push((layer.node_id, proof));
     }
@@ -1447,7 +1516,7 @@ where
     }
 
     // Build unified STARK using backend B + Blake2sMerkleChannel
-    eprintln!("Building unified STARK proof (all non-matmul components)...");
+    eprintln!("Phase 3/3: {} Building unified STARK proof (all non-matmul components)...", tag);
     let t_stark = std::time::Instant::now();
     // Per-component log_sizes: each component uses its own size derived from
     // its table or data length. The max_log_size drives twiddle precomputation.

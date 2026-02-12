@@ -41,7 +41,7 @@ use crate::components::activation::{ActivationEval, ActivationType};
 use crate::components::matmul::{
     M31Matrix, MatMulError, MatMulSumcheckProof,
     MatMulSumcheckProofOnChain,
-    matmul_m31, prove_matmul_sumcheck,
+    matmul_m31, prove_matmul_sumcheck_auto,
     prove_matmul_sumcheck_onchain_auto,
 };
 use crate::compiler::prove::prove_activation_layer;
@@ -478,15 +478,15 @@ where
     let v_p = pad_to_pow2(&intermediates.v);
 
     // 1. Q projection proof
-    let q_proof = prove_matmul_sumcheck(&input_p, &wq_p, &q_p)
+    let q_proof = prove_matmul_sumcheck_auto(&input_p, &wq_p, &q_p)
         .map_err(|e| AttentionError::MatMul { stage: "Q_projection".into(), source: e })?;
 
     // 2. K projection proof
-    let k_proof = prove_matmul_sumcheck(&input_p, &wk_p, &k_p)
+    let k_proof = prove_matmul_sumcheck_auto(&input_p, &wk_p, &k_p)
         .map_err(|e| AttentionError::MatMul { stage: "K_projection".into(), source: e })?;
 
     // 3. V projection proof
-    let v_proof = prove_matmul_sumcheck(&input_p, &wv_p, &v_p)
+    let v_proof = prove_matmul_sumcheck_auto(&input_p, &wv_p, &v_p)
         .map_err(|e| AttentionError::MatMul { stage: "V_projection".into(), source: e })?;
 
     // Split for per-head proofs
@@ -507,7 +507,7 @@ where
 
         // We need the padded score matrix that matches q_h_p × k_t_p
         let scores_p_raw = matmul_m31(&q_h_p, &k_t_p);
-        let score_proof = prove_matmul_sumcheck(&q_h_p, &k_t_p, &scores_p_raw)
+        let score_proof = prove_matmul_sumcheck_auto(&q_h_p, &k_t_p, &scores_p_raw)
             .map_err(|e| AttentionError::MatMul {
                 stage: format!("score_head_{h}"),
                 source: e,
@@ -525,7 +525,7 @@ where
         let soft_p = pad_to_pow2(&intermediates.softmax_outputs[h]);
         let v_h_p = pad_to_pow2(&v_heads[h]);
         let context_p = matmul_m31(&soft_p, &v_h_p);
-        let attn_v_proof = prove_matmul_sumcheck(&soft_p, &v_h_p, &context_p)
+        let attn_v_proof = prove_matmul_sumcheck_auto(&soft_p, &v_h_p, &context_p)
             .map_err(|e| AttentionError::MatMul {
                 stage: format!("attn_v_head_{h}"),
                 source: e,
@@ -536,7 +536,7 @@ where
     // Output projection proof
     let concat_p = pad_to_pow2(&intermediates.concat);
     let out_p = pad_to_pow2(&intermediates.final_output);
-    let output_proof = prove_matmul_sumcheck(&concat_p, &wo_p, &out_p)
+    let output_proof = prove_matmul_sumcheck_auto(&concat_p, &wo_p, &out_p)
         .map_err(|e| AttentionError::MatMul { stage: "output_projection".into(), source: e })?;
 
     // Batched softmax exp STARK proof (all heads in one proof)

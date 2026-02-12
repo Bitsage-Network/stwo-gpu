@@ -15,6 +15,8 @@
 
 #[cfg(feature = "cuda-runtime")]
 use std::sync::Arc;
+#[cfg(feature = "cuda-runtime")]
+use std::sync::OnceLock;
 
 #[cfg(feature = "cuda-runtime")]
 use num_traits::{One, Zero};
@@ -38,6 +40,9 @@ use stwo::prover::backend::gpu::cuda_executor::{get_cuda_executor, CudaFftError}
 
 #[cfg(feature = "cuda-runtime")]
 use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, LaunchConfig, LaunchAsync};
+
+#[cfg(feature = "cuda-runtime")]
+use starknet_ff::FieldElement;
 
 #[cfg(feature = "cuda-runtime")]
 use crate::components::matmul::{
@@ -407,6 +412,21 @@ impl GpuSumcheckExecutor {
         })
     }
 
+    /// Get or create a cached global GPU executor.
+    ///
+    /// CUDA kernels are compiled via NVRTC exactly once on first call,
+    /// then reused for all subsequent sumcheck proofs. This avoids
+    /// recompiling ~200ms of NVRTC per matmul × 160+ matmuls = 32 seconds wasted.
+    pub fn cached() -> Result<Arc<Self>, CudaFftError> {
+        static EXECUTOR: OnceLock<Arc<GpuSumcheckExecutor>> = OnceLock::new();
+        EXECUTOR.get_or_try_init(|| {
+            eprintln!("[GPU] Compiling sumcheck CUDA kernels (one-time)...");
+            let executor = GpuSumcheckExecutor::new()?;
+            eprintln!("[GPU] Kernels compiled and cached.");
+            Ok(Arc::new(executor))
+        }).cloned()
+    }
+
     /// Compute the sumcheck round polynomial (s0, s1, s2) on GPU.
     ///
     /// Returns three QM31 values representing the polynomial evaluated at t=0, t=1, t=2.
@@ -729,11 +749,9 @@ pub fn prove_matmul_sumcheck_gpu(
     assert_eq!(f_a.len(), k, "f_a should have k={k} elements");
     assert_eq!(f_b.len(), k, "f_b should have k={k} elements");
 
-    // Initialize GPU executor
-    let gpu_executor = Arc::new(
-        GpuSumcheckExecutor::new()
-            .map_err(|e| MatMulError::SumcheckFailed(format!("GPU init: {e}")))?
-    );
+    // Get cached GPU executor (kernels compiled once, reused across all matmuls)
+    let gpu_executor = GpuSumcheckExecutor::cached()
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU init: {e}")))?;
 
     // Upload restricted MLEs to GPU
     let f_a_u32: Vec<u32> = f_a.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
@@ -864,8 +882,8 @@ pub fn prove_matmul_sumcheck_onchain_gpu(
     channel.mix_felt(a_commitment);
     channel.mix_felt(b_commitment);
 
-    // Initialize GPU executor and upload MLEs
-    let gpu_executor = GpuSumcheckExecutor::new()
+    // Get cached GPU executor (kernels compiled once, reused across all matmuls)
+    let gpu_executor = GpuSumcheckExecutor::cached()
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU init: {e}")))?;
 
     let f_a_u32: Vec<u32> = f_a.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
@@ -949,6 +967,268 @@ pub fn prove_matmul_sumcheck_onchain_gpu(
         b_commitment,
         a_opening,
         b_opening,
+    })
+}
+
+// =============================================================================
+// Batched Sumcheck — Multiple Matmuls in One Protocol
+// =============================================================================
+
+/// Per-matmul data for a batch: the pre-computed MLE restrictions and metadata.
+#[cfg(feature = "cuda-runtime")]
+pub struct BatchEntry {
+    pub node_id: usize,
+    pub m: usize,
+    pub k: usize,
+    pub n: usize,
+    pub claimed_sum: SecureField,
+    pub r_i: Vec<SecureField>,
+    pub r_j: Vec<SecureField>,
+    pub a_commitment: starknet_ff::FieldElement,
+    pub b_commitment: starknet_ff::FieldElement,
+    /// Restricted f_a (k elements)
+    pub f_a: Vec<SecureField>,
+    /// Restricted f_b (k elements)
+    pub f_b: Vec<SecureField>,
+}
+
+/// Result of a batched sumcheck: shared round polys + per-matmul final evaluations.
+#[cfg(feature = "cuda-runtime")]
+pub struct BatchedSumcheckResult {
+    pub round_polys: Vec<crate::components::matmul::RoundPoly>,
+    pub assignment: Vec<SecureField>,
+    pub lambda: SecureField,
+    pub per_matmul: Vec<BatchedPerMatMulResult>,
+}
+
+#[cfg(feature = "cuda-runtime")]
+pub struct BatchedPerMatMulResult {
+    pub node_id: usize,
+    pub final_a_eval: SecureField,
+    pub final_b_eval: SecureField,
+}
+
+/// Prove a batch of matmuls with the same padded k dimension in one sumcheck.
+///
+/// Uses lambda-weighted combination: h(x) = Σ_i λ^i · f_a_i(x) · f_b_i(x)
+/// This collapses N individual sumcheck protocols into ONE, sharing:
+///   - Round polynomials (combined with lambda)
+///   - Fiat-Shamir transcript (one PoseidonChannel)
+///   - Sumcheck assignment (shared challenges)
+///
+/// Per-matmul data (claimed_sum, commitments, final evals) remains individual.
+///
+/// For Qwen3-14B: ~80 matmuls per dimension group → 2 batched sumchecks instead of 160.
+#[cfg(feature = "cuda-runtime")]
+pub fn prove_matmul_batch_onchain_gpu(
+    entries: &[BatchEntry],
+) -> Result<BatchedSumcheckResult, MatMulError> {
+    use crate::components::matmul::RoundPoly;
+    use crate::crypto::poseidon_channel::{PoseidonChannel, securefield_to_felt};
+
+    if entries.is_empty() {
+        return Err(MatMulError::SumcheckFailed("empty batch".into()));
+    }
+
+    let k = entries[0].k;
+    let log_k = k.ilog2() as usize;
+    let num_entries = entries.len();
+
+    // All entries must have same k
+    for e in entries {
+        assert_eq!(e.k, k, "All entries in batch must have same padded k");
+    }
+
+    // Combined Fiat-Shamir channel
+    let mut channel = PoseidonChannel::new();
+    // Mix batch metadata
+    channel.mix_u64(num_entries as u64);
+    channel.mix_u64(k as u64);
+
+    // Mix all per-matmul commitments and claimed sums
+    for e in entries {
+        channel.mix_felt(securefield_to_felt(e.claimed_sum));
+        channel.mix_felt(e.a_commitment);
+        channel.mix_felt(e.b_commitment);
+    }
+
+    // Draw batching lambda
+    let lambda = channel.draw_qm31();
+
+    // Get cached GPU executor
+    let gpu_executor = GpuSumcheckExecutor::cached()
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU init: {e}")))?;
+
+    // Upload all f_a, f_b to GPU
+    let mut d_f_a_list: Vec<CudaSlice<u32>> = Vec::with_capacity(num_entries);
+    let mut d_f_b_list: Vec<CudaSlice<u32>> = Vec::with_capacity(num_entries);
+
+    for e in entries {
+        let f_a_u32: Vec<u32> = e.f_a.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
+        let f_b_u32: Vec<u32> = e.f_b.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
+
+        let d_f_a = gpu_executor.device.htod_sync_copy(&f_a_u32)
+            .map_err(|e| MatMulError::SumcheckFailed(format!("GPU upload batch f_a: {:?}", e)))?;
+        let d_f_b = gpu_executor.device.htod_sync_copy(&f_b_u32)
+            .map_err(|e| MatMulError::SumcheckFailed(format!("GPU upload batch f_b: {:?}", e)))?;
+
+        d_f_a_list.push(d_f_a);
+        d_f_b_list.push(d_f_b);
+    }
+
+    // Batched sumcheck: log_k rounds
+    let mut round_polys = Vec::with_capacity(log_k);
+    let mut assignment = Vec::with_capacity(log_k);
+    let mut cur_n_points = k;
+
+    for _round in 0..log_k {
+        let mid = cur_n_points / 2;
+
+        // GPU: compute per-matmul (s0, s1, s2) and combine with lambda
+        let mut combined_s0 = SecureField::zero();
+        let mut combined_s1 = SecureField::zero();
+        let mut combined_s2 = SecureField::zero();
+        let mut lambda_power = SecureField::one();
+
+        for i in 0..num_entries {
+            let (s0_u32, s1_u32, s2_u32) = gpu_executor
+                .compute_round_poly(&d_f_a_list[i], &d_f_b_list[i], mid)
+                .map_err(|e| MatMulError::SumcheckFailed(
+                    format!("GPU batch round entry {i}: {e}"),
+                ))?;
+
+            let s0 = u32s_to_secure_field(&s0_u32);
+            let s1 = u32s_to_secure_field(&s1_u32);
+            let s2 = u32s_to_secure_field(&s2_u32);
+
+            combined_s0 = combined_s0 + lambda_power * s0;
+            combined_s1 = combined_s1 + lambda_power * s1;
+            combined_s2 = combined_s2 + lambda_power * s2;
+
+            lambda_power = lambda_power * lambda;
+        }
+
+        // Extract combined round polynomial coefficients
+        let c0 = combined_s0;
+        let two = SecureField::from(M31::from(2));
+        let c2 = (combined_s2 - two * combined_s1 + combined_s0) * two.inverse();
+        let c1 = combined_s1 - combined_s0 - c2;
+
+        round_polys.push(RoundPoly { c0, c1, c2 });
+
+        // Fiat-Shamir: mix combined polynomial and draw shared challenge
+        channel.mix_poly_coeffs(c0, c1, c2);
+        let r_k = channel.draw_qm31();
+        assignment.push(r_k);
+
+        // GPU: fold ALL MLEs with shared challenge
+        let challenge_u32 = secure_field_to_u32s(r_k);
+
+        for i in 0..num_entries {
+            let new_d_f_a = gpu_executor.mle_fold(&d_f_a_list[i], cur_n_points, &challenge_u32)
+                .map_err(|e| MatMulError::SumcheckFailed(
+                    format!("GPU batch fold f_a entry {i}: {e}"),
+                ))?;
+            let new_d_f_b = gpu_executor.mle_fold(&d_f_b_list[i], cur_n_points, &challenge_u32)
+                .map_err(|e| MatMulError::SumcheckFailed(
+                    format!("GPU batch fold f_b entry {i}: {e}"),
+                ))?;
+
+            d_f_a_list[i] = new_d_f_a;
+            d_f_b_list[i] = new_d_f_b;
+        }
+
+        cur_n_points = mid;
+    }
+
+    // Download per-matmul final evaluations
+    assert_eq!(cur_n_points, 1);
+    let mut per_matmul = Vec::with_capacity(num_entries);
+
+    for i in 0..num_entries {
+        let mut final_a_u32 = [0u32; 4];
+        let mut final_b_u32 = [0u32; 4];
+        gpu_executor.device.dtoh_sync_copy_into(&d_f_a_list[i], &mut final_a_u32)
+            .map_err(|e| MatMulError::SumcheckFailed(format!("download final_a {i}: {:?}", e)))?;
+        gpu_executor.device.dtoh_sync_copy_into(&d_f_b_list[i], &mut final_b_u32)
+            .map_err(|e| MatMulError::SumcheckFailed(format!("download final_b {i}: {:?}", e)))?;
+
+        per_matmul.push(BatchedPerMatMulResult {
+            node_id: entries[i].node_id,
+            final_a_eval: u32s_to_secure_field(&final_a_u32),
+            final_b_eval: u32s_to_secure_field(&final_b_u32),
+        });
+    }
+
+    Ok(BatchedSumcheckResult {
+        round_polys,
+        assignment,
+        lambda,
+        per_matmul,
+    })
+}
+
+/// Prepare a BatchEntry from raw matrices (CPU work: MLE construction + restriction).
+///
+/// This can be called in parallel for multiple matmuls before feeding to
+/// `prove_matmul_batch_onchain_gpu`.
+#[cfg(feature = "cuda-runtime")]
+pub fn prepare_batch_entry(
+    node_id: usize,
+    a: &M31Matrix,
+    b: &M31Matrix,
+    c: &M31Matrix,
+) -> Result<BatchEntry, MatMulError> {
+    use crate::components::matmul::pad_matrix_pow2;
+    use crate::crypto::poseidon_channel::{PoseidonChannel, securefield_to_felt};
+    use crate::crypto::mle_opening::commit_mle;
+
+    let a = &pad_matrix_pow2(a);
+    let b = &pad_matrix_pow2(b);
+    let c = &pad_matrix_pow2(c);
+
+    let m = a.rows;
+    let k = a.cols;
+    let n = b.cols;
+    let log_m = m.ilog2() as usize;
+    let log_n = n.ilog2() as usize;
+
+    let mle_a = matrix_to_mle_pub(a);
+    let mle_b_t = matrix_to_mle_col_major_pub(b);
+    let mle_c = matrix_to_mle_pub(c);
+
+    // Per-matmul Poseidon channel for r_i, r_j
+    let mut channel = PoseidonChannel::new();
+    channel.mix_u64(m as u64);
+    channel.mix_u64(k as u64);
+    channel.mix_u64(n as u64);
+
+    let r_i = channel.draw_qm31s(log_m);
+    let r_j = channel.draw_qm31s(log_n);
+
+    let mut r_ij = Vec::with_capacity(log_m + log_n);
+    r_ij.extend_from_slice(&r_i);
+    r_ij.extend_from_slice(&r_j);
+    let claimed_sum = evaluate_mle_pub(&mle_c, &r_ij);
+
+    let f_a = restrict_mle_pub(&mle_a, &r_i);
+    let f_b = restrict_mle_pub(&mle_b_t, &r_j);
+
+    let (a_commitment, _) = commit_mle(&f_a);
+    let (b_commitment, _) = commit_mle(&f_b);
+
+    Ok(BatchEntry {
+        node_id,
+        m,
+        k,
+        n,
+        claimed_sum,
+        r_i,
+        r_j,
+        a_commitment,
+        b_commitment,
+        f_a,
+        f_b,
     })
 }
 

@@ -39,7 +39,7 @@ use crate::components::elementwise::{ElementwiseAddEval, ElementwiseMulEval};
 use crate::components::layernorm::{LayerNormConfig, LayerNormEval, LayerNormRelation, build_rsqrt_table};
 use crate::components::matmul::{
     M31Matrix, matmul_m31,
-    MatMulSumcheckProof, prove_matmul_sumcheck,
+    MatMulSumcheckProof, prove_matmul_sumcheck_auto,
 };
 use crate::gadgets::lookup_table::PrecomputedTable;
 
@@ -873,7 +873,7 @@ where
                 let output = matmul_m31(&current, weight);
 
                 // Generate sumcheck proof
-                let proof = prove_matmul_sumcheck(&current, weight, &output)
+                let proof = prove_matmul_sumcheck_auto(&current, weight, &output)
                     .map_err(|e| ModelError::ProvingError {
                         layer: node.id,
                         message: format!("MatMul sumcheck: {e}"),
@@ -1176,7 +1176,7 @@ where
                     ModelError::MissingWeight(node.id)
                 )?;
                 let output = matmul_m31(&current, weight);
-                let proof = prove_matmul_sumcheck(&current, weight, &output)
+                let proof = prove_matmul_sumcheck_auto(&current, weight, &output)
                     .map_err(|e| ModelError::ProvingError {
                         layer: node.id,
                         message: format!("MatMul sumcheck: {e}"),

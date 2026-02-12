@@ -353,24 +353,41 @@ fn main() {
         })
         .unwrap_or(0);
 
-    // Compute weight commitment from all weight matrices
+    // Compute weight commitment using streaming Poseidon hash.
+    // Hash each weight matrix individually, then combine all per-matrix hashes.
+    // This avoids collecting 14B+ parameters into one Vec (59 GB OOM for Qwen3-14B).
+    eprintln!("Computing weight commitment ({} matrices)...", model.weights.weights.len());
+    let t_commit = std::time::Instant::now();
     let weight_commitment = {
-        let mut all_weight_data: Vec<M31> = Vec::new();
-        for (_, w) in &model.weights.weights {
-            all_weight_data.extend_from_slice(&w.data);
+        let mut per_matrix_hashes: Vec<FieldElement> = Vec::new();
+        for (layer_id, w) in &model.weights.weights {
+            // Hash each weight matrix in chunks to avoid huge FieldElement allocations
+            let chunk_size = 4096; // 4K elements per Poseidon batch
+            let mut layer_hash_inputs: Vec<FieldElement> = Vec::with_capacity(chunk_size + 2);
+            // Include layer_id and dimensions in the hash for domain separation
+            layer_hash_inputs.push(FieldElement::from(*layer_id as u64));
+            layer_hash_inputs.push(FieldElement::from((w.rows as u64) << 32 | w.cols as u64));
+
+            let mut running_hash = starknet_crypto::poseidon_hash_many(&layer_hash_inputs);
+            layer_hash_inputs.clear();
+
+            for chunk in w.data.chunks(chunk_size) {
+                layer_hash_inputs.clear();
+                layer_hash_inputs.push(running_hash);
+                for &v in chunk {
+                    layer_hash_inputs.push(FieldElement::from(v.0 as u64));
+                }
+                running_hash = starknet_crypto::poseidon_hash_many(&layer_hash_inputs);
+            }
+            per_matrix_hashes.push(running_hash);
         }
-        if all_weight_data.is_empty() {
+        if per_matrix_hashes.is_empty() {
             FieldElement::ZERO
         } else {
-            let weight_matrix = M31Matrix {
-                rows: 1,
-                cols: all_weight_data.len(),
-                data: all_weight_data,
-            };
-            let dummy_output = M31Matrix::new(1, 1);
-            compute_io_commitment(&weight_matrix, &dummy_output)
+            starknet_crypto::poseidon_hash_many(&per_matrix_hashes)
         }
     };
+    eprintln!("Weight commitment computed in {:.2}s", t_commit.elapsed().as_secs_f64());
 
     // Compute TEE attestation hash for on-chain commitment
     let tee_hash = tee_attestation
@@ -388,13 +405,18 @@ fn main() {
     };
 
     // Serialize
+    eprintln!("Serializing proof (format={:?})...", cli.format);
+    let t_ser = Instant::now();
     let output_str = match cli.format {
         OutputFormat::CairoSerde => {
             let felts = serialize_ml_proof_for_recursive(&proof, &metadata, cli.salt);
+            eprintln!("  {} felt252 values, converting to hex...", felts.len());
             serialize_ml_proof_to_arguments_file(&felts)
         }
         OutputFormat::Json => json_serde::proof_to_json(&proof, &metadata),
     };
+
+    let ser_elapsed = t_ser.elapsed();
 
     std::fs::write(&cli.output, &output_str).unwrap_or_else(|e| {
         eprintln!("Error writing output to '{}': {e}", cli.output.display());
@@ -402,10 +424,11 @@ fn main() {
     });
 
     eprintln!(
-        "Proof written to {} ({} bytes, format={:?})",
+        "Proof written to {} ({} bytes, format={:?}, serialize={:.2}s)",
         cli.output.display(),
         output_str.len(),
         cli.format,
+        ser_elapsed.as_secs_f64(),
     );
     eprintln!(
         "  matmul_proofs: {}, activation_claims: {}",
