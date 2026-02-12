@@ -3,8 +3,13 @@
 //! Provides commitment and authentication path generation for
 //! on-chain verification of MLE evaluations.
 
+use rayon::prelude::*;
 use starknet_crypto::poseidon_hash;
 use starknet_ff::FieldElement;
+
+/// Minimum number of pairs per layer to trigger rayon parallelism.
+/// Below this, sequential hashing is faster due to rayon overhead.
+const PARALLEL_THRESHOLD: usize = 256;
 
 /// A binary Merkle tree with Poseidon hash.
 ///
@@ -49,6 +54,65 @@ impl PoseidonMerkleTree {
         }
 
         Self { layers }
+    }
+
+    /// Build a Poseidon Merkle tree with rayon-parallel hashing.
+    ///
+    /// Each layer's hash pairs are independent, so layers with >= PARALLEL_THRESHOLD
+    /// pairs use `par_chunks(2)` for parallel Poseidon hashing.
+    pub fn build_parallel(leaves: Vec<FieldElement>) -> Self {
+        assert!(!leaves.is_empty(), "cannot build tree from empty leaves");
+
+        let n = leaves.len().next_power_of_two().max(2);
+        let mut padded = leaves;
+        padded.resize(n, FieldElement::ZERO);
+
+        let mut layers = vec![padded];
+
+        while layers.last().unwrap().len() > 1 {
+            let current = layers.last().unwrap();
+            let n_pairs = current.len() / 2;
+
+            let next = if n_pairs >= PARALLEL_THRESHOLD {
+                current.par_chunks(2).map(|pair| poseidon_hash(pair[0], pair[1])).collect()
+            } else {
+                let mut v = Vec::with_capacity(n_pairs);
+                for i in (0..current.len()).step_by(2) {
+                    v.push(poseidon_hash(current[i], current[i + 1]));
+                }
+                v
+            };
+            layers.push(next);
+        }
+
+        Self { layers }
+    }
+
+    /// Compute only the Merkle root without storing intermediate layers.
+    ///
+    /// Uses rayon for large layers. Returns just the root FieldElement.
+    /// More memory-efficient than `build()` when only the commitment is needed.
+    pub fn root_only_parallel(leaves: Vec<FieldElement>) -> FieldElement {
+        assert!(!leaves.is_empty(), "cannot compute root from empty leaves");
+
+        let n = leaves.len().next_power_of_two().max(2);
+        let mut current = leaves;
+        current.resize(n, FieldElement::ZERO);
+
+        while current.len() > 1 {
+            let n_pairs = current.len() / 2;
+            current = if n_pairs >= PARALLEL_THRESHOLD {
+                current.par_chunks(2).map(|pair| poseidon_hash(pair[0], pair[1])).collect()
+            } else {
+                let mut v = Vec::with_capacity(n_pairs);
+                for i in (0..current.len()).step_by(2) {
+                    v.push(poseidon_hash(current[i], current[i + 1]));
+                }
+                v
+            };
+        }
+
+        current[0]
     }
 
     /// Returns the Merkle root.
@@ -172,5 +236,29 @@ mod tests {
             !PoseidonMerkleTree::verify(root, 1, FieldElement::from(10u64), &path),
             "wrong index should not verify"
         );
+    }
+
+    #[test]
+    fn test_build_parallel_matches_sequential() {
+        let leaves: Vec<FieldElement> = (0..512).map(|i| FieldElement::from(i as u64)).collect();
+        let seq = PoseidonMerkleTree::build(leaves.clone());
+        let par = PoseidonMerkleTree::build_parallel(leaves);
+        assert_eq!(seq.root(), par.root());
+
+        // Verify proofs from parallel tree
+        for i in [0, 1, 255, 511] {
+            let path = par.prove(i);
+            assert!(PoseidonMerkleTree::verify(par.root(), i, FieldElement::from(i as u64), &path));
+        }
+    }
+
+    #[test]
+    fn test_root_only_matches_build() {
+        for n in [2, 4, 8, 16, 64, 512] {
+            let leaves: Vec<FieldElement> = (0..n).map(|i| FieldElement::from(i as u64)).collect();
+            let tree = PoseidonMerkleTree::build(leaves.clone());
+            let root = PoseidonMerkleTree::root_only_parallel(leaves);
+            assert_eq!(tree.root(), root, "mismatch for n={n}");
+        }
     }
 }

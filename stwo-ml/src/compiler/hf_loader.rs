@@ -735,6 +735,25 @@ fn load_weights_from_shards(
             .map_err(|e| WeightError::IoError(e.to_string()))?;
         let mmap = unsafe { memmap2::Mmap::map(&file) }
             .map_err(|e| WeightError::IoError(e.to_string()))?;
+
+        // Advise kernel to prefetch pages sequentially (reduces page fault stalls).
+        // MADV_SEQUENTIAL triggers aggressive readahead; MADV_WILLNEED starts prefetch now.
+        #[cfg(unix)]
+        {
+            unsafe {
+                libc::madvise(
+                    mmap.as_ptr() as *mut libc::c_void,
+                    mmap.len(),
+                    libc::MADV_SEQUENTIAL,
+                );
+                libc::madvise(
+                    mmap.as_ptr() as *mut libc::c_void,
+                    mmap.len(),
+                    libc::MADV_WILLNEED,
+                );
+            }
+        }
+
         shards.push(ShardHandle { _file: file, mmap });
     }
 
@@ -775,77 +794,82 @@ fn load_weights_from_shards(
         }
     }
 
-    // Process one shard at a time — deserialize ONCE per shard (8 total, not 160).
-    // Within each shard, parallelize weight processing (transpose + quantize) with rayon.
+    // Two-phase loading:
+    // Phase 1: Extract raw f32 data from all shards sequentially (triggers mmap page faults).
+    //          MADV_WILLNEED prefetching overlaps I/O across shards.
+    // Phase 2: Parallel transpose + quantize across ALL weights at once (better rayon utilization
+    //          on many-core CPUs like 72-core Grace — 160 tasks vs ~20 per shard).
     use rayon::prelude::*;
+
+    let t_extract = std::time::Instant::now();
+    let mut all_raw: Vec<(usize, usize, usize, Vec<f32>, Vec<usize>)> = Vec::with_capacity(total_weights);
 
     for shard_idx in 0..shards.len() {
         let Some(weight_list) = shard_to_weights.get(&shard_idx) else { continue };
         let tensors = safetensors::SafeTensors::deserialize(&shards[shard_idx].mmap)
             .map_err(|e| WeightError::IoError(e.to_string()))?;
 
-        // Extract raw tensor data sequentially (SafeTensors not Send)
-        let raw_data: Vec<(usize, usize, usize, Vec<f32>, Vec<usize>)> = weight_list.iter()
-            .map(|&(idx, k, n, tensor_name)| {
-                let tensor = tensors.tensor(tensor_name)
-                    .map_err(|e| WeightError::IoError(format!("{}: {e}", tensor_name)))?;
-                let data = tensor_to_f32(tensor.data(), tensor.dtype());
-                let shape = tensor.shape().to_vec();
-                Ok((idx, k, n, data, shape))
-            })
-            .collect::<Result<Vec<_>, WeightError>>()?;
+        for &(idx, k, n, tensor_name) in weight_list {
+            let tensor = tensors.tensor(tensor_name)
+                .map_err(|e| WeightError::IoError(format!("{}: {e}", tensor_name)))?;
+            let data = tensor_to_f32(tensor.data(), tensor.dtype());
+            let shape = tensor.shape().to_vec();
+            all_raw.push((idx, k, n, data, shape));
+        }
+    }
+    eprintln!(
+        "  Extracted {} tensors from {} shards in {:.1}s",
+        all_raw.len(), shards.len(), t_extract.elapsed().as_secs_f64(),
+    );
 
-        let shard_weight_count = raw_data.len();
-        eprintln!(
-            "  Shard {}/{}: processing {} weights in parallel...",
-            shard_idx + 1, shards.len(), shard_weight_count,
-        );
+    // Drop shard mmaps to free virtual memory before parallel processing
+    drop(shards);
 
-        // Parallel transpose + quantize
-        let processed: Vec<(usize, M31Matrix)> = raw_data.par_iter()
-            .map(|(idx, k, n, data, shape)| {
-                let (k, n) = (*k, *n);
-                let (weight_data, wk, wn) = if shape.len() == 2 {
-                    let rows = shape[0];
-                    let cols = shape[1];
-                    if rows == n && cols == k {
-                        let mut transposed = vec![0.0f32; data.len()];
-                        const BLOCK: usize = 64;
-                        for r_block in (0..rows).step_by(BLOCK) {
-                            for c_block in (0..cols).step_by(BLOCK) {
-                                let r_end = (r_block + BLOCK).min(rows);
-                                let c_end = (c_block + BLOCK).min(cols);
-                                for r in r_block..r_end {
-                                    for c in c_block..c_end {
-                                        transposed[c * rows + r] = data[r * cols + c];
-                                    }
+    let t_process = std::time::Instant::now();
+    eprintln!("  Processing {} weights in parallel (transpose + quantize)...", all_raw.len());
+
+    let processed: Vec<(usize, M31Matrix)> = all_raw.par_iter()
+        .map(|(idx, k, n, data, shape)| {
+            let (k, n) = (*k, *n);
+            let (weight_data, wk, wn) = if shape.len() == 2 {
+                let rows = shape[0];
+                let cols = shape[1];
+                if rows == n && cols == k {
+                    let mut transposed = vec![0.0f32; data.len()];
+                    const BLOCK: usize = 64;
+                    for r_block in (0..rows).step_by(BLOCK) {
+                        for c_block in (0..cols).step_by(BLOCK) {
+                            let r_end = (r_block + BLOCK).min(rows);
+                            let c_end = (c_block + BLOCK).min(cols);
+                            for r in r_block..r_end {
+                                for c in c_block..c_end {
+                                    transposed[c * rows + r] = data[r * cols + c];
                                 }
                             }
                         }
-                        (transposed, k, n)
-                    } else if rows == k && cols == n {
-                        (data.clone(), k, n)
-                    } else {
-                        (data.clone(), k, n)
                     }
+                    (transposed, k, n)
+                } else if rows == k && cols == n {
+                    (data.clone(), k, n)
                 } else {
                     (data.clone(), k, n)
-                };
-                let (matrix, _params) = quantize_weight_matrix(&weight_data, wk, wn, strategy);
-                (*idx, matrix)
-            })
-            .collect();
+                }
+            } else {
+                (data.clone(), k, n)
+            };
+            let (matrix, _params) = quantize_weight_matrix(&weight_data, wk, wn, strategy);
+            (*idx, matrix)
+        })
+        .collect();
 
-        for (idx, matrix) in processed {
-            weights.add_weight(idx, matrix);
-            loaded_count += 1;
-        }
-
-        eprintln!(
-            "  Shard {}/{}: {} weights processed",
-            shard_idx + 1, shards.len(), shard_weight_count,
-        );
+    for (idx, matrix) in processed {
+        weights.add_weight(idx, matrix);
+        loaded_count += 1;
     }
+    eprintln!(
+        "  Transpose + quantize: {:.1}s",
+        t_process.elapsed().as_secs_f64(),
+    );
 
     eprintln!(
         "  All {} weights loaded in {:.1}s",

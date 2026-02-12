@@ -46,7 +46,7 @@ use stwo::prover::lookups::sumcheck::{
 use stwo::prover::lookups::utils::UnivariatePoly;
 
 use crate::crypto::poseidon_channel::{PoseidonChannel, securefield_to_felt};
-use crate::crypto::mle_opening::{MleOpeningProof, commit_mle, prove_mle_opening, verify_mle_opening};
+use crate::crypto::mle_opening::{MleOpeningProof, commit_mle_root_only, prove_mle_opening, verify_mle_opening};
 
 /// Matrix dimensions for a matmul operation.
 #[derive(Debug, Clone, Copy)]
@@ -206,6 +206,213 @@ fn matrix_to_mle_col_major(matrix: &M31Matrix) -> Vec<SecureField> {
         }
         evals
     }
+}
+
+/// Compute all Lagrange basis evaluations L_j(challenges) for j=0..2^v - 1.
+///
+/// Uses the tensor product structure:
+///   L_j(c_0..c_{v-1}) = Π_l ((1-c_l)(1-j_l) + c_l·j_l)
+///
+/// Built bottom-up: each challenge doubles the weight table.
+/// O(n log n) work, O(n) memory where n = 2^v.
+fn compute_lagrange_basis(challenges: &[SecureField]) -> Vec<SecureField> {
+    let mut weights = vec![SecureField::one()];
+    for &c in challenges {
+        let one_minus_c = SecureField::one() - c;
+        let new_len = weights.len() * 2;
+        let mut new_weights = Vec::with_capacity(new_len);
+        for &w in &weights {
+            new_weights.push(w * one_minus_c);
+            new_weights.push(w * c);
+        }
+        weights = new_weights;
+    }
+    weights
+}
+
+/// Fused column-restrict: Σ_j matrix[i][j] × L_j(challenges) for each row i.
+///
+/// Equivalent to `restrict_mle(matrix_to_mle_col_major(matrix), challenges)` but
+/// avoids allocating the full rows×cols SecureField MLE.
+///
+/// Memory: O(rows + cols) instead of O(rows × cols).
+/// For Qwen3-14B (k=8192, n=8192): 256 KB instead of 1 GB per matrix.
+///
+/// The matrix-vector multiply is parallelized across rows with rayon.
+pub fn restrict_cols_fused(matrix: &M31Matrix, challenges: &[SecureField]) -> Vec<SecureField> {
+    use rayon::prelude::*;
+    use num_traits::Zero;
+
+    let k = matrix.rows;
+    let n = matrix.cols;
+
+    if challenges.is_empty() {
+        // n=1: no column restriction, just convert each row's single element
+        return (0..k).map(|i| SecureField::from(matrix.data[i * n])).collect();
+    }
+
+    let lagrange = compute_lagrange_basis(challenges);
+    assert_eq!(lagrange.len(), n);
+
+    // f_b[i] = Σ_j matrix.data[i*n + j] × lagrange[j]
+    // Each row is independent → parallelize across rows.
+    // Inner loop reads B row sequentially (cache-friendly) and reuses lagrange (fits L2).
+    if k >= 64 {
+        (0..k).into_par_iter().map(|i| {
+            let row_start = i * n;
+            let mut sum = SecureField::zero();
+            for j in 0..n {
+                sum += SecureField::from(matrix.data[row_start + j]) * lagrange[j];
+            }
+            sum
+        }).collect()
+    } else {
+        (0..k).map(|i| {
+            let row_start = i * n;
+            let mut sum = SecureField::zero();
+            for j in 0..n {
+                sum += SecureField::from(matrix.data[row_start + j]) * lagrange[j];
+            }
+            sum
+        }).collect()
+    }
+}
+
+/// Fused row-restrict: Σ_i matrix[i][j] × L_i(challenges) for each column j.
+///
+/// Equivalent to `restrict_mle(matrix_to_mle(matrix), challenges)` but
+/// avoids the full rows×cols SecureField allocation.
+///
+/// Memory: O(rows + cols) instead of O(rows × cols).
+pub fn restrict_rows_fused(matrix: &M31Matrix, challenges: &[SecureField]) -> Vec<SecureField> {
+    use rayon::prelude::*;
+    use num_traits::Zero;
+
+    let m = matrix.rows;
+    let k = matrix.cols;
+
+    if challenges.is_empty() {
+        // m=1: no row restriction, just convert the single row
+        return matrix.data[..k].iter().map(|&v| SecureField::from(v)).collect();
+    }
+
+    let lagrange = compute_lagrange_basis(challenges);
+    assert_eq!(lagrange.len(), m);
+
+    // f_a[j] = Σ_i matrix.data[i*k + j] × lagrange[i]
+    if k >= 64 {
+        (0..k).into_par_iter().map(|j| {
+            let mut sum = SecureField::zero();
+            for i in 0..m {
+                sum += SecureField::from(matrix.data[i * k + j]) * lagrange[i];
+            }
+            sum
+        }).collect()
+    } else {
+        (0..k).map(|j| {
+            let mut sum = SecureField::zero();
+            for i in 0..m {
+                sum += SecureField::from(matrix.data[i * k + j]) * lagrange[i];
+            }
+            sum
+        }).collect()
+    }
+}
+
+/// Fused column-restrict on an UNPADDED matrix.
+///
+/// Same as `restrict_cols_fused` but works on the original (non-power-of-2) matrix
+/// with challenges drawn for padded dimensions. Avoids the cost of copying the full
+/// matrix into a padded version.
+///
+/// - `challenges` has `log2(padded_cols)` elements → Lagrange basis has `padded_cols` entries
+/// - Only the first `matrix.cols` Lagrange weights are used (rest multiply zero-padding)
+/// - Output has `padded_rows` elements: first `matrix.rows` from data, rest zero
+pub fn restrict_cols_unpadded(
+    matrix: &M31Matrix,
+    challenges: &[SecureField],
+    padded_rows: usize,
+) -> Vec<SecureField> {
+    use rayon::prelude::*;
+    use num_traits::Zero;
+
+    let k_orig = matrix.rows;
+    let n_orig = matrix.cols;
+
+    let lagrange = compute_lagrange_basis(challenges);
+    // lagrange.len() = 2^challenges.len() = padded_cols >= n_orig
+
+    // f_b[i] = Σ_{j=0}^{n_orig-1} matrix[i][j] × lagrange[j]
+    // Only sum over actual columns; lagrange[j>=n_orig] multiply zeros.
+    let mut result = if k_orig >= 64 {
+        (0..k_orig).into_par_iter().map(|i| {
+            let row_start = i * n_orig;
+            let mut sum = SecureField::zero();
+            for j in 0..n_orig {
+                sum += SecureField::from(matrix.data[row_start + j]) * lagrange[j];
+            }
+            sum
+        }).collect::<Vec<_>>()
+    } else {
+        (0..k_orig).map(|i| {
+            let row_start = i * n_orig;
+            let mut sum = SecureField::zero();
+            for j in 0..n_orig {
+                sum += SecureField::from(matrix.data[row_start + j]) * lagrange[j];
+            }
+            sum
+        }).collect()
+    };
+
+    // Zero-pad rows to padded_rows (padded rows contribute zero)
+    result.resize(padded_rows, SecureField::zero());
+    result
+}
+
+/// Fused row-restrict on an UNPADDED matrix.
+///
+/// Same as `restrict_rows_fused` but works on the original (non-power-of-2) matrix.
+///
+/// - `challenges` has `log2(padded_rows)` elements → Lagrange basis has `padded_rows` entries
+/// - Only first `matrix.rows` Lagrange weights are used (rest multiply zero-padding)
+/// - Output has `padded_cols` elements: first `matrix.cols` from data, rest zero
+pub fn restrict_rows_unpadded(
+    matrix: &M31Matrix,
+    challenges: &[SecureField],
+    padded_cols: usize,
+) -> Vec<SecureField> {
+    use rayon::prelude::*;
+    use num_traits::Zero;
+
+    let m_orig = matrix.rows;
+    let k_orig = matrix.cols;
+
+    let lagrange = compute_lagrange_basis(challenges);
+    // lagrange.len() = 2^challenges.len() = padded_rows >= m_orig
+
+    // f_a[j] = Σ_{i=0}^{m_orig-1} matrix[i][j] × lagrange[i]
+    // Only sum over actual rows; lagrange[i>=m_orig] multiply zeros.
+    let mut result = if k_orig >= 64 {
+        (0..k_orig).into_par_iter().map(|j| {
+            let mut sum = SecureField::zero();
+            for i in 0..m_orig {
+                sum += SecureField::from(matrix.data[i * k_orig + j]) * lagrange[i];
+            }
+            sum
+        }).collect::<Vec<_>>()
+    } else {
+        (0..k_orig).map(|j| {
+            let mut sum = SecureField::zero();
+            for i in 0..m_orig {
+                sum += SecureField::from(matrix.data[i * k_orig + j]) * lagrange[i];
+            }
+            sum
+        }).collect()
+    };
+
+    // Zero-pad columns to padded_cols (padded columns contribute zero)
+    result.resize(padded_cols, SecureField::zero());
+    result
 }
 
 /// Compute C = A × B in M31 arithmetic.
@@ -706,9 +913,9 @@ pub fn prove_matmul_sumcheck_onchain(
     assert_eq!(f_a.len(), k);
     assert_eq!(f_b.len(), k);
 
-    // Commit to restricted MLEs
-    let (a_commitment, _a_tree) = commit_mle(&f_a);
-    let (b_commitment, _b_tree) = commit_mle(&f_b);
+    // Commit to restricted MLEs (root-only: tree not needed for sumcheck)
+    let a_commitment = commit_mle_root_only(&f_a);
+    let b_commitment = commit_mle_root_only(&f_b);
 
     // Mix commitments
     channel.mix_felt(a_commitment);
@@ -1298,5 +1505,172 @@ mod tests {
 
         let result = verify_matmul_sumcheck_onchain(&proof);
         assert!(result.is_err(), "mismatched final_eval should fail verification");
+    }
+
+    #[test]
+    fn test_restrict_cols_fused_matches_original() {
+        // Verify that restrict_cols_fused produces identical results to
+        // matrix_to_mle_col_major + restrict_mle for various dimensions.
+        use stwo::core::fields::qm31::SecureField;
+
+        for (k, n) in [(2, 4), (4, 4), (4, 8), (8, 16)] {
+            let mut b = M31Matrix::new(k, n);
+            for i in 0..k {
+                for j in 0..n {
+                    b.set(i, j, M31::from((i * n + j + 1) as u32));
+                }
+            }
+
+            let log_n = n.ilog2() as usize;
+            // Generate deterministic challenges
+            let challenges: Vec<SecureField> = (0..log_n)
+                .map(|i| SecureField::from(M31::from(i as u32 * 7 + 3)))
+                .collect();
+
+            // Original approach: full MLE allocation + restrict
+            let mle_col = matrix_to_mle_col_major(&b);
+            let expected = restrict_mle(&mle_col, &challenges);
+
+            // Fused approach: O(k + n) memory
+            let actual = restrict_cols_fused(&b, &challenges);
+
+            assert_eq!(expected.len(), actual.len(),
+                "length mismatch for {}x{}", k, n);
+            for i in 0..expected.len() {
+                assert_eq!(expected[i], actual[i],
+                    "mismatch at index {} for {}x{}", i, k, n);
+            }
+        }
+    }
+
+    #[test]
+    fn test_restrict_rows_fused_matches_original() {
+        // Verify that restrict_rows_fused produces identical results to
+        // matrix_to_mle + restrict_mle.
+        use stwo::core::fields::qm31::SecureField;
+
+        for (m, k) in [(2, 4), (4, 4), (4, 8), (8, 16)] {
+            let mut a = M31Matrix::new(m, k);
+            for i in 0..m {
+                for j in 0..k {
+                    a.set(i, j, M31::from((i * k + j + 1) as u32));
+                }
+            }
+
+            let log_m = m.ilog2() as usize;
+            let challenges: Vec<SecureField> = (0..log_m)
+                .map(|i| SecureField::from(M31::from(i as u32 * 11 + 5)))
+                .collect();
+
+            // Original
+            let mle_row = matrix_to_mle(&a);
+            let expected = restrict_mle(&mle_row, &challenges);
+
+            // Fused
+            let actual = restrict_rows_fused(&a, &challenges);
+
+            assert_eq!(expected.len(), actual.len(),
+                "length mismatch for {}x{}", m, k);
+            for i in 0..expected.len() {
+                assert_eq!(expected[i], actual[i],
+                    "mismatch at index {} for {}x{}", i, m, k);
+            }
+        }
+    }
+
+    #[test]
+    fn test_restrict_fused_empty_challenges() {
+        // Empty challenges should return converted data without folding
+        let mut b = M31Matrix::new(4, 1);
+        for i in 0..4 {
+            b.set(i, 0, M31::from(i as u32 + 10));
+        }
+        let result = restrict_cols_fused(&b, &[]);
+        assert_eq!(result.len(), 4);
+        for i in 0..4 {
+            assert_eq!(result[i], SecureField::from(M31::from(i as u32 + 10)));
+        }
+
+        let mut a = M31Matrix::new(1, 4);
+        for j in 0..4 {
+            a.set(0, j, M31::from(j as u32 + 20));
+        }
+        let result = restrict_rows_fused(&a, &[]);
+        assert_eq!(result.len(), 4);
+        for j in 0..4 {
+            assert_eq!(result[j], SecureField::from(M31::from(j as u32 + 20)));
+        }
+    }
+
+    #[test]
+    fn test_restrict_cols_unpadded_matches_padded() {
+        // Non-POW2 matrix: 6×5, padded to 8×8
+        let mut b = M31Matrix::new(6, 5);
+        for i in 0..6 {
+            for j in 0..5 {
+                b.set(i, j, M31::from((i * 5 + j + 1) as u32));
+            }
+        }
+        let b_padded = pad_matrix_pow2(&b);
+        assert_eq!(b_padded.rows, 8);
+        assert_eq!(b_padded.cols, 8);
+
+        // 3 challenges for padded cols (log2(8)=3)
+        let challenges = vec![
+            SecureField::from(M31::from(3)),
+            SecureField::from(M31::from(7)),
+            SecureField::from(M31::from(11)),
+        ];
+
+        let padded_result = restrict_cols_fused(&b_padded, &challenges);
+        let unpadded_result = restrict_cols_unpadded(&b, &challenges, 8);
+
+        assert_eq!(padded_result.len(), unpadded_result.len());
+        for i in 0..padded_result.len() {
+            assert_eq!(padded_result[i], unpadded_result[i], "mismatch at index {i}");
+        }
+    }
+
+    #[test]
+    fn test_restrict_rows_unpadded_matches_padded() {
+        // Non-POW2 matrix: 5×6, padded to 8×8
+        let mut a = M31Matrix::new(5, 6);
+        for i in 0..5 {
+            for j in 0..6 {
+                a.set(i, j, M31::from((i * 6 + j + 1) as u32));
+            }
+        }
+        let a_padded = pad_matrix_pow2(&a);
+        assert_eq!(a_padded.rows, 8);
+        assert_eq!(a_padded.cols, 8);
+
+        // 3 challenges for padded rows (log2(8)=3)
+        let challenges = vec![
+            SecureField::from(M31::from(5)),
+            SecureField::from(M31::from(2)),
+            SecureField::from(M31::from(9)),
+        ];
+
+        let padded_result = restrict_rows_fused(&a_padded, &challenges);
+        let unpadded_result = restrict_rows_unpadded(&a, &challenges, 8);
+
+        assert_eq!(padded_result.len(), unpadded_result.len());
+        for i in 0..padded_result.len() {
+            assert_eq!(padded_result[i], unpadded_result[i], "mismatch at index {i}");
+        }
+    }
+
+    #[test]
+    fn test_commit_mle_root_only_matches() {
+        use crate::crypto::mle_opening::{commit_mle, commit_mle_root_only};
+
+        let evals: Vec<SecureField> = (0..64)
+            .map(|i| SecureField::from(M31::from(i + 1)))
+            .collect();
+
+        let (root_full, _tree) = commit_mle(&evals);
+        let root_only = commit_mle_root_only(&evals);
+
+        assert_eq!(root_full, root_only);
     }
 }
