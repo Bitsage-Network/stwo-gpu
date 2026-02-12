@@ -4,19 +4,18 @@
 # ========================================================
 #
 # Complete pipeline for submitting the recursive STARK proof on-chain
-# from the H200 GPU worker (bitsage-worker).
+# from the H200 GPU worker.
 #
 # This script:
 #   1. Sets up the H200 environment (CUDA, sncast)
-#   2. Runs the full recursive pipeline (prove-qwen → cairo-prove) if --prove
+#   2. Optionally runs the full recursive pipeline (prove-model -> cairo-prove)
 #   3. Parses the proof and submits verify_recursive_output() on-chain
 #
 # Usage:
-#   brev shell bitsage-worker
-#   cd ~/stwo-ml   # or wherever the repo lives
-#   bash scripts/h200_submit_onchain.sh --submit
-#   bash scripts/h200_submit_onchain.sh --dry-run
-#   bash scripts/h200_submit_onchain.sh --prove --submit  # full pipeline
+#   cd /path/to/bitsage-network/libs
+#   bash scripts/h200_submit_onchain.sh --proof recursive_proof.json --dry-run
+#   bash scripts/h200_submit_onchain.sh --proof recursive_proof.json --submit
+#   bash scripts/h200_submit_onchain.sh --prove --layers 1 --model-dir ~/models/qwen3-14b --submit
 #
 set -euo pipefail
 
@@ -32,19 +31,22 @@ NC='\033[0m'
 # Configuration
 # ═══════════════════════════════════════════════════════════════
 
-# H200 paths (Brev bitsage-worker)
-STWO_ML_DIR="${STWO_ML_DIR:-$(pwd)}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_DIR="${SCRIPT_DIR}/.."
+
+# Contract addresses (Starknet Sepolia)
+STARK_VERIFIER="0x005928ac548dc2719ef1b34869db2b61c2a55a4b148012fad742262a8d674fba"
+OBELYSK_VERIFIER="0x04f8c5377d94baa15291832dc3821c2fc235a95f0823f86add32f828ea965a15"
+
+# Paths
 MODEL_DIR="${MODEL_DIR:-$HOME/models/qwen3-14b}"
-CAIRO_PROVE="${CAIRO_PROVE:-$HOME/stwo-cairo/cairo-prove/target/release/cairo-prove}"
-PROVE_QWEN="${PROVE_QWEN:-./target/release/prove-qwen}"
-EXECUTABLE="${EXECUTABLE:-cairo/stwo-ml-recursive/target/release/stwo_ml_recursive.executable.json}"
 PROOF_FILE="${PROOF_FILE:-recursive_proof.json}"
 
 # Starknet
 ACCOUNT="${SNCAST_ACCOUNT:-deployer}"
 
 # CUDA (critical for H200 — driver 550 needs 12.4 NVRTC)
-export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/usr/local/cuda-12.4/lib64:/usr/lib/x86_64-linux-gnu}"
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/cuda-12.4/lib64:/usr/lib/x86_64-linux-gnu"
 export PATH="/usr/local/cuda-12.4/bin:$PATH"
 
 # ═══════════════════════════════════════════════════════════════
@@ -68,13 +70,13 @@ while [[ $# -gt 0 ]]; do
         --proof)       PROOF_FILE="$2"; shift 2 ;;
         --account)     ACCOUNT="$2"; shift 2 ;;
         -h|--help)
-            echo "Usage: $0 [--prove] [--submit|--dry-run] [--skip-build] [--layers N]"
+            echo "Usage: $0 [--prove] [--submit|--dry-run] [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --prove       Run GPU proving pipeline first (prove-qwen → cairo-prove)"
+            echo "  --prove       Run full recursive pipeline first (prove-model -> cairo-prove)"
             echo "  --submit      Submit transactions on-chain (required for actual submission)"
             echo "  --dry-run     Print commands without executing"
-            echo "  --skip-build  Skip building prove-qwen and cairo-prove"
+            echo "  --skip-build  Skip building prove-model and cairo-prove"
             echo "  --layers N    Number of transformer layers to prove (default: 1)"
             echo "  --model-dir   Path to Qwen3-14B model directory"
             echo "  --proof       Path to recursive_proof.json (default: recursive_proof.json)"
@@ -96,12 +98,12 @@ fi
 # Banner
 # ═══════════════════════════════════════════════════════════════
 
-echo -e "${CYAN}"
+echo -e "${CYAN}${BOLD}"
 echo "╔═══════════════════════════════════════════════════════════════╗"
 echo "║  Obelysk Protocol — H200 On-Chain STARK Submission Pipeline  ║"
 echo "║                                                               ║"
-echo "║  GPU Prover → Circle STARK → verify_recursive_output()       ║"
-echo "║  Qwen3-14B → Starknet Sepolia (1 tx, ~20K gas)              ║"
+echo "║  prove-model -> cairo-prove -> verify_recursive_output()     ║"
+echo "║  Qwen3-14B -> Starknet Sepolia (1 tx, ~20K gas)             ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 echo -e "${NC}"
 
@@ -118,7 +120,7 @@ if command -v nvidia-smi &>/dev/null; then
     DRIVER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)
     echo "  GPU:    ${GPU_NAME} (${GPU_MEM})"
     echo "  Driver: ${DRIVER}"
-    echo "  CUDA:   $(nvcc --version 2>/dev/null | grep release | awk '{print $6}' | tr -d ',')"
+    echo "  CUDA:   $(nvcc --version 2>/dev/null | grep release | awk '{print $6}' | tr -d ',' || echo 'not found')"
 else
     echo "  GPU: Not detected (CPU mode)"
 fi
@@ -142,61 +144,38 @@ echo "  sncast: $(sncast --version 2>/dev/null || echo 'available')"
 echo ""
 
 # ═══════════════════════════════════════════════════════════════
-# Step 1 (Optional): GPU Proving Pipeline
+# Step 1 (Optional): Full Recursive Pipeline
 # ═══════════════════════════════════════════════════════════════
 
 if [ "$DO_PROVE" = true ]; then
-    echo -e "${CYAN}════════════════════════════════════════════════════${NC}"
-    echo -e "${CYAN}  PHASE 1: GPU PROVING PIPELINE${NC}"
-    echo -e "${CYAN}════════════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}${BOLD}════════════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}${BOLD}  PHASE 1: FULL RECURSIVE PIPELINE${NC}"
+    echo -e "${CYAN}${BOLD}════════════════════════════════════════════════════${NC}"
     echo ""
 
-    # Build prove-qwen
-    if [ "$SKIP_BUILD" = false ]; then
-        echo -e "${YELLOW}[1a] Building prove-qwen with GPU features${NC}"
-        FEATURES="safetensors"
-        if command -v nvidia-smi &>/dev/null; then
-            FEATURES="safetensors,cuda-runtime"
-        fi
-        cargo build --release --bin prove-qwen --features "${FEATURES}" 2>&1 | tail -5
-        echo -e "  ${GREEN}Built prove-qwen${NC}"
-        echo ""
+    # Delegate to the recursive pipeline script
+    PIPELINE_ARGS=""
+    if [ "$SKIP_BUILD" = true ]; then
+        PIPELINE_ARGS+=" --skip-build"
+    fi
+    PIPELINE_ARGS+=" --layers ${NUM_LAYERS}"
+    PIPELINE_ARGS+=" --output ${PROOF_FILE}"
+    if [ -n "$MODEL_DIR" ]; then
+        PIPELINE_ARGS+=" --model-dir ${MODEL_DIR}"
     fi
 
-    # Run prove-qwen --recursive
-    echo -e "${YELLOW}[1b] Running recursive proving pipeline${NC}"
-    echo "  Model:  ${MODEL_DIR}"
-    echo "  Layers: ${NUM_LAYERS}"
-    echo "  Output: ${PROOF_FILE}"
-    echo ""
-
-    PROVE_CMD="${PROVE_QWEN} --model-dir ${MODEL_DIR} --layers ${NUM_LAYERS} --recursive"
-    PROVE_CMD+=" --cairo-prove-bin ${CAIRO_PROVE}"
-    PROVE_CMD+=" --executable ${EXECUTABLE}"
-    PROVE_CMD+=" --proof-output ${PROOF_FILE}"
-
-    echo "  $ ${PROVE_CMD}"
-    time eval ${PROVE_CMD}
+    bash "${SCRIPT_DIR}/h200_recursive_pipeline.sh" ${PIPELINE_ARGS}
 
     echo ""
-
-    # Verify locally
-    if [ -f "$PROOF_FILE" ]; then
-        echo -e "${YELLOW}[1c] Local STARK verification${NC}"
-        ${CAIRO_PROVE} verify "${PROOF_FILE}" && \
-            echo -e "  ${GREEN}LOCAL VERIFICATION: PASS${NC}" || \
-            { echo -e "  ${RED}LOCAL VERIFICATION: FAIL${NC}"; exit 1; }
-        echo ""
-    fi
 fi
 
 # ═══════════════════════════════════════════════════════════════
 # Step 2: Parse Proof and Submit On-Chain
 # ═══════════════════════════════════════════════════════════════
 
-echo -e "${CYAN}════════════════════════════════════════════════════${NC}"
-echo -e "${CYAN}  PHASE 2: ON-CHAIN SUBMISSION${NC}"
-echo -e "${CYAN}════════════════════════════════════════════════════${NC}"
+echo -e "${CYAN}${BOLD}════════════════════════════════════════════════════${NC}"
+echo -e "${CYAN}${BOLD}  PHASE 2: ON-CHAIN SUBMISSION${NC}"
+echo -e "${CYAN}${BOLD}════════════════════════════════════════════════════${NC}"
 echo ""
 
 if [ ! -f "$PROOF_FILE" ]; then
@@ -214,19 +193,41 @@ if [ "$DO_SUBMIT" = true ]; then
     MODE_FLAG="--submit"
 fi
 
-# Find the submit script
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SUBMIT_SCRIPT="${SCRIPT_DIR}/submit_recursive_proof.py"
+# Find the submit script — check multiple locations
+SUBMIT_SCRIPT=""
 
-if [ ! -f "$SUBMIT_SCRIPT" ]; then
-    # Try relative to current dir
+# 1. Same directory as this script (libs/scripts/)
+if [ -f "${SCRIPT_DIR}/submit_recursive_proof.py" ]; then
+    SUBMIT_SCRIPT="${SCRIPT_DIR}/submit_recursive_proof.py"
+fi
+
+# 2. Parent repo's scripts/ directory
+if [ -z "$SUBMIT_SCRIPT" ] && [ -f "${REPO_DIR}/../scripts/submit_recursive_proof.py" ]; then
+    SUBMIT_SCRIPT="${REPO_DIR}/../scripts/submit_recursive_proof.py"
+fi
+
+# 3. Relative to current directory
+if [ -z "$SUBMIT_SCRIPT" ] && [ -f "scripts/submit_recursive_proof.py" ]; then
     SUBMIT_SCRIPT="scripts/submit_recursive_proof.py"
 fi
 
-if [ ! -f "$SUBMIT_SCRIPT" ]; then
+# 4. Relative to repo root
+if [ -z "$SUBMIT_SCRIPT" ] && [ -f "../scripts/submit_recursive_proof.py" ]; then
+    SUBMIT_SCRIPT="../scripts/submit_recursive_proof.py"
+fi
+
+if [ -z "$SUBMIT_SCRIPT" ]; then
     echo -e "${RED}ERROR: submit_recursive_proof.py not found${NC}"
+    echo "  Searched:"
+    echo "    ${SCRIPT_DIR}/submit_recursive_proof.py"
+    echo "    ${REPO_DIR}/../scripts/submit_recursive_proof.py"
+    echo "    scripts/submit_recursive_proof.py"
+    echo "    ../scripts/submit_recursive_proof.py"
     exit 1
 fi
+
+echo "  Submit script: ${SUBMIT_SCRIPT}"
+echo ""
 
 python3 "${SUBMIT_SCRIPT}" \
     --proof "${PROOF_FILE}" \
@@ -234,17 +235,19 @@ python3 "${SUBMIT_SCRIPT}" \
     ${MODE_FLAG}
 
 echo ""
-echo -e "${GREEN}"
+echo -e "${GREEN}${BOLD}"
 echo "╔═══════════════════════════════════════════════════════════════╗"
-echo "║  PIPELINE COMPLETE                                           ║"
-echo "║                                                               ║"
 if [ "$DO_SUBMIT" = true ]; then
+echo "║  ON-CHAIN SUBMISSION COMPLETE                                ║"
+echo "║                                                               ║"
 echo "║  Qwen3-14B inference verified on Starknet Sepolia            ║"
 echo "║  via verify_recursive_output() — 1 tx, permanent record     ║"
 else
-echo "║  Dry run complete — re-run with --submit to execute          ║"
+echo "║  DRY RUN COMPLETE                                            ║"
+echo "║                                                               ║"
+echo "║  Re-run with --submit to execute on-chain                    ║"
 fi
 echo "║                                                               ║"
-echo "║  Contract: ${STARK_VERIFIER:0:20}...  ║"
+echo "║  Contract: ${STARK_VERIFIER}  ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 echo -e "${NC}"

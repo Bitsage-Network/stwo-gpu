@@ -5,26 +5,28 @@
 # Captures every metric needed for the README and scientific claims.
 #
 # Outputs a structured JSON + human-readable summary with:
-#   - Per-block proving times (all N blocks)
+#   - Per-block proving times (each block proved individually)
 #   - Per-block matmul sumcheck count and dimensions
-#   - Total proving time
+#   - Total proving time (all blocks together)
 #   - Peak GPU memory
 #   - Recursive STARK generation time
 #   - Proof sizes (pre-recursion and post-recursion)
 #   - Verification time (local CPU)
-#   - FFT kernel timing breakdown
 #   - On-chain submission readiness
 #
 # Usage:
 #   ssh h200
-#   cd /path/to/bitsage-network
+#   cd /path/to/bitsage-network/libs
 #   bash scripts/benchmark_full_model.sh \
 #     --layers 40 \
-#     --model-dir /path/to/qwen3-14b \
+#     --model-dir ~/models/qwen3-14b \
 #     --output benchmarks/qwen3_14b_full.json
 #
 # For quick single-block validation:
-#   bash scripts/benchmark_full_model.sh --layers 1
+#   bash scripts/benchmark_full_model.sh --layers 1 --model-dir ~/models/qwen3-14b
+#
+# For full-model one-shot (all N blocks in a single prove-model call):
+#   bash scripts/benchmark_full_model.sh --layers 40 --model-dir ~/models/qwen3-14b --one-shot
 #
 set -euo pipefail
 
@@ -46,8 +48,8 @@ MODEL_DIR=""
 OUTPUT_FILE=""
 SKIP_BUILD=false
 SKIP_RECURSIVE=false
-RUN_FFT_BENCH=true
 WARMUP_RUNS=1
+ONE_SHOT=false
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -57,8 +59,8 @@ while [[ $# -gt 0 ]]; do
         --output)          OUTPUT_FILE="$2"; shift 2 ;;
         --skip-build)      SKIP_BUILD=true; shift ;;
         --skip-recursive)  SKIP_RECURSIVE=true; shift ;;
-        --no-fft-bench)    RUN_FFT_BENCH=false; shift ;;
         --warmup)          WARMUP_RUNS="$2"; shift 2 ;;
+        --one-shot)        ONE_SHOT=true; shift ;;
         -h|--help)
             echo "Usage: $0 [OPTIONS]"
             echo ""
@@ -68,12 +70,18 @@ while [[ $# -gt 0 ]]; do
             echo "  --output PATH       Output JSON file for results"
             echo "  --skip-build        Skip building binaries"
             echo "  --skip-recursive    Skip recursive STARK generation"
-            echo "  --no-fft-bench      Skip FFT microbenchmark"
             echo "  --warmup N          GPU warmup runs before measurement (default: 1)"
+            echo "  --one-shot          Prove all N blocks in a single invocation"
             exit 0 ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
+
+if [ -z "$MODEL_DIR" ]; then
+    echo -e "${RED}ERROR: --model-dir is required${NC}"
+    echo "  Example: --model-dir ~/models/qwen3-14b"
+    exit 1
+fi
 
 mkdir -p "$RESULTS_DIR"
 
@@ -112,6 +120,10 @@ echo -e "${NC}"
 # ─────────────────────────────────────────────────────────────────────────────
 echo -e "${YELLOW}[ENV] Capturing hardware environment${NC}"
 
+# CUDA paths
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/cuda-12.4/lib64:/usr/lib/x86_64-linux-gnu"
+export PATH="/usr/local/cuda-12.4/bin:${PATH}"
+
 GPU_NAME="unknown"
 GPU_MEMORY="unknown"
 CUDA_VERSION="unknown"
@@ -128,13 +140,16 @@ RUST_VERSION=$(rustc --version 2>/dev/null || echo "unknown")
 HOSTNAME=$(hostname)
 DATE_ISO=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-echo "  GPU:    ${GPU_NAME}"
-echo "  VRAM:   ${GPU_MEMORY}"
-echo "  CUDA:   ${CUDA_VERSION}"
-echo "  Driver: ${DRIVER_VERSION}"
-echo "  Rust:   ${RUST_VERSION}"
-echo "  Host:   ${HOSTNAME}"
-echo "  Date:   ${DATE_ISO}"
+echo "  GPU:       ${GPU_NAME}"
+echo "  VRAM:      ${GPU_MEMORY}"
+echo "  CUDA:      ${CUDA_VERSION}"
+echo "  Driver:    ${DRIVER_VERSION}"
+echo "  Rust:      ${RUST_VERSION}"
+echo "  Host:      ${HOSTNAME}"
+echo "  Date:      ${DATE_ISO}"
+echo "  Model dir: ${MODEL_DIR}"
+echo "  Layers:    ${NUM_LAYERS}"
+echo "  Mode:      $([ "$ONE_SHOT" = true ] && echo "one-shot" || echo "per-block")"
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -150,9 +165,13 @@ if [ "$SKIP_BUILD" = false ]; then
     echo "  Building prove-model..."
     (
         cd "${REPO_DIR}/stwo-ml"
-        RUSTUP_TOOLCHAIN=nightly cargo build --release \
+        FEATURES="cli"
+        if command -v nvidia-smi &>/dev/null; then
+            FEATURES="cli,cuda-runtime"
+        fi
+        cargo build --release \
             --bin prove-model \
-            --features "cuda-runtime,safetensors,onnx" 2>&1 | tail -3
+            --features "${FEATURES}" 2>&1 | tail -3
     )
     PROVE_BIN=$(find "${REPO_DIR}" -name "prove-model" -path "*/release/*" -type f 2>/dev/null | head -1)
 
@@ -160,7 +179,7 @@ if [ "$SKIP_BUILD" = false ]; then
     echo "  Building cairo-prove..."
     (
         cd "${REPO_DIR}/stwo-cairo/cairo-prove"
-        RUSTUP_TOOLCHAIN=nightly cargo build --release 2>&1 | tail -3
+        cargo build --release 2>&1 | tail -3
     )
     CAIRO_PROVE_BIN=$(find "${REPO_DIR}" -name "cairo-prove" -path "*/release/*" -type f 2>/dev/null | head -1)
 
@@ -180,112 +199,141 @@ echo "  cairo-prove: ${CAIRO_PROVE_BIN:-not found}"
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Validate model
+# ─────────────────────────────────────────────────────────────────────────────
+echo -e "${YELLOW}[VALIDATE] Checking model directory${NC}"
+${PROVE_BIN} --model-dir "${MODEL_DIR}" --layers "${NUM_LAYERS}" --validate 2>&1 || {
+    echo -e "${RED}ERROR: Model validation failed${NC}"
+    exit 1
+}
+echo -e "  ${GREEN}Model validation passed${NC}"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Warmup
 # ─────────────────────────────────────────────────────────────────────────────
 if [ "$WARMUP_RUNS" -gt 0 ]; then
-    echo -e "${YELLOW}[WARMUP] Running ${WARMUP_RUNS} warmup pass(es) on block 0${NC}"
+    echo -e "${YELLOW}[WARMUP] Running ${WARMUP_RUNS} warmup pass(es)${NC}"
     for i in $(seq 1 "$WARMUP_RUNS"); do
         echo "  Warmup run $i/${WARMUP_RUNS}..."
-        # Run a single-block prove to warm up GPU caches, JIT kernels, etc.
-        # The --inspect flag just loads the model and prints structure (fast)
-        if [ -n "$MODEL_DIR" ]; then
-            ${PROVE_BIN} --model "${MODEL_DIR}" --inspect 2>/dev/null || true
-        fi
+        # Single-layer prove to warm up GPU caches, JIT kernels, etc.
+        ${PROVE_BIN} --model-dir "${MODEL_DIR}" --layers 1 --output /dev/null --format json --gpu 2>/dev/null || true
     done
     echo ""
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Per-Block Proving Benchmark
+# Proving Benchmark
 # ─────────────────────────────────────────────────────────────────────────────
 echo -e "${CYAN}${BOLD}"
 echo "════════════════════════════════════════════════════════════════════"
 echo "  PROVING ${NUM_LAYERS} TRANSFORMER BLOCKS"
-echo "  Model: Qwen3-14B"
+echo "  Model: Qwen3-14B | GPU: ${GPU_NAME}"
 echo "════════════════════════════════════════════════════════════════════"
 echo -e "${NC}"
 
-TOTAL_PROVE_START=$(date +%s%N)
 BLOCK_TIMES=()
 PROOF_SIZES=()
 MATMUL_COUNTS=()
 PEAK_GPU_MEM=0
 
-for block in $(seq 0 $((NUM_LAYERS - 1))); do
-    echo -e "${YELLOW}[Block ${block}/${NUM_LAYERS}]${NC} Proving..."
+if [ "$ONE_SHOT" = true ]; then
+    # ── ONE-SHOT MODE: Prove all N layers in a single invocation ──
+    echo -e "${YELLOW}[ONE-SHOT] Proving all ${NUM_LAYERS} blocks in a single invocation${NC}"
 
-    BLOCK_START=$(date +%s%N)
+    FULL_PROOF="benchmarks/full_${NUM_LAYERS}blocks_proof.json"
+    FULL_LOG="benchmarks/full_${NUM_LAYERS}blocks.log"
 
-    # Capture GPU memory before
     GPU_MEM_BEFORE=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 | xargs || echo "0")
 
-    # Run single-block prove
-    BLOCK_PROOF="benchmarks/block_${block}_proof.json"
-    BLOCK_LOG="benchmarks/block_${block}.log"
+    TOTAL_PROVE_START=$(date +%s%N)
 
-    if [ -n "$MODEL_DIR" ]; then
-        PROVE_CMD="${PROVE_BIN} --model ${MODEL_DIR} --input /dev/null --output ${BLOCK_PROOF} --gpu --format json"
-    else
-        # Without model dir, we need a synthetic run
-        PROVE_CMD="${PROVE_BIN} --model synthetic_qwen3_block --output ${BLOCK_PROOF} --gpu --format json"
-    fi
+    ${PROVE_BIN} \
+        --model-dir "${MODEL_DIR}" \
+        --layers "${NUM_LAYERS}" \
+        --output "${FULL_PROOF}" \
+        --format json \
+        --gpu 2>"${FULL_LOG}" || true
 
-    # Run and capture timing + output
-    ${PROVE_CMD} 2>"${BLOCK_LOG}" || true
+    TOTAL_PROVE_END=$(date +%s%N)
+    TOTAL_PROVE_MS=$(( (TOTAL_PROVE_END - TOTAL_PROVE_START) / 1000000 ))
+    TOTAL_PROVE_SEC=$(echo "scale=3; ${TOTAL_PROVE_MS}/1000" | bc)
 
-    BLOCK_END=$(date +%s%N)
-    BLOCK_MS=$(( (BLOCK_END - BLOCK_START) / 1000000 ))
-    BLOCK_SEC=$(echo "scale=3; ${BLOCK_MS}/1000" | bc)
-
-    # Capture GPU memory peak
     GPU_MEM_AFTER=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 | xargs || echo "0")
-    if [ "$GPU_MEM_AFTER" -gt "$PEAK_GPU_MEM" ]; then
-        PEAK_GPU_MEM=$GPU_MEM_AFTER
-    fi
+    PEAK_GPU_MEM=$GPU_MEM_AFTER
 
-    # Get proof size
-    if [ -f "$BLOCK_PROOF" ]; then
-        PROOF_SIZE=$(du -b "$BLOCK_PROOF" 2>/dev/null | cut -f1 || echo "0")
+    if [ -f "$FULL_PROOF" ]; then
+        PROOF_SIZE=$(du -b "$FULL_PROOF" 2>/dev/null | cut -f1 || echo "0")
     else
         PROOF_SIZE=0
     fi
 
-    # Extract matmul count from log
-    MATMUL_COUNT=$(grep -o "matmul_proofs: [0-9]*" "${BLOCK_LOG}" 2>/dev/null | grep -o "[0-9]*" || echo "0")
+    MATMUL_COUNT=$(grep -o "matmul_proofs: [0-9]*" "${FULL_LOG}" 2>/dev/null | grep -o "[0-9]*" || echo "0")
 
-    BLOCK_TIMES+=("${BLOCK_SEC}")
+    # Store as single "block" entry
+    BLOCK_TIMES+=("${TOTAL_PROVE_SEC}")
     PROOF_SIZES+=("${PROOF_SIZE}")
     MATMUL_COUNTS+=("${MATMUL_COUNT}")
 
-    echo "  Time: ${BLOCK_SEC}s | Proof: ${PROOF_SIZE} bytes | MatMuls: ${MATMUL_COUNT} | GPU Mem: ${GPU_MEM_AFTER} MiB"
-done
+    echo "  Time: ${TOTAL_PROVE_SEC}s | Proof: ${PROOF_SIZE} bytes | MatMuls: ${MATMUL_COUNT} | GPU Mem: ${GPU_MEM_AFTER} MiB"
 
-TOTAL_PROVE_END=$(date +%s%N)
-TOTAL_PROVE_MS=$(( (TOTAL_PROVE_END - TOTAL_PROVE_START) / 1000000 ))
-TOTAL_PROVE_SEC=$(echo "scale=3; ${TOTAL_PROVE_MS}/1000" | bc)
+else
+    # ── PER-BLOCK MODE: Prove each block individually ──
+    TOTAL_PROVE_START=$(date +%s%N)
+
+    for block in $(seq 1 "${NUM_LAYERS}"); do
+        echo -e "${YELLOW}[Block ${block}/${NUM_LAYERS}]${NC} Proving (layers=${block})..."
+
+        BLOCK_START=$(date +%s%N)
+
+        # Capture GPU memory before
+        GPU_MEM_BEFORE=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 | xargs || echo "0")
+
+        BLOCK_PROOF="benchmarks/block_${block}_proof.json"
+        BLOCK_LOG="benchmarks/block_${block}.log"
+
+        # Prove exactly 'block' layers to get per-block cumulative timing
+        ${PROVE_BIN} \
+            --model-dir "${MODEL_DIR}" \
+            --layers "${block}" \
+            --output "${BLOCK_PROOF}" \
+            --format json \
+            --gpu 2>"${BLOCK_LOG}" || true
+
+        BLOCK_END=$(date +%s%N)
+        BLOCK_MS=$(( (BLOCK_END - BLOCK_START) / 1000000 ))
+        BLOCK_SEC=$(echo "scale=3; ${BLOCK_MS}/1000" | bc)
+
+        # Capture GPU memory peak
+        GPU_MEM_AFTER=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 | xargs || echo "0")
+        if [ "$GPU_MEM_AFTER" -gt "$PEAK_GPU_MEM" ]; then
+            PEAK_GPU_MEM=$GPU_MEM_AFTER
+        fi
+
+        # Get proof size
+        if [ -f "$BLOCK_PROOF" ]; then
+            PROOF_SIZE=$(du -b "$BLOCK_PROOF" 2>/dev/null | cut -f1 || echo "0")
+        else
+            PROOF_SIZE=0
+        fi
+
+        # Extract matmul count from log
+        MATMUL_COUNT=$(grep -o "matmul_proofs: [0-9]*" "${BLOCK_LOG}" 2>/dev/null | grep -o "[0-9]*" || echo "0")
+
+        BLOCK_TIMES+=("${BLOCK_SEC}")
+        PROOF_SIZES+=("${PROOF_SIZE}")
+        MATMUL_COUNTS+=("${MATMUL_COUNT}")
+
+        echo "  Time: ${BLOCK_SEC}s | Proof: ${PROOF_SIZE} bytes | MatMuls: ${MATMUL_COUNT} | GPU Mem: ${GPU_MEM_AFTER} MiB"
+    done
+
+    TOTAL_PROVE_END=$(date +%s%N)
+    TOTAL_PROVE_MS=$(( (TOTAL_PROVE_END - TOTAL_PROVE_START) / 1000000 ))
+    TOTAL_PROVE_SEC=$(echo "scale=3; ${TOTAL_PROVE_MS}/1000" | bc)
+fi
 
 echo ""
-echo -e "${GREEN}Total proving time (${NUM_LAYERS} blocks): ${TOTAL_PROVE_SEC}s${NC}"
-echo ""
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Verification Benchmark
-# ─────────────────────────────────────────────────────────────────────────────
-echo -e "${YELLOW}[VERIFY] Measuring CPU verification time${NC}"
-
-VERIFY_TIMES=()
-for block in $(seq 0 $((NUM_LAYERS - 1))); do
-    BLOCK_PROOF="benchmarks/block_${block}_proof.json"
-    if [ -f "$BLOCK_PROOF" ]; then
-        V_START=$(date +%s%N)
-        # Verify
-        ${PROVE_BIN} --verify "${BLOCK_PROOF}" 2>/dev/null || true
-        V_END=$(date +%s%N)
-        V_MS=$(( (V_END - V_START) / 1000000 ))
-        VERIFY_TIMES+=("${V_MS}")
-    fi
-done
-
+echo -e "${GREEN}Total proving time: ${TOTAL_PROVE_SEC}s${NC}"
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -297,24 +345,44 @@ RECURSIVE_PROOF_SIZE="N/A"
 if [ "$SKIP_RECURSIVE" = false ] && [ -n "$CAIRO_PROVE_BIN" ]; then
     echo -e "${YELLOW}[RECURSIVE] Generating recursive Circle STARK${NC}"
 
-    RECURSIVE_START=$(date +%s%N)
+    # First re-prove the full model in cairo_serde format for recursive consumption
+    CAIRO_SERDE_PROOF="benchmarks/ml_proof_cairo_serde.json"
+    echo "  Generating cairo_serde proof for recursive pipeline..."
 
-    # Aggregate all block proofs into a single recursive proof
-    bash "${SCRIPT_DIR}/h200_recursive_pipeline.sh" \
-        --skip-build \
+    ${PROVE_BIN} \
+        --model-dir "${MODEL_DIR}" \
         --layers "${NUM_LAYERS}" \
-        ${MODEL_DIR:+--model-dir "${MODEL_DIR}"} \
-        --output "benchmarks/recursive_proof.json" 2>&1 | tail -10
+        --output "${CAIRO_SERDE_PROOF}" \
+        --format cairo_serde \
+        --gpu 2>/dev/null || true
 
-    RECURSIVE_END=$(date +%s%N)
-    RECURSIVE_MS=$(( (RECURSIVE_END - RECURSIVE_START) / 1000000 ))
-    RECURSIVE_TIME_SEC=$(echo "scale=3; ${RECURSIVE_MS}/1000" | bc)
+    if [ -f "$CAIRO_SERDE_PROOF" ]; then
+        EXECUTABLE="${REPO_DIR}/stwo-cairo/stwo_cairo_verifier/target/dev/obelysk_ml_verifier.executable.json"
 
-    if [ -f "benchmarks/recursive_proof.json" ]; then
-        RECURSIVE_PROOF_SIZE=$(du -b "benchmarks/recursive_proof.json" | cut -f1)
+        if [ -f "$EXECUTABLE" ]; then
+            RECURSIVE_START=$(date +%s%N)
+
+            ${CAIRO_PROVE_BIN} prove-ml \
+                --verifier-executable "${EXECUTABLE}" \
+                --ml-proof "${CAIRO_SERDE_PROOF}" \
+                --output "benchmarks/recursive_proof.json" 2>&1 | tail -10
+
+            RECURSIVE_END=$(date +%s%N)
+            RECURSIVE_MS=$(( (RECURSIVE_END - RECURSIVE_START) / 1000000 ))
+            RECURSIVE_TIME_SEC=$(echo "scale=3; ${RECURSIVE_MS}/1000" | bc)
+
+            if [ -f "benchmarks/recursive_proof.json" ]; then
+                RECURSIVE_PROOF_SIZE=$(du -b "benchmarks/recursive_proof.json" | cut -f1)
+            fi
+
+            echo -e "  ${GREEN}Recursive STARK: ${RECURSIVE_TIME_SEC}s, size: ${RECURSIVE_PROOF_SIZE} bytes${NC}"
+        else
+            echo -e "  ${YELLOW}ML verifier executable not found — skipping recursive${NC}"
+            echo "  Expected: ${EXECUTABLE}"
+        fi
+    else
+        echo -e "  ${YELLOW}cairo_serde proof generation failed — skipping recursive${NC}"
     fi
-
-    echo -e "  ${GREEN}Recursive STARK: ${RECURSIVE_TIME_SEC}s, size: ${RECURSIVE_PROOF_SIZE} bytes${NC}"
 else
     echo -e "${YELLOW}[RECURSIVE] Skipped${NC}"
 fi
@@ -326,6 +394,13 @@ echo ""
 # ─────────────────────────────────────────────────────────────────────────────
 echo -e "${YELLOW}[OUTPUT] Writing results to ${OUTPUT_FILE}${NC}"
 
+# Compute average
+if [ ${#BLOCK_TIMES[@]} -gt 0 ]; then
+    AVG_BLOCK_SEC=$(echo "scale=3; ${TOTAL_PROVE_SEC}/${NUM_LAYERS}" | bc)
+else
+    AVG_BLOCK_SEC="0"
+fi
+
 # Build block times array for JSON
 BLOCK_TIMES_JSON="["
 for i in "${!BLOCK_TIMES[@]}"; do
@@ -336,7 +411,7 @@ BLOCK_TIMES_JSON+="]"
 
 cat > "${OUTPUT_FILE}" << ENDJSON
 {
-  "benchmark_version": "1.0.0",
+  "benchmark_version": "1.1.0",
   "timestamp": "${DATE_ISO}",
   "hostname": "${HOSTNAME}",
   "hardware": {
@@ -357,9 +432,10 @@ cat > "${OUTPUT_FILE}" << ENDJSON
     "head_dim": 128
   },
   "proving": {
+    "mode": "$([ "$ONE_SHOT" = true ] && echo "one_shot" || echo "per_block")",
     "total_blocks": ${NUM_LAYERS},
     "total_prove_sec": ${TOTAL_PROVE_SEC},
-    "avg_block_prove_sec": $(echo "scale=3; ${TOTAL_PROVE_SEC}/${NUM_LAYERS}" | bc),
+    "avg_block_prove_sec": ${AVG_BLOCK_SEC},
     "peak_gpu_memory_mib": ${PEAK_GPU_MEM},
     "per_block": ${BLOCK_TIMES_JSON}
   },
@@ -380,7 +456,8 @@ cat > "${OUTPUT_FILE}" << ENDJSON
     "All times measured with wall-clock (date +%s%N)",
     "GPU warmup: ${WARMUP_RUNS} pass(es) before measurement",
     "Proving uses cuda-runtime feature with GPU residency",
-    "Peak GPU memory is max observed across all blocks"
+    "Peak GPU memory is max observed across all blocks",
+    "Per-block times are cumulative (block N = prove layers 1..N)"
   ]
 }
 ENDJSON
@@ -396,12 +473,12 @@ echo "╔═══════════════════════�
 echo "║                    BENCHMARK RESULTS SUMMARY                     ║"
 echo "╠═══════════════════════════════════════════════════════════════════╣"
 echo "║                                                                   ║"
-echo "║  Model:           Qwen3-14B (${NUM_LAYERS} blocks)                          ║"
-echo "║  GPU:             ${GPU_NAME}                                     "
+printf "║  Model:           Qwen3-14B (%d blocks)\n" "${NUM_LAYERS}"
+printf "║  GPU:             %s\n" "${GPU_NAME}"
 echo "║                                                                   ║"
 echo "║  ── Proving ──────────────────────────────────────────────────── ║"
 printf "║  Total prove:     %-10s (%d blocks)\n" "${TOTAL_PROVE_SEC}s" "${NUM_LAYERS}"
-printf "║  Avg per block:   %-10s\n" "$(echo "scale=3; ${TOTAL_PROVE_SEC}/${NUM_LAYERS}" | bc)s"
+printf "║  Avg per block:   %-10s\n" "${AVG_BLOCK_SEC}s"
 printf "║  Peak GPU mem:    %-10s\n" "${PEAK_GPU_MEM} MiB"
 echo "║                                                                   ║"
 echo "║  ── Recursive STARK ──────────────────────────────────────────── ║"
@@ -415,16 +492,18 @@ echo "╚═══════════════════════�
 echo -e "${NC}"
 
 # Quick stats
-echo "Per-block breakdown:"
-for i in "${!BLOCK_TIMES[@]}"; do
-    printf "  Block %2d: %8ss | %s matmuls | %s bytes\n" \
-        "$i" "${BLOCK_TIMES[$i]}" "${MATMUL_COUNTS[$i]}" "${PROOF_SIZES[$i]}"
-done
+if [ "$ONE_SHOT" = false ]; then
+    echo "Per-block breakdown:"
+    for i in "${!BLOCK_TIMES[@]}"; do
+        printf "  Block %2d: %8ss | %s matmuls | %s bytes\n" \
+            "$((i+1))" "${BLOCK_TIMES[$i]}" "${MATMUL_COUNTS[$i]}" "${PROOF_SIZES[$i]}"
+    done
+    echo ""
+fi
 
-echo ""
 echo -e "${GREEN}Benchmark complete. Results: ${OUTPUT_FILE}${NC}"
 echo ""
 echo "Next steps:"
 echo "  1. Review results and update libs/README.md with real numbers"
-echo "  2. Run: bash scripts/h200_submit_onchain.sh  (to submit proof to Starknet)"
-echo "  3. Commit benchmarks/: git add benchmarks/ && git commit -m 'Add verified benchmarks'"
+echo "  2. Run: bash scripts/h200_submit_onchain.sh --proof benchmarks/recursive_proof.json --submit"
+echo "  3. Commit: git add benchmarks/ && git commit -m 'Add verified benchmarks'"
