@@ -19,7 +19,7 @@ use stwo::core::fields::qm31::SecureField;
 use super::matmul::{
     M31Matrix, MatMulSumcheckProofOnChain,
     estimate_sumcheck_memory, matmul_m31, pad_matrix_pow2,
-    prove_matmul_sumcheck_onchain,
+    prove_matmul_sumcheck_onchain_auto,
 };
 
 /// Configuration for tiled matmul proving.
@@ -197,7 +197,7 @@ pub fn prove_tiled_matmul(
         let c_padded = pad_matrix_pow2(&c_tile);
 
         // Prove this tile
-        let proof = prove_matmul_sumcheck_onchain(&a_padded, &b_padded, &c_padded)
+        let proof = prove_matmul_sumcheck_onchain_auto(&a_padded, &b_padded, &c_padded)
             .map_err(|e| TiledMatMulError::TileProvingFailed {
                 tile: tile_idx,
                 message: format!("{e}"),

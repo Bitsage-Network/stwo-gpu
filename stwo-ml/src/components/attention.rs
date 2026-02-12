@@ -42,7 +42,7 @@ use crate::components::matmul::{
     M31Matrix, MatMulError, MatMulSumcheckProof,
     MatMulSumcheckProofOnChain,
     matmul_m31, prove_matmul_sumcheck,
-    prove_matmul_sumcheck_onchain,
+    prove_matmul_sumcheck_onchain_auto,
 };
 use crate::compiler::prove::prove_activation_layer;
 use crate::gadgets::lookup_table::PrecomputedTable;
@@ -579,11 +579,11 @@ pub fn prove_attention_onchain(
     let k_p = pad_to_pow2(&intermediates.k);
     let v_p = pad_to_pow2(&intermediates.v);
 
-    let q_proof = prove_matmul_sumcheck_onchain(&input_p, &wq_p, &q_p)
+    let q_proof = prove_matmul_sumcheck_onchain_auto(&input_p, &wq_p, &q_p)
         .map_err(|e| AttentionError::MatMul { stage: "Q_projection".into(), source: e })?;
-    let k_proof = prove_matmul_sumcheck_onchain(&input_p, &wk_p, &k_p)
+    let k_proof = prove_matmul_sumcheck_onchain_auto(&input_p, &wk_p, &k_p)
         .map_err(|e| AttentionError::MatMul { stage: "K_projection".into(), source: e })?;
-    let v_proof = prove_matmul_sumcheck_onchain(&input_p, &wv_p, &v_p)
+    let v_proof = prove_matmul_sumcheck_onchain_auto(&input_p, &wv_p, &v_p)
         .map_err(|e| AttentionError::MatMul { stage: "V_projection".into(), source: e })?;
 
     let q_heads = split_heads(&intermediates.q, config.num_heads);
@@ -598,21 +598,21 @@ pub fn prove_attention_onchain(
         let q_h_p = pad_to_pow2(&q_heads[h]);
         let k_t_p = pad_to_pow2(&k_t);
         let scores_p = matmul_m31(&q_h_p, &k_t_p);
-        let sp = prove_matmul_sumcheck_onchain(&q_h_p, &k_t_p, &scores_p)
+        let sp = prove_matmul_sumcheck_onchain_auto(&q_h_p, &k_t_p, &scores_p)
             .map_err(|e| AttentionError::MatMul { stage: format!("score_head_{h}"), source: e })?;
         score_proofs.push(sp);
 
         let soft_p = pad_to_pow2(&intermediates.softmax_outputs[h]);
         let v_h_p = pad_to_pow2(&v_heads[h]);
         let context_p = matmul_m31(&soft_p, &v_h_p);
-        let avp = prove_matmul_sumcheck_onchain(&soft_p, &v_h_p, &context_p)
+        let avp = prove_matmul_sumcheck_onchain_auto(&soft_p, &v_h_p, &context_p)
             .map_err(|e| AttentionError::MatMul { stage: format!("attn_v_head_{h}"), source: e })?;
         attn_v_proofs.push(avp);
     }
 
     let concat_p = pad_to_pow2(&intermediates.concat);
     let out_p = pad_to_pow2(&intermediates.final_output);
-    let output_proof = prove_matmul_sumcheck_onchain(&concat_p, &wo_p, &out_p)
+    let output_proof = prove_matmul_sumcheck_onchain_auto(&concat_p, &wo_p, &out_p)
         .map_err(|e| AttentionError::MatMul { stage: "output_projection".into(), source: e })?;
 
     Ok(AttentionProofOnChain {

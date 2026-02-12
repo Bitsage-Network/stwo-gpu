@@ -59,7 +59,7 @@ use crate::components::activation::{
 use crate::components::matmul::{
     M31Matrix, matmul_m31,
     MatMulSumcheckProof, prove_matmul_sumcheck_auto,
-    MatMulSumcheckProofOnChain, prove_matmul_sumcheck_onchain,
+    MatMulSumcheckProofOnChain, prove_matmul_sumcheck_onchain_auto,
     estimate_sumcheck_memory,
 };
 use crate::components::tiled_matmul::{
@@ -1050,7 +1050,7 @@ impl AggregatedModelProofOnChain {
 
 /// Prove an entire computation graph with on-chain Poseidon-based matmul proofs.
 ///
-/// Same as `prove_model_aggregated` but calls `prove_matmul_sumcheck_onchain()`
+/// Same as `prove_model_aggregated` but calls `prove_matmul_sumcheck_onchain_auto()`
 /// for each matmul layer, producing proofs with Poseidon Merkle commitments
 /// and MLE opening proofs compatible with the Cairo verifier.
 ///
@@ -1143,7 +1143,7 @@ where
                     compose_tiled_proof(&tiled)
                 } else {
                     // Use standard on-chain proving
-                    prove_matmul_sumcheck_onchain(&current, weight, &output)
+                    prove_matmul_sumcheck_onchain_auto(&current, weight, &output)
                         .map_err(|e| ModelError::ProvingError {
                             layer: node.id,
                             message: format!("MatMul sumcheck (on-chain): {e}"),
@@ -1317,7 +1317,7 @@ where
                 let (im2col_mat, kernel_mat, output) =
                     conv2d_forward(&current.data, &kernel.data, &im2col_config, *out_channels);
                 // Conv2D matmul uses on-chain proving
-                let proof = prove_matmul_sumcheck_onchain(&im2col_mat, &kernel_mat, &output)
+                let proof = prove_matmul_sumcheck_onchain_auto(&im2col_mat, &kernel_mat, &output)
                     .map_err(|e| ModelError::ProvingError {
                         layer: node.id,
                         message: format!("Conv2D matmul (on-chain): {e}"),

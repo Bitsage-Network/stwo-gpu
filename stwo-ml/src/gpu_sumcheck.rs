@@ -26,6 +26,8 @@ use stwo::core::fields::qm31::{QM31, SecureField};
 #[cfg(feature = "cuda-runtime")]
 use stwo::core::fields::cm31::CM31;
 #[cfg(feature = "cuda-runtime")]
+use stwo::core::fields::FieldExpOps;
+#[cfg(feature = "cuda-runtime")]
 use stwo::core::channel::{Blake2sChannel, Channel};
 #[cfg(feature = "cuda-runtime")]
 use stwo::prover::lookups::sumcheck::{self, MultivariatePolyOracle};
@@ -258,6 +260,39 @@ extern "C" __global__ void sumcheck_round_kernel(
     }
 }
 
+// GPU-resident MLE fold kernel: fix first variable to challenge.
+// result[i] = input[i] + alpha * (input[half_n + i] - input[i])
+// Operates entirely on-device — no CPU round-trip.
+extern "C" __global__ void mle_fold_kernel(
+    const uint32_t* __restrict__ input,
+    const uint32_t* __restrict__ alpha,
+    uint32_t* __restrict__ output,
+    uint32_t half_n
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= half_n) return;
+
+    // Load alpha (same for all threads — broadcast from constant memory)
+    QM31 a = {alpha[0], alpha[1], alpha[2], alpha[3]};
+
+    // Load lhs = input[idx], rhs = input[half_n + idx]
+    uint32_t lo = idx * 4;
+    uint32_t hi = (half_n + idx) * 4;
+    QM31 lhs = {input[lo], input[lo+1], input[lo+2], input[lo+3]};
+    QM31 rhs = {input[hi], input[hi+1], input[hi+2], input[hi+3]};
+
+    // result = lhs + alpha * (rhs - lhs)
+    QM31 diff = qm31_sub(rhs, lhs);
+    QM31 term = qm31_mul(a, diff);
+    QM31 result = qm31_add(lhs, term);
+
+    uint32_t out = idx * 4;
+    output[out]   = result.a0;
+    output[out+1] = result.a1;
+    output[out+2] = result.a2;
+    output[out+3] = result.a3;
+}
+
 // Second-pass reduction kernel: reduces per-block partial sums to a single QM31 per channel.
 // Only needed when grid_dim > 1 (mid > 256).
 extern "C" __global__ void sumcheck_reduce_kernel(
@@ -320,9 +355,10 @@ extern "C" __global__ void sumcheck_reduce_kernel(
 /// Compiled CUDA functions for sumcheck operations.
 #[cfg(feature = "cuda-runtime")]
 pub struct GpuSumcheckExecutor {
-    device: Arc<CudaDevice>,
+    pub device: Arc<CudaDevice>,
     sumcheck_round_fn: CudaFunction,
     sumcheck_reduce_fn: CudaFunction,
+    mle_fold_fn: CudaFunction,
 }
 
 #[cfg(feature = "cuda-runtime")]
@@ -341,6 +377,7 @@ impl GpuSumcheckExecutor {
         device.load_ptx(ptx, "sumcheck", &[
             "sumcheck_round_kernel",
             "sumcheck_reduce_kernel",
+            "mle_fold_kernel",
         ]).map_err(|e| CudaFftError::KernelCompilation(format!("load sumcheck PTX: {:?}", e)))?;
 
         let sumcheck_round_fn = device.get_func("sumcheck", "sumcheck_round_kernel")
@@ -353,10 +390,16 @@ impl GpuSumcheckExecutor {
                 "sumcheck_reduce_kernel not found".into(),
             ))?;
 
+        let mle_fold_fn = device.get_func("sumcheck", "mle_fold_kernel")
+            .ok_or_else(|| CudaFftError::KernelCompilation(
+                "mle_fold_kernel not found".into(),
+            ))?;
+
         Ok(Self {
             device,
             sumcheck_round_fn,
             sumcheck_reduce_fn,
+            mle_fold_fn,
         })
     }
 
@@ -476,6 +519,7 @@ impl GpuSumcheckExecutor {
     /// splits into lower/upper halves and computes:
     ///   result[i] = lhs[i] + challenge * (rhs[i] - lhs[i])
     ///
+    /// Runs entirely on GPU — no CPU round-trip.
     /// Returns a new device buffer of `n_points/2 * 4` u32.
     pub fn mle_fold(
         &self,
@@ -485,27 +529,36 @@ impl GpuSumcheckExecutor {
     ) -> Result<CudaSlice<u32>, CudaFftError> {
         let half_n = n_points / 2;
 
-        // Upload to contiguous layout for stwo's mle_fold_secure
-        // lhs = input[0..half_n*4], rhs = input[half_n*4..n_points*4]
-        // We can reuse stwo's kernel directly via the CudaFftExecutor
-        let executor = get_cuda_executor().map_err(|e| e.clone())?;
+        // Upload challenge (4 u32 = 16 bytes — the only transfer per round)
+        let d_alpha = self.device.htod_sync_copy(challenge)
+            .map_err(|e| CudaFftError::MemoryAllocation(format!("alpha upload: {:?}", e)))?;
 
-        // Download input to CPU, split, and call stwo's mle_fold_secure
-        // (For v1, this is simpler and correct. GPU-resident fold is a future optimization.)
-        let mut cpu_data = vec![0u32; n_points * 4];
-        self.device.dtoh_sync_copy_into(d_input, &mut cpu_data)
-            .map_err(|e| CudaFftError::MemoryTransfer(format!("{:?}", e)))?;
+        // Allocate output buffer on GPU
+        let mut d_output = unsafe { self.device.alloc::<u32>(half_n * 4) }
+            .map_err(|e| CudaFftError::MemoryAllocation(format!("fold output: {:?}", e)))?;
 
-        let lhs = &cpu_data[..half_n * 4];
-        let rhs = &cpu_data[half_n * 4..];
+        let block_size = 256u32;
+        let grid_size = ((half_n as u32) + block_size - 1) / block_size;
 
-        let folded = executor.mle_fold_secure(lhs, rhs, challenge, half_n)?;
+        let cfg = LaunchConfig {
+            grid_dim: (grid_size, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: 0,
+        };
 
-        // Upload result back to GPU
-        let d_result = self.device.htod_sync_copy(&folded)
-            .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
+        unsafe {
+            self.mle_fold_fn.clone().launch(
+                cfg,
+                (
+                    d_input,
+                    &d_alpha,
+                    &mut d_output,
+                    half_n as u32,
+                ),
+            ).map_err(|e| CudaFftError::KernelExecution(format!("mle_fold: {:?}", e)))?;
+        }
 
-        Ok(d_result)
+        Ok(d_output)
     }
 }
 
@@ -625,15 +678,18 @@ pub fn prove_matmul_sumcheck_gpu(
         ));
     }
 
+    // Auto-pad to power-of-2 dimensions (same as CPU path)
+    let a = &crate::components::matmul::pad_matrix_pow2(a);
+    let b = &crate::components::matmul::pad_matrix_pow2(b);
+    let c = &crate::components::matmul::pad_matrix_pow2(c);
+
     let m = a.rows;
     let k = a.cols;
     let n = b.cols;
 
-    for (name, val) in [("m", m), ("k", k), ("n", n)] {
-        if !val.is_power_of_two() {
-            return Err(MatMulError::NonPowerOfTwo(format!("{name}={val}")));
-        }
-    }
+    debug_assert!(m.is_power_of_two());
+    debug_assert!(k.is_power_of_two());
+    debug_assert!(n.is_power_of_two());
 
     let log_m = m.ilog2() as usize;
     let log_n = n.ilog2() as usize;
@@ -718,6 +774,177 @@ pub fn prove_matmul_sumcheck_gpu(
         final_a_eval,
         final_b_eval,
         assignment,
+    })
+}
+
+// =============================================================================
+// On-Chain GPU Sumcheck (Poseidon Fiat-Shamir)
+// =============================================================================
+
+/// Prove C = A × B using GPU-accelerated sumcheck with Poseidon Fiat-Shamir
+/// channel and MLE Poseidon Merkle commitments, formatted for on-chain Cairo
+/// verification.
+///
+/// Same protocol as `prove_matmul_sumcheck_onchain` but the sumcheck inner
+/// loop (s0/s1/s2 reduction + MLE fold) runs on GPU. Fiat-Shamir hashing
+/// and Lagrange interpolation remain on CPU (O(1) per round, not hot).
+#[cfg(feature = "cuda-runtime")]
+pub fn prove_matmul_sumcheck_onchain_gpu(
+    a: &M31Matrix,
+    b: &M31Matrix,
+    c: &M31Matrix,
+) -> Result<crate::components::matmul::MatMulSumcheckProofOnChain, MatMulError> {
+    use crate::components::matmul::{
+        MatMulSumcheckProofOnChain, RoundPoly, pad_matrix_pow2,
+    };
+    use crate::crypto::poseidon_channel::{PoseidonChannel, securefield_to_felt};
+    use crate::crypto::mle_opening::{commit_mle, prove_mle_opening};
+
+    // Validate dimensions
+    if a.cols != b.rows {
+        return Err(MatMulError::DimensionMismatch(
+            format!("A.cols={} != B.rows={}", a.cols, b.rows),
+        ));
+    }
+    if c.rows != a.rows || c.cols != b.cols {
+        return Err(MatMulError::DimensionMismatch(
+            format!("C({},{}) != expected ({},{})", c.rows, c.cols, a.rows, b.cols),
+        ));
+    }
+
+    // Auto-pad to power-of-2 dimensions
+    let a = &pad_matrix_pow2(a);
+    let b = &pad_matrix_pow2(b);
+    let c = &pad_matrix_pow2(c);
+
+    let m = a.rows;
+    let k = a.cols;
+    let n = b.cols;
+    let log_m = m.ilog2() as usize;
+    let log_k = k.ilog2() as usize;
+    let log_n = n.ilog2() as usize;
+
+    // Build MLEs on CPU (one-time cost)
+    let mle_a = matrix_to_mle_pub(a);
+    let mle_b_t = matrix_to_mle_col_major_pub(b);
+    let mle_c = matrix_to_mle_pub(c);
+
+    // PoseidonChannel for Fiat-Shamir (must match CPU path exactly)
+    let mut channel = PoseidonChannel::new();
+    channel.mix_u64(m as u64);
+    channel.mix_u64(k as u64);
+    channel.mix_u64(n as u64);
+
+    let r_i = channel.draw_qm31s(log_m);
+    let r_j = channel.draw_qm31s(log_n);
+
+    // Compute claimed sum: MLE_C(r_i, r_j)
+    let mut r_ij = Vec::with_capacity(log_m + log_n);
+    r_ij.extend_from_slice(&r_i);
+    r_ij.extend_from_slice(&r_j);
+    let claimed_sum = evaluate_mle_pub(&mle_c, &r_ij);
+
+    channel.mix_felt(securefield_to_felt(claimed_sum));
+
+    // Restrict MLEs on CPU
+    let f_a = restrict_mle_pub(&mle_a, &r_i);
+    let f_b = restrict_mle_pub(&mle_b_t, &r_j);
+
+    assert_eq!(f_a.len(), k);
+    assert_eq!(f_b.len(), k);
+
+    // Commit to restricted MLEs
+    let (a_commitment, _a_tree) = commit_mle(&f_a);
+    let (b_commitment, _b_tree) = commit_mle(&f_b);
+
+    channel.mix_felt(a_commitment);
+    channel.mix_felt(b_commitment);
+
+    // Initialize GPU executor and upload MLEs
+    let gpu_executor = GpuSumcheckExecutor::new()
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU init: {e}")))?;
+
+    let f_a_u32: Vec<u32> = f_a.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
+    let f_b_u32: Vec<u32> = f_b.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
+
+    let mut d_f_a = gpu_executor.device.htod_sync_copy(&f_a_u32)
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU upload f_a: {:?}", e)))?;
+    let mut d_f_b = gpu_executor.device.htod_sync_copy(&f_b_u32)
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU upload f_b: {:?}", e)))?;
+
+    // === Sumcheck with GPU inner loop + Poseidon channel ===
+    let num_rounds = log_k;
+    let mut round_polys = Vec::with_capacity(num_rounds);
+    let mut assignment = Vec::with_capacity(num_rounds);
+    let mut cur_n_points = k;
+
+    for _round in 0..num_rounds {
+        let mid = cur_n_points / 2;
+
+        // GPU: compute s0, s1, s2 in parallel (only 48 bytes downloaded)
+        let (s0_u32, s1_u32, s2_u32) = gpu_executor
+            .compute_round_poly(&d_f_a, &d_f_b, mid)
+            .map_err(|e| MatMulError::SumcheckFailed(format!("GPU round: {e}")))?;
+
+        let s0 = u32s_to_secure_field(&s0_u32);
+        let s1 = u32s_to_secure_field(&s1_u32);
+        let s2 = u32s_to_secure_field(&s2_u32);
+
+        // CPU: extract coefficients and build round polynomial
+        let c0 = s0;
+        let two = SecureField::from(M31::from(2));
+        let c2 = (s2 - two * s1 + s0) * SecureField::from(M31::from(2)).inverse();
+        let c1 = s1 - s0 - c2;
+
+        round_polys.push(RoundPoly { c0, c1, c2 });
+
+        // CPU: Poseidon Fiat-Shamir — mix polynomial and draw challenge
+        channel.mix_poly_coeffs(c0, c1, c2);
+        let r_k = channel.draw_qm31();
+        assignment.push(r_k);
+
+        // GPU: fold both MLEs with challenge (16 bytes uploaded, no download)
+        let challenge_u32 = secure_field_to_u32s(r_k);
+
+        let new_d_f_a = gpu_executor.mle_fold(&d_f_a, cur_n_points, &challenge_u32)
+            .map_err(|e| MatMulError::SumcheckFailed(format!("GPU fold f_a: {e}")))?;
+        let new_d_f_b = gpu_executor.mle_fold(&d_f_b, cur_n_points, &challenge_u32)
+            .map_err(|e| MatMulError::SumcheckFailed(format!("GPU fold f_b: {e}")))?;
+
+        d_f_a = new_d_f_a;
+        d_f_b = new_d_f_b;
+        cur_n_points = mid;
+    }
+
+    // Download final single-point evaluations (8 bytes total)
+    assert_eq!(cur_n_points, 1);
+    let mut final_a_u32 = [0u32; 4];
+    let mut final_b_u32 = [0u32; 4];
+    gpu_executor.device.dtoh_sync_copy_into(&d_f_a, &mut final_a_u32)
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU download final_a: {:?}", e)))?;
+    gpu_executor.device.dtoh_sync_copy_into(&d_f_b, &mut final_b_u32)
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU download final_b: {:?}", e)))?;
+
+    let final_a_eval = u32s_to_secure_field(&final_a_u32);
+    let final_b_eval = u32s_to_secure_field(&final_b_u32);
+
+    // MLE opening proofs (CPU — these use Poseidon Merkle paths)
+    let a_opening = prove_mle_opening(&f_a, &assignment, &mut channel);
+    let b_opening = prove_mle_opening(&f_b, &assignment, &mut channel);
+
+    Ok(MatMulSumcheckProofOnChain {
+        m: m as u32,
+        k: k as u32,
+        n: n as u32,
+        num_rounds: num_rounds as u32,
+        claimed_sum,
+        round_polys,
+        final_a_eval,
+        final_b_eval,
+        a_commitment,
+        b_commitment,
+        a_opening,
+        b_opening,
     })
 }
 
