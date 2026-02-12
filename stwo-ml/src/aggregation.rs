@@ -43,6 +43,8 @@ use stwo_constraint_framework::{
 };
 
 use num_traits::One;
+#[cfg(feature = "cuda-runtime")]
+use num_traits::Zero;
 use std::collections::HashMap;
 
 use crate::compiler::graph::{ComputationGraph, GraphOp, GraphWeights};
