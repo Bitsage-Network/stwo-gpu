@@ -35,7 +35,7 @@ use stwo::prover::lookups::utils::UnivariatePoly;
 use stwo::prover::backend::gpu::cuda_executor::{get_cuda_executor, CudaFftExecutor, CudaFftError};
 
 #[cfg(feature = "cuda-runtime")]
-use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, LaunchConfig};
+use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, LaunchConfig, LaunchAsync};
 
 #[cfg(feature = "cuda-runtime")]
 use crate::components::matmul::{
@@ -424,30 +424,16 @@ impl GpuSumcheckExecutor {
         let mut d_partials = unsafe { self.device.alloc::<u32>(total_partials) }
             .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
 
-        // Copy block partials into packed layout
-        // cudarc dtod_copy: src -> dst
-        unsafe {
-            cudarc::driver::result::memcpy_dtod_async(
-                *d_partials.device_ptr_mut(),
-                *d_block_s0.device_ptr(),
-                n_blocks * 4 * std::mem::size_of::<u32>(),
-                self.device.cu_stream(),
-            ).map_err(|e| CudaFftError::MemoryTransfer(format!("dtod s0: {:?}", e)))?;
-
-            cudarc::driver::result::memcpy_dtod_async(
-                d_partials.device_ptr_mut().add(n_blocks * 4),
-                *d_block_s1.device_ptr(),
-                n_blocks * 4 * std::mem::size_of::<u32>(),
-                self.device.cu_stream(),
-            ).map_err(|e| CudaFftError::MemoryTransfer(format!("dtod s1: {:?}", e)))?;
-
-            cudarc::driver::result::memcpy_dtod_async(
-                d_partials.device_ptr_mut().add(2 * n_blocks * 4),
-                *d_block_s2.device_ptr(),
-                n_blocks * 4 * std::mem::size_of::<u32>(),
-                self.device.cu_stream(),
-            ).map_err(|e| CudaFftError::MemoryTransfer(format!("dtod s2: {:?}", e)))?;
-        }
+        // Copy block partials into packed layout: [s0_blocks | s1_blocks | s2_blocks]
+        let s0_len = n_blocks * 4;
+        let s1_offset = s0_len;
+        let s2_offset = 2 * s0_len;
+        self.device.dtod_copy(&d_block_s0, &mut d_partials.slice_mut(0..s0_len))
+            .map_err(|e| CudaFftError::MemoryTransfer(format!("dtod s0: {:?}", e)))?;
+        self.device.dtod_copy(&d_block_s1, &mut d_partials.slice_mut(s1_offset..s1_offset + s0_len))
+            .map_err(|e| CudaFftError::MemoryTransfer(format!("dtod s1: {:?}", e)))?;
+        self.device.dtod_copy(&d_block_s2, &mut d_partials.slice_mut(s2_offset..s2_offset + s0_len))
+            .map_err(|e| CudaFftError::MemoryTransfer(format!("dtod s2: {:?}", e)))?;
 
         // Output: 3 QM31 values = 12 u32
         let mut d_output = unsafe { self.device.alloc::<u32>(12) }
