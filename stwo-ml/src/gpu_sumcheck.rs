@@ -61,6 +61,10 @@ use crate::components::matmul::{
 /// A second `sumcheck_reduce_kernel` finishes cross-block reduction when grid_dim > 1.
 #[cfg(feature = "cuda-runtime")]
 const SUMCHECK_CUDA_KERNEL: &str = r#"
+// NVRTC does not include <stdint.h> — define fixed-width types explicitly
+typedef unsigned int uint32_t;
+typedef unsigned long long uint64_t;
+
 #define M31_PRIME 0x7FFFFFFFu
 
 __device__ __forceinline__ uint32_t m31_add(uint32_t a, uint32_t b) {
@@ -233,14 +237,14 @@ extern "C" __global__ void sumcheck_round_kernel(
             s_s0[mine] = sum.a0; s_s0[mine+1] = sum.a1;
             s_s0[mine+2] = sum.a2; s_s0[mine+3] = sum.a3;
 
-            a = (QM31){s_s1[mine], s_s1[mine+1], s_s1[mine+2], s_s1[mine+3]};
-            b_val = (QM31){s_s1[other], s_s1[other+1], s_s1[other+2], s_s1[other+3]};
+            a = QM31{s_s1[mine], s_s1[mine+1], s_s1[mine+2], s_s1[mine+3]};
+            b_val = QM31{s_s1[other], s_s1[other+1], s_s1[other+2], s_s1[other+3]};
             sum = qm31_add(a, b_val);
             s_s1[mine] = sum.a0; s_s1[mine+1] = sum.a1;
             s_s1[mine+2] = sum.a2; s_s1[mine+3] = sum.a3;
 
-            a = (QM31){s_s2[mine], s_s2[mine+1], s_s2[mine+2], s_s2[mine+3]};
-            b_val = (QM31){s_s2[other], s_s2[other+1], s_s2[other+2], s_s2[other+3]};
+            a = QM31{s_s2[mine], s_s2[mine+1], s_s2[mine+2], s_s2[mine+3]};
+            b_val = QM31{s_s2[other], s_s2[other+1], s_s2[other+2], s_s2[other+3]};
             sum = qm31_add(a, b_val);
             s_s2[mine] = sum.a0; s_s2[mine+1] = sum.a1;
             s_s2[mine+2] = sum.a2; s_s2[mine+3] = sum.a3;
@@ -315,8 +319,8 @@ extern "C" __global__ void sumcheck_reduce_kernel(
     QM31 val = qm31_zero();
     if (tid < n_blocks) {
         uint32_t base = tid * 4;
-        val = (QM31){channel_partials[base], channel_partials[base+1],
-                     channel_partials[base+2], channel_partials[base+3]};
+        val = QM31{channel_partials[base], channel_partials[base+1],
+                   channel_partials[base+2], channel_partials[base+3]};
     }
 
     uint32_t base = tid * 4;
