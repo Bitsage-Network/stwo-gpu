@@ -33,9 +33,13 @@ use stwo::core::pcs::PcsConfig;
 use stwo::core::channel::MerkleChannel;
 use stwo::core::proof::StarkProof;
 use stwo::core::vcs_lifted::MerkleHasherLifted;
+use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
+use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::BackendForChannel;
 use stwo::prover::poly::circle::PolyOps;
 use stwo_constraint_framework::FrameworkComponent;
+
+type Blake2sHash = <Blake2sMerkleChannel as MerkleChannel>::H;
 
 use crate::components::activation::{ActivationEval, ActivationType};
 use crate::components::matmul::{
@@ -172,7 +176,7 @@ pub struct AttentionProof<H: MerkleHasherLifted> {
     pub intermediates: AttentionIntermediates,
 }
 
-/// On-chain attention proof (Poseidon channel).
+/// On-chain attention proof (Poseidon channel for matmuls, Blake2s for softmax STARK).
 #[derive(Debug)]
 pub struct AttentionProofOnChain {
     pub q_proof: MatMulSumcheckProofOnChain,
@@ -181,6 +185,12 @@ pub struct AttentionProofOnChain {
     pub score_proofs: Vec<MatMulSumcheckProofOnChain>,
     pub attn_v_proofs: Vec<MatMulSumcheckProofOnChain>,
     pub output_proof: MatMulSumcheckProofOnChain,
+    /// Aggregated softmax exp STARK proof (all heads batched, Blake2s channel).
+    pub softmax_exp_proof: StarkProof<Blake2sHash>,
+    /// LogUp claimed sum for the softmax STARK.
+    pub softmax_claimed_sum: stwo::core::fields::qm31::SecureField,
+    /// Log2 of trace size for softmax STARK.
+    pub softmax_log_size: u32,
     pub intermediates: AttentionIntermediates,
 }
 
@@ -602,6 +612,8 @@ pub fn prove_attention_onchain(
 
     let mut score_proofs = Vec::with_capacity(config.num_heads);
     let mut attn_v_proofs = Vec::with_capacity(config.num_heads);
+    let mut all_softmax_inputs = Vec::new();
+    let mut all_softmax_outputs = Vec::new();
 
     for h in 0..config.num_heads {
         let k_t = transpose_m31(&k_heads[h]);
@@ -611,6 +623,13 @@ pub fn prove_attention_onchain(
         let sp = prove_matmul_sumcheck_onchain_auto(&q_h_p, &k_t_p, &scores_p)
             .map_err(|e| AttentionError::MatMul { stage: format!("score_head_{h}"), source: e })?;
         score_proofs.push(sp);
+
+        // Collect softmax exp inputs/outputs for batched STARK
+        let score_mat = &intermediates.score_matrices[h];
+        for val in &score_mat.data {
+            all_softmax_inputs.push(*val);
+            all_softmax_outputs.push(softmax_exp(*val));
+        }
 
         let soft_p = pad_to_pow2(&intermediates.softmax_outputs[h]);
         let v_h_p = pad_to_pow2(&v_heads[h]);
@@ -625,6 +644,19 @@ pub fn prove_attention_onchain(
     let output_proof = prove_matmul_sumcheck_onchain_auto(&concat_p, &wo_p, &out_p)
         .map_err(|e| AttentionError::MatMul { stage: "output_projection".into(), source: e })?;
 
+    // Batched softmax exp STARK proof (all heads in one proof, Blake2s channel)
+    let table = PrecomputedTable::build_parallel(
+        softmax_exp, ActivationType::Softmax.production_log_size(),
+    );
+    let pcs_config = PcsConfig::default();
+    let (component, softmax_exp_proof) = prove_activation_layer::<SimdBackend, Blake2sMerkleChannel>(
+        &all_softmax_inputs,
+        &all_softmax_outputs,
+        &table,
+        pcs_config,
+    ).map_err(|e| AttentionError::Activation(format!("softmax exp STARK: {e}")))?;
+    let softmax_log_size = table.log_size.max(4);
+
     Ok(AttentionProofOnChain {
         q_proof,
         k_proof,
@@ -632,6 +664,9 @@ pub fn prove_attention_onchain(
         score_proofs,
         attn_v_proofs,
         output_proof,
+        softmax_exp_proof,
+        softmax_claimed_sum: component.claimed_sum(),
+        softmax_log_size,
         intermediates,
     })
 }
@@ -762,8 +797,6 @@ pub fn attention_forward_f32(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
-    use stwo::prover::backend::simd::SimdBackend;
 
     /// Generate deterministic weights for testing.
     fn make_test_weights(d_model: usize, seed: u64) -> AttentionWeights {
@@ -1066,6 +1099,8 @@ mod tests {
         let proof = result.unwrap();
         // Verify Poseidon commitments are non-zero
         assert_ne!(proof.q_proof.a_commitment, starknet_ff::FieldElement::ZERO);
+        // Verify softmax STARK proof was generated
+        assert!(proof.softmax_log_size > 0, "softmax log_size should be > 0");
     }
 
     #[test]

@@ -130,6 +130,22 @@ pub fn prove_for_starknet_onchain(
     Ok(build_starknet_proof_onchain(&proof))
 }
 
+/// Prove and serialize for Starknet on-chain verification with weight cache.
+///
+/// Same as [`prove_for_starknet_onchain`] but reuses cached weight commitments.
+/// For repeated inference with the same model, this is the recommended entry point.
+pub fn prove_for_starknet_onchain_cached(
+    graph: &ComputationGraph,
+    input: &M31Matrix,
+    weights: &GraphWeights,
+    weight_cache: &crate::weight_cache::SharedWeightCache,
+) -> Result<StarknetModelProof, StarknetModelError> {
+    let proof = crate::aggregation::prove_model_aggregated_onchain_auto_cached(
+        graph, input, weights, weight_cache,
+    )?;
+    Ok(build_starknet_proof_onchain(&proof))
+}
+
 /// Convert an already-computed `AggregatedModelProof` into Starknet calldata.
 ///
 /// Useful when you've already proven the model (e.g., via `GpuModelProver`)
@@ -280,6 +296,10 @@ pub fn build_starknet_proof_onchain(proof: &AggregatedModelProofOnChain) -> Star
             serialize_matmul_sumcheck_proof(ap, &mut attn_buf);
         }
         serialize_matmul_sumcheck_proof(&attn_proof.output_proof, &mut attn_buf);
+        // Softmax exp STARK proof
+        let softmax_calldata = serialize_proof(&attn_proof.softmax_exp_proof);
+        attn_buf.push(FieldElement::from(softmax_calldata.len() as u64));
+        attn_buf.extend_from_slice(&softmax_calldata);
         combined.push(FieldElement::from(attn_buf.len() as u64));
         combined.extend_from_slice(&attn_buf);
     }
