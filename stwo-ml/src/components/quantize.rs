@@ -11,6 +11,13 @@ use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 // Relation for range-check lookup: (value,).
 stwo_constraint_framework::relation!(QuantizeRelation, 1);
 
+impl QuantizeRelation {
+    /// Access the inner LookupElements for computing LogUp fractions in the prover.
+    pub fn lookup_elements(&self) -> &stwo_constraint_framework::logup::LookupElements<1> {
+        &self.0
+    }
+}
+
 /// Evaluator for quantization range-check constraints.
 ///
 /// Verifies each quantized value exists in the range table [0, 2^bits).

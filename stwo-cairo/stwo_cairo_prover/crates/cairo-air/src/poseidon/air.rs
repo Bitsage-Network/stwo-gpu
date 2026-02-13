@@ -1,6 +1,8 @@
 use num_traits::Zero;
 use stwo::core::fields::qm31::QM31;
 use stwo::prover::backend::simd::SimdBackend;
+#[cfg(feature = "cuda-runtime")]
+use stwo::prover::backend::gpu::GpuBackend;
 use stwo::prover::ComponentProver;
 use stwo_constraint_framework::TraceLocationAllocator;
 
@@ -181,6 +183,14 @@ impl PoseidonContextComponents {
         self.components
             .as_ref()
             .map(|c| c.provers())
+            .unwrap_or_default()
+    }
+
+    #[cfg(feature = "cuda-runtime")]
+    pub fn provers_gpu(&self) -> Vec<&dyn ComponentProver<GpuBackend>> {
+        self.components
+            .as_ref()
+            .map(|c| c.provers_gpu())
             .unwrap_or_default()
     }
 }
@@ -387,6 +397,18 @@ impl Components {
     }
 
     pub fn provers(&self) -> Vec<&dyn ComponentProver<SimdBackend>> {
+        vec![
+            &self.poseidon_aggregator,
+            &self.poseidon_3_partial_rounds_chain,
+            &self.poseidon_full_round_chain,
+            &self.cube_252,
+            &self.poseidon_round_keys,
+            &self.range_check_252_width_27,
+        ]
+    }
+
+    #[cfg(feature = "cuda-runtime")]
+    pub fn provers_gpu(&self) -> Vec<&dyn ComponentProver<GpuBackend>> {
         vec![
             &self.poseidon_aggregator,
             &self.poseidon_3_partial_rounds_chain,

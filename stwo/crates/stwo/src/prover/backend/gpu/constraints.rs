@@ -305,9 +305,251 @@ __global__ void compute_quotient_batch(
 }
 "#;
 
+/// CUDA kernel source for CM31 (complex M31) and QM31 (degree-4 extension) arithmetic,
+/// plus the fused PCS quotient combination kernel.
+///
+/// CM31 = M31[i] / (i² + 1), stored as (real, imag) pairs of M31.
+/// QM31 = CM31[j] / (j² - 2 - i), stored as (a, b, c, d) where val = (a+bi) + (c+di)j.
+///
+/// The PCS quotient kernel fuses denominator inverse + numerator combination into a single
+/// kernel launch, eliminating intermediate memory traffic.
+pub const PCS_QUOTIENT_KERNEL: &str = r#"
+// ============================================================
+// CM31 Arithmetic (Complex M31)
+// CM31 = (real, imag) where i² = -1 (mod p)
+// ============================================================
+
+// CM31 addition
+__device__ __forceinline__ void cm31_add(
+    uint32_t ar, uint32_t ai,
+    uint32_t br, uint32_t bi,
+    uint32_t* out_r, uint32_t* out_i
+) {
+    *out_r = m31_add(ar, br);
+    *out_i = m31_add(ai, bi);
+}
+
+// CM31 subtraction
+__device__ __forceinline__ void cm31_sub(
+    uint32_t ar, uint32_t ai,
+    uint32_t br, uint32_t bi,
+    uint32_t* out_r, uint32_t* out_i
+) {
+    *out_r = m31_sub(ar, br);
+    *out_i = m31_sub(ai, bi);
+}
+
+// CM31 multiplication: (a+bi)(c+di) = (ac-bd) + (ad+bc)i
+__device__ __forceinline__ void cm31_mul(
+    uint32_t ar, uint32_t ai,
+    uint32_t br, uint32_t bi,
+    uint32_t* out_r, uint32_t* out_i
+) {
+    uint32_t ac = m31_mul(ar, br);
+    uint32_t bd = m31_mul(ai, bi);
+    uint32_t ad = m31_mul(ar, bi);
+    uint32_t bc = m31_mul(ai, br);
+    *out_r = m31_sub(ac, bd);
+    *out_i = m31_add(ad, bc);
+}
+
+// CM31 inverse: (a+bi)^(-1) = (a-bi) / (a² + b²)
+// norm² = a² + b² is in M31, so we only need M31 inverse.
+__device__ __forceinline__ void cm31_inv(
+    uint32_t ar, uint32_t ai,
+    uint32_t* out_r, uint32_t* out_i
+) {
+    uint32_t norm_sq = m31_add(m31_mul(ar, ar), m31_mul(ai, ai));
+    uint32_t norm_inv = m31_inv(norm_sq);
+    *out_r = m31_mul(ar, norm_inv);
+    *out_i = m31_mul(m31_neg(ai), norm_inv);
+}
+
+// ============================================================
+// QM31 Arithmetic (Degree-4 Extension)
+// QM31 = (a+bi) + (c+di)j where j² = 2+i
+// Stored as 4 M31 values: (a, b, c, d)
+// ============================================================
+
+// QM31 addition
+__device__ __forceinline__ void qm31_add(
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1, uint32_t b2, uint32_t b3,
+    uint32_t* o0, uint32_t* o1, uint32_t* o2, uint32_t* o3
+) {
+    *o0 = m31_add(a0, b0);
+    *o1 = m31_add(a1, b1);
+    *o2 = m31_add(a2, b2);
+    *o3 = m31_add(a3, b3);
+}
+
+// QM31 subtraction
+__device__ __forceinline__ void qm31_sub(
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1, uint32_t b2, uint32_t b3,
+    uint32_t* o0, uint32_t* o1, uint32_t* o2, uint32_t* o3
+) {
+    *o0 = m31_sub(a0, b0);
+    *o1 = m31_sub(a1, b1);
+    *o2 = m31_sub(a2, b2);
+    *o3 = m31_sub(a3, b3);
+}
+
+// QM31 × M31 scalar multiplication
+__device__ __forceinline__ void qm31_mul_m31(
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t s,
+    uint32_t* o0, uint32_t* o1, uint32_t* o2, uint32_t* o3
+) {
+    *o0 = m31_mul(a0, s);
+    *o1 = m31_mul(a1, s);
+    *o2 = m31_mul(a2, s);
+    *o3 = m31_mul(a3, s);
+}
+
+// QM31 × CM31 multiplication
+// (a+bi + (c+di)j) * (e+fi)
+// = (a+bi)(e+fi) + ((c+di)(e+fi))j
+__device__ __forceinline__ void qm31_mul_cm31(
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t cr, uint32_t ci,
+    uint32_t* o0, uint32_t* o1, uint32_t* o2, uint32_t* o3
+) {
+    // First CM31: (a0 + a1*i) * (cr + ci*i)
+    cm31_mul(a0, a1, cr, ci, o0, o1);
+    // Second CM31: (a2 + a3*i) * (cr + ci*i)
+    cm31_mul(a2, a3, cr, ci, o2, o3);
+}
+
+// ============================================================
+// Fused PCS Quotient Combination Kernel
+// ============================================================
+//
+// For each domain point idx, computes:
+//   quotient[idx] = Σ_s (full_numerator_s * denom_inv_s)
+//
+// where for each sample point s:
+//   denom = (Pr_x - D_x) * Pi_y - (Pr_y - D_y) * Pi_x   (CM31)
+//   denom_inv = 1 / denom                                  (CM31)
+//   full_numerator = lifted_partial_num - first_linear_term * D_y  (QM31)
+//   quotient += full_numerator * denom_inv
+//
+// Each thread handles one domain point.
+// Domain points are pre-computed and passed as arrays.
+
+__global__ void pcs_quotient_combine(
+    // Domain points (M31 values, domain_size each)
+    const uint32_t* __restrict__ domain_x_r,  // M31 real part of domain point x
+    const uint32_t* __restrict__ domain_x_i,  // Always 0 for base field domain points
+    const uint32_t* __restrict__ domain_y_r,  // M31 real part of domain point y
+    const uint32_t* __restrict__ domain_y_i,  // Always 0 for base field domain points
+    // Partial numerators: 4 columns per sample point, SoA layout
+    // Layout: num_samples * 4 * numerator_size (each column contiguous)
+    const uint32_t* __restrict__ partial_nums,
+    // Per-sample data (packed): sample_point (8 M31s: x.r, x.i, x.j_r, x.j_i, y.r, y.i, y.j_r, y.j_i)
+    // + first_linear_term (4 M31s) + log_ratio (1 u32) = 13 u32 per sample
+    const uint32_t* __restrict__ sample_data,
+    // Output: 4 columns, domain_size each
+    uint32_t* __restrict__ out_c0,
+    uint32_t* __restrict__ out_c1,
+    uint32_t* __restrict__ out_c2,
+    uint32_t* __restrict__ out_c3,
+    uint32_t domain_size,
+    uint32_t num_samples
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= domain_size) return;
+
+    // Domain point (base field — imaginary parts are 0)
+    uint32_t dx_r = domain_x_r[idx];
+    uint32_t dy_r = domain_y_r[idx];
+
+    // Accumulate quotient for this domain point
+    uint32_t q0 = 0, q1 = 0, q2 = 0, q3 = 0;
+
+    for (uint32_t s = 0; s < num_samples; s++) {
+        // Load sample data (13 u32 per sample)
+        uint32_t base = s * 13;
+        // Sample point x: QM31 = (sx_r + sx_i*i) + (sx_jr + sx_ji*i)*j
+        uint32_t sx_r  = sample_data[base + 0];  // x.0.0 (real of CM31.0)
+        uint32_t sx_i  = sample_data[base + 1];  // x.0.1 (imag of CM31.0)
+        // Sample point y: QM31
+        uint32_t sy_r  = sample_data[base + 4];  // y.0.0
+        uint32_t sy_i  = sample_data[base + 5];  // y.0.1
+        // First linear term: QM31
+        uint32_t flt0  = sample_data[base + 8];
+        uint32_t flt1  = sample_data[base + 9];
+        uint32_t flt2  = sample_data[base + 10];
+        uint32_t flt3  = sample_data[base + 11];
+        // Log ratio for lifting
+        uint32_t log_ratio = sample_data[base + 12];
+
+        // Compute denominator: (Pr_x - D_x) * Pi_y - (Pr_y - D_y) * Pi_x
+        // Where P = sample_point, Pr = real part (CM31.0), Pi = imag part (CM31.1)
+        // Since domain point is base field: D_x = (dx_r, 0), D_y = (dy_r, 0)
+        // Pr_x = (sx_r, sx_i), Pi_x = sample_data[2,3]
+        uint32_t pix_r = sample_data[base + 2];
+        uint32_t pix_i = sample_data[base + 3];
+        uint32_t piy_r = sample_data[base + 6];
+        uint32_t piy_i = sample_data[base + 7];
+
+        // (Pr_x - D_x): CM31 - M31 = (sx_r - dx_r, sx_i)
+        uint32_t diff_x_r = m31_sub(sx_r, dx_r);
+        uint32_t diff_x_i = sx_i;
+
+        // (Pr_y - D_y): CM31 - M31 = (sy_r - dy_r, sy_i)
+        uint32_t diff_y_r = m31_sub(sy_r, dy_r);
+        uint32_t diff_y_i = sy_i;
+
+        // denom = diff_x * Pi_y - diff_y * Pi_x (CM31 arithmetic)
+        uint32_t t1_r, t1_i, t2_r, t2_i;
+        cm31_mul(diff_x_r, diff_x_i, piy_r, piy_i, &t1_r, &t1_i);
+        cm31_mul(diff_y_r, diff_y_i, pix_r, pix_i, &t2_r, &t2_i);
+        uint32_t den_r, den_i;
+        cm31_sub(t1_r, t1_i, t2_r, t2_i, &den_r, &den_i);
+
+        // Compute CM31 inverse of denominator
+        uint32_t den_inv_r, den_inv_i;
+        cm31_inv(den_r, den_i, &den_inv_r, &den_inv_i);
+
+        // Load lifted partial numerator (with log_ratio lifting)
+        uint32_t src_idx = idx >> log_ratio;
+        uint32_t num_size = domain_size >> log_ratio;
+        uint32_t n0 = partial_nums[s * 4 * num_size + 0 * num_size + src_idx];
+        uint32_t n1 = partial_nums[s * 4 * num_size + 1 * num_size + src_idx];
+        uint32_t n2 = partial_nums[s * 4 * num_size + 2 * num_size + src_idx];
+        uint32_t n3 = partial_nums[s * 4 * num_size + 3 * num_size + src_idx];
+
+        // full_numerator = lifted_num - first_linear_term * D_y
+        // first_linear_term * D_y = QM31 * M31
+        uint32_t flt_dy0, flt_dy1, flt_dy2, flt_dy3;
+        qm31_mul_m31(flt0, flt1, flt2, flt3, dy_r, &flt_dy0, &flt_dy1, &flt_dy2, &flt_dy3);
+
+        uint32_t fn0, fn1, fn2, fn3;
+        qm31_sub(n0, n1, n2, n3, flt_dy0, flt_dy1, flt_dy2, flt_dy3, &fn0, &fn1, &fn2, &fn3);
+
+        // quotient += full_numerator * denom_inv (QM31 × CM31)
+        uint32_t prod0, prod1, prod2, prod3;
+        qm31_mul_cm31(fn0, fn1, fn2, fn3, den_inv_r, den_inv_i, &prod0, &prod1, &prod2, &prod3);
+
+        qm31_add(q0, q1, q2, q3, prod0, prod1, prod2, prod3, &q0, &q1, &q2, &q3);
+    }
+
+    out_c0[idx] = q0;
+    out_c1[idx] = q1;
+    out_c2[idx] = q2;
+    out_c3[idx] = q3;
+}
+"#;
+
 /// Combined kernel source with all M31 operations and constraint evaluation.
 pub fn get_full_kernel_source() -> String {
     format!("{}\n{}\n{}", M31_FIELD_KERNEL, CONSTRAINT_EVAL_KERNEL, QUOTIENT_KERNEL)
+}
+
+/// Combined kernel source with M31 + CM31/QM31 + PCS quotient operations.
+pub fn get_pcs_quotient_kernel_source() -> String {
+    format!("{}\n{}", M31_FIELD_KERNEL, PCS_QUOTIENT_KERNEL)
 }
 
 /// Configuration for constraint kernel launches.
@@ -584,6 +826,135 @@ impl ConstraintKernel {
         &self.device
     }
 }
+
+/// GPU-accelerated PCS quotient combiner.
+///
+/// Compiles and caches the fused quotient combination CUDA kernel, which
+/// computes denominator inverses and quotient accumulation in a single pass.
+#[allow(dead_code)]
+#[cfg(feature = "cuda-runtime")]
+pub struct GpuQuotientExecutor {
+    device: Arc<CudaDevice>,
+    quotient_combine_fn: CudaFunction,
+    config: ConstraintKernelConfig,
+}
+
+#[cfg(feature = "cuda-runtime")]
+impl GpuQuotientExecutor {
+    /// Compile and load the PCS quotient kernel.
+    pub fn new(device: Arc<CudaDevice>) -> Result<Self, CudaFftError> {
+        Self::with_config(device, ConstraintKernelConfig::default())
+    }
+
+    /// Compile with custom configuration.
+    pub fn with_config(
+        device: Arc<CudaDevice>,
+        config: ConstraintKernelConfig,
+    ) -> Result<Self, CudaFftError> {
+        let source = get_pcs_quotient_kernel_source();
+        let ptx = compile_constraint_ptx(&source)?;
+
+        device
+            .load_ptx(ptx, "pcs_quotient_kernels", &["pcs_quotient_combine"])
+            .map_err(|e| CudaFftError::DriverInit(format!("Failed to load PCS quotient PTX: {}", e)))?;
+
+        let quotient_combine_fn = device
+            .get_func("pcs_quotient_kernels", "pcs_quotient_combine")
+            .ok_or_else(|| CudaFftError::DriverInit("Missing pcs_quotient_combine kernel".into()))?;
+
+        Ok(Self {
+            device,
+            quotient_combine_fn,
+            config,
+        })
+    }
+
+    /// Run the fused PCS quotient combination on GPU.
+    ///
+    /// # Arguments
+    /// * `domain_x_r`, `domain_y_r` - Real parts of domain points (M31, base field)
+    /// * `partial_nums` - Flattened partial numerator columns (4 cols per sample, SoA)
+    /// * `sample_data` - Packed per-sample parameters (13 u32 each)
+    /// * `domain_size` - Number of domain points
+    /// * `num_samples` - Number of sample points
+    ///
+    /// # Returns
+    /// Four output columns (c0, c1, c2, c3) representing the QM31 quotient.
+    pub fn compute_quotients(
+        &self,
+        domain_x_r: &CudaSlice<u32>,
+        domain_x_i: &CudaSlice<u32>,
+        domain_y_r: &CudaSlice<u32>,
+        domain_y_i: &CudaSlice<u32>,
+        partial_nums: &CudaSlice<u32>,
+        sample_data: &CudaSlice<u32>,
+        out_c0: &mut CudaSlice<u32>,
+        out_c1: &mut CudaSlice<u32>,
+        out_c2: &mut CudaSlice<u32>,
+        out_c3: &mut CudaSlice<u32>,
+        domain_size: u32,
+        num_samples: u32,
+    ) -> Result<(), CudaFftError> {
+        let grid_size = (domain_size + self.config.block_size - 1) / self.config.block_size;
+
+        let launch_config = LaunchConfig {
+            grid_dim: (grid_size, 1, 1),
+            block_dim: (self.config.block_size, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        unsafe {
+            self.quotient_combine_fn
+                .clone()
+                .launch(
+                    launch_config,
+                    (
+                        domain_x_r,
+                        domain_x_i,
+                        domain_y_r,
+                        domain_y_i,
+                        partial_nums,
+                        sample_data,
+                        out_c0,
+                        out_c1,
+                        out_c2,
+                        out_c3,
+                        domain_size,
+                        num_samples,
+                    ),
+                )
+                .map_err(|e| CudaFftError::KernelLaunch(format!("pcs_quotient_combine: {}", e)))?;
+        }
+
+        Ok(())
+    }
+
+    /// Get the underlying CUDA device.
+    pub fn device(&self) -> &Arc<CudaDevice> {
+        &self.device
+    }
+}
+
+/// Global cached PCS quotient executor (compiled once, reused across calls).
+#[cfg(feature = "cuda-runtime")]
+static GPU_QUOTIENT_EXECUTOR: std::sync::OnceLock<Result<GpuQuotientExecutor, CudaFftError>> =
+    std::sync::OnceLock::new();
+
+/// Get or initialize the global GPU quotient executor.
+#[cfg(feature = "cuda-runtime")]
+pub fn get_gpu_quotient_executor() -> Result<&'static GpuQuotientExecutor, &'static CudaFftError> {
+    GPU_QUOTIENT_EXECUTOR
+        .get_or_init(|| {
+            let device = CudaDevice::new(0)
+                .map_err(|e| CudaFftError::DriverInit(format!("Failed to init CUDA device: {}", e)))?;
+            GpuQuotientExecutor::new(device)
+        })
+        .as_ref()
+}
+
+/// Minimum log domain size to dispatch to GPU for quotient operations.
+/// Below this threshold, the SIMD backend is used (GPU transfer overhead dominates).
+pub const GPU_QUOTIENT_THRESHOLD_LOG_SIZE: u32 = 14;
 
 /// Compile CUDA source to PTX.
 #[cfg(feature = "cuda-runtime")]

@@ -76,7 +76,7 @@ impl PreProcessedColumn for PedersenPoints {
     fn gen_column_simd(&self) -> CircleEvaluation<SimdBackend, BaseField, BitReversedOrder> {
         CircleEvaluation::new(
             CanonicCoset::new(self.log_size()).circle_domain(),
-            BaseColumn::from_cpu(PEDERSEN_TABLE.column_data[self.index].clone()),
+            BaseColumn::from_cpu(&PEDERSEN_TABLE.column_data[self.index]),
         )
     }
 }

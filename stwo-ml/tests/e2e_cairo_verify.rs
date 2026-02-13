@@ -18,7 +18,7 @@ use stwo_ml::cairo_serde::{
     serialize_ml_proof_for_recursive, serialize_ml_proof_to_arguments_file,
     MLClaimMetadata,
 };
-use stwo_ml::starknet::compute_io_commitment;
+use stwo_ml::aggregation::compute_io_commitment;
 
 /// Build a small 2-layer MLP with auto-generated weights.
 fn build_small_mlp() -> (OnnxModel, M31Matrix) {

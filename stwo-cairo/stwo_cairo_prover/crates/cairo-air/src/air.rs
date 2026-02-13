@@ -10,8 +10,10 @@ use stwo::core::fields::qm31::{SecureField, QM31};
 use stwo::core::fields::FieldExpOps;
 use stwo::core::pcs::TreeVec;
 use stwo::core::proof::StarkProof;
-use stwo::core::vcs::MerkleHasher;
+use stwo::core::vcs_lifted::MerkleHasherLifted;
 use stwo::prover::backend::simd::SimdBackend;
+#[cfg(feature = "cuda-runtime")]
+use stwo::prover::backend::gpu::GpuBackend;
 use stwo::prover::ComponentProver;
 use stwo_cairo_common::prover_types::cpu::CasmState;
 use stwo_cairo_common::prover_types::felt::split_f252;
@@ -41,7 +43,7 @@ use crate::relations;
 use crate::verifier::RelationUse;
 
 #[derive(Serialize, Deserialize)]
-pub struct CairoProof<H: MerkleHasher> {
+pub struct CairoProof<H: MerkleHasherLifted> {
     pub claim: CairoClaim,
     pub interaction_pow: u64,
     pub interaction_claim: CairoInteractionClaim,
@@ -50,7 +52,7 @@ pub struct CairoProof<H: MerkleHasher> {
     pub channel_salt: Option<u64>,
 }
 
-impl<H: MerkleHasher> CairoSerialize for CairoProof<H>
+impl<H: MerkleHasherLifted> CairoSerialize for CairoProof<H>
 where
     H::Hash: CairoSerialize,
 {
@@ -70,7 +72,7 @@ where
     }
 }
 
-impl<H: MerkleHasher> CairoDeserialize for CairoProof<H>
+impl<H: MerkleHasherLifted> CairoDeserialize for CairoProof<H>
 where
     H::Hash: CairoDeserialize,
 {
@@ -912,6 +914,33 @@ impl CairoComponents {
                 &self.verify_bitwise_xor_8 as &dyn ComponentProver<SimdBackend>,
                 &self.verify_bitwise_xor_8_b as &dyn ComponentProver<SimdBackend>,
                 &self.verify_bitwise_xor_9 as &dyn ComponentProver<SimdBackend>,
+            ]
+        )
+        .collect()
+    }
+
+    #[cfg(feature = "cuda-runtime")]
+    pub fn provers_gpu(&self) -> Vec<&dyn ComponentProver<GpuBackend>> {
+        chain!(
+            self.opcodes.provers_gpu(),
+            [&self.verify_instruction as &dyn ComponentProver<GpuBackend>,],
+            self.blake_context.provers_gpu(),
+            self.builtins.provers_gpu(),
+            self.pedersen_context.provers_gpu(),
+            self.poseidon_context.provers_gpu(),
+            [&self.memory_address_to_id as &dyn ComponentProver<GpuBackend>,],
+            self.memory_id_to_value
+                .0
+                .iter()
+                .map(|component| component as &dyn ComponentProver<GpuBackend>),
+            [&self.memory_id_to_value.1 as &dyn ComponentProver<GpuBackend>,],
+            self.range_checks.provers_gpu(),
+            [
+                &self.verify_bitwise_xor_4 as &dyn ComponentProver<GpuBackend>,
+                &self.verify_bitwise_xor_7 as &dyn ComponentProver<GpuBackend>,
+                &self.verify_bitwise_xor_8 as &dyn ComponentProver<GpuBackend>,
+                &self.verify_bitwise_xor_8_b as &dyn ComponentProver<GpuBackend>,
+                &self.verify_bitwise_xor_9 as &dyn ComponentProver<GpuBackend>,
             ]
         )
         .collect()

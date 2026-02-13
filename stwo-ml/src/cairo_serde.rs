@@ -363,6 +363,7 @@ use crate::aggregation::{
     AggregatedModelProofOnChain, LayerClaim,
     BatchedMatMulProofOnChain,
 };
+use crate::components::attention::AttentionProofOnChain;
 
 /// Metadata about the ML model, needed to construct the Cairo MLClaim.
 pub struct MLClaimMetadata {
@@ -411,6 +412,55 @@ fn serialize_layernorm_claim(
     serialize_qm31(claim.claimed_sum, output);
 }
 
+/// Serialize a lightweight Embedding layer claim.
+///
+/// Layout:
+/// - `layer_index` (u32, 1 felt)
+/// - `trace_rows` (u32, 1 felt)
+///
+/// Embedding is verified inside the unified STARK (pure AIR, no LogUp).
+fn serialize_embedding_claim(
+    claim: &LayerClaim,
+    output: &mut Vec<FieldElement>,
+) {
+    serialize_u32(claim.layer_index as u32, output);
+    serialize_u32(claim.trace_rows as u32, output);
+}
+
+/// Serialize an on-chain attention proof (all matmul sub-proofs).
+///
+/// Layout:
+/// - `num_heads` (u32, 1 felt) — derived from score_proofs.len()
+/// - `q_proof`: MatMulSumcheckProofOnChain (10-field)
+/// - `k_proof`: MatMulSumcheckProofOnChain (10-field)
+/// - `v_proof`: MatMulSumcheckProofOnChain (10-field)
+/// - `score_proofs`: Array<MatMulSumcheckProofOnChain>
+/// - `attn_v_proofs`: Array<MatMulSumcheckProofOnChain>
+/// - `output_proof`: MatMulSumcheckProofOnChain (10-field)
+fn serialize_attention_proof_onchain(
+    proof: &AttentionProofOnChain,
+    output: &mut Vec<FieldElement>,
+) {
+    // num_heads (for the verifier to know how many score/attn_v proofs to expect)
+    serialize_u32(proof.score_proofs.len() as u32, output);
+    // Q, K, V projections
+    serialize_matmul_for_recursive(&proof.q_proof, output);
+    serialize_matmul_for_recursive(&proof.k_proof, output);
+    serialize_matmul_for_recursive(&proof.v_proof, output);
+    // Per-head score proofs
+    serialize_u32(proof.score_proofs.len() as u32, output);
+    for sp in &proof.score_proofs {
+        serialize_matmul_for_recursive(sp, output);
+    }
+    // Per-head attn×V proofs
+    serialize_u32(proof.attn_v_proofs.len() as u32, output);
+    for ap in &proof.attn_v_proofs {
+        serialize_matmul_for_recursive(ap, output);
+    }
+    // Output projection
+    serialize_matmul_for_recursive(&proof.output_proof, output);
+}
+
 /// Serialize an ML proof for the recursive Cairo verifier.
 ///
 /// Output format matches Cairo's `MLProof { claim, matmul_proofs, channel_salt, unified_stark_proof }`:
@@ -419,10 +469,12 @@ fn serialize_layernorm_claim(
 /// 2. matmul_proofs: Array<MatMulSumcheckProofOnChain> (10-field version, no MLE openings)
 /// 3. channel_salt: Option<u64> (0 for None, 1 + value for Some)
 /// 4. unified_stark_proof: Option<UnifiedStarkProof> — contains ALL non-matmul component claims
-///    (activations, add, mul, layernorm) plus interaction claims and the STARK proof
+///    (activations, add, mul, layernorm, embedding) plus interaction claims and the STARK proof
 /// 5. add_claims: Array<ElementwiseClaim> (layer_index + trace_rows) — graph-level metadata
 /// 6. mul_claims: Array<ElementwiseClaim> (layer_index + trace_rows) — graph-level metadata
 /// 7. layernorm_claims: Array<LayerNormClaim> (layer_index + trace_rows + claimed_sum) — graph-level metadata
+/// 8. embedding_claims: Array<EmbeddingClaim> (layer_index + trace_rows) — graph-level metadata
+/// 9. attention_proofs: Array<(layer_index, AttentionProofOnChain)> — attention sub-proofs
 pub fn serialize_ml_proof_for_recursive(
     proof: &AggregatedModelProofOnChain,
     metadata: &MLClaimMetadata,
@@ -474,6 +526,7 @@ pub fn serialize_ml_proof_for_recursive(
                 &proof.add_claims,
                 &proof.mul_claims,
                 &proof.layernorm_claims,
+                &proof.embedding_claims,
                 metadata.activation_type,
                 &mut output,
             );
@@ -498,7 +551,20 @@ pub fn serialize_ml_proof_for_recursive(
         serialize_layernorm_claim(claim, &mut output);
     }
 
-    // 8. tee_attestation_hash: Option<felt252>
+    // 8. embedding_claims: Array<EmbeddingClaim>
+    serialize_u32(proof.embedding_claims.len() as u32, &mut output);
+    for claim in &proof.embedding_claims {
+        serialize_embedding_claim(claim, &mut output);
+    }
+
+    // 9. attention_proofs: Array<(layer_index, AttentionProofOnChain)>
+    serialize_u32(proof.attention_proofs.len() as u32, &mut output);
+    for (layer_idx, attn_proof) in &proof.attention_proofs {
+        serialize_u32(*layer_idx as u32, &mut output);
+        serialize_attention_proof_onchain(attn_proof, &mut output);
+    }
+
+    // 10. tee_attestation_hash: Option<felt252>
     //    Serialized as Cairo Option: 0 = None, 1 + value = Some.
     match metadata.tee_attestation_hash {
         Some(hash) if hash != FieldElement::ZERO => {
@@ -669,16 +735,18 @@ fn serialize_ml_interaction_claim(sum: SecureField, output: &mut Vec<FieldElemen
 /// 4. `mul_claims: Array<ElementwiseComponentClaim>` — len + per-claim (2 felts each)
 /// 5. `layernorm_claims: Array<LayerNormComponentClaim>` — len + per-claim (2 felts each)
 /// 6. `layernorm_interaction_claims: Array<QM31>` — len + per-claim (4 felts each)
-/// 7. `interaction_claim: MLInteractionClaim` — 4 felts (total LogUp sum across activations + layernorms)
-/// 8. `pcs_config: PcsConfig` — 4 felts (pow_bits + fri_config)
-/// 9. `interaction_pow: u64` — 1 felt (hardcode 0, Rust prover handles PoW internally)
-/// 10. `stark_proof: StarkProof` — CommitmentSchemeProof (existing serializer)
+/// 7. `embedding_claims: Array<EmbeddingComponentClaim>` — len + per-claim (2 felts each)
+/// 8. `interaction_claim: MLInteractionClaim` — 4 felts (total LogUp sum across activations + layernorms)
+/// 9. `pcs_config: PcsConfig` — 4 felts (pow_bits + fri_config)
+/// 10. `interaction_pow: u64` — 1 felt (hardcode 0, Rust prover handles PoW internally)
+/// 11. `stark_proof: StarkProof` — CommitmentSchemeProof (existing serializer)
 fn serialize_unified_stark_proof(
     stark_proof: &Blake2sProof,
     activation_claims: &[LayerClaim],
     add_claims: &[LayerClaim],
     mul_claims: &[LayerClaim],
     layernorm_claims: &[LayerClaim],
+    embedding_claims: &[LayerClaim],
     activation_type: u8,
     output: &mut Vec<FieldElement>,
 ) {
@@ -722,7 +790,14 @@ fn serialize_unified_stark_proof(
         serialize_interaction_claim(claim.claimed_sum, output);
     }
 
-    // 7. interaction_claim: MLInteractionClaim (sum of ALL LogUp claimed_sums)
+    // 7. embedding_claims: Array<EmbeddingComponentClaim>
+    let emb_serde: Vec<ElementwiseClaimForSerde> = embedding_claims
+        .iter()
+        .map(ElementwiseClaimForSerde::from_layer_claim)
+        .collect();
+    serialize_span(&emb_serde, serialize_elementwise_component_claim, output);
+
+    // 8. interaction_claim: MLInteractionClaim (sum of ALL LogUp claimed_sums)
     let total_sum: SecureField = activation_claims
         .iter()
         .chain(layernorm_claims.iter())
@@ -730,13 +805,13 @@ fn serialize_unified_stark_proof(
         .fold(SecureField::default(), |acc, s| acc + s);
     serialize_ml_interaction_claim(total_sum, output);
 
-    // 8. pcs_config: PcsConfig (from the proof itself)
+    // 9. pcs_config: PcsConfig (from the proof itself)
     serialize_pcs_config(&stark_proof.0.config, output);
 
-    // 9. interaction_pow: u64 (hardcode 0 — Rust prover handles PoW internally)
+    // 10. interaction_pow: u64 (hardcode 0 — Rust prover handles PoW internally)
     serialize_u64(0, output);
 
-    // 10. stark_proof: StarkProof → CommitmentSchemeProof
+    // 11. stark_proof: StarkProof → CommitmentSchemeProof
     serialize_commitment_scheme_proof(&stark_proof.0, output);
 }
 
@@ -1067,6 +1142,9 @@ mod tests {
             activation_claims: vec![],
             attention_proofs: Vec::new(),
             embedding_claims: Vec::new(),
+            quantize_claims: Vec::new(),
+            layer_chain_commitment: starknet_ff::FieldElement::ZERO,
+            io_commitment: starknet_ff::FieldElement::ZERO,
         };
 
         let metadata = MLClaimMetadata {
@@ -1137,6 +1215,9 @@ mod tests {
             activation_claims: vec![],
             attention_proofs: Vec::new(),
             embedding_claims: Vec::new(),
+            quantize_claims: Vec::new(),
+            layer_chain_commitment: starknet_ff::FieldElement::ZERO,
+            io_commitment: starknet_ff::FieldElement::ZERO,
         };
 
         let metadata = MLClaimMetadata {
@@ -1156,23 +1237,25 @@ mod tests {
         // Salt adds 1 extra felt (variant index 1 + value) vs (variant index 0)
         assert_eq!(with_salt.len(), no_salt.len() + 1);
 
-        // Both end with: unified_stark(0), add_claims(0), mul_claims(0), layernorm_claims(0), tee(0)
+        // Both end with: unified_stark(0), add_claims(0), mul_claims(0), layernorm_claims(0), embedding(0), attention(0), tee(0)
         assert_eq!(no_salt[no_salt.len() - 1], FieldElement::ZERO, "tee = None");
-        assert_eq!(no_salt[no_salt.len() - 2], FieldElement::ZERO, "layernorm_claims = 0");
-        assert_eq!(no_salt[no_salt.len() - 3], FieldElement::ZERO, "mul_claims = 0");
-        assert_eq!(no_salt[no_salt.len() - 4], FieldElement::ZERO, "add_claims = 0");
-        assert_eq!(no_salt[no_salt.len() - 5], FieldElement::ZERO, "unified_stark = None");
+        assert_eq!(no_salt[no_salt.len() - 2], FieldElement::ZERO, "attention_proofs = 0");
+        assert_eq!(no_salt[no_salt.len() - 3], FieldElement::ZERO, "embedding_claims = 0");
+        assert_eq!(no_salt[no_salt.len() - 4], FieldElement::ZERO, "layernorm_claims = 0");
+        assert_eq!(no_salt[no_salt.len() - 5], FieldElement::ZERO, "mul_claims = 0");
+        assert_eq!(no_salt[no_salt.len() - 6], FieldElement::ZERO, "add_claims = 0");
+        assert_eq!(no_salt[no_salt.len() - 7], FieldElement::ZERO, "unified_stark = None");
 
         assert_eq!(with_salt[with_salt.len() - 1], FieldElement::ZERO, "tee = None");
-        assert_eq!(with_salt[with_salt.len() - 2], FieldElement::ZERO, "layernorm_claims = 0");
-        assert_eq!(with_salt[with_salt.len() - 5], FieldElement::ZERO, "unified_stark = None");
+        assert_eq!(with_salt[with_salt.len() - 4], FieldElement::ZERO, "layernorm_claims = 0");
+        assert_eq!(with_salt[with_salt.len() - 7], FieldElement::ZERO, "unified_stark = None");
 
-        // no_salt layout ends: ..., channel_salt=None(0), unified_stark=None(0), add(0), mul(0), layernorm(0), tee(0)
-        assert_eq!(no_salt[no_salt.len() - 6], FieldElement::ZERO, "channel_salt = None");
+        // no_salt layout ends: ..., channel_salt=None(0), unified_stark=None(0), add(0), mul(0), layernorm(0), embedding(0), attention(0), tee(0)
+        assert_eq!(no_salt[no_salt.len() - 8], FieldElement::ZERO, "channel_salt = None");
 
-        // with_salt layout ends: ..., channel_salt=Some(1), 12345, unified_stark=None(0), add(0), mul(0), layernorm(0), tee(0)
-        assert_eq!(with_salt[with_salt.len() - 7], FieldElement::from(1u64), "channel_salt = Some");
-        assert_eq!(with_salt[with_salt.len() - 6], FieldElement::from(12345u64), "salt value");
+        // with_salt layout ends: ..., channel_salt=Some(1), 12345, unified_stark=None(0), add(0), mul(0), layernorm(0), embedding(0), attention(0), tee(0)
+        assert_eq!(with_salt[with_salt.len() - 9], FieldElement::from(1u64), "channel_salt = Some");
+        assert_eq!(with_salt[with_salt.len() - 8], FieldElement::from(12345u64), "salt value");
     }
 
     #[test]
@@ -1264,6 +1347,9 @@ mod tests {
             activation_claims: vec![],
             attention_proofs: Vec::new(),
             embedding_claims: Vec::new(),
+            quantize_claims: Vec::new(),
+            layer_chain_commitment: starknet_ff::FieldElement::ZERO,
+            io_commitment: starknet_ff::FieldElement::ZERO,
         };
         let felts_none = serialize_ml_proof_for_recursive(&aggregated_none, &metadata, None);
 
@@ -1287,6 +1373,9 @@ mod tests {
             activation_claims,
             attention_proofs: Vec::new(),
             embedding_claims: Vec::new(),
+            quantize_claims: Vec::new(),
+            layer_chain_commitment: starknet_ff::FieldElement::ZERO,
+            io_commitment: starknet_ff::FieldElement::ZERO,
         };
         let felts_some = serialize_ml_proof_for_recursive(&aggregated_some, &metadata, None);
 
@@ -1298,17 +1387,17 @@ mod tests {
             felts_some.len(),
         );
 
-        // None ends with: channel_salt=None(0), unified_stark=None(0), add(0), mul(0), layernorm(0), tee(0)
+        // None ends with: channel_salt=None(0), unified_stark=None(0), add(0), mul(0), layernorm(0), embedding(0), attention(0), tee(0)
         assert_eq!(felts_none[felts_none.len() - 1], FieldElement::ZERO, "tee = None");
-        assert_eq!(felts_none[felts_none.len() - 2], FieldElement::ZERO, "layernorm_claims = 0");
-        assert_eq!(felts_none[felts_none.len() - 5], FieldElement::ZERO, "unified_stark = None");
-        assert_eq!(felts_none[felts_none.len() - 6], FieldElement::ZERO, "channel_salt = None");
+        assert_eq!(felts_none[felts_none.len() - 4], FieldElement::ZERO, "layernorm_claims = 0");
+        assert_eq!(felts_none[felts_none.len() - 7], FieldElement::ZERO, "unified_stark = None");
+        assert_eq!(felts_none[felts_none.len() - 8], FieldElement::ZERO, "channel_salt = None");
 
         // Some path: both share the same prefix up to channel_salt
-        // The None path is: [MLClaim(5) + matmul_array + channel_salt(1) + activation_none(1) + add(0) + mul(0) + layernorm(0) + tee(0)]
-        // The Some path is: [MLClaim(5) + matmul_array + channel_salt(1) + activation_some(1) + data... + add(0) + mul(0) + layernorm(0) + tee(0)]
-        // The divergence point is at felts_none.len() - 5 (activation discriminant)
-        let diverge_idx = felts_none.len() - 5;
+        // The None path is: [MLClaim(5) + matmul_array + batched(0) + channel_salt(1) + activation_none(1) + add(0) + mul(0) + layernorm(0) + embedding(0) + attention(0) + tee(0)]
+        // The Some path is: [MLClaim(5) + matmul_array + batched(0) + channel_salt(1) + activation_some(1) + data... + add(0) + mul(0) + layernorm(0) + embedding(0) + attention(0) + tee(0)]
+        // The divergence point is at felts_none.len() - 7 (activation discriminant)
+        let diverge_idx = felts_none.len() - 7;
         assert_eq!(felts_none[diverge_idx], FieldElement::ZERO, "None discriminant");
         assert_eq!(felts_some[diverge_idx], FieldElement::from(1u64), "Some discriminant");
     }
@@ -1360,6 +1449,9 @@ mod tests {
             activation_claims,
             attention_proofs: Vec::new(),
             embedding_claims: Vec::new(),
+            quantize_claims: Vec::new(),
+            layer_chain_commitment: starknet_ff::FieldElement::ZERO,
+            io_commitment: starknet_ff::FieldElement::ZERO,
         };
 
         let metadata = MLClaimMetadata {
@@ -1450,13 +1542,17 @@ mod tests {
         assert_eq!(felts[idx], FieldElement::ZERO, "layernorm_interaction_claims length = 0");
         idx += 1;
 
-        // 4.7: interaction_claim: MLInteractionClaim = 4 felts (sum of all LogUp claimed_sums = 0)
+        // 4.7: embedding_claims array (length=0, empty for this proof)
+        assert_eq!(felts[idx], FieldElement::ZERO, "embedding_claims length = 0");
+        idx += 1;
+
+        // 4.8: interaction_claim: MLInteractionClaim = 4 felts (sum of all LogUp claimed_sums = 0)
         for i in 0..4 {
             assert_eq!(felts[idx + i], FieldElement::ZERO, "ml_interaction_claim[{i}]");
         }
         idx += 4;
 
-        // 4.8: pcs_config = 4 felts (pow_bits + fri_config)
+        // 4.9: pcs_config = 4 felts (pow_bits + fri_config)
         let default_config = PcsConfig::default();
         assert_eq!(felts[idx], FieldElement::from(default_config.pow_bits as u64), "pcs_config.pow_bits");
         idx += 1;
@@ -1467,11 +1563,11 @@ mod tests {
         assert_eq!(felts[idx], FieldElement::from(default_config.fri_config.n_queries as u64), "fri_config.n_queries");
         idx += 1;
 
-        // 4.9: interaction_pow = 0 (u64)
+        // 4.10: interaction_pow = 0 (u64)
         assert_eq!(felts[idx], FieldElement::ZERO, "interaction_pow = 0");
         idx += 1;
 
-        // 4.10: stark_proof (CommitmentSchemeProof) — starts with PcsConfig again
+        // 4.11: stark_proof (CommitmentSchemeProof) — starts with PcsConfig again
         assert_eq!(felts[idx], FieldElement::from(default_config.pow_bits as u64), "stark_proof config.pow_bits");
         idx += 4; // skip past the 4 PcsConfig felts
 
@@ -1565,15 +1661,17 @@ mod tests {
 
         let felts = serialize_ml_proof_for_recursive(&proof, &metadata, None);
 
-        // The last 4 sections: add_claims(1 claim), mul_claims(empty), layernorm_claims(empty), tee(None)
+        // Trailing sections: add_claims(1 claim), mul_claims(empty), layernorm_claims(empty), embedding(empty), attention(empty), tee(None)
         // Claims are lightweight: add_claim = layer_index(1) + trace_rows(1) = 2 felts per claim
         let last = felts.len() - 1;
         assert_eq!(felts[last], FieldElement::ZERO, "tee_attestation_hash = None");
-        assert_eq!(felts[last - 1], FieldElement::ZERO, "layernorm_claims count = 0");
-        assert_eq!(felts[last - 2], FieldElement::ZERO, "mul_claims count = 0");
+        assert_eq!(felts[last - 1], FieldElement::ZERO, "attention_proofs count = 0");
+        assert_eq!(felts[last - 2], FieldElement::ZERO, "embedding_claims count = 0");
+        assert_eq!(felts[last - 3], FieldElement::ZERO, "layernorm_claims count = 0");
+        assert_eq!(felts[last - 4], FieldElement::ZERO, "mul_claims count = 0");
         // add_claims section: count(1) + 1 claim * 2 felts = 3 felts before mul_claims
         // add_claims count should be 1
-        assert_eq!(felts[last - 5], FieldElement::from(1u64), "add_claims count = 1");
+        assert_eq!(felts[last - 7], FieldElement::from(1u64), "add_claims count = 1");
         assert!(felts.len() > 20, "should have data: {} felts", felts.len());
     }
 
@@ -1605,6 +1703,9 @@ mod tests {
             activation_claims: vec![],
             attention_proofs: Vec::new(),
             embedding_claims: Vec::new(),
+            quantize_claims: Vec::new(),
+            layer_chain_commitment: starknet_ff::FieldElement::ZERO,
+            io_commitment: starknet_ff::FieldElement::ZERO,
         };
 
         let metadata = MLClaimMetadata {
@@ -1618,15 +1719,17 @@ mod tests {
 
         let felts = serialize_ml_proof_for_recursive(&aggregated, &metadata, None);
 
-        // Last 4 felts should be [0, 0, 0, 0] (empty add_claims, mul_claims, layernorm_claims, tee=None)
+        // Last 6 felts should be [0, 0, 0, 0, 0, 0] (empty add, mul, layernorm, embedding, attention, tee)
         let len = felts.len();
-        assert_eq!(felts[len - 4], FieldElement::ZERO, "add_claims count = 0");
-        assert_eq!(felts[len - 3], FieldElement::ZERO, "mul_claims count = 0");
-        assert_eq!(felts[len - 2], FieldElement::ZERO, "layernorm_claims count = 0");
+        assert_eq!(felts[len - 6], FieldElement::ZERO, "add_claims count = 0");
+        assert_eq!(felts[len - 5], FieldElement::ZERO, "mul_claims count = 0");
+        assert_eq!(felts[len - 4], FieldElement::ZERO, "layernorm_claims count = 0");
+        assert_eq!(felts[len - 3], FieldElement::ZERO, "embedding_claims count = 0");
+        assert_eq!(felts[len - 2], FieldElement::ZERO, "attention_proofs count = 0");
         assert_eq!(felts[len - 1], FieldElement::ZERO, "tee_attestation_hash = None");
 
-        // unified_stark=None(0), add(0), mul(0), layernorm(0), tee(0)
-        assert_eq!(felts[len - 5], FieldElement::ZERO, "unified_stark = None");
+        // unified_stark=None(0), add(0), mul(0), layernorm(0), embedding(0), attention(0), tee(0)
+        assert_eq!(felts[len - 7], FieldElement::ZERO, "unified_stark = None");
     }
 
     #[test]
@@ -1694,6 +1797,9 @@ mod tests {
             activation_claims: activation_claims.clone(),
             attention_proofs: Vec::new(),
             embedding_claims: Vec::new(),
+            quantize_claims: Vec::new(),
+            layer_chain_commitment: starknet_ff::FieldElement::ZERO,
+            io_commitment: starknet_ff::FieldElement::ZERO,
         };
 
         let metadata = MLClaimMetadata {
@@ -1778,32 +1884,38 @@ mod tests {
         assert_eq!(felts[idx], FieldElement::from(20u64), "ln interaction sum[0]");
         idx += 4;
 
-        // 7. interaction_claim: total sum = activation(10) + layernorm(20) = 30
+        // 7. embedding_claims: length=0 (empty for this proof)
+        assert_eq!(felts[idx], FieldElement::ZERO, "embedding_claims len = 0");
+        idx += 1;
+
+        // 8. interaction_claim: total sum = activation(10) + layernorm(20) = 30
         assert_eq!(felts[idx], FieldElement::from(30u64), "total interaction sum[0]");
         idx += 4;
 
-        // 8. pcs_config
+        // 9. pcs_config
         let default_config = PcsConfig::default();
         assert_eq!(felts[idx], FieldElement::from(default_config.pow_bits as u64), "pcs_config.pow_bits");
         idx += 4;
 
-        // 9. interaction_pow = 0
+        // 10. interaction_pow = 0
         assert_eq!(felts[idx], FieldElement::ZERO, "interaction_pow");
         idx += 1;
 
-        // 10. stark_proof data follows
+        // 11. stark_proof data follows
         assert!(felts.len() > idx + 10, "STARK proof should have data after header");
 
         // === Outer MLProof sections (graph-level metadata) ===
-        // Trailing: add(count+claim) + mul(count+claim) + layernorm(count+claim+sum) + tee(1)
+        // Trailing: add(count+claim) + mul(count+claim) + layernorm(count+claim+sum) + embedding(count) + attention(count) + tee(1)
         let len = felts.len();
         // tee_attestation_hash: None = 1 felt (0)
         assert_eq!(felts[len - 1], FieldElement::ZERO, "tee_attestation_hash = None");
+        assert_eq!(felts[len - 2], FieldElement::ZERO, "attention_proofs count = 0");
+        assert_eq!(felts[len - 3], FieldElement::ZERO, "embedding_claims count = 0");
         // layernorm_claims: count(1) + claim(layer_index + trace_rows + claimed_sum) = 1 + 6 = 7
         // mul_claims: count(1) + claim(layer_index + trace_rows) = 1 + 2 = 3
         // add_claims: count(1) + claim(layer_index + trace_rows) = 1 + 2 = 3
-        // Total trailing before tee = 7 + 3 + 3 = 13 felts
-        let ln_end = len - 1; // skip tee
+        // Total trailing before embedding = 7 + 3 + 3 = 13 felts
+        let ln_end = len - 3; // skip tee + attention + embedding counts
         let ln_start = ln_end - 7; // 1 count + 1 claim * (1 + 1 + 4) = 7
         assert_eq!(felts[ln_start], FieldElement::from(1u64), "outer layernorm count");
         assert_eq!(felts[ln_start + 1], FieldElement::from(7u64), "outer ln layer_index");

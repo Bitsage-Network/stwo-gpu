@@ -4,5 +4,7 @@
 pub use stwo;
 
 pub mod debug_tools;
+#[cfg(feature = "cuda-runtime")]
+pub mod gpu_bridge;
 pub mod prover;
 pub mod witness;

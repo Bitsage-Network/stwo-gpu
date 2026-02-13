@@ -5,6 +5,8 @@ edition.workspace = true
 
 [features]
 slow-tests = []
+gpu = ["stwo/gpu"]
+cuda-runtime = ["gpu", "stwo/cuda-runtime"]
 
 [dependencies]
 bincode.workspace = true
