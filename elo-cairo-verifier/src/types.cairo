@@ -78,6 +78,59 @@ pub struct MatMulSumcheckProof {
     pub b_opening: MleOpeningProof,
 }
 
+// ============================================================================
+// Batched Matmul Sumcheck Types
+// ============================================================================
+
+/// Per-matmul entry within a batched proof.
+///
+/// Field order matches cairo_serde.rs serialize_batched_matmul_for_recursive()
+/// per-entry layout: node_id, m, n, claimed_sum, final_a_eval, final_b_eval,
+/// a_commitment, b_commitment.
+#[derive(Drop, Copy, Serde)]
+pub struct BatchedMatMulEntry {
+    /// Graph node identifier for this matmul.
+    pub node_id: u32,
+    /// Row dimension of matrix A.
+    pub m: u32,
+    /// Column dimension of matrix B.
+    pub n: u32,
+    /// MLE_C evaluated at (r_i, r_j) for this matmul.
+    pub claimed_sum: QM31,
+    /// MLE_A evaluated at (row_challenges, assignment).
+    pub final_a_eval: QM31,
+    /// MLE_B evaluated at (assignment, col_challenges).
+    pub final_b_eval: QM31,
+    /// Poseidon Merkle root of restricted MLE_A.
+    pub a_commitment: felt252,
+    /// Poseidon Merkle root of restricted MLE_B.
+    pub b_commitment: felt252,
+}
+
+/// Batched matmul sumcheck proof — multiple matmuls combined with lambda weighting.
+///
+/// Instead of N individual sumcheck proofs, a batch combines them:
+///   h(x) = Σ λ^i · f_a_i(x) · f_b_i(x)
+/// One set of shared round polynomials + per-matmul final evaluations.
+///
+/// Field order matches cairo_serde.rs serialize_batched_matmul_for_recursive():
+/// k, num_rounds, lambda, combined_claimed_sum, round_polys[], entries[].
+#[derive(Drop, Serde)]
+pub struct BatchedMatMulProof {
+    /// Padded k dimension (shared by all entries in this batch).
+    pub k: u32,
+    /// Number of sumcheck rounds (= log2(k)).
+    pub num_rounds: u32,
+    /// Lambda batching weight drawn from Fiat-Shamir.
+    pub lambda: QM31,
+    /// Combined claimed sum: Σ λ^i · claimed_sum_i.
+    pub combined_claimed_sum: QM31,
+    /// Shared round polynomials (one degree-2 polynomial per round).
+    pub round_polys: Array<RoundPoly>,
+    /// Per-matmul entries with individual evaluations and commitments.
+    pub entries: Array<BatchedMatMulEntry>,
+}
+
 /// Verification result emitted as event data.
 #[derive(Drop, Copy, Serde)]
 pub struct VerificationResult {
