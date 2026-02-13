@@ -4,6 +4,8 @@ use stwo::core::channel::Channel;
 use stwo::core::fields::qm31::QM31;
 use stwo::core::pcs::TreeVec;
 use stwo::prover::backend::simd::SimdBackend;
+#[cfg(feature = "cuda-runtime")]
+use stwo::prover::backend::gpu::GpuBackend;
 use stwo::prover::ComponentProver;
 use stwo_cairo_serialize::{CairoDeserialize, CairoSerialize};
 use stwo_constraint_framework::TraceLocationAllocator;
@@ -167,6 +169,14 @@ impl BlakeContextComponents {
             .map(|c| c.provers())
             .unwrap_or_default()
     }
+
+    #[cfg(feature = "cuda-runtime")]
+    pub fn provers_gpu(&self) -> Vec<&dyn ComponentProver<GpuBackend>> {
+        self.components
+            .as_ref()
+            .map(|c| c.provers_gpu())
+            .unwrap_or_default()
+    }
 }
 
 impl std::fmt::Display for BlakeContextComponents {
@@ -281,6 +291,17 @@ impl Components {
     }
 
     pub fn provers(&self) -> Vec<&dyn ComponentProver<SimdBackend>> {
+        vec![
+            &self.blake_round,
+            &self.blake_g,
+            &self.blake_sigma,
+            &self.triple_xor_32,
+            &self.verify_bitwise_xor_12,
+        ]
+    }
+
+    #[cfg(feature = "cuda-runtime")]
+    pub fn provers_gpu(&self) -> Vec<&dyn ComponentProver<GpuBackend>> {
         vec![
             &self.blake_round,
             &self.blake_g,

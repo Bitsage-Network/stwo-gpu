@@ -19,7 +19,7 @@ use stwo_ml::compiler::prove::{prove_model, verify_model_matmuls};
 use stwo_ml::cairo_serde::{
     serialize_ml_proof_for_recursive, serialize_proof, MLClaimMetadata,
 };
-use stwo_ml::starknet::compute_io_commitment;
+use stwo_ml::aggregation::compute_io_commitment;
 
 /// Cross-verify: per-layer proof verified in Rust, then aggregated and serialized.
 #[test]

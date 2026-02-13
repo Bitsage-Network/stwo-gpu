@@ -164,6 +164,10 @@ pub struct AttentionProof<H: MerkleHasherLifted> {
     pub output_proof: MatMulSumcheckProof,
     /// Aggregated softmax exp STARK proof (all heads batched)
     pub softmax_exp_proof: StarkProof<H>,
+    /// LogUp claimed sum for the softmax STARK (needed by verifier to reconstruct component).
+    pub softmax_claimed_sum: stwo::core::fields::qm31::SecureField,
+    /// Log2 of trace size for softmax STARK.
+    pub softmax_log_size: u32,
     /// Forward pass intermediates (for verification replay)
     pub intermediates: AttentionIntermediates,
 }
@@ -542,12 +546,16 @@ where
     // Batched softmax exp STARK proof (all heads in one proof)
     let table = PrecomputedTable::build_parallel(softmax_exp, ActivationType::Softmax.production_log_size());
     let pcs_config = PcsConfig::default();
-    let (_component, softmax_exp_proof) = prove_activation_layer::<B, MC>(
+    let (component, softmax_exp_proof) = prove_activation_layer::<B, MC>(
         &all_softmax_inputs,
         &all_softmax_outputs,
         &table,
         pcs_config,
     ).map_err(|e| AttentionError::Activation(format!("softmax exp STARK: {e}")))?;
+
+    // Extract metadata needed for verification.
+    // Must match prove_activation_layer's log_size = table.log_size.max(4).
+    let softmax_log_size = table.log_size.max(4);
 
     Ok(AttentionProof {
         q_proof,
@@ -557,6 +565,8 @@ where
         attn_v_proofs,
         output_proof,
         softmax_exp_proof,
+        softmax_claimed_sum: component.claimed_sum(),
+        softmax_log_size,
         intermediates,
     })
 }

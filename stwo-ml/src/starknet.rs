@@ -19,6 +19,8 @@
 
 use starknet_ff::FieldElement;
 
+use stwo::core::pcs::PcsConfig;
+
 use crate::aggregation::{
     AggregatedModelProof, AggregatedModelProofOnChain,
     AggregationError, LayerClaim,
@@ -57,12 +59,22 @@ pub struct StarknetModelProof {
     pub num_mul_claims: usize,
     /// Number of LayerNorm claims in the unified STARK.
     pub num_layernorm_claims: usize,
+    /// Number of Attention proofs (separate from unified STARK).
+    pub num_attention_proofs: usize,
+    /// Number of Embedding claims in the unified STARK.
+    pub num_embedding_claims: usize,
     /// Total number of proven layers.
     pub num_proven_layers: usize,
+    /// PCS configuration used for STARK proving (security parameters).
+    /// `pow_bits`: proof-of-work difficulty, `fri_config`: FRI query/blowup parameters.
+    pub pcs_config: PcsConfig,
     /// Estimated gas cost for on-chain verification.
     pub estimated_gas: u64,
     /// Total calldata size in felt252 elements.
     pub calldata_size: usize,
+    /// Layer chain commitment: running Poseidon hash of intermediate values.
+    /// Binds layer outputs to layer inputs, preventing substitution of intermediates.
+    pub layer_chain_commitment: FieldElement,
     /// TEE attestation hash (Poseidon hash of the NVIDIA CC attestation report).
     /// `None` when the proof was generated without TEE (pure ZK-only).
     /// `Some(hash)` when the proof was generated on CC-On hardware and includes
@@ -126,6 +138,11 @@ pub fn build_starknet_proof(proof: &AggregatedModelProof) -> StarknetModelProof 
         None => Vec::new(),
     };
 
+    let pcs_config = match &proof.unified_stark {
+        Some(stark_proof) => stark_proof.config,
+        None => PcsConfig::default(),
+    };
+
     let total_trace_rows: usize = proof.activation_claims.iter().map(|c| c.trace_rows).sum();
     let num_proven = proof.num_proven_layers();
     let estimated_gas = estimate_verification_gas(num_proven, total_trace_rows.max(1));
@@ -141,9 +158,13 @@ pub fn build_starknet_proof(proof: &AggregatedModelProof) -> StarknetModelProof 
         num_add_claims: proof.add_claims.len(),
         num_mul_claims: proof.mul_claims.len(),
         num_layernorm_claims: proof.layernorm_claims.len(),
+        num_attention_proofs: proof.attention_proofs.len(),
+        num_embedding_claims: proof.embedding_claims.len(),
         num_proven_layers: num_proven,
+        pcs_config,
         estimated_gas,
         calldata_size,
+        layer_chain_commitment: proof.layer_chain_commitment,
         tee_attestation_hash: None,
     }
 }
@@ -160,20 +181,7 @@ pub fn build_starknet_proof_with_tee(
     result
 }
 
-/// Compute IO commitment: Poseidon hash of flattened input and output M31 values.
-///
-/// This binds the proof to specific computation inputs/outputs.
-/// The Cairo verifier checks `proof_data[4]` == expected_io_hash.
-pub fn compute_io_commitment(input: &M31Matrix, output: &M31Matrix) -> FieldElement {
-    let mut hash_inputs = Vec::new();
-    for &v in &input.data {
-        hash_inputs.push(FieldElement::from(v.0 as u64));
-    }
-    for &v in &output.data {
-        hash_inputs.push(FieldElement::from(v.0 as u64));
-    }
-    starknet_crypto::poseidon_hash_many(&hash_inputs)
-}
+// compute_io_commitment is imported from crate::aggregation
 
 /// Convert an on-chain aggregated proof into complete Starknet calldata.
 ///
@@ -197,23 +205,28 @@ pub fn build_starknet_proof_onchain(proof: &AggregatedModelProofOnChain) -> Star
         matmul_calldata.push(buf);
     }
 
-    // Compute IO commitment
-    let io_commitment = compute_io_commitment(
-        &proof.execution.intermediates.first()
-            .map(|(_, m)| m.clone())
-            .unwrap_or_else(|| M31Matrix::new(1, 1)),
-        &proof.execution.output,
-    );
+    // Use the IO commitment from the proof (computed during proving and verified).
+    let io_commitment = proof.io_commitment;
+
+    // Extract the real PCS config from the unified STARK proof.
+    // If no unified STARK exists (matmul-only model), use PcsConfig::default()
+    // which has real security parameters (pow_bits=10, n_queries=3).
+    let pcs_config = match &proof.unified_stark {
+        Some(stark_proof) => stark_proof.config,
+        None => PcsConfig::default(),
+    };
 
     // Assemble combined calldata
     let mut combined = vec![
-        // PCS config placeholder (4 felts)
-        FieldElement::ZERO, // pow_bits
-        FieldElement::ZERO, // log_blowup_factor
-        FieldElement::ZERO, // log_last_layer_deg
-        FieldElement::ZERO, // n_queries
+        // PCS config (4 felts) — real values from the proof
+        FieldElement::from(pcs_config.pow_bits as u64),
+        FieldElement::from(pcs_config.fri_config.log_blowup_factor as u64),
+        FieldElement::from(pcs_config.fri_config.log_last_layer_degree_bound as u64),
+        FieldElement::from(pcs_config.fri_config.n_queries as u64),
         // IO commitment at index [4]
         io_commitment,
+        // Layer chain commitment at index [5]
+        proof.layer_chain_commitment,
     ];
 
     // Unified STARK calldata (covers activations + add + mul + layernorm)
@@ -226,6 +239,53 @@ pub fn build_starknet_proof_onchain(proof: &AggregatedModelProofOnChain) -> Star
     for mc in &matmul_calldata {
         combined.push(FieldElement::from(mc.len() as u64)); // per-proof length
         combined.extend_from_slice(mc);
+    }
+
+    // Batched matmul proofs count + serialized batch data
+    combined.push(FieldElement::from(proof.batched_matmul_proofs.len() as u64));
+    for batch in &proof.batched_matmul_proofs {
+        // Serialize batch: k, num_rounds, num_entries, then per-entry (m, n)
+        combined.push(FieldElement::from(batch.k as u64));
+        combined.push(FieldElement::from(batch.num_rounds as u64));
+        combined.push(FieldElement::from(batch.entries.len() as u64));
+        for entry in &batch.entries {
+            combined.push(FieldElement::from(entry.node_id as u64));
+            combined.push(FieldElement::from(entry.m as u64));
+            combined.push(FieldElement::from(entry.n as u64));
+            combined.push(entry.a_commitment);
+            combined.push(entry.b_commitment);
+        }
+    }
+
+    // Attention proofs count + serialized sub-proofs
+    combined.push(FieldElement::from(proof.attention_proofs.len() as u64));
+    for (layer_idx, attn_proof) in &proof.attention_proofs {
+        combined.push(FieldElement::from(*layer_idx as u64));
+        // Serialize each matmul sub-proof in the attention proof
+        let mut attn_buf = Vec::new();
+        serialize_matmul_sumcheck_proof(&attn_proof.q_proof, &mut attn_buf);
+        serialize_matmul_sumcheck_proof(&attn_proof.k_proof, &mut attn_buf);
+        serialize_matmul_sumcheck_proof(&attn_proof.v_proof, &mut attn_buf);
+        // Score proofs
+        attn_buf.push(FieldElement::from(attn_proof.score_proofs.len() as u64));
+        for sp in &attn_proof.score_proofs {
+            serialize_matmul_sumcheck_proof(sp, &mut attn_buf);
+        }
+        // Attn×V proofs
+        attn_buf.push(FieldElement::from(attn_proof.attn_v_proofs.len() as u64));
+        for ap in &attn_proof.attn_v_proofs {
+            serialize_matmul_sumcheck_proof(ap, &mut attn_buf);
+        }
+        serialize_matmul_sumcheck_proof(&attn_proof.output_proof, &mut attn_buf);
+        combined.push(FieldElement::from(attn_buf.len() as u64));
+        combined.extend_from_slice(&attn_buf);
+    }
+
+    // Embedding claims count
+    combined.push(FieldElement::from(proof.embedding_claims.len() as u64));
+    for claim in &proof.embedding_claims {
+        combined.push(FieldElement::from(claim.layer_index as u64));
+        combined.push(FieldElement::from(claim.trace_rows as u64));
     }
 
     let total_trace_rows: usize = proof.activation_claims.iter().map(|c| c.trace_rows).sum();
@@ -243,9 +303,13 @@ pub fn build_starknet_proof_onchain(proof: &AggregatedModelProofOnChain) -> Star
         num_add_claims: proof.add_claims.len(),
         num_mul_claims: proof.mul_claims.len(),
         num_layernorm_claims: proof.layernorm_claims.len(),
+        num_attention_proofs: proof.attention_proofs.len(),
+        num_embedding_claims: proof.embedding_claims.len(),
         num_proven_layers: num_proven,
+        pcs_config,
         estimated_gas,
         calldata_size,
+        layer_chain_commitment: proof.layer_chain_commitment,
         tee_attestation_hash: None,
     }
 }
@@ -295,6 +359,7 @@ pub fn estimate_gas_from_proof(proof: &StarknetModelProof) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aggregation::compute_io_commitment;
     use crate::compiler::graph::GraphBuilder;
     use crate::components::activation::ActivationType;
     use stwo::core::fields::m31::M31;
@@ -477,6 +542,77 @@ mod tests {
             "combined_calldata[4] must equal io_commitment"
         );
         assert_ne!(starknet_proof.io_commitment, FieldElement::ZERO);
+
+        // PCS config at [0..4] must have real security parameters (not zeros)
+        let default_config = PcsConfig::default();
+        assert_eq!(
+            starknet_proof.combined_calldata[0],
+            FieldElement::from(default_config.pow_bits as u64),
+            "combined_calldata[0] must be pow_bits (matmul-only falls back to default)"
+        );
+        assert_ne!(
+            starknet_proof.combined_calldata[3], FieldElement::ZERO,
+            "combined_calldata[3] (n_queries) must not be zero"
+        );
+    }
+
+    #[test]
+    fn test_pcs_config_from_unified_stark() {
+        use crate::aggregation::prove_model_aggregated_onchain;
+
+        // Build a model WITH unified STARK (has activation)
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(4).activation(ActivationType::ReLU).linear(2);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+
+        let mut weights = GraphWeights::new();
+        let mut w0 = M31Matrix::new(4, 4);
+        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        weights.add_weight(0, w0);
+        let mut w2 = M31Matrix::new(4, 2);
+        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        weights.add_weight(2, w2);
+
+        let agg_proof = prove_model_aggregated_onchain(&graph, &input, &weights)
+            .expect("on-chain proving should succeed");
+
+        assert!(agg_proof.unified_stark.is_some(), "should have unified STARK");
+
+        let starknet_proof = build_starknet_proof_onchain(&agg_proof);
+
+        // PCS config should come from the actual proof, not defaults
+        let actual_config = agg_proof.unified_stark.as_ref().unwrap().config;
+        assert_eq!(
+            starknet_proof.combined_calldata[0],
+            FieldElement::from(actual_config.pow_bits as u64),
+            "pow_bits must match proof's PCS config"
+        );
+        assert_eq!(
+            starknet_proof.combined_calldata[1],
+            FieldElement::from(actual_config.fri_config.log_blowup_factor as u64),
+            "log_blowup_factor must match proof's PCS config"
+        );
+        assert_eq!(
+            starknet_proof.combined_calldata[2],
+            FieldElement::from(actual_config.fri_config.log_last_layer_degree_bound as u64),
+            "log_last_layer_deg must match proof's PCS config"
+        );
+        assert_eq!(
+            starknet_proof.combined_calldata[3],
+            FieldElement::from(actual_config.fri_config.n_queries as u64),
+            "n_queries must match proof's PCS config"
+        );
+
+        // pcs_config field on the struct should match too
+        assert_eq!(starknet_proof.pcs_config.pow_bits, actual_config.pow_bits);
+        assert_eq!(starknet_proof.pcs_config.fri_config.n_queries, actual_config.fri_config.n_queries);
+
+        // Security sanity: pow_bits > 0 and n_queries > 0
+        assert!(starknet_proof.pcs_config.pow_bits > 0, "pow_bits must be > 0 for soundness");
+        assert!(starknet_proof.pcs_config.fri_config.n_queries > 0, "n_queries must be > 0 for soundness");
     }
 
     #[test]

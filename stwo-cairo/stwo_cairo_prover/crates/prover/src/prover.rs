@@ -15,7 +15,7 @@ use stwo::core::fri::FriConfig;
 use stwo::core::pcs::PcsConfig;
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::proof_of_work::GrindOps;
-use stwo::core::vcs::blake2_merkle::Blake2sMerkleChannel;
+use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::BackendForChannel;
 use stwo::prover::poly::circle::PolyOps;
@@ -24,6 +24,8 @@ use stwo_cairo_adapter::ProverInput;
 use tracing::{event, span, Level};
 
 use crate::witness::cairo::CairoClaimGenerator;
+#[cfg(feature = "cuda-runtime")]
+use crate::witness::utils::TreeBuilder as _;
 use crate::witness::utils::witness_trace_cells;
 
 mod json {
@@ -149,6 +151,119 @@ where
     })
 }
 
+/// GPU-accelerated variant of [`prove_cairo`].
+///
+/// Keeps witness generation on `SimdBackend` (CPU), then bridges to `GpuBackend` via
+/// zero-copy transmute for all STARK proving operations (FFT, FRI, Merkle, constraints).
+///
+/// The bridge exploits the fact that `GpuBackend` and `SimdBackend` use identical column
+/// types (`Vec<PackedM31>`). See [`crate::gpu_bridge::SimdToGpuTreeBuilder`].
+#[cfg(feature = "cuda-runtime")]
+pub fn prove_cairo_gpu<MC: MerkleChannel>(
+    input: ProverInput,
+    prover_params: ProverParameters,
+) -> Result<CairoProof<MC::H>, ProvingError>
+where
+    stwo::prover::backend::gpu::GpuBackend: BackendForChannel<MC>,
+{
+    use stwo::prover::backend::gpu::GpuBackend;
+    use crate::gpu_bridge::SimdToGpuTreeBuilder;
+
+    let _span = span!(Level::INFO, "prove_cairo_gpu").entered();
+
+    let ProverParameters {
+        channel_hash: _,
+        channel_salt,
+        pcs_config,
+        preprocessed_trace,
+        store_polynomials_coefficients,
+    } = prover_params;
+
+    // 1. GpuBackend twiddle precomputation.
+    let twiddles = GpuBackend::precompute_twiddles(
+        CanonicCoset::new(LOG_MAX_ROWS + pcs_config.fri_config.log_blowup_factor + 2)
+            .circle_domain()
+            .half_coset,
+    );
+
+    // 2. Setup protocol with GpuBackend commitment scheme.
+    let channel = &mut MC::C::default();
+    if let Some(salt) = channel_salt {
+        channel.mix_u64(salt);
+    }
+    pcs_config.mix_into(channel);
+    let mut commitment_scheme =
+        CommitmentSchemeProver::<GpuBackend, MC>::new(pcs_config, &twiddles);
+    if store_polynomials_coefficients {
+        commitment_scheme.set_store_polynomials_coefficients();
+    }
+
+    // 3. Preprocessed trace — SimdBackend evals bridged to GpuBackend.
+    let preprocessed_trace = Arc::new(preprocessed_trace.to_preprocessed_trace());
+    let mut gpu_tree = SimdToGpuTreeBuilder::new(commitment_scheme.tree_builder());
+    gpu_tree.extend_evals(preprocessed_trace.gen_trace());
+    gpu_tree.commit(channel);
+
+    // 4. Base trace — witness generation on CPU (SimdBackend), commitment on GPU.
+    let cairo_claim_generator = CairoClaimGenerator::new(input, preprocessed_trace.clone());
+    let mut gpu_tree = SimdToGpuTreeBuilder::new(commitment_scheme.tree_builder());
+    let span = span!(Level::INFO, "Base trace").entered();
+    let (claim, interaction_generator) = cairo_claim_generator.write_trace(&mut gpu_tree);
+    span.exit();
+
+    claim.mix_into(channel);
+    gpu_tree.commit(channel);
+
+    // 5. Draw interaction elements.
+    let interaction_pow = GpuBackend::grind(channel, INTERACTION_POW_BITS);
+    channel.mix_u64(interaction_pow);
+    let interaction_elements = CairoInteractionElements::draw(channel);
+
+    // 6. Interaction trace — same SimdToGpu bridge.
+    let span = span!(Level::INFO, "Interaction trace").entered();
+    let mut gpu_tree = SimdToGpuTreeBuilder::new(commitment_scheme.tree_builder());
+    let interaction_claim =
+        interaction_generator.write_interaction_trace(&mut gpu_tree, &interaction_elements);
+    span.exit();
+
+    tracing::info!(
+        "Witness trace cells: {:?}",
+        witness_trace_cells(&claim, &preprocessed_trace)
+    );
+    debug_assert_eq!(
+        lookup_sum(&claim, &interaction_elements, &interaction_claim),
+        SecureField::zero()
+    );
+
+    interaction_claim.mix_into(channel);
+    gpu_tree.commit(channel);
+
+    // 7. Component provers — GPU variants.
+    let component_builder = CairoComponents::new(
+        &claim,
+        &interaction_elements,
+        &interaction_claim,
+        &preprocessed_trace.ids(),
+    );
+
+    let components = component_builder.provers_gpu();
+
+    // 8. STARK proving — ALL on GpuBackend (FFT, FRI, Merkle, constraints).
+    let span = span!(Level::INFO, "Prove STARKs (GPU)").entered();
+    let proof = prove::<GpuBackend, _>(&components, channel, commitment_scheme)?;
+    span.exit();
+
+    event!(name: "component_info", Level::DEBUG, "Components: {}", component_builder);
+
+    Ok(CairoProof {
+        claim,
+        interaction_pow,
+        interaction_claim,
+        stark_proof: proof,
+        channel_salt,
+    })
+}
+
 /// Concrete parameters of the proving system.
 /// Used both for producing and verifying proofs.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -232,7 +347,7 @@ pub fn create_and_serialize_proof(
         }
         #[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
         ChannelHash::Poseidon252 => {
-            use stwo::core::vcs::poseidon252_merkle::Poseidon252MerkleChannel;
+            use stwo::core::vcs_lifted::poseidon252_merkle::Poseidon252MerkleChannel;
             let proof = prove_cairo::<Poseidon252MerkleChannel>(input, proof_params)?;
             serialize_proof_to_file(&proof, &proof_path, proof_format)?;
             if verify {
@@ -272,7 +387,7 @@ pub mod tests {
         use dev_utils::utils::get_proof_file_path;
         use stwo::core::fri::FriConfig;
         use stwo::core::pcs::PcsConfig;
-        use stwo::core::vcs::poseidon252_merkle::Poseidon252MerkleChannel;
+        use stwo::core::vcs_lifted::poseidon252_merkle::Poseidon252MerkleChannel;
         use stwo_cairo_serialize::CairoSerialize;
         use stwo_cairo_utils::vm_utils::{run_and_adapt, ProgramType};
         use tempfile::NamedTempFile;
@@ -355,7 +470,7 @@ pub mod tests {
         use itertools::Itertools;
         use stwo::core::fri::FriConfig;
         use stwo::core::pcs::PcsConfig;
-        use stwo::core::vcs::blake2_merkle::Blake2sMerkleChannel;
+        use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
         use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTrace;
         use stwo_cairo_serialize::CairoSerialize;
         use tempfile::NamedTempFile;

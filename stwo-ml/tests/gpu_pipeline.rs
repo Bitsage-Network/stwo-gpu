@@ -16,7 +16,8 @@ use stwo_ml::receipt::{
     ComputeReceipt, prove_receipt, prove_receipt_batch,
     prove_receipt_batch_auto, prove_receipt_batch_with,
 };
-use stwo_ml::starknet::{prove_for_starknet, build_starknet_proof, build_starknet_proof_onchain, estimate_gas_from_proof, compute_io_commitment};
+use stwo_ml::starknet::{prove_for_starknet, build_starknet_proof, build_starknet_proof_onchain, estimate_gas_from_proof};
+use stwo_ml::aggregation::compute_io_commitment;
 use stwo_ml::cairo_serde::serialize_proof;
 use stwo_ml::compiler::prove::{
     prove_model, prove_model_auto, prove_model_with, verify_model_matmuls,

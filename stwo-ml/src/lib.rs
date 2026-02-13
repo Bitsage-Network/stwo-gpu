@@ -55,6 +55,7 @@ pub mod prelude {
         prove_model_aggregated, prove_model_aggregated_with, prove_model_aggregated_auto,
         prove_model_aggregated_onchain, prove_model_aggregated_onchain_auto,
         verify_aggregated_model_proof,
+        verify_aggregated_model_proof_onchain,
     };
     pub use crate::receipt::{prove_receipt, prove_receipt_batch, prove_receipt_batch_auto};
     pub use crate::backend::BackendInfo;
@@ -66,8 +67,8 @@ pub mod prelude {
         prove_matmul_sumcheck_onchain, prove_matmul_sumcheck_onchain_auto,
         prove_matmul_sumcheck_auto,
     };
+    pub use crate::aggregation::compute_io_commitment;
     pub use crate::starknet::{
-        compute_io_commitment,
         build_starknet_proof_with_tee, build_starknet_proof_onchain_with_tee,
     };
     pub use crate::tee::{

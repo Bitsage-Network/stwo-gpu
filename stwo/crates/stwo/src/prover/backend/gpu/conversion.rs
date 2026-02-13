@@ -289,6 +289,31 @@ pub fn aos_to_secure_column(aos: &[u32], n: usize) -> SecureColumnByCoords<SimdB
     }
 }
 
+/// Convert 4 separate SoA columns (c0, c1, c2, c3 as flat `&[u32]`) back to
+/// `SecureColumnByCoords<SimdBackend>`.
+///
+/// This is the inverse of extracting individual coordinate columns from GPU output.
+/// Each input slice has `n` u32 values representing M31 elements.
+pub fn aos_to_secure_column_from_soa(
+    c0: &[u32], c1: &[u32], c2: &[u32], c3: &[u32], n: usize,
+) -> SecureColumnByCoords<SimdBackend> {
+    use crate::core::fields::m31::M31;
+
+    assert_eq!(c0.len(), n);
+    assert_eq!(c1.len(), n);
+    assert_eq!(c2.len(), n);
+    assert_eq!(c3.len(), n);
+
+    SecureColumnByCoords {
+        columns: [
+            BaseColumn::from_iter((0..n).map(|i| M31(c0[i]))),
+            BaseColumn::from_iter((0..n).map(|i| M31(c1[i]))),
+            BaseColumn::from_iter((0..n).map(|i| M31(c2[i]))),
+            BaseColumn::from_iter((0..n).map(|i| M31(c3[i]))),
+        ],
+    }
+}
+
 /// Reinterpret a `BaseColumn`'s packed data as a `&[u32]` slice of length `n`.
 ///
 /// `BaseColumn.data` is `Vec<PackedBaseField>` where `PackedBaseField` is

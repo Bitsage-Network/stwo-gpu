@@ -60,18 +60,20 @@ dev-utils = { path = "crates/dev_utils" }
 stwo-cairo-common = { path = "crates/common" }
 cairo-air = { path = "crates/cairo-air" }
 stwo-cairo-serialize = { path = "crates/cairo-serialize", version = "~0.1.0" }
+# Using local stwo fork with GPU backend (GpuBackend, CUDA kernels, MerkleHasherLifted).
+# Diverged from upstream starkware-libs/stwo rev 45d0180 — our fork is now authoritative.
 # TODO(Ohad): re export stwo from constraint-framework.
 # TODO(Ohad): separate cairo-air from prover code and use prover features only in the prover crate.
-stwo = { git = "https://github.com/starkware-libs/stwo", rev = "45d0180", features = [
+stwo = { path = "../../stwo/crates/stwo", features = [
     "parallel",
     "prover",
 ], default-features = false }
-stwo-constraint-framework = { git = "https://github.com/starkware-libs/stwo", rev = "45d0180", features = [
+stwo-constraint-framework = { path = "../../stwo/crates/constraint-framework", features = [
     "parallel",
     "prover",
 ] }
-stwo-air-utils-derive = { git = "https://github.com/starkware-libs/stwo", rev = "45d0180" }
-stwo-air-utils = { git = "https://github.com/starkware-libs/stwo", rev = "45d0180" }
+stwo-air-utils-derive = { path = "../../stwo/crates/air-utils-derive" }
+stwo-air-utils = { path = "../../stwo/crates/air-utils" }
 test-case = "3.3.1"
 thiserror = { version = "2.0.12", default-features = false }
 tracing = "0.1.40"

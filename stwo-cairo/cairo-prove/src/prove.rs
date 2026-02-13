@@ -5,7 +5,7 @@ use stwo_cairo_adapter::adapter::adapt;
 use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_prover::prover::{prove_cairo, ChannelHash, ProverParameters};
 use stwo_cairo_prover::stwo::core::pcs::PcsConfig;
-use stwo_cairo_prover::stwo::core::vcs::blake2_merkle::{
+use stwo_cairo_prover::stwo::core::vcs_lifted::blake2_merkle::{
     Blake2sMerkleChannel, Blake2sMerkleHasher,
 };
 
@@ -43,16 +43,27 @@ pub fn prove(input: ProverInput, pcs_config: PcsConfig) -> Result<CairoProof<Bla
 
 /// Prove with GPU backend when cuda-runtime feature is enabled.
 ///
-/// Architecture note: `prove_cairo` in stwo_cairo_prover is hardcoded to SimdBackend because
-/// CairoClaimGenerator::write_trace() pushes evaluations directly into a TreeBuilder<SimdBackend>.
-/// Genericizing requires upstream changes to separate witness generation from commitment.
-///
-/// This is intentional — recursive proving verifies a ~800KB Cairo executable, not a heavy ML
-/// workload. SimdBackend handles this in ~1-2 minutes. GPU acceleration for the ML proving step
-/// (stwo-ml) is where the real compute savings happen (hours → minutes).
+/// Uses [`prove_cairo_gpu`] which keeps witness generation on SimdBackend (CPU)
+/// and bridges to GpuBackend via zero-copy transmute for STARK proving
+/// (FFT, FRI, Merkle, constraints). Expected 3-5x speedup on GPU.
 #[cfg(feature = "cuda-runtime")]
 pub fn prove_gpu(input: ProverInput, pcs_config: PcsConfig) -> Result<CairoProof<Blake2sMerkleHasher>> {
-    prove(input, pcs_config)
+    use stwo_cairo_prover::prover::prove_cairo_gpu;
+
+    let preprocessed_trace = match input.public_segment_context[1] {
+        true => PreProcessedTraceVariant::Canonical,
+        false => PreProcessedTraceVariant::CanonicalWithoutPedersen,
+    };
+    let prover_params = ProverParameters {
+        channel_hash: ChannelHash::Blake2s,
+        channel_salt: None,
+        pcs_config,
+        preprocessed_trace,
+        store_polynomials_coefficients: false,
+    };
+
+    prove_cairo_gpu::<Blake2sMerkleChannel>(input, prover_params)
+        .map_err(|e| CairoProveError::ProofGeneration(format!("{:?}", e)))
 }
 
 fn prove_inner(

@@ -4,8 +4,10 @@
 //!
 //! # Strategy
 //!
-//! Delegates to the SIMD backend for correctness, with GPU-accelerated paths
-//! for large domains when CUDA is available.
+//! - `accumulate_numerators`: Delegates to SIMD backend (rayon-parallel, column-level work).
+//! - `compute_quotients_and_combine`: GPU-accelerated for large domains (log_size >= 14),
+//!   using a fused CUDA kernel that combines denominator inverse computation and quotient
+//!   accumulation in a single pass. Falls back to SIMD for small domains.
 
 use crate::core::fields::m31::BaseField;
 use crate::core::pcs::quotients::ColumnSampleBatch;
@@ -24,17 +26,15 @@ impl QuotientOps for GpuBackend {
         sample_batches: &[ColumnSampleBatch],
         accumulated_numerators_vec: &mut Vec<AccumulatedNumerators<Self>>,
     ) {
-        // Convert GpuBackend columns to SimdBackend columns
+        // Convert GpuBackend columns to SimdBackend columns (zero-copy transmute)
         let simd_columns: Vec<&CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>> =
             columns.iter().map(|c| circle_eval_ref_to_simd(*c)).collect();
 
-        // Delegate to SIMD backend
+        // Delegate to SIMD backend (rayon-parallel)
         let mut simd_acc: Vec<AccumulatedNumerators<SimdBackend>> = Vec::new();
         SimdBackend::accumulate_numerators(&simd_columns, sample_batches, &mut simd_acc);
 
-        // Convert results back to GpuBackend types
-        // Since GpuBackend and SimdBackend share the same column representation,
-        // we can transmute the accumulated numerators.
+        // Convert results back (zero-copy — same column types)
         for acc in simd_acc {
             accumulated_numerators_vec.push(AccumulatedNumerators {
                 sample_point: acc.sample_point,
@@ -49,29 +49,205 @@ impl QuotientOps for GpuBackend {
     fn compute_quotients_and_combine(
         accs: Vec<AccumulatedNumerators<Self>>,
     ) -> SecureEvaluation<Self, BitReversedOrder> {
-        // Convert GpuBackend accumulated numerators to SimdBackend
-        let simd_accs: Vec<AccumulatedNumerators<SimdBackend>> = accs
-            .into_iter()
-            .map(|acc| AccumulatedNumerators {
-                sample_point: acc.sample_point,
-                partial_numerators_acc: SecureColumnByCoords {
-                    columns: acc.partial_numerators_acc.columns,
-                },
-                first_linear_term_acc: acc.first_linear_term_acc,
-            })
-            .collect();
+        let max_log_size = accs
+            .iter()
+            .map(|x| x.partial_numerators_acc.len())
+            .max()
+            .unwrap()
+            .ilog2();
 
-        // Delegate to SIMD backend
-        let result = SimdBackend::compute_quotients_and_combine(simd_accs);
+        // GPU dispatch for large domains
+        #[cfg(feature = "cuda-runtime")]
+        {
+            use super::constraints::GPU_QUOTIENT_THRESHOLD_LOG_SIZE;
 
-        // Convert back to GpuBackend
-        SecureEvaluation::new(
-            result.domain,
-            SecureColumnByCoords {
-                columns: result.values.columns,
-            },
-        )
+            if max_log_size >= GPU_QUOTIENT_THRESHOLD_LOG_SIZE {
+                match gpu_compute_quotients_and_combine(&accs, max_log_size) {
+                    Ok(result) => {
+                        tracing::debug!(
+                            "[GPU] PCS quotient combination: log_size={}, {} samples",
+                            max_log_size,
+                            accs.len()
+                        );
+                        return result;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "[GPU] PCS quotient failed ({}), falling back to SIMD",
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        // SIMD fallback
+        simd_compute_quotients_and_combine(accs)
     }
+}
+
+/// SIMD fallback for compute_quotients_and_combine.
+fn simd_compute_quotients_and_combine(
+    accs: Vec<AccumulatedNumerators<GpuBackend>>,
+) -> SecureEvaluation<GpuBackend, BitReversedOrder> {
+    let simd_accs: Vec<AccumulatedNumerators<SimdBackend>> = accs
+        .into_iter()
+        .map(|acc| AccumulatedNumerators {
+            sample_point: acc.sample_point,
+            partial_numerators_acc: SecureColumnByCoords {
+                columns: acc.partial_numerators_acc.columns,
+            },
+            first_linear_term_acc: acc.first_linear_term_acc,
+        })
+        .collect();
+
+    let result = SimdBackend::compute_quotients_and_combine(simd_accs);
+
+    SecureEvaluation::new(
+        result.domain,
+        SecureColumnByCoords {
+            columns: result.values.columns,
+        },
+    )
+}
+
+/// GPU-accelerated compute_quotients_and_combine using the fused CUDA kernel.
+///
+/// Transfers domain points, partial numerators, and sample metadata to GPU,
+/// runs the fused kernel, and reads back the result.
+#[cfg(feature = "cuda-runtime")]
+fn gpu_compute_quotients_and_combine(
+    accs: &[AccumulatedNumerators<GpuBackend>],
+    max_log_size: u32,
+) -> Result<SecureEvaluation<GpuBackend, BitReversedOrder>, super::cuda_executor::CudaFftError> {
+    use crate::core::circle::CirclePoint;
+    use crate::core::fields::m31::M31;
+    use crate::core::fields::qm31::SecureField;
+    use crate::core::poly::circle::CanonicCoset;
+    use crate::prover::backend::simd::column::BaseColumn;
+    use crate::prover::backend::simd::domain::CircleDomainBitRevIterator;
+    use crate::prover::backend::simd::m31::PackedBaseField;
+    use super::constraints::get_gpu_quotient_executor;
+    use super::cuda_executor::CudaFftError;
+
+    let executor = get_gpu_quotient_executor()
+        .map_err(|e| e.clone())?;
+    let device = executor.device();
+
+    let domain_size = 1u32 << max_log_size;
+    let domain = CanonicCoset::new(max_log_size).circle_domain();
+    let num_samples = accs.len() as u32;
+
+    // Extract domain points as raw M31 values.
+    // CircleDomainBitRevIterator yields CirclePoint<PackedBaseField> (16 M31s per pack).
+    let mut domain_x_r_host = Vec::with_capacity(domain_size as usize);
+    let mut domain_y_r_host = Vec::with_capacity(domain_size as usize);
+
+    for point in CircleDomainBitRevIterator::new(domain) {
+        // Each PackedBaseField holds 16 M31 values.
+        // Extract raw u32 values via bytemuck-style reinterpretation.
+        let x_ptr = &point.x as *const PackedBaseField as *const u32;
+        let y_ptr = &point.y as *const PackedBaseField as *const u32;
+        unsafe {
+            for i in 0..16 {
+                domain_x_r_host.push(*x_ptr.add(i));
+                domain_y_r_host.push(*y_ptr.add(i));
+            }
+        }
+    }
+    // Domain points are base field, so imaginary parts are all zero.
+    let domain_xi_host = vec![0u32; domain_size as usize];
+    let domain_yi_host = vec![0u32; domain_size as usize];
+
+    // Pack sample data: 13 u32 per sample
+    // [sx.0.0, sx.0.1, sx.1.0, sx.1.1, sy.0.0, sy.0.1, sy.1.0, sy.1.1, flt0, flt1, flt2, flt3, log_ratio]
+    let mut sample_data_host = Vec::with_capacity(num_samples as usize * 13);
+    for acc in accs {
+        let sp = acc.sample_point;
+        let flt = acc.first_linear_term_acc;
+        let log_ratio = max_log_size - acc.partial_numerators_acc.len().ilog2();
+
+        // CirclePoint<SecureField>: x and y are QM31 = (CM31, CM31) = ((M31,M31),(M31,M31))
+        // SecureField = QM31 { 0: CM31(M31, M31), 1: CM31(M31, M31) }
+        // sp.x.0.0 = real of first CM31, sp.x.0.1 = imag of first CM31
+        // sp.x.1.0 = real of second CM31, sp.x.1.1 = imag of second CM31
+        sample_data_host.push(sp.x.0 .0 .0); // Pr_x real
+        sample_data_host.push(sp.x.0 .1 .0); // Pr_x imag
+        sample_data_host.push(sp.x.1 .0 .0); // Pi_x real
+        sample_data_host.push(sp.x.1 .1 .0); // Pi_x imag
+        sample_data_host.push(sp.y.0 .0 .0); // Pr_y real
+        sample_data_host.push(sp.y.0 .1 .0); // Pr_y imag
+        sample_data_host.push(sp.y.1 .0 .0); // Pi_y real
+        sample_data_host.push(sp.y.1 .1 .0); // Pi_y imag
+        sample_data_host.push(flt.0 .0 .0);  // first_linear_term c0
+        sample_data_host.push(flt.0 .1 .0);  // first_linear_term c1
+        sample_data_host.push(flt.1 .0 .0);  // first_linear_term c2
+        sample_data_host.push(flt.1 .1 .0);  // first_linear_term c3
+        sample_data_host.push(log_ratio);
+    }
+
+    // Pack partial numerators: for each sample, flatten 4 BaseColumns
+    let mut partial_nums_host = Vec::new();
+    for acc in accs {
+        let num_size = acc.partial_numerators_acc.len();
+        for col_idx in 0..4 {
+            let col = &acc.partial_numerators_acc.columns[col_idx];
+            let ptr = col.data.as_ptr() as *const u32;
+            let raw = unsafe { std::slice::from_raw_parts(ptr, col.data.len() * 16) };
+            partial_nums_host.extend_from_slice(&raw[..num_size]);
+        }
+    }
+
+    // Transfer to GPU
+    let d_domain_xr = device.htod_copy(domain_x_r_host)
+        .map_err(|e| CudaFftError::MemoryTransfer(format!("domain_xr: {}", e)))?;
+    let d_domain_xi = device.htod_copy(domain_xi_host)
+        .map_err(|e| CudaFftError::MemoryTransfer(format!("domain_xi: {}", e)))?;
+    let d_domain_yr = device.htod_copy(domain_y_r_host)
+        .map_err(|e| CudaFftError::MemoryTransfer(format!("domain_yr: {}", e)))?;
+    let d_domain_yi = device.htod_copy(domain_yi_host)
+        .map_err(|e| CudaFftError::MemoryTransfer(format!("domain_yi: {}", e)))?;
+    let d_partial_nums = device.htod_copy(partial_nums_host)
+        .map_err(|e| CudaFftError::MemoryTransfer(format!("partial_nums: {}", e)))?;
+    let d_sample_data = device.htod_copy(sample_data_host)
+        .map_err(|e| CudaFftError::MemoryTransfer(format!("sample_data: {}", e)))?;
+
+    // Allocate output buffers
+    let mut d_out_c0 = device.alloc_zeros::<u32>(domain_size as usize)
+        .map_err(|e| CudaFftError::MemoryAllocation(format!("out_c0: {}", e)))?;
+    let mut d_out_c1 = device.alloc_zeros::<u32>(domain_size as usize)
+        .map_err(|e| CudaFftError::MemoryAllocation(format!("out_c1: {}", e)))?;
+    let mut d_out_c2 = device.alloc_zeros::<u32>(domain_size as usize)
+        .map_err(|e| CudaFftError::MemoryAllocation(format!("out_c2: {}", e)))?;
+    let mut d_out_c3 = device.alloc_zeros::<u32>(domain_size as usize)
+        .map_err(|e| CudaFftError::MemoryAllocation(format!("out_c3: {}", e)))?;
+
+    // Launch kernel
+    executor.compute_quotients(
+        &d_domain_xr, &d_domain_xi,
+        &d_domain_yr, &d_domain_yi,
+        &d_partial_nums, &d_sample_data,
+        &mut d_out_c0, &mut d_out_c1,
+        &mut d_out_c2, &mut d_out_c3,
+        domain_size, num_samples,
+    )?;
+
+    // Read results back
+    let out_c0 = device.dtoh_sync_copy(&d_out_c0)
+        .map_err(|e| CudaFftError::MemoryTransfer(format!("dtoh c0: {}", e)))?;
+    let out_c1 = device.dtoh_sync_copy(&d_out_c1)
+        .map_err(|e| CudaFftError::MemoryTransfer(format!("dtoh c1: {}", e)))?;
+    let out_c2 = device.dtoh_sync_copy(&d_out_c2)
+        .map_err(|e| CudaFftError::MemoryTransfer(format!("dtoh c2: {}", e)))?;
+    let out_c3 = device.dtoh_sync_copy(&d_out_c3)
+        .map_err(|e| CudaFftError::MemoryTransfer(format!("dtoh c3: {}", e)))?;
+
+    // Convert back to SecureColumnByCoords
+    let result_col = super::conversion::aos_to_secure_column_from_soa(
+        &out_c0, &out_c1, &out_c2, &out_c3, domain_size as usize,
+    );
+
+    Ok(SecureEvaluation::new(domain, result_col))
 }
 
 #[cfg(test)]
@@ -81,5 +257,14 @@ mod tests {
         // Compile-time check that GpuBackend implements QuotientOps
         fn _assert_impl<T: super::QuotientOps>() {}
         _assert_impl::<super::GpuBackend>();
+    }
+
+    #[test]
+    fn test_pcs_quotient_kernel_source_compiles() {
+        use super::super::constraints::get_pcs_quotient_kernel_source;
+        let source = get_pcs_quotient_kernel_source();
+        assert!(source.contains("cm31_inv"));
+        assert!(source.contains("qm31_mul_cm31"));
+        assert!(source.contains("pcs_quotient_combine"));
     }
 }

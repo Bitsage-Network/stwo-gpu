@@ -118,22 +118,36 @@ impl PoseidonChannel {
 
     /// Draw a QM31 value from the channel.
     ///
-    /// Draws one felt252 and extracts 4 M31 components (each reduced mod P_M31).
+    /// Draws one felt252 and extracts 4 M31 components via successive
+    /// `floor_div(2^31)` — matching STWO's `Poseidon252Channel::draw_base_felts()`
+    /// and Cairo's `felt252_to_m31_array_8()` exactly.
+    ///
+    /// Extraction order is LSB-first: index 0 = least significant 31 bits.
+    /// Each component is reduced mod P_M31 = 2^31 - 1.
     pub fn draw_qm31(&mut self) -> SecureField {
         let felt = self.draw_felt252();
-        // Extract 4 M31 values from the felt252
-        // Use byte extraction for each component
-        let bytes = felt.to_bytes_be();
+        let shift = FieldElement::from(1u64 << 31);
+        let p = (1u64 << 31) - 1;
 
-        // Extract 4 values from different byte positions within the felt252
-        // Each M31 needs 31 bits. We extract from non-overlapping 32-bit windows.
-        let p = (1u32 << 31) - 1;
-        let v0 = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) % p;
-        let v1 = u32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) % p;
-        let v2 = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]) % p;
-        let v3 = u32::from_be_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]) % p;
+        let mut cur = felt;
+        let mut m31s = [M31::from(0u32); 4];
+        for m31 in m31s.iter_mut() {
+            // Integer floor division: next = cur / 2^31
+            let next = cur.floor_div(shift);
+            // Remainder: res = cur - next * 2^31 = cur mod 2^31, in [0, 2^31)
+            let res = cur - next * shift;
+            cur = next;
+            // Extract the small value from the low bytes of the remainder
+            let bytes = res.to_bytes_be();
+            let val = u64::from_be_bytes([
+                bytes[24], bytes[25], bytes[26], bytes[27],
+                bytes[28], bytes[29], bytes[30], bytes[31],
+            ]);
+            // Reduce mod P = 2^31 - 1 (matching BaseField::reduce)
+            *m31 = M31::from((val % p) as u32);
+        }
 
-        QM31(CM31(M31::from(v0), M31::from(v1)), CM31(M31::from(v2), M31::from(v3)))
+        QM31(CM31(m31s[0], m31s[1]), CM31(m31s[2], m31s[3]))
     }
 
     /// Draw multiple QM31 values.
@@ -245,5 +259,116 @@ mod tests {
         // First draw after mix should be deterministic based on new digest
         let d3 = ch.draw_felt252();
         assert_ne!(d3, FieldElement::ZERO);
+    }
+
+    /// Cross-verify draw_qm31 against STWO's canonical Poseidon252Channel.
+    ///
+    /// Both channels must produce identical QM31 values from the same
+    /// initial state and operations. This ensures Fiat-Shamir transcript
+    /// consistency between stwo-ml (Rust prover) and the Cairo verifier.
+    #[test]
+    fn test_draw_qm31_matches_stwo_canonical() {
+        use stwo::core::channel::Poseidon252Channel;
+        use stwo::core::channel::Channel;
+
+        // Test with several different initial states
+        for seed in [0u64, 1, 42, 12345, 999999, u64::MAX] {
+            let mut our_ch = PoseidonChannel::new();
+            let mut stwo_ch = Poseidon252Channel::default();
+
+            our_ch.mix_u64(seed);
+            stwo_ch.mix_u64(seed);
+
+            // Draw 4 QM31 values and compare
+            for draw_idx in 0..4 {
+                let our_qm31 = our_ch.draw_qm31();
+                let stwo_qm31 = stwo_ch.draw_secure_felt();
+
+                assert_eq!(
+                    our_qm31.0 .0, stwo_qm31.0 .0,
+                    "seed={seed}, draw={draw_idx}: CM31.a.real mismatch"
+                );
+                assert_eq!(
+                    our_qm31.0 .1, stwo_qm31.0 .1,
+                    "seed={seed}, draw={draw_idx}: CM31.a.imag mismatch"
+                );
+                assert_eq!(
+                    our_qm31.1 .0, stwo_qm31.1 .0,
+                    "seed={seed}, draw={draw_idx}: CM31.b.real mismatch"
+                );
+                assert_eq!(
+                    our_qm31.1 .1, stwo_qm31.1 .1,
+                    "seed={seed}, draw={draw_idx}: CM31.b.imag mismatch"
+                );
+            }
+        }
+    }
+
+    /// Verify that draw_qm31 extracts via floor_div(2^31) LSB-first,
+    /// matching the modular arithmetic pattern (not byte positions).
+    #[test]
+    fn test_draw_qm31_lsb_first_extraction() {
+        let mut ch = PoseidonChannel::new();
+        ch.mix_u64(42);
+
+        // Get the raw felt252 that draw_qm31 will consume
+        let mut ch_copy = ch.clone();
+        let raw_felt = ch_copy.draw_felt252();
+
+        // Manually extract using floor_div pattern (canonical)
+        let shift = FieldElement::from(1u64 << 31);
+        let p = (1u64 << 31) - 1;
+        let mut cur = raw_felt;
+        let mut expected = [0u32; 4];
+        for val in expected.iter_mut() {
+            let next = cur.floor_div(shift);
+            let rem = cur - next * shift;
+            cur = next;
+            let bytes = rem.to_bytes_be();
+            let v = u64::from_be_bytes([
+                bytes[24], bytes[25], bytes[26], bytes[27],
+                bytes[28], bytes[29], bytes[30], bytes[31],
+            ]);
+            *val = (v % p) as u32;
+        }
+
+        // draw_qm31 should produce these exact M31 values
+        let qm31 = ch.draw_qm31();
+        assert_eq!(qm31.0 .0 .0, expected[0], "m31[0] = LSB");
+        assert_eq!(qm31.0 .1 .0, expected[1], "m31[1]");
+        assert_eq!(qm31.1 .0 .0, expected[2], "m31[2]");
+        assert_eq!(qm31.1 .1 .0, expected[3], "m31[3] = MSB-ish");
+    }
+
+    /// Verify that mix_u64 + draw roundtrip matches STWO's Poseidon252Channel.
+    ///
+    /// Note: Our `mix_felt(securefield_to_felt(sf))` uses a single-QM31 pack,
+    /// while STWO's `mix_felts(&[sf])` packs chunks of 2 QM31s. These are
+    /// different encoding paths used in different protocol contexts.
+    /// The on-chain verifier matches our encoding (mix_felt + pack_qm31_to_felt).
+    #[test]
+    fn test_mix_u64_draw_matches_stwo_canonical() {
+        use stwo::core::channel::Poseidon252Channel;
+        use stwo::core::channel::Channel;
+
+        // Both channels should agree after identical mix_u64 sequences
+        let mut our_ch = PoseidonChannel::new();
+        let mut stwo_ch = Poseidon252Channel::default();
+
+        // Mix identical u64 values
+        our_ch.mix_u64(42);
+        our_ch.mix_u64(9999);
+        stwo_ch.mix_u64(42);
+        stwo_ch.mix_u64(9999);
+
+        // Draw should match
+        let our_val = our_ch.draw_qm31();
+        let stwo_val = stwo_ch.draw_secure_felt();
+        assert_eq!(our_val, stwo_val, "mix_u64 + draw should match STWO");
+
+        // Continue drawing — should still match
+        let our_val2 = our_ch.draw_qm31();
+        let stwo_val2 = stwo_ch.draw_secure_felt();
+        assert_eq!(our_val2, stwo_val2, "second draw should also match");
     }
 }

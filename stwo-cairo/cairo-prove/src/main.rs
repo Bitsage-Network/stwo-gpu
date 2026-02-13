@@ -14,7 +14,7 @@ use clap::Parser;
 use log::{error, info};
 use stwo_cairo_prover::stwo::core::fri::FriConfig;
 use stwo_cairo_prover::stwo::core::pcs::PcsConfig;
-use stwo_cairo_prover::stwo::core::vcs::blake2_merkle::{
+use stwo_cairo_prover::stwo::core::vcs_lifted::blake2_merkle::{
     Blake2sMerkleChannel, Blake2sMerkleHasher,
 };
 
@@ -153,7 +153,22 @@ fn handle_prove_ml(
     // Step 4: Generate recursive STARK proof
     let prove_start = Instant::now();
     let prover_input = prover_input_from_runner(&runner)?;
-    let cairo_proof = prove(prover_input, secure_pcs_config())?;
+    let cairo_proof = {
+        #[cfg(feature = "cuda-runtime")]
+        {
+            if gpu {
+                info!("[GPU] Using GpuBackend for STARK proving.");
+                cairo_prove::prove::prove_gpu(prover_input, secure_pcs_config())?
+            } else {
+                prove(prover_input, secure_pcs_config())?
+            }
+        }
+        #[cfg(not(feature = "cuda-runtime"))]
+        {
+            let _ = gpu; // suppress unused warning
+            prove(prover_input, secure_pcs_config())?
+        }
+    };
     info!("Recursive STARK proof generated in {:.2?}.", prove_start.elapsed());
 
     // Step 5: Save the proof

@@ -1,6 +1,8 @@
 use num_traits::Zero;
 use stwo::core::fields::qm31::QM31;
 use stwo::prover::backend::simd::SimdBackend;
+#[cfg(feature = "cuda-runtime")]
+use stwo::prover::backend::gpu::GpuBackend;
 use stwo::prover::ComponentProver;
 use stwo_constraint_framework::TraceLocationAllocator;
 
@@ -147,6 +149,14 @@ impl PedersenContextComponents {
             .map(|c| c.provers())
             .unwrap_or_default()
     }
+
+    #[cfg(feature = "cuda-runtime")]
+    pub fn provers_gpu(&self) -> Vec<&dyn ComponentProver<GpuBackend>> {
+        self.components
+            .as_ref()
+            .map(|c| c.provers_gpu())
+            .unwrap_or_default()
+    }
 }
 
 impl std::fmt::Display for PedersenContextComponents {
@@ -255,6 +265,15 @@ impl Components {
     }
 
     pub fn provers(&self) -> Vec<&dyn ComponentProver<SimdBackend>> {
+        vec![
+            &self.pedersen_aggregator,
+            &self.partial_ec_mul,
+            &self.pedersen_points_table,
+        ]
+    }
+
+    #[cfg(feature = "cuda-runtime")]
+    pub fn provers_gpu(&self) -> Vec<&dyn ComponentProver<GpuBackend>> {
         vec![
             &self.pedersen_aggregator,
             &self.partial_ec_mul,

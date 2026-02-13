@@ -161,11 +161,55 @@ pub mod activations {
         if val <= half_p { x } else { M31::from(0) }
     }
 
-    /// Approximate GELU using a piecewise-linear table.
+    /// Fixed-point scale for GELU (and other scaled activations).
+    ///
+    /// M31 values are interpreted as x_real = val / GELU_SCALE.
+    /// Output is round(gelu(x_real) * GELU_SCALE).
+    /// Matches the scale convention used by sigmoid_approx and softmax_exp.
+    pub const GELU_FIXED_POINT_SCALE: u32 = 1 << 16;
+
+    /// GELU: x * Φ(x) ≈ 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x³)))
+    ///
+    /// Uses fixed-point arithmetic with scale = GELU_FIXED_POINT_SCALE (2^16).
+    /// Interprets M31 values using the standard sign convention:
+    ///   val <= P/2  → positive: x_real = val / scale
+    ///   val >  P/2  → negative: x_real = -(P - val) / scale
+    ///
+    /// For table inputs [0, 2^log_size), all values are positive (since 2^18 << P/2).
+    /// The f64 computation matches the reference implementation in f32_ops::gelu_f32.
     pub fn gelu_approx(x: M31) -> M31 {
         let val = x.0;
+        let p = (1u64 << 31) - 1; // M31 prime
         let half_p = (1u32 << 30) - 1;
-        if val > half_p { M31::from(0) } else { x }
+        let scale = GELU_FIXED_POINT_SCALE as f64;
+
+        if val == 0 {
+            return M31::from(0);
+        }
+
+        // Convert M31 to signed real number
+        let x_real = if val <= half_p {
+            val as f64 / scale
+        } else {
+            -((p - val as u64) as f64) / scale
+        };
+
+        // GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+        let sqrt_2_over_pi: f64 = (2.0_f64 / std::f64::consts::PI).sqrt();
+        let inner = sqrt_2_over_pi * (x_real + 0.044715 * x_real * x_real * x_real);
+        let gelu = 0.5 * x_real * (1.0 + inner.tanh());
+
+        // Convert back to M31 fixed-point
+        if gelu >= 0.0 {
+            let result = (gelu * scale).round();
+            let clamped = (result as u64).min(p - 1) as u32;
+            M31::from(clamped)
+        } else {
+            // Negative result wraps around in M31
+            let neg = (-gelu * scale).round() as u64;
+            let wrapped = (p - neg.min(p - 1)) as u32;
+            M31::from(wrapped)
+        }
     }
 
     /// Approximate sigmoid: 1/(1+e^(-x)).
@@ -290,6 +334,180 @@ mod tests {
         for i in [0, 100, 500, 1000, 2048, 4095] {
             let result = table.lookup(M31::from(i as u32));
             assert!(result.is_some(), "lookup failed for {i}");
+        }
+    }
+
+    // ===== GELU-specific tests =====
+
+    #[test]
+    fn test_gelu_zero() {
+        assert_eq!(activations::gelu_approx(M31::from(0)), M31::from(0));
+    }
+
+    #[test]
+    fn test_gelu_differs_from_relu() {
+        // The core bug: GELU was identical to ReLU. Verify they now differ.
+        let scale = activations::GELU_FIXED_POINT_SCALE;
+
+        // At x_real = 0.5 (val = scale/2), GELU ≈ 0.346, ReLU = 0.5
+        let val_half = M31::from(scale / 2);
+        let gelu_out = activations::gelu_approx(val_half);
+        let relu_out = activations::relu(val_half);
+        assert_ne!(
+            gelu_out, relu_out,
+            "GELU and ReLU must differ at x=0.5 (scale/2={}, gelu={}, relu={})",
+            scale / 2, gelu_out.0, relu_out.0,
+        );
+
+        // GELU output should be less than ReLU output for moderate positive values
+        assert!(
+            gelu_out.0 < relu_out.0,
+            "GELU({}) = {} should be < ReLU({}) = {} for moderate x",
+            val_half.0, gelu_out.0, val_half.0, relu_out.0,
+        );
+
+        // At x_real = 1.0 (val = scale), GELU ≈ 0.841, ReLU = 1.0
+        let val_one = M31::from(scale);
+        let gelu_one = activations::gelu_approx(val_one);
+        let relu_one = activations::relu(val_one);
+        assert_ne!(gelu_one, relu_one, "GELU and ReLU must differ at x=1.0");
+        assert!(gelu_one.0 < relu_one.0, "GELU(1.0) < ReLU(1.0)");
+    }
+
+    #[test]
+    fn test_gelu_known_values() {
+        let scale = activations::GELU_FIXED_POINT_SCALE as f64;
+
+        // Test against reference gelu_f32 at known points
+        let test_points: Vec<(f64, f64)> = vec![
+            (0.0, 0.0),
+            (0.5, 0.3457),  // GELU(0.5) ≈ 0.3457
+            (1.0, 0.8412),  // GELU(1.0) ≈ 0.8412
+            (2.0, 1.9545),  // GELU(2.0) ≈ 1.9545
+            (3.0, 2.9964),  // GELU(3.0) ≈ 2.9964
+        ];
+
+        for (x_real, expected_gelu) in test_points {
+            let val = (x_real * scale).round() as u32;
+            let output = activations::gelu_approx(M31::from(val));
+            let expected_val = (expected_gelu * scale).round() as u32;
+            let tolerance = (0.01 * scale).round() as u32; // 1% tolerance
+
+            let diff = if output.0 > expected_val {
+                output.0 - expected_val
+            } else {
+                expected_val - output.0
+            };
+            assert!(
+                diff <= tolerance,
+                "GELU({}) = {} (expected ~{}, diff={})",
+                x_real, output.0, expected_val, diff,
+            );
+        }
+    }
+
+    #[test]
+    fn test_gelu_converges_to_identity_for_large_x() {
+        let scale = activations::GELU_FIXED_POINT_SCALE;
+
+        // For large x_real (> 4), GELU(x) ≈ x
+        // x_real = 5.0 → val = 5 * scale
+        let val_large = 5 * scale;
+        let gelu_large = activations::gelu_approx(M31::from(val_large));
+        let tolerance = scale / 100; // 1% of scale
+
+        let diff = if gelu_large.0 > val_large {
+            gelu_large.0 - val_large
+        } else {
+            val_large - gelu_large.0
+        };
+        assert!(
+            diff <= tolerance,
+            "GELU(5.0) should be ≈ 5.0: got {} (expected ~{}, diff={})",
+            gelu_large.0, val_large, diff,
+        );
+    }
+
+    #[test]
+    fn test_gelu_negative_returns_near_zero() {
+        let scale = activations::GELU_FIXED_POINT_SCALE;
+        let p = (1u64 << 31) - 1;
+
+        // x_real = -5.0 → val = P - 5*scale
+        // GELU(-5.0) ≈ -5 * Φ(-5) ≈ -5 * 0.0000003 ≈ 0 (within rounding)
+        let val_neg5 = (p - 5 * scale as u64) as u32;
+        let result = activations::gelu_approx(M31::from(val_neg5));
+        assert_eq!(
+            result,
+            M31::from(0),
+            "GELU(-5.0) should be 0: got {}",
+            result.0,
+        );
+
+        // x_real = -3.0 → GELU(-3.0) ≈ -0.00363 → rounds to 0 in fixed-point
+        let val_neg3 = (p - 3 * scale as u64) as u32;
+        let result_neg3 = activations::gelu_approx(M31::from(val_neg3));
+        // For x=-3, GELU is very small negative. In fixed-point it may round to 0
+        // or wrap to a value very close to P. Either way, the M31 value should be
+        // 0 or very close to P (representing a tiny negative).
+        let is_near_zero = result_neg3.0 == 0 || result_neg3.0 > p as u32 - scale;
+        assert!(
+            is_near_zero,
+            "GELU(-3.0) should be near zero: got {} (P={})",
+            result_neg3.0, p,
+        );
+    }
+
+    #[test]
+    fn test_gelu_monotonic_positive() {
+        // GELU should be monotonically increasing for positive x
+        let scale = activations::GELU_FIXED_POINT_SCALE;
+        let mut prev = 0u32;
+        for i in 0..100 {
+            let val = i * (scale / 10); // x_real = 0.0, 0.1, 0.2, ..., 9.9
+            let out = activations::gelu_approx(M31::from(val));
+            assert!(
+                out.0 >= prev,
+                "GELU should be monotonic: GELU({}) = {} < prev = {}",
+                val, out.0, prev,
+            );
+            prev = out.0;
+        }
+    }
+
+    #[test]
+    fn test_gelu_table_builds_correctly() {
+        let table = PrecomputedTable::build(activations::gelu_approx, 8);
+        assert_eq!(table.size(), 256);
+
+        // GELU(0) = 0
+        assert_eq!(table.lookup(M31::from(0)), Some(M31::from(0)));
+
+        // All entries should be valid M31 values (no panics during build)
+        for i in 0..256 {
+            let result = table.lookup(M31::from(i as u32));
+            assert!(result.is_some(), "table should contain entry for {i}");
+        }
+    }
+
+    #[test]
+    fn test_gelu_matches_f64_reference() {
+        // Cross-check our M31 GELU against an f64 reference implementation
+        let scale = activations::GELU_FIXED_POINT_SCALE as f64;
+        let sqrt_2_over_pi: f64 = (2.0_f64 / std::f64::consts::PI).sqrt();
+
+        for i in (0..200).map(|x| x * 500) {
+            let x_real = i as f64 / scale;
+            let inner = sqrt_2_over_pi * (x_real + 0.044715 * x_real.powi(3));
+            let expected = 0.5 * x_real * (1.0 + inner.tanh());
+            let expected_val = (expected * scale).round() as u32;
+
+            let actual = activations::gelu_approx(M31::from(i as u32));
+            assert_eq!(
+                actual.0, expected_val,
+                "M31 GELU({}) = {} but f64 reference = {} (x_real={})",
+                i, actual.0, expected_val, x_real,
+            );
         }
     }
 }

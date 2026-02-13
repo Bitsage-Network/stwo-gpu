@@ -10,8 +10,6 @@
 
 use starknet_ff::FieldElement;
 use stwo::core::fields::qm31::SecureField;
-use num_traits::Zero;
-
 use crate::crypto::poseidon_channel::{PoseidonChannel, securefield_to_felt};
 use crate::crypto::poseidon_merkle::{PoseidonMerkleTree, MerkleAuthPath};
 
@@ -202,38 +200,109 @@ pub fn prove_mle_opening(
     }
 }
 
-/// Verify an MLE opening proof.
+/// Verify an MLE opening proof against a committed Poseidon Merkle root.
 ///
-/// Checks:
-/// 1. Final value matches what folding through all query rounds produces
-/// 2. All query chains fold consistently to `final_value`
-/// 3. Structural consistency (round counts match challenges)
-///
-/// Note: On-chain verification additionally checks Merkle auth paths against
-/// commitment roots. This local check verifies algebraic consistency.
+/// Full verification matching Cairo's `verify_mle_opening` in elo-cairo-verifier:
+/// 1. Replay Fiat-Shamir transcript (mix commitment + intermediate roots)
+/// 2. Draw query indices from channel
+/// 3. For each query at each round:
+///    a. Verify Merkle auth paths against layer roots
+///    b. Check algebraic folding consistency
+/// 4. Final folded value must equal `proof.final_value`
 pub fn verify_mle_opening(
-    _commitment: FieldElement,
+    commitment: FieldElement,
     proof: &MleOpeningProof,
     challenges: &[SecureField],
-    _channel: &mut PoseidonChannel,
+    channel: &mut PoseidonChannel,
 ) -> bool {
-    // Verify each query chain
-    for query in &proof.queries {
-        if query.rounds.len() != challenges.len() {
+    let n_rounds = challenges.len();
+
+    // 1. Replay channel transcript: mix initial commitment + intermediate roots
+    channel.mix_felt(commitment);
+    for root in &proof.intermediate_roots {
+        channel.mix_felt(*root);
+    }
+
+    // Build layer roots: layer 0 = commitment, layers 1..n-1 = intermediate_roots
+    let layer_roots_len = 1 + proof.intermediate_roots.len();
+
+    if n_rounds == 0 {
+        return proof.queries.is_empty();
+    }
+
+    // 2. Draw query indices from channel (matching prover's query derivation)
+    let half_n = 1usize << (n_rounds - 1);
+    let n_queries = MLE_N_QUERIES.min(half_n);
+
+    let mut query_indices = Vec::with_capacity(n_queries);
+    for _ in 0..n_queries {
+        let felt = channel.draw_felt252();
+        let bytes = felt.to_bytes_be();
+        let raw = u64::from_be_bytes([
+            bytes[24], bytes[25], bytes[26], bytes[27],
+            bytes[28], bytes[29], bytes[30], bytes[31],
+        ]);
+        query_indices.push((raw as usize) % half_n);
+    }
+
+    if proof.queries.len() != n_queries {
+        return false;
+    }
+
+    // 3. Verify each query chain
+    for (q_idx, query) in proof.queries.iter().enumerate() {
+        if query.rounds.len() != n_rounds {
             return false;
         }
 
-        // Check folding consistency at each round
-        let mut last_folded = SecureField::zero();
-        for (round_idx, round_data) in query.rounds.iter().enumerate() {
-            let r = challenges[round_idx];
-            // Lo/hi folding: f(r, rest) = left + r * (right - left)
-            last_folded = round_data.left_value + r * (round_data.right_value - round_data.left_value);
+        // Verify initial pair index matches channel-derived query
+        if query.initial_pair_index as usize != query_indices[q_idx] {
+            return false;
         }
 
-        // Last round's folded value should equal final_value
-        if last_folded != proof.final_value {
-            return false;
+        let mut current_idx = query.initial_pair_index as usize;
+        let mut layer_size = 1usize << n_rounds;
+
+        for (round, round_data) in query.rounds.iter().enumerate() {
+            let mid = layer_size / 2;
+            let left_idx = current_idx;
+            let right_idx = mid + current_idx;
+
+            // 3a. Verify Merkle auth paths for rounds that have trees
+            if round < layer_roots_len {
+                let layer_root = if round == 0 {
+                    commitment
+                } else {
+                    proof.intermediate_roots[round - 1]
+                };
+
+                let left_leaf = securefield_to_felt(round_data.left_value);
+                let right_leaf = securefield_to_felt(round_data.right_value);
+
+                let left_path = MerkleAuthPath { siblings: round_data.left_siblings.clone() };
+                let right_path = MerkleAuthPath { siblings: round_data.right_siblings.clone() };
+
+                if !PoseidonMerkleTree::verify(layer_root, left_idx, left_leaf, &left_path) {
+                    return false;
+                }
+                if !PoseidonMerkleTree::verify(layer_root, right_idx, right_leaf, &right_path) {
+                    return false;
+                }
+            }
+
+            // 3b. Algebraic fold: f(r) = left + r * (right - left)
+            let r = challenges[round];
+            let folded = round_data.left_value + r * (round_data.right_value - round_data.left_value);
+
+            // Last round: folded value must equal final_value
+            if round == n_rounds - 1 && folded != proof.final_value {
+                return false;
+            }
+
+            // Advance index for next round
+            let next_half = (mid / 2).max(1);
+            current_idx %= next_half;
+            layer_size = mid;
         }
     }
 
@@ -334,6 +403,29 @@ mod tests {
         let mut ch_v = PoseidonChannel::new();
         ch_v.mix_u64(42);
         assert!(!verify_mle_opening(commitment, &proof, &challenges, &mut ch_v));
+    }
+
+    #[test]
+    fn test_mle_opening_wrong_commitment_fails() {
+        let evals = make_evals(4);
+        let mut ch = PoseidonChannel::new();
+        ch.mix_u64(42);
+
+        let challenges = vec![
+            SecureField::from(M31::from(3)),
+            SecureField::from(M31::from(7)),
+        ];
+
+        let proof = prove_mle_opening(&evals, &challenges, &mut ch);
+
+        // Use a WRONG commitment — should fail Merkle verification
+        let wrong_commitment = FieldElement::from(0xDEADBEEFu64);
+        let mut ch_v = PoseidonChannel::new();
+        ch_v.mix_u64(42);
+        assert!(
+            !verify_mle_opening(wrong_commitment, &proof, &challenges, &mut ch_v),
+            "Wrong commitment should fail Merkle verification"
+        );
     }
 
     #[test]
