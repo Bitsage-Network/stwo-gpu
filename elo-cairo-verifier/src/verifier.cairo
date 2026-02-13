@@ -13,7 +13,7 @@
 //   7. verify_mle_opening(A, assignment, channel)
 //   8. verify_mle_opening(B, assignment, channel)
 
-use crate::types::MatMulSumcheckProof;
+use crate::types::{MatMulSumcheckProof, BatchedMatMulProof};
 
 #[starknet::interface]
 pub trait ISumcheckVerifier<TContractState> {
@@ -27,6 +27,15 @@ pub trait ISumcheckVerifier<TContractState> {
     /// final evaluation, and MLE opening proofs for both matrices.
     fn verify_matmul(
         ref self: TContractState, model_id: felt252, proof: MatMulSumcheckProof,
+    ) -> bool;
+
+    /// Verify a batched matmul sumcheck proof on-chain.
+    /// Multiple matmuls combined with lambda weighting into one sumcheck.
+    /// Replays the full Fiat-Shamir transcript, re-derives lambda,
+    /// validates combined_claimed_sum, verifies rounds, and checks
+    /// the final evaluation Σ λ^i · a_i · b_i.
+    fn verify_batched_matmul(
+        ref self: TContractState, model_id: felt252, proof: BatchedMatMulProof,
     ) -> bool;
 
     /// Get the weight commitment for a registered model.
@@ -44,12 +53,12 @@ pub trait ISumcheckVerifier<TContractState> {
 
 #[starknet::contract]
 mod SumcheckVerifierContract {
-    use super::MatMulSumcheckProof;
+    use super::{MatMulSumcheckProof, BatchedMatMulProof};
     use crate::field::{log2_ceil, next_power_of_two, pack_qm31_to_felt};
     use crate::channel::{
         channel_default, channel_mix_u64, channel_mix_felt, channel_draw_qm31s,
     };
-    use crate::sumcheck::verify_sumcheck_inner;
+    use crate::sumcheck::{verify_sumcheck_inner, verify_batched_sumcheck};
     use crate::mle::verify_mle_opening;
     use starknet::storage::{
         StoragePointerReadAccess, StoragePointerWriteAccess, Map, StoragePathEntry,
@@ -73,6 +82,7 @@ mod SumcheckVerifierContract {
     enum Event {
         ModelRegistered: ModelRegistered,
         MatMulVerified: MatMulVerified,
+        BatchMatMulVerified: BatchMatMulVerified,
         VerificationFailed: VerificationFailed,
     }
 
@@ -90,6 +100,16 @@ mod SumcheckVerifierContract {
         model_id: felt252,
         proof_hash: felt252,
         dimensions: felt252,
+        num_rounds: u32,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    struct BatchMatMulVerified {
+        #[key]
+        model_id: felt252,
+        proof_hash: felt252,
+        num_entries: u32,
+        k: u32,
         num_rounds: u32,
     }
 
@@ -223,6 +243,47 @@ mod SumcheckVerifierContract {
                             + (k.into() * 0x10000)
                             + n.into(),
                         num_rounds,
+                    },
+                );
+
+            true
+        }
+
+        fn verify_batched_matmul(
+            ref self: ContractState, model_id: felt252, proof: BatchedMatMulProof,
+        ) -> bool {
+            // 1. Validate model is registered
+            let commitment = self.model_commitments.entry(model_id).read();
+            assert!(commitment != 0, "Model not registered");
+
+            // 2. Basic structure validation
+            let num_entries: u32 = proof.entries.len();
+            assert!(num_entries > 0, "Batch must have at least one entry");
+            assert!(proof.num_rounds > 0, "Must have at least one round");
+            assert!(
+                proof.round_polys.len() == proof.num_rounds, "Round count mismatch",
+            );
+
+            let k = proof.k;
+            let num_rounds = proof.num_rounds;
+
+            // 3. Full Fiat-Shamir verification (replays prover transcript)
+            let (is_valid, proof_hash) = verify_batched_sumcheck(@proof);
+
+            if !is_valid {
+                self.emit(VerificationFailed { model_id, reason: proof_hash });
+                return false;
+            }
+
+            // 4. Record verification
+            self.verified_proofs.entry(proof_hash).write(true);
+            let count = self.verification_counts.entry(model_id).read();
+            self.verification_counts.entry(model_id).write(count + 1);
+
+            self
+                .emit(
+                    BatchMatMulVerified {
+                        model_id, proof_hash, num_entries, k, num_rounds,
                     },
                 );
 
