@@ -29,9 +29,13 @@ pub mod receipt;
 pub mod crypto;
 pub mod json_serde;
 pub mod weight_cache;
+pub mod gkr;
 
 #[cfg(feature = "cuda-runtime")]
 pub mod gpu_sumcheck;
+
+#[cfg(feature = "multi-gpu")]
+pub mod multi_gpu;
 
 /// Re-export core STWO types used throughout stwo-ml.
 pub mod prelude {
@@ -56,8 +60,11 @@ pub mod prelude {
         prove_model_aggregated, prove_model_aggregated_with, prove_model_aggregated_auto,
         prove_model_aggregated_onchain, prove_model_aggregated_onchain_auto,
         prove_model_aggregated_onchain_auto_cached,
+        prove_model_aggregated_onchain_gkr, prove_model_aggregated_onchain_gkr_auto,
+        prove_model_aggregated_onchain_logup_gkr, prove_model_aggregated_onchain_logup_gkr_auto,
         verify_aggregated_model_proof,
         verify_aggregated_model_proof_onchain,
+        GkrBatchData,
     };
     pub use crate::receipt::{prove_receipt, prove_receipt_batch, prove_receipt_batch_auto};
     pub use crate::backend::BackendInfo;
@@ -73,7 +80,20 @@ pub mod prelude {
     pub use crate::starknet::{
         build_starknet_proof_with_tee, build_starknet_proof_onchain_with_tee,
         prove_for_starknet_onchain_cached,
+        build_starknet_proof_direct, DirectStarknetProof, prove_for_starknet_direct,
     };
+    #[cfg(feature = "multi-gpu")]
+    pub use crate::starknet::prove_for_starknet_direct_multi_gpu;
+    #[cfg(feature = "multi-gpu")]
+    pub use crate::multi_gpu::{
+        MultiGpuExecutor, MultiGpuProvingResult, DeviceProvingStat, MultiGpuError,
+        DeviceGuard, GpuDeviceInfo, ChunkWorkload, DeviceAssignment,
+    };
+    #[cfg(feature = "multi-gpu")]
+    pub use crate::compiler::chunked::{
+        prove_model_chunked_multi_gpu, prove_model_chunked_multi_gpu_with_metrics,
+    };
+    pub use crate::cairo_serde::DirectProofMetadata;
     pub use crate::tee::{
         SecurityLevel, TeeAttestation, TeeCapability, TeeModelProver,
         detect_tee_capability, verify_attestation,
