@@ -35,6 +35,9 @@ DO_DRY_RUN=false
 MAX_FEE="${MAX_FEE:-0.05}"
 MAX_RETRIES=3
 ALL_TX_HASHES=()
+FORCE_PAYMASTER=false
+FORCE_NO_PAYMASTER=false
+DEPLOY_ACCOUNT=false
 
 # ─── Parse Arguments ─────────────────────────────────────────────────
 
@@ -48,10 +51,14 @@ while [[ $# -gt 0 ]]; do
         --submit)      DO_SUBMIT=true; shift ;;
         --dry-run)     DO_DRY_RUN=true; shift ;;
         --max-fee)     MAX_FEE="$2"; shift 2 ;;
+        --paymaster)   FORCE_PAYMASTER=true; shift ;;
+        --no-paymaster) FORCE_NO_PAYMASTER=true; shift ;;
+        --deploy-account) DEPLOY_ACCOUNT=true; shift ;;
         -h|--help)
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Submit a proof to Starknet for on-chain verification."
+            echo "On Sepolia with no STARKNET_PRIVATE_KEY, uses AVNU paymaster (zero-config)."
             echo ""
             echo "Proof source (pick one):"
             echo "  --proof-dir DIR    Directory with ml_proof.json + metadata.json"
@@ -61,6 +68,12 @@ while [[ $# -gt 0 ]]; do
             echo "  --submit           Actually submit transactions on-chain"
             echo "  --dry-run          Print commands without executing"
             echo ""
+            echo "Submission mode:"
+            echo "  --paymaster        Force AVNU paymaster mode (gasless, sponsored)"
+            echo "  --no-paymaster     Force legacy sncast mode (you pay gas in STRK)"
+            echo "  --deploy-account   Deploy new agent account via factory before verifying"
+            echo "  (default on Sepolia: auto-paymaster when no STARKNET_PRIVATE_KEY)"
+            echo ""
             echo "Options:"
             echo "  --network NET      sepolia | mainnet (default: sepolia)"
             echo "  --contract ADDR    Override verifier contract address"
@@ -69,10 +82,14 @@ while [[ $# -gt 0 ]]; do
             echo "  -h, --help         Show this help"
             echo ""
             echo "Environment variables:"
-            echo "  STARKNET_PRIVATE_KEY  Private key for auto-creating sncast account"
-            echo "  STARKNET_RPC          Override RPC URL (bypasses Alchemy/Nethermind)"
-            echo "  ALCHEMY_KEY           Alchemy API key for RPC"
-            echo "  SNCAST_ACCOUNT        Default sncast account name"
+            echo "  STARKNET_PRIVATE_KEY     Private key (for sncast or paymaster with own account)"
+            echo "  STARKNET_ACCOUNT_ADDRESS Account address (when using own key with paymaster)"
+            echo "  STARKNET_RPC             Override RPC URL"
+            echo "  ALCHEMY_KEY              Alchemy API key for RPC"
+            echo "  OBELYSK_DEPLOYER_KEY     Deployer key for factory account creation"
+            echo "  OBELYSK_DEPLOYER_ADDRESS Deployer address for factory account creation"
+            echo "  AVNU_PAYMASTER_API_KEY   AVNU API key for sponsored mode"
+            echo "  SNCAST_ACCOUNT           Default sncast account name"
             exit 0
             ;;
         *) err "Unknown argument: $1"; exit 1 ;;
@@ -167,14 +184,31 @@ fi
 
 RPC_URL=$(get_rpc_url "$NETWORK")
 
+# ─── Determine Submission Mode ──────────────────────────────────────
+
+USE_PAYMASTER=false
+
+if [[ "$FORCE_PAYMASTER" == "true" ]]; then
+    USE_PAYMASTER=true
+elif [[ "$FORCE_NO_PAYMASTER" == "true" ]]; then
+    USE_PAYMASTER=false
+elif [[ -z "${STARKNET_PRIVATE_KEY:-}" ]] && [[ "$NETWORK" == "sepolia" ]]; then
+    # Zero-config: auto-enable paymaster on Sepolia when no key provided
+    USE_PAYMASTER=true
+fi
+
 # ─── Check Tools ────────────────────────────────────────────────────
 
 if [[ "$DO_SUBMIT" == "true" ]]; then
-    ensure_sncast || exit 1
-
-    # Auto-create sncast account from STARKNET_PRIVATE_KEY if set
-    if [[ -n "${STARKNET_PRIVATE_KEY:-}" ]]; then
-        setup_sncast_account "$ACCOUNT" "$NETWORK" || exit 1
+    if [[ "$USE_PAYMASTER" == "true" ]]; then
+        ensure_node || exit 1
+        ensure_starknet_js "${SCRIPT_DIR}/lib" || exit 1
+    else
+        ensure_sncast || exit 1
+        # Auto-create sncast account from STARKNET_PRIVATE_KEY if set
+        if [[ -n "${STARKNET_PRIVATE_KEY:-}" ]]; then
+            setup_sncast_account "$ACCOUNT" "$NETWORK" || exit 1
+        fi
     fi
 fi
 
@@ -195,7 +229,11 @@ log "Mode:       ${PROOF_MODE}"
 log "Proof:      ${PROOF_FILE} ($(du -h "$PROOF_FILE" | cut -f1))"
 log "Network:    ${NETWORK}"
 log "Contract:   ${CONTRACT}"
-log "Account:    ${ACCOUNT}"
+if [[ "$USE_PAYMASTER" == "true" ]]; then
+    log "Submit via: AVNU Paymaster (gasless, sponsored)"
+else
+    log "Submit via: sncast (account: ${ACCOUNT})"
+fi
 log "Action:     $([ "$DO_SUBMIT" == "true" ] && echo "SUBMIT" || echo "DRY RUN")"
 echo ""
 
@@ -257,100 +295,179 @@ sncast_invoke_tracked() {
 # Mode-specific submission
 # ═══════════════════════════════════════════════════════════════════════
 
-case "$PROOF_MODE" in
+MODEL_ID_FROM_META=$(parse_json_field "${METADATA_FILE:-/dev/null}" "model_id" 2>/dev/null || echo "0x1")
 
-    # ─── Recursive: delegate to submit_recursive_proof.py ─────────────
-    recursive)
-        header "Recursive STARK Submission"
+if [[ "$USE_PAYMASTER" == "true" ]] && [[ "$PROOF_MODE" != "recursive" ]]; then
+    # ─── Paymaster Path (gasless via AVNU) ─────────────────────────────
+    header "Paymaster Submission (AVNU Sponsored)"
 
-        # Find the submit script
-        SUBMIT_SCRIPT=""
-        for path in \
-            "${SCRIPT_DIR}/../submit_recursive_proof.py" \
-            "${SCRIPT_DIR}/../../scripts/submit_recursive_proof.py" \
-            "scripts/submit_recursive_proof.py" \
-            "../scripts/submit_recursive_proof.py"; do
-            if [[ -f "$path" ]]; then
-                SUBMIT_SCRIPT="$path"
-                break
-            fi
-        done
+    PAYMASTER_SCRIPT="${SCRIPT_DIR}/lib/paymaster_submit.mjs"
 
-        if [[ -z "$SUBMIT_SCRIPT" ]]; then
-            err "submit_recursive_proof.py not found"
-            err "Ensure it exists in the scripts/ directory"
+    # Auto-setup account if first run and deployer key is available
+    ACCOUNT_CONFIG="${OBELYSK_DIR}/starknet/pipeline_account.json"
+    if [[ "$DEPLOY_ACCOUNT" == "true" ]] || { [[ ! -f "$ACCOUNT_CONFIG" ]] && [[ -z "${STARKNET_PRIVATE_KEY:-}" ]] && [[ -n "${OBELYSK_DEPLOYER_KEY:-}" ]]; }; then
+        log "Deploying pipeline account via factory..."
+        run_cmd node "$PAYMASTER_SCRIPT" setup \
+            --network "$NETWORK" || {
+            err "Account deployment failed"
+            err "Set OBELYSK_DEPLOYER_KEY and OBELYSK_DEPLOYER_ADDRESS, or use --no-paymaster"
             exit 1
+        }
+        ok "Pipeline account deployed"
+    fi
+
+    # Verify we have an account to use
+    if [[ -z "${STARKNET_PRIVATE_KEY:-}" ]] && [[ ! -f "$ACCOUNT_CONFIG" ]]; then
+        err "No account available for paymaster submission."
+        err ""
+        err "Options:"
+        err "  1. Set OBELYSK_DEPLOYER_KEY + OBELYSK_DEPLOYER_ADDRESS to auto-deploy"
+        err "  2. Set STARKNET_PRIVATE_KEY + STARKNET_ACCOUNT_ADDRESS to use your own account"
+        err "  3. Use --no-paymaster with STARKNET_PRIVATE_KEY for legacy sncast flow"
+        exit 1
+    fi
+
+    # Submit via paymaster
+    log "Submitting ${PROOF_MODE} proof via AVNU paymaster (gasless)..."
+    log "Model ID: ${MODEL_ID_FROM_META}"
+
+    PAYMASTER_OUTPUT=$(run_cmd node "$PAYMASTER_SCRIPT" verify \
+        --proof "$PROOF_FILE" \
+        --contract "$CONTRACT" \
+        --model-id "$MODEL_ID_FROM_META" \
+        --network "$NETWORK" 2>&1) || {
+        err "Paymaster submission failed"
+        echo "$PAYMASTER_OUTPUT" >&2
+        exit 1
+    }
+
+    # Parse JSON output (last line of stderr is info, stdout is JSON)
+    # The script outputs JSON to stdout and logs to stderr
+    PAYMASTER_JSON=$(echo "$PAYMASTER_OUTPUT" | grep '^{' | head -1)
+    if [[ -z "$PAYMASTER_JSON" ]]; then
+        # Try getting JSON from the full output
+        PAYMASTER_JSON=$(echo "$PAYMASTER_OUTPUT" | python3 -c "
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if line.startswith('{'):
+        try:
+            json.loads(line)
+            print(line)
+            break
+        except: pass
+" 2>/dev/null || echo "")
+    fi
+
+    if [[ -n "$PAYMASTER_JSON" ]]; then
+        TX_HASH=$(echo "$PAYMASTER_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['txHash'])" 2>/dev/null || echo "")
+        IS_VERIFIED_PM=$(echo "$PAYMASTER_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('isVerified','false'))" 2>/dev/null || echo "false")
+        EXPLORER_URL=$(echo "$PAYMASTER_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('explorerUrl',''))" 2>/dev/null || echo "")
+
+        if [[ -n "$TX_HASH" ]]; then
+            ALL_TX_HASHES+=("$TX_HASH")
+            ok "TX submitted via paymaster: ${TX_HASH:0:20}..."
+            log "Explorer: ${EXPLORER_URL}"
+            log "Gas sponsored: true"
         fi
+    else
+        warn "Could not parse paymaster output"
+        echo "$PAYMASTER_OUTPUT" >&2
+    fi
 
-        log "Submit script: ${SUBMIT_SCRIPT}"
+else
+    # ─── Legacy sncast Path ────────────────────────────────────────────
 
-        MODE_FLAG="--dry-run"
-        if [[ "$DO_SUBMIT" == "true" ]]; then
-            MODE_FLAG="--submit"
-        fi
+    case "$PROOF_MODE" in
 
-        run_cmd python3 "${SUBMIT_SCRIPT}" \
-            --proof "${PROOF_FILE}" \
-            --account "${ACCOUNT}" \
-            ${MODE_FLAG}
-        ;;
+        # ─── Recursive: delegate to submit_recursive_proof.py ─────────
+        recursive)
+            header "Recursive STARK Submission"
 
-    # ─── Direct: upload chunks + verify_model_direct ──────────────────
-    direct)
-        header "Direct Proof Submission"
-
-        SESSION_ID="0x$(date +%s | xxd -p 2>/dev/null | head -c 16 || printf '%x' "$(date +%s)")"
-        log "Session ID: ${SESSION_ID}"
-
-        # Upload STARK chunks if present
-        CHUNK_DIR="${PROOF_DIR:-$(dirname "$PROOF_FILE")}/chunks"
-        if [[ -d "$CHUNK_DIR" ]]; then
-            CHUNK_COUNT=$(ls "$CHUNK_DIR"/chunk_*.json 2>/dev/null | wc -l | tr -d ' ')
-            log "Uploading ${CHUNK_COUNT} STARK chunks..."
-
-            for i in $(seq 0 $((CHUNK_COUNT - 1))); do
-                CHUNK_FILE="${CHUNK_DIR}/chunk_${i}.json"
-                if [[ -f "$CHUNK_FILE" ]]; then
-                    CHUNK_SIZE=$(wc -c < "$CHUNK_FILE" | tr -d ' ')
-                    log "  Chunk ${i}: ${CHUNK_SIZE} bytes"
-
-                    CHUNK_DATA=$(cat "$CHUNK_FILE")
-                    run_cmd sncast_invoke_tracked upload_proof_chunk "$SESSION_ID" "$i" $CHUNK_DATA
-
-                    ok "  Chunk ${i} uploaded"
+            # Find the submit script
+            SUBMIT_SCRIPT=""
+            for path in \
+                "${SCRIPT_DIR}/../submit_recursive_proof.py" \
+                "${SCRIPT_DIR}/../../scripts/submit_recursive_proof.py" \
+                "scripts/submit_recursive_proof.py" \
+                "../scripts/submit_recursive_proof.py"; do
+                if [[ -f "$path" ]]; then
+                    SUBMIT_SCRIPT="$path"
+                    break
                 fi
             done
-        else
-            log "No STARK chunks to upload"
-        fi
 
-        # Call verify_model_direct
-        log "Calling verify_model_direct..."
+            if [[ -z "$SUBMIT_SCRIPT" ]]; then
+                err "submit_recursive_proof.py not found"
+                err "Ensure it exists in the scripts/ directory"
+                exit 1
+            fi
 
-        MODEL_ID_FROM_META=$(parse_json_field "${METADATA_FILE:-/dev/null}" "model_id" 2>/dev/null || echo "0x1")
+            log "Submit script: ${SUBMIT_SCRIPT}"
 
-        BATCHED_DATA="${PROOF_DIR:-$(dirname "$PROOF_FILE")}/batched_calldata.json"
-        CALLDATA=""
-        if [[ -f "$BATCHED_DATA" ]]; then
-            CALLDATA=$(cat "$BATCHED_DATA")
-        fi
+            MODE_FLAG="--dry-run"
+            if [[ "$DO_SUBMIT" == "true" ]]; then
+                MODE_FLAG="--submit"
+            fi
 
-        run_cmd sncast_invoke_tracked verify_model_direct "${MODEL_ID_FROM_META}" "$SESSION_ID" $CALLDATA
+            run_cmd python3 "${SUBMIT_SCRIPT}" \
+                --proof "${PROOF_FILE}" \
+                --account "${ACCOUNT}" \
+                ${MODE_FLAG}
+            ;;
 
-        ok "verify_model_direct submitted"
-        ;;
+        # ─── Direct: upload chunks + verify_model_direct ──────────────
+        direct)
+            header "Direct Proof Submission"
 
-    # ─── GKR: verify_model_gkr ───────────────────────────────────────
-    gkr)
-        header "GKR Proof Submission"
+            SESSION_ID="0x$(date +%s | xxd -p 2>/dev/null | head -c 16 || printf '%x' "$(date +%s)")"
+            log "Session ID: ${SESSION_ID}"
 
-        MODEL_ID_FROM_META=$(parse_json_field "${METADATA_FILE:-/dev/null}" "model_id" 2>/dev/null || echo "0x1")
+            # Upload STARK chunks if present
+            CHUNK_DIR="${PROOF_DIR:-$(dirname "$PROOF_FILE")}/chunks"
+            if [[ -d "$CHUNK_DIR" ]]; then
+                CHUNK_COUNT=$(ls "$CHUNK_DIR"/chunk_*.json 2>/dev/null | wc -l | tr -d ' ')
+                log "Uploading ${CHUNK_COUNT} STARK chunks..."
 
-        log "Submitting GKR proof for model ${MODEL_ID_FROM_META}..."
+                for i in $(seq 0 $((CHUNK_COUNT - 1))); do
+                    CHUNK_FILE="${CHUNK_DIR}/chunk_${i}.json"
+                    if [[ -f "$CHUNK_FILE" ]]; then
+                        CHUNK_SIZE=$(wc -c < "$CHUNK_FILE" | tr -d ' ')
+                        log "  Chunk ${i}: ${CHUNK_SIZE} bytes"
 
-        # Read the GKR calldata from proof file
-        if command -v python3 &>/dev/null && [[ -f "$PROOF_FILE" ]]; then
-            GKR_CALLDATA=$(python3 -c "
+                        CHUNK_DATA=$(cat "$CHUNK_FILE")
+                        run_cmd sncast_invoke_tracked upload_proof_chunk "$SESSION_ID" "$i" $CHUNK_DATA
+
+                        ok "  Chunk ${i} uploaded"
+                    fi
+                done
+            else
+                log "No STARK chunks to upload"
+            fi
+
+            # Call verify_model_direct
+            log "Calling verify_model_direct..."
+
+            BATCHED_DATA="${PROOF_DIR:-$(dirname "$PROOF_FILE")}/batched_calldata.json"
+            CALLDATA=""
+            if [[ -f "$BATCHED_DATA" ]]; then
+                CALLDATA=$(cat "$BATCHED_DATA")
+            fi
+
+            run_cmd sncast_invoke_tracked verify_model_direct "${MODEL_ID_FROM_META}" "$SESSION_ID" $CALLDATA
+
+            ok "verify_model_direct submitted"
+            ;;
+
+        # ─── GKR: verify_model_gkr ───────────────────────────────────
+        gkr)
+            header "GKR Proof Submission"
+
+            log "Submitting GKR proof for model ${MODEL_ID_FROM_META}..."
+
+            # Read the GKR calldata from proof file
+            if command -v python3 &>/dev/null && [[ -f "$PROOF_FILE" ]]; then
+                GKR_CALLDATA=$(python3 -c "
 import json
 with open('${PROOF_FILE}') as f:
     proof = json.load(f)
@@ -362,18 +479,19 @@ elif 'gkr_calldata' in proof:
 else:
     print('')
 " 2>/dev/null || echo "")
-        fi
+            fi
 
-        if [[ -n "${GKR_CALLDATA:-}" ]]; then
-            run_cmd sncast_invoke_tracked verify_model_gkr "${MODEL_ID_FROM_META}" $GKR_CALLDATA
+            if [[ -n "${GKR_CALLDATA:-}" ]]; then
+                run_cmd sncast_invoke_tracked verify_model_gkr "${MODEL_ID_FROM_META}" $GKR_CALLDATA
 
-            ok "verify_model_gkr submitted"
-        else
-            warn "Could not extract GKR calldata from proof file"
-            warn "Manual submission may be required"
-        fi
-        ;;
-esac
+                ok "verify_model_gkr submitted"
+            else
+                warn "Could not extract GKR calldata from proof file"
+                warn "Manual submission may be required"
+            fi
+            ;;
+    esac
+fi
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -396,8 +514,19 @@ if [[ "$DO_SUBMIT" == "true" ]]; then
 
     # Check on-chain verification status
     MODEL_ID_CHECK=$(parse_json_field "${METADATA_FILE:-/dev/null}" "model_id" 2>/dev/null || echo "0x1")
-    IS_VERIFIED=$(check_is_verified "$CONTRACT" "$MODEL_ID_CHECK" "$RPC_URL" 2>/dev/null || echo "false")
-    if [[ "$IS_VERIFIED" == "true" ]]; then
+    if [[ "$USE_PAYMASTER" == "true" ]] && [[ -n "${IS_VERIFIED_PM:-}" ]]; then
+        # Paymaster script already checked verification
+        IS_VERIFIED="$IS_VERIFIED_PM"
+    elif command -v sncast &>/dev/null; then
+        IS_VERIFIED=$(check_is_verified "$CONTRACT" "$MODEL_ID_CHECK" "$RPC_URL" 2>/dev/null || echo "false")
+    else
+        # No sncast and not paymaster — try via node
+        IS_VERIFIED=$(node "${SCRIPT_DIR}/lib/paymaster_submit.mjs" status \
+            --contract "$CONTRACT" --model-id "$MODEL_ID_CHECK" --network "$NETWORK" 2>/dev/null \
+            | python3 -c "import sys,json; print(str(json.load(sys.stdin).get('verification',{}).get('isVerified','false')).lower())" 2>/dev/null || echo "false")
+    fi
+    if [[ "$IS_VERIFIED" == "true" ]] || [[ "$IS_VERIFIED" == "True" ]]; then
+        IS_VERIFIED="true"
         ok "On-chain verification: VERIFIED"
     else
         warn "On-chain verification status: unconfirmed (may need time to propagate)"
@@ -407,18 +536,22 @@ if [[ "$DO_SUBMIT" == "true" ]]; then
     # Save receipt
     LAST_TX="${ALL_TX_HASHES[${#ALL_TX_HASHES[@]}-1]:-}"
     RECEIPT_FILE="${OUTPUT_DIR:-/tmp}/verify_receipt.json"
+    SUBMIT_VIA="sncast"
+    [[ "$USE_PAYMASTER" == "true" ]] && SUBMIT_VIA="avnu_paymaster"
+
     python3 -c "
 import json
 receipt = {
     'network': '${NETWORK}',
     'contract': '${CONTRACT}',
     'mode': '${PROOF_MODE}',
-    'account': '${ACCOUNT}',
+    'submit_via': '${SUBMIT_VIA}',
     'proof_file': '${PROOF_FILE}',
     'submitted_at': '$(date -u +%Y-%m-%dT%H:%M:%SZ)',
     'elapsed_seconds': ${ELAPSED},
     'tx_hashes': $(python3 -c "import json; print(json.dumps([$(printf "'%s'," "${ALL_TX_HASHES[@]}" | sed 's/,$//')])" 2>/dev/null || echo '[]'),
     'is_verified': '${IS_VERIFIED}',
+    'gas_sponsored': ${USE_PAYMASTER},
 }
 with open('${RECEIPT_FILE}', 'w') as f:
     json.dump(receipt, f, indent=2)
@@ -429,12 +562,13 @@ with open('${RECEIPT_FILE}', 'w') as f:
     "network": "${NETWORK}",
     "contract": "${CONTRACT}",
     "mode": "${PROOF_MODE}",
-    "account": "${ACCOUNT}",
+    "submit_via": "${SUBMIT_VIA}",
     "proof_file": "${PROOF_FILE}",
     "submitted_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
     "elapsed_seconds": ${ELAPSED},
     "last_tx": "${LAST_TX}",
-    "is_verified": "${IS_VERIFIED}"
+    "is_verified": "${IS_VERIFIED}",
+    "gas_sponsored": ${USE_PAYMASTER}
 }
 RCPTEOF
     }
@@ -456,6 +590,9 @@ printf "  ║  Mode:         %-36s ║\n" "${PROOF_MODE}"
 printf "  ║  Network:      %-36s ║\n" "${NETWORK}"
 printf "  ║  Contract:     %-36s ║\n" "${CONTRACT:0:36}"
 printf "  ║  Duration:     %-36s ║\n" "$(format_duration $ELAPSED)"
+if [[ "$USE_PAYMASTER" == "true" ]]; then
+printf "  ║  Submit via:   %-36s ║\n" "AVNU Paymaster (gasless)"
+fi
 if [[ "$DO_SUBMIT" == "true" ]] && (( ${#ALL_TX_HASHES[@]} > 0 )); then
 printf "  ║  TXs:          %-36s ║\n" "${#ALL_TX_HASHES[@]} submitted"
 printf "  ║  Last TX:      %-36s ║\n" "${ALL_TX_HASHES[${#ALL_TX_HASHES[@]}-1]:0:36}"

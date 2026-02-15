@@ -27,6 +27,21 @@ ELO_VERIFIER_SEPOLIA="0x04f8c5377d94baa15291832dc3821c2fc235a95f0823f86add32f828
 STARK_VERIFIER_MAINNET=""
 ELO_VERIFIER_MAINNET=""
 
+# ─── Agent Account Factory (Sepolia) ─────────────────────────────────
+
+AGENT_FACTORY_SEPOLIA="0x2f69e566802910359b438ccdb3565dce304a7cc52edbf9fd246d6ad2cd89ce4"
+AGENT_CLASS_HASH_SEPOLIA="0x14d44fb938b43e5fbcec27894670cb94898d759e2ef30e7af70058b4da57e7f"
+IDENTITY_REGISTRY_SEPOLIA="0x72eb37b0389e570bf8b158ce7f0e1e3489de85ba43ab3876a0594df7231631"
+
+AGENT_FACTORY_MAINNET=""
+AGENT_CLASS_HASH_MAINNET=""
+IDENTITY_REGISTRY_MAINNET=""
+
+# ─── AVNU Paymaster ──────────────────────────────────────────────────
+
+AVNU_PAYMASTER_SEPOLIA="https://sepolia.paymaster.avnu.fi"
+AVNU_PAYMASTER_MAINNET="https://starknet.paymaster.avnu.fi"
+
 # ─── RPC Endpoints ───────────────────────────────────────────────────
 
 # Alchemy v0_8 (required for starkli V3 transactions)
@@ -94,5 +109,23 @@ get_explorer_url() {
         sepolia)  echo "https://sepolia.starkscan.co/tx/${tx_hash}" ;;
         mainnet)  echo "https://starkscan.co/tx/${tx_hash}" ;;
         *)        echo "https://sepolia.starkscan.co/tx/${tx_hash}" ;;
+    esac
+}
+
+get_factory_address() {
+    local network="${1:-sepolia}"
+    case "$network" in
+        sepolia)  echo "$AGENT_FACTORY_SEPOLIA" ;;
+        mainnet)  echo "$AGENT_FACTORY_MAINNET" ;;
+        *)        err "Unknown network: ${network}"; return 1 ;;
+    esac
+}
+
+get_paymaster_url() {
+    local network="${1:-sepolia}"
+    case "$network" in
+        sepolia)  echo "$AVNU_PAYMASTER_SEPOLIA" ;;
+        mainnet)  echo "$AVNU_PAYMASTER_MAINNET" ;;
+        *)        err "Unknown network: ${network}"; return 1 ;;
     esac
 }

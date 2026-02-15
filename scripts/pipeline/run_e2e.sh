@@ -34,6 +34,8 @@ RESUME_FROM=""
 HF_TOKEN_ARG=""
 MAX_FEE="0.05"
 MODEL_ID="0x1"
+FORCE_PAYMASTER=false
+FORCE_NO_PAYMASTER=false
 
 # Passthrough arrays for sub-scripts
 SETUP_ARGS=()
@@ -57,6 +59,8 @@ while [[ $# -gt 0 ]]; do
         --multi-gpu)       DO_MULTI_GPU=true; DO_GPU=true; shift ;;
         --skip-setup)      SKIP_SETUP=true; shift ;;
         --skip-inference)  SKIP_INFERENCE=true; shift ;;
+        --paymaster)       FORCE_PAYMASTER=true; shift ;;
+        --no-paymaster)    FORCE_NO_PAYMASTER=true; shift ;;
         --resume-from)     RESUME_FROM="$2"; shift 2 ;;
         --hf-token)        HF_TOKEN_ARG="$2"; shift 2 ;;
         --max-fee)         MAX_FEE="$2"; shift 2 ;;
@@ -81,6 +85,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --skip-setup         Skip GPU setup (machine already configured)"
             echo "  --skip-inference     Skip inference testing"
             echo "  --resume-from STEP   Resume from: model, validate, inference, prove, verify"
+            echo "  --paymaster          Force AVNU paymaster (gasless, sponsored)"
+            echo "  --no-paymaster       Force legacy sncast submission (you pay gas)"
             echo ""
             echo "Options:"
             echo "  --layers N           Number of layers to prove"
@@ -95,14 +101,18 @@ while [[ $# -gt 0 ]]; do
             echo "  -h, --help           Show this help"
             echo ""
             echo "Environment variables:"
-            echo "  HF_TOKEN               HuggingFace token"
-            echo "  STARKNET_PRIVATE_KEY   For on-chain submission"
-            echo "  STARKNET_RPC           Override RPC endpoint"
-            echo "  OBELYSK_DEBUG=1        Debug logging"
+            echo "  HF_TOKEN                  HuggingFace token"
+            echo "  STARKNET_PRIVATE_KEY      For on-chain submission (optional on Sepolia)"
+            echo "  STARKNET_ACCOUNT_ADDRESS  Account address (when using own key with paymaster)"
+            echo "  STARKNET_RPC              Override RPC endpoint"
+            echo "  OBELYSK_DEPLOYER_KEY      Deployer key for factory account creation"
+            echo "  OBELYSK_DEPLOYER_ADDRESS  Deployer address for factory account creation"
+            echo "  OBELYSK_DEBUG=1           Debug logging"
             echo ""
             echo "Examples:"
             echo "  $0 --preset phi3-mini --gpu --dry-run"
-            echo "  $0 --preset qwen3-14b --gpu --submit"
+            echo "  $0 --preset qwen3-14b --gpu --submit          # zero-config on Sepolia"
+            echo "  $0 --preset qwen3-14b --gpu --submit --no-paymaster  # legacy sncast"
             echo "  HF_TOKEN=hf_xxx $0 --preset llama3-8b --chat --submit"
             exit 0
             ;;
@@ -275,6 +285,8 @@ if (( START_IDX <= 5 )); then
     else
         _VERIFY_ARGS+=("--dry-run")
     fi
+    [[ "$FORCE_PAYMASTER" == "true" ]] && _VERIFY_ARGS+=("--paymaster")
+    [[ "$FORCE_NO_PAYMASTER" == "true" ]] && _VERIFY_ARGS+=("--no-paymaster")
 
     run_step "On-Chain Verification" "$CURRENT" "$TOTAL_STEPS" \
         bash "${SCRIPT_DIR}/04_verify_onchain.sh" "${_VERIFY_ARGS[@]}" || {

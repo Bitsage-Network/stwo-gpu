@@ -11,9 +11,9 @@ Prove that an ML model ran correctly, and verify the proof on-chain. Works on an
 - Internet connection
 - ~50GB free disk space (for model + build + proof)
 
-**Optional (for on-chain verification):**
-- A Starknet wallet private key
+**Optional:**
 - A HuggingFace token (only for gated models like Llama or Gemma)
+- A Starknet wallet private key (only if you want to pay your own gas — Sepolia uses free AVNU paymaster by default)
 
 ---
 
@@ -31,10 +31,16 @@ cd stwo-ml/scripts/pipeline
 
 This does everything: installs drivers, downloads the model, tests it, generates a proof, and verifies it locally.
 
-To also submit the proof on-chain:
+To also submit the proof on-chain (zero-config on Sepolia — no wallet needed):
 
 ```bash
-STARKNET_PRIVATE_KEY=0x_your_key_here ./run_e2e.sh --preset qwen3-14b --gpu --submit
+./run_e2e.sh --preset qwen3-14b --gpu --submit
+```
+
+Gas is paid by Obelysk via AVNU paymaster. To use your own account instead:
+
+```bash
+STARKNET_PRIVATE_KEY=0x_your_key ./run_e2e.sh --preset qwen3-14b --gpu --submit --no-paymaster
 ```
 
 That's it. The rest of this guide explains what each step does and how to run them individually.
@@ -169,24 +175,30 @@ The proof is saved to `~/.obelysk/proofs/`.
 
 ### Step 4 — Verify On-Chain
 
-**What it does:** Submits the proof to the Starknet smart contract, waits for the transaction to confirm, and checks that `is_verified` returns true.
-
-**You need a Starknet private key for this step.**
+**What it does:** Submits the proof to Starknet. On Sepolia, gas is paid by
+Obelysk via AVNU paymaster — you don't need STRK or a wallet.
 
 ```bash
 # Dry run first — shows what will be submitted without sending anything
 ./04_verify_onchain.sh --dry-run
 
-# Submit for real
-STARKNET_PRIVATE_KEY=0x_your_key ./04_verify_onchain.sh --submit
+# Zero-config (Sepolia) — just works, no setup needed
+./04_verify_onchain.sh --submit
+
+# With your own account (paymaster still sponsors gas)
+STARKNET_PRIVATE_KEY=0x... STARKNET_ACCOUNT_ADDRESS=0x... ./04_verify_onchain.sh --submit --paymaster
+
+# Legacy mode (you pay gas in STRK, uses sncast)
+STARKNET_PRIVATE_KEY=0x_your_key ./04_verify_onchain.sh --submit --no-paymaster
 ```
 
 The script will:
-1. Auto-create a Starknet account (if needed)
-2. Submit the proof transaction
-3. Wait for confirmation (~30 seconds)
-4. Check `is_verified()` on the contract
-5. Print the explorer link
+1. Auto-detect submission mode (paymaster on Sepolia when no key, sncast otherwise)
+2. Auto-install Node.js + starknet.js if needed (for paymaster mode)
+3. Submit the proof transaction (gasless via AVNU paymaster, or via sncast)
+4. Wait for confirmation (~30 seconds)
+5. Check `is_verified()` on the contract
+6. Print the explorer link
 
 ---
 
@@ -198,11 +210,14 @@ The script will:
 # Test everything locally (no on-chain, smallest model)
 ./run_e2e.sh --preset phi3-mini --gpu --dry-run
 
-# Full pipeline with on-chain verification
-STARKNET_PRIVATE_KEY=0x... ./run_e2e.sh --preset qwen3-14b --gpu --submit
+# Full pipeline with zero-config on-chain verification (Sepolia)
+./run_e2e.sh --preset qwen3-14b --gpu --submit
+
+# With your own account (legacy sncast, you pay gas)
+STARKNET_PRIVATE_KEY=0x... ./run_e2e.sh --preset qwen3-14b --gpu --submit --no-paymaster
 
 # Gated model with HF auth + on-chain
-HF_TOKEN=hf_xxx STARKNET_PRIVATE_KEY=0x... ./run_e2e.sh --preset llama3-8b --gpu --submit
+HF_TOKEN=hf_xxx ./run_e2e.sh --preset llama3-8b --gpu --submit
 
 # Chat with the model before proving
 ./run_e2e.sh --preset phi3-mini --gpu --chat --dry-run
@@ -218,8 +233,11 @@ HF_TOKEN=hf_xxx STARKNET_PRIVATE_KEY=0x... ./run_e2e.sh --preset llama3-8b --gpu
 
 | Variable | What it does |
 |----------|--------------|
-| `STARKNET_PRIVATE_KEY` | Your Starknet wallet key (for on-chain) |
+| `STARKNET_PRIVATE_KEY` | Your Starknet wallet key (optional on Sepolia — paymaster is default) |
+| `STARKNET_ACCOUNT_ADDRESS` | Account address (when using own key with paymaster) |
 | `HF_TOKEN` | HuggingFace token (for gated models) |
+| `OBELYSK_DEPLOYER_KEY` | Deployer key for factory account creation |
+| `OBELYSK_DEPLOYER_ADDRESS` | Deployer address for factory account creation |
 | `DRY_RUN=1` | Print commands without running them |
 | `OBELYSK_DEBUG=1` | Show verbose debug output |
 
