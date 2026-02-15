@@ -18,6 +18,54 @@
 [[ -n "${_OBELYSK_STARKNET_UTILS_LOADED:-}" ]] && return 0
 _OBELYSK_STARKNET_UTILS_LOADED=1
 
+# ─── Install Node.js ───────────────────────────────────────────────
+
+ensure_node() {
+    if command -v node &>/dev/null; then
+        local ver
+        ver=$(node --version 2>/dev/null)
+        debug "Node.js found: $ver"
+        return 0
+    fi
+
+    log "Node.js not found — installing via nvm..."
+    if curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.0/install.sh 2>/dev/null | bash 2>/dev/null; then
+        export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+        # shellcheck disable=SC1091
+        [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+        nvm install 22 && nvm use 22
+    fi
+
+    if command -v node &>/dev/null; then
+        ok "Node.js installed: $(node --version 2>/dev/null)"
+        return 0
+    fi
+
+    err "Failed to install Node.js."
+    err "Install manually: https://nodejs.org or 'brew install node'"
+    return 1
+}
+
+# ─── Install starknet.js ──────────────────────────────────────────
+
+ensure_starknet_js() {
+    local lib_dir="${1:-${SCRIPT_DIR}/lib}"
+    if [[ -d "${lib_dir}/node_modules/starknet" ]]; then
+        debug "starknet.js already installed"
+        return 0
+    fi
+
+    log "Installing starknet.js..."
+    if (cd "$lib_dir" && npm install --production 2>&1 | tail -3); then
+        ok "starknet.js installed"
+        return 0
+    fi
+
+    err "Failed to install starknet.js."
+    err "Manual: cd ${lib_dir} && npm install"
+    return 1
+}
+
 # ─── Install sncast ─────────────────────────────────────────────────
 
 ensure_sncast() {

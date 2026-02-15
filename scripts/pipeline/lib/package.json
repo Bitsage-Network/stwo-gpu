@@ -1,0 +1,8 @@
+{
+  "name": "obelysk-pipeline-lib",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "starknet": "^8.9.1"
+  }
+}
