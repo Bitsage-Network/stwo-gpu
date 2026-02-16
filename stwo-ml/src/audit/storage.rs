@@ -485,25 +485,248 @@ impl RelayClient {
     }
 }
 
-/// Create the appropriate storage client based on available credentials.
-///
-/// - If `IRYS_TOKEN` is set → direct `ArweaveClient` (user's own token)
-/// - Otherwise → `RelayClient` (proxied through coordinator EC2)
-///
-/// Returns `(uploader, is_relay)` where `is_relay` indicates which path was taken.
-#[cfg(feature = "audit-http")]
-pub fn create_audit_storage() -> (Box<dyn AuditUploader>, bool) {
-    let transport = Box::new(UreqTransport);
+// ─── Marketplace Client ─────────────────────────────────────────────────────
 
-    if let Ok(token) = std::env::var("IRYS_TOKEN") {
-        if !token.is_empty() {
-            let client = ArweaveClient::with_defaults(transport).with_auth(token);
-            return (Box::new(ArweaveUploader(client)), false);
+/// Client that routes audit uploads through the BitSage Marketplace.
+///
+/// The marketplace handles encryption, Arweave upload, and database indexing.
+/// Pipeline users get auto-provisioned accounts and can view their proofs
+/// in the marketplace dashboard at `/storage`.
+///
+/// Default marketplace URL: from `MARKETPLACE_URL` env var.
+pub struct MarketplaceClient {
+    /// Marketplace API URL (e.g., "https://marketplace.bitsage.xyz").
+    marketplace_url: String,
+    /// API key for marketplace authentication.
+    api_key: String,
+    /// HTTP transport implementation.
+    transport: Box<dyn HttpTransport>,
+}
+
+impl MarketplaceClient {
+    /// Create a new marketplace client.
+    pub fn new(
+        marketplace_url: impl Into<String>,
+        api_key: impl Into<String>,
+        transport: Box<dyn HttpTransport>,
+    ) -> Self {
+        Self {
+            marketplace_url: marketplace_url.into(),
+            api_key: api_key.into(),
+            transport,
         }
     }
 
+    /// Create from environment variables.
+    ///
+    /// Reads `MARKETPLACE_URL` and `MARKETPLACE_API_KEY`.
+    pub fn from_env(transport: Box<dyn HttpTransport>) -> Option<Self> {
+        let url = std::env::var("MARKETPLACE_URL").ok()?;
+        let key = std::env::var("MARKETPLACE_API_KEY").ok()?;
+        if url.is_empty() || key.is_empty() {
+            return None;
+        }
+        Some(Self::new(url, key, transport))
+    }
+
+    /// Upload audit data via the marketplace API.
+    ///
+    /// The marketplace encrypts the data, uploads to Arweave, and indexes it.
+    pub fn upload(
+        &self,
+        data: &[u8],
+        audit_id: &str,
+        model_id: &str,
+        extra_tags: &[ArweaveTag],
+    ) -> Result<StorageReceipt, AuditError> {
+        let url = format!("{}/api/v1/pipeline/upload", self.marketplace_url);
+
+        let data_b64 = base64_encode(data);
+
+        // Build tags JSON array
+        let tags_json: Vec<String> = extra_tags
+            .iter()
+            .map(|t| {
+                format!(
+                    "{{\"name\":\"{}\",\"value\":\"{}\"}}",
+                    escape_json_string(&t.name),
+                    escape_json_string(&t.value)
+                )
+            })
+            .collect();
+
+        // Extract model name from model_id (or use as-is)
+        let model_name = model_id;
+
+        // Build the JSON body matching the marketplace UploadSchema
+        let now = chrono_utc_now();
+        let body = format!(
+            concat!(
+                "{{\"data\":\"{}\",",
+                "\"auditId\":\"{}\",",
+                "\"modelName\":\"{}\",",
+                "\"inferenceCount\":0,",
+                "\"timeWindowStart\":\"{}\",",
+                "\"timeWindowEnd\":\"{}\",",
+                "\"tags\":[{}]}}"
+            ),
+            data_b64,
+            escape_json_string(audit_id),
+            escape_json_string(model_name),
+            now, now,
+            tags_json.join(",")
+        );
+
+        let api_key_header = self.api_key.clone();
+        let headers: Vec<(&str, &str)> = vec![
+            ("Content-Type", "application/json"),
+            ("X-API-Key", &api_key_header),
+        ];
+
+        let response = self.transport.post(&url, &headers, body.as_bytes())?;
+
+        // Parse response: {"arweaveTxId": "...", "gatewayUrl": "...", ...}
+        let tx_id = parse_marketplace_response(&response)?;
+
+        Ok(StorageReceipt {
+            tx_id: tx_id.clone(),
+            size_bytes: data.len(),
+            gateway_url: format!("https://arweave.net/{}", tx_id),
+        })
+    }
+
+    /// Download data from Arweave gateway (reads go direct, no marketplace needed).
+    pub fn download(&self, tx_id: &str) -> Result<Vec<u8>, AuditError> {
+        let url = format!("https://arweave.net/{}", tx_id);
+        self.transport.get(&url)
+    }
+
+    /// Check status via Arweave gateway.
+    pub fn status(&self, tx_id: &str) -> Result<TxStatus, AuditError> {
+        let url = format!("https://arweave.net/tx/{}/status", tx_id);
+        match self.transport.get(&url) {
+            Ok(body) => {
+                let text = String::from_utf8_lossy(&body);
+                if let Some(height) = extract_block_height(&text) {
+                    Ok(TxStatus::Confirmed { block_height: height })
+                } else {
+                    Ok(TxStatus::Pending)
+                }
+            }
+            Err(_) => Ok(TxStatus::NotFound),
+        }
+    }
+}
+
+/// Parse marketplace upload response to extract arweaveTxId.
+fn parse_marketplace_response(response: &[u8]) -> Result<String, AuditError> {
+    let text = String::from_utf8_lossy(response);
+
+    // Look for "arweaveTxId":"..."
+    if let Some(start) = text.find("\"arweaveTxId\"") {
+        let after = &text[start + 13..];
+        if let Some(colon) = after.find(':') {
+            let after_colon = after[colon + 1..].trim();
+            if after_colon.starts_with('"') {
+                if let Some(end) = after_colon[1..].find('"') {
+                    return Ok(after_colon[1..1 + end].to_string());
+                }
+            }
+        }
+    }
+
+    // Fallback to generic "id" field
+    parse_upload_response(response)
+}
+
+/// Generate a UTC ISO 8601 timestamp without pulling in chrono.
+fn chrono_utc_now() -> String {
+    // Use std::time to compute a reasonable timestamp
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // Convert to ISO 8601 (simplified — good enough for API calls)
+    let days = secs / 86400;
+    let time_of_day = secs % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+
+    // Compute year/month/day from days since epoch (1970-01-01)
+    let (year, month, day) = days_to_ymd(days);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year, month, day, hours, minutes, seconds
+    )
+}
+
+fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
+    let mut year = 1970u64;
+    loop {
+        let days_in_year = if is_leap(year) { 366 } else { 365 };
+        if days < days_in_year {
+            break;
+        }
+        days -= days_in_year;
+        year += 1;
+    }
+    let leap = is_leap(year);
+    let month_days: [u64; 12] = [
+        31,
+        if leap { 29 } else { 28 },
+        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+    ];
+    let mut month = 0u64;
+    for (i, &md) in month_days.iter().enumerate() {
+        if days < md {
+            month = (i + 1) as u64;
+            break;
+        }
+        days -= md;
+    }
+    if month == 0 {
+        month = 12;
+    }
+    (year, month, days + 1)
+}
+
+fn is_leap(y: u64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+/// Create the appropriate storage client based on available credentials.
+///
+/// Priority chain:
+/// 1. `IRYS_TOKEN` set → direct `ArweaveClient` (user's own token)
+/// 2. `MARKETPLACE_URL` + `MARKETPLACE_API_KEY` set → `MarketplaceClient` (via marketplace)
+/// 3. Otherwise → `RelayClient` (proxied through coordinator EC2)
+///
+/// Returns `(uploader, backend_name)`.
+#[cfg(feature = "audit-http")]
+pub fn create_audit_storage() -> (Box<dyn AuditUploader>, &'static str) {
+    // 1. Direct Irys upload (user has their own token)
+    if let Ok(token) = std::env::var("IRYS_TOKEN") {
+        if !token.is_empty() {
+            let transport = Box::new(UreqTransport);
+            let client = ArweaveClient::with_defaults(transport).with_auth(token);
+            return (Box::new(ArweaveUploader(client)), "irys-direct");
+        }
+    }
+
+    // 2. Marketplace (auto-provisioned, handles encryption + Arweave + indexing)
+    {
+        let transport = Box::new(UreqTransport);
+        if let Some(client) = MarketplaceClient::from_env(transport) {
+            return (Box::new(MarketplaceUploader(client)), "marketplace");
+        }
+    }
+
+    // 3. Relay fallback (coordinator EC2 holds the token)
+    let transport = Box::new(UreqTransport);
     let relay = RelayClient::from_env(transport);
-    (Box::new(RelayUploader(relay)), true)
+    (Box::new(RelayUploader(relay)), "relay")
 }
 
 /// Trait for abstracting upload behavior (direct vs relay).
@@ -538,6 +761,18 @@ struct RelayUploader(RelayClient);
 
 #[cfg(feature = "audit-http")]
 impl AuditUploader for RelayUploader {
+    fn upload(&self, data: &[u8], audit_id: &str, model_id: &str, extra_tags: &[ArweaveTag]) -> Result<StorageReceipt, AuditError> {
+        self.0.upload(data, audit_id, model_id, extra_tags)
+    }
+    fn download(&self, tx_id: &str) -> Result<Vec<u8>, AuditError> { self.0.download(tx_id) }
+    fn status(&self, tx_id: &str) -> Result<TxStatus, AuditError> { self.0.status(tx_id) }
+}
+
+#[cfg(feature = "audit-http")]
+struct MarketplaceUploader(MarketplaceClient);
+
+#[cfg(feature = "audit-http")]
+impl AuditUploader for MarketplaceUploader {
     fn upload(&self, data: &[u8], audit_id: &str, model_id: &str, extra_tags: &[ArweaveTag]) -> Result<StorageReceipt, AuditError> {
         self.0.upload(data, audit_id, model_id, extra_tags)
     }
@@ -813,6 +1048,71 @@ mod tests {
         let headers = mock.last_post_headers();
         let auth = headers.iter().find(|(k, _)| k == "Authorization");
         assert_eq!(auth.unwrap().1, "Bearer irys-secret-token");
+    }
+
+    #[test]
+    fn test_marketplace_upload_and_download() {
+        let transport = Box::new(MockTransport::new());
+        let client = MarketplaceClient::new(
+            "https://marketplace.test",
+            "bsk_test_key_12345",
+            transport,
+        );
+
+        let data = b"audit report data";
+        let receipt = client.upload(data, "audit_0x42", "qwen3-14b", &[]).unwrap();
+
+        assert!(!receipt.tx_id.is_empty());
+        assert_eq!(receipt.size_bytes, data.len());
+
+        let downloaded = client.download(&receipt.tx_id).unwrap();
+        assert_eq!(downloaded, data);
+    }
+
+    #[test]
+    fn test_marketplace_sends_api_key_header() {
+        use std::sync::Arc;
+        let mock = Arc::new(MockTransport::new());
+
+        struct ArcTransport(Arc<MockTransport>);
+        impl HttpTransport for ArcTransport {
+            fn post(&self, url: &str, headers: &[(&str, &str)], body: &[u8]) -> Result<Vec<u8>, AuditError> {
+                self.0.post(url, headers, body)
+            }
+            fn get(&self, url: &str) -> Result<Vec<u8>, AuditError> {
+                self.0.get(url)
+            }
+        }
+
+        let mock_ref = Arc::clone(&mock);
+        let client = MarketplaceClient::new(
+            "https://marketplace.test",
+            "bsk_my_secret_key",
+            Box::new(ArcTransport(mock_ref)),
+        );
+
+        client.upload(b"test", "a", "m", &[]).unwrap();
+
+        let headers = mock.last_post_headers();
+        let api_key = headers.iter().find(|(k, _)| k == "X-API-Key");
+        assert_eq!(api_key.unwrap().1, "bsk_my_secret_key");
+    }
+
+    #[test]
+    fn test_chrono_utc_now_format() {
+        let ts = chrono_utc_now();
+        // Should match ISO 8601: YYYY-MM-DDTHH:MM:SSZ
+        assert_eq!(ts.len(), 20);
+        assert!(ts.ends_with('Z'));
+        assert_eq!(&ts[4..5], "-");
+        assert_eq!(&ts[7..8], "-");
+        assert_eq!(&ts[10..11], "T");
+    }
+
+    #[test]
+    fn test_parse_marketplace_response() {
+        let resp = br#"{"status":"created","arweaveTxId":"abc123","reportHash":"deadbeef"}"#;
+        assert_eq!(parse_marketplace_response(resp).unwrap(), "abc123");
     }
 
     #[test]

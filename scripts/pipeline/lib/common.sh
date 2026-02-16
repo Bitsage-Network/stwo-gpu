@@ -79,6 +79,113 @@ init_obelysk_dir() {
         source "$_secrets_sh"
         load_secrets
     fi
+
+    # Auto-load marketplace credentials if cached
+    if [[ -z "${MARKETPLACE_API_KEY:-}" ]] && [[ -f "${OBELYSK_DIR}/marketplace.env" ]]; then
+        source "${OBELYSK_DIR}/marketplace.env"
+        debug "Loaded marketplace credentials from cache"
+    fi
+}
+
+# ─── Marketplace Auto-Registration ───────────────────────────────────
+#
+# Registers this machine with the BitSage marketplace for zero-config
+# audit storage. Auto-provisions an org + API key on first run.
+# Credentials are cached in ~/.obelysk/marketplace.env.
+
+MARKETPLACE_URL="${MARKETPLACE_URL:-https://marketplace.bitsage.xyz}"
+
+register_with_marketplace() {
+    # Skip if already registered
+    if [[ -n "${MARKETPLACE_API_KEY:-}" ]]; then
+        debug "Marketplace already registered (key prefix: ${MARKETPLACE_API_KEY:0:12})"
+        return 0
+    fi
+
+    # Generate a stable machine fingerprint
+    local machine_id=""
+    if command -v nvidia-smi &>/dev/null; then
+        local gpu_uuid
+        gpu_uuid=$(nvidia-smi --query-gpu=gpu_uuid --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')
+        machine_id="$(hostname)-${gpu_uuid}"
+    else
+        machine_id="$(hostname)-nogpu-$(uname -m)"
+    fi
+
+    # Hash the machine ID for privacy
+    local machine_hash
+    if command -v sha256sum &>/dev/null; then
+        machine_hash=$(echo -n "$machine_id" | sha256sum | cut -c1-32)
+    elif command -v shasum &>/dev/null; then
+        machine_hash=$(echo -n "$machine_id" | shasum -a 256 | cut -c1-32)
+    else
+        machine_hash=$(echo -n "$machine_id" | md5sum 2>/dev/null | cut -c1-32 || echo "$machine_id" | cut -c1-32)
+    fi
+
+    local gpu_model=""
+    if command -v nvidia-smi &>/dev/null; then
+        gpu_model=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')
+    fi
+
+    log "Registering with marketplace (${MARKETPLACE_URL})..."
+
+    local register_body
+    register_body=$(printf '{"machineId":"%s","gpuModel":"%s","hostname":"%s"}' \
+        "$machine_hash" "${gpu_model:-unknown}" "$(hostname)")
+
+    local response
+    if command -v curl &>/dev/null; then
+        response=$(curl -sS --max-time 30 \
+            -X POST "${MARKETPLACE_URL}/api/v1/pipeline/register" \
+            -H "Content-Type: application/json" \
+            -d "$register_body" 2>&1) || {
+            warn "Marketplace registration failed (network error). Audit will use relay fallback."
+            return 1
+        }
+    else
+        warn "curl not found. Marketplace registration skipped."
+        return 1
+    fi
+
+    # Extract API key from response (either "apiKey" for new or check "status":"existing")
+    local api_key=""
+    local status=""
+
+    # Parse status
+    status=$(echo "$response" | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+    if [[ "$status" == "created" ]]; then
+        api_key=$(echo "$response" | grep -o '"apiKey":"[^"]*"' | head -1 | cut -d'"' -f4)
+        if [[ -n "$api_key" ]]; then
+            # Save credentials
+            cat > "${OBELYSK_DIR}/marketplace.env" << MKTEOF
+# BitSage Marketplace credentials — auto-generated, do not edit
+MARKETPLACE_URL="${MARKETPLACE_URL}"
+MARKETPLACE_API_KEY="${api_key}"
+MARKETPLACE_MACHINE_ID="${machine_hash}"
+MARKETPLACE_REGISTERED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+MKTEOF
+            chmod 600 "${OBELYSK_DIR}/marketplace.env"
+            export MARKETPLACE_API_KEY="$api_key"
+            export MARKETPLACE_URL
+            ok "Marketplace registered. Your proofs will appear at ${MARKETPLACE_URL}/storage"
+            return 0
+        fi
+    elif [[ "$status" == "existing" ]]; then
+        # Already registered — check if we have cached key
+        if [[ -f "${OBELYSK_DIR}/marketplace.env" ]]; then
+            source "${OBELYSK_DIR}/marketplace.env"
+            ok "Marketplace: device already registered (cached key loaded)"
+            return 0
+        else
+            warn "Marketplace: device registered but API key not cached. Re-register or set MARKETPLACE_API_KEY manually."
+            return 1
+        fi
+    fi
+
+    warn "Marketplace registration response unexpected. Audit will use relay fallback."
+    debug "Response: ${response:0:500}"
+    return 1
 }
 
 # ─── State Persistence ───────────────────────────────────────────────
