@@ -93,7 +93,7 @@ init_obelysk_dir() {
 # audit storage. Auto-provisions an org + API key on first run.
 # Credentials are cached in ~/.obelysk/marketplace.env.
 
-MARKETPLACE_URL="${MARKETPLACE_URL:-https://marketplace.bitsage.xyz}"
+MARKETPLACE_URL="${MARKETPLACE_URL:-https://marketplace.bitsage.network}"
 
 register_with_marketplace() {
     # Skip if already registered
@@ -127,11 +127,33 @@ register_with_marketplace() {
         gpu_model=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')
     fi
 
+    # Prompt for email (optional) — links audits to a dashboard account
+    local user_email="${MARKETPLACE_EMAIL:-}"
+    if [[ -z "$user_email" ]] && [[ -t 0 ]]; then
+        echo "" >&2
+        echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}" >&2
+        echo -e "${BOLD}  BitSage Audit Dashboard${NC}" >&2
+        echo -e "  View and manage your proof audit reports at:" >&2
+        echo -e "  ${CYAN}https://marketplace.bitsage.network/storage${NC}" >&2
+        echo "" >&2
+        echo -e "  Enter your email to link this device to your account." >&2
+        echo -e "  All future proofs will appear in your dashboard." >&2
+        echo -e "  ${DIM}(Press Enter to skip — audits still stored on-chain + Arweave)${NC}" >&2
+        echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}" >&2
+        read -rp "  Email: " user_email
+        echo "" >&2
+    fi
+
     log "Registering with marketplace (${MARKETPLACE_URL})..."
 
     local register_body
-    register_body=$(printf '{"machineId":"%s","gpuModel":"%s","hostname":"%s"}' \
-        "$machine_hash" "${gpu_model:-unknown}" "$(hostname)")
+    if [[ -n "$user_email" ]]; then
+        register_body=$(printf '{"machineId":"%s","gpuModel":"%s","hostname":"%s","email":"%s"}' \
+            "$machine_hash" "${gpu_model:-unknown}" "$(hostname)" "$user_email")
+    else
+        register_body=$(printf '{"machineId":"%s","gpuModel":"%s","hostname":"%s"}' \
+            "$machine_hash" "${gpu_model:-unknown}" "$(hostname)")
+    fi
 
     local response
     if command -v curl &>/dev/null; then
@@ -147,12 +169,10 @@ register_with_marketplace() {
         return 1
     fi
 
-    # Extract API key from response (either "apiKey" for new or check "status":"existing")
-    local api_key=""
-    local status=""
-
-    # Parse status
+    # Extract fields from response
+    local api_key="" status="" message=""
     status=$(echo "$response" | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
+    message=$(echo "$response" | grep -o '"message":"[^"]*"' | head -1 | cut -d'"' -f4)
 
     if [[ "$status" == "created" ]]; then
         api_key=$(echo "$response" | grep -o '"apiKey":"[^"]*"' | head -1 | cut -d'"' -f4)
@@ -163,12 +183,14 @@ register_with_marketplace() {
 MARKETPLACE_URL="${MARKETPLACE_URL}"
 MARKETPLACE_API_KEY="${api_key}"
 MARKETPLACE_MACHINE_ID="${machine_hash}"
+MARKETPLACE_EMAIL="${user_email}"
 MARKETPLACE_REGISTERED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 MKTEOF
             chmod 600 "${OBELYSK_DIR}/marketplace.env"
             export MARKETPLACE_API_KEY="$api_key"
             export MARKETPLACE_URL
-            ok "Marketplace registered. Your proofs will appear at ${MARKETPLACE_URL}/storage"
+            ok "Marketplace registered."
+            [[ -n "$message" ]] && log "$message"
             return 0
         fi
     elif [[ "$status" == "existing" ]]; then
