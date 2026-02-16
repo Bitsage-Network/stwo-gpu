@@ -231,6 +231,11 @@ print('Download complete')
 "
         # Method 3: git lfs
         else
+            if ! git lfs version &>/dev/null; then
+                err "huggingface_hub not available and git-lfs is not installed."
+                err "Install git-lfs: sudo apt-get install git-lfs  (or run 00_setup_gpu.sh first)"
+                exit 1
+            fi
             warn "huggingface_hub not available, falling back to git lfs..."
             run_cmd git lfs install 2>/dev/null || true
             GIT_LFS_SKIP_SMUDGE=0 run_cmd git clone --depth 1 \

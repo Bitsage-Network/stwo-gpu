@@ -335,11 +335,19 @@ if (( START_IDX <= 7 )) && [[ "$DO_AUDIT" == "true" ]]; then
         _AUDIT_ARGS+=("--dry-run")
     fi
 
-    run_step "Inference Audit" "$CURRENT" "$TOTAL_STEPS" \
-        bash "${SCRIPT_DIR}/05_audit.sh" "${_AUDIT_ARGS[@]}" || {
-        warn "Audit step failed (non-critical)"
-        STEP_RESULTS+=("Inference Audit: WARN")
-    }
+    if [[ "$DO_SUBMIT" == "true" ]]; then
+        run_step "Inference Audit" "$CURRENT" "$TOTAL_STEPS" \
+            bash "${SCRIPT_DIR}/05_audit.sh" "${_AUDIT_ARGS[@]}" || {
+            err "Audit step failed during submission — aborting"
+            exit 1
+        }
+    else
+        run_step "Inference Audit" "$CURRENT" "$TOTAL_STEPS" \
+            bash "${SCRIPT_DIR}/05_audit.sh" "${_AUDIT_ARGS[@]}" || {
+            warn "Audit step failed (non-critical in dry-run mode)"
+            STEP_RESULTS+=("Inference Audit: WARN")
+        }
+    fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════════

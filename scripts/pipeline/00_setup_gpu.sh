@@ -123,15 +123,15 @@ step "2/7" "Rust nightly toolchain"
 
 if ! command -v rustup &>/dev/null; then
     log "Installing rustup..."
-    run_cmd curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly
+    run_cmd curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly-2025-07-14
     source "$HOME/.cargo/env"
 else
     log "rustup already installed"
 fi
 
-run_cmd rustup install nightly 2>/dev/null || true
-run_cmd rustup default nightly 2>/dev/null || true
-run_cmd rustup component add rust-src --toolchain nightly 2>/dev/null || true
+run_cmd rustup install nightly-2025-07-14 2>/dev/null || true
+run_cmd rustup default nightly-2025-07-14 2>/dev/null || true
+run_cmd rustup component add rust-src --toolchain nightly-2025-07-14 2>/dev/null || true
 
 ok "$(rustc --version)"
 ok "$(cargo --version)"
