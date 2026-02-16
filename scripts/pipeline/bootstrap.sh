@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# ═══════════════════════════════════════════════════════════════════════
+# Obelysk Bootstrap — One-liner setup for fresh GPU machines
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Usage:
+#   curl -fsSL https://raw.githubusercontent.com/Bitsage-Network/stwo-ml/main/scripts/pipeline/bootstrap.sh | bash
+#
+#   # With options:
+#   curl -fsSL https://raw.githubusercontent.com/Bitsage-Network/stwo-ml/main/scripts/pipeline/bootstrap.sh | bash -s -- --preset qwen3-14b --gpu --submit
+#
+set -euo pipefail
+
+REPO_URL="${REPO_URL:-https://github.com/Bitsage-Network/stwo-ml.git}"
+BRANCH="${BRANCH:-main}"
+INSTALL_DIR="${INSTALL_DIR:-$HOME/obelysk}"
+
+echo ""
+echo "  ╔══════════════════════════════════════════════════════╗"
+echo "  ║        Obelysk Pipeline — Bootstrap                  ║"
+echo "  ╚══════════════════════════════════════════════════════╝"
+echo ""
+
+# Ensure git is available
+if ! command -v git &>/dev/null; then
+    echo "[*] Installing git..."
+    if command -v apt-get &>/dev/null; then
+        sudo apt-get update -qq && sudo apt-get install -y -qq git
+    elif command -v yum &>/dev/null; then
+        sudo yum install -y git
+    else
+        echo "[!] git not found and no package manager detected. Please install git manually."
+        exit 1
+    fi
+fi
+
+# Clone or update the repo
+if [[ -d "${INSTALL_DIR}/.git" ]]; then
+    echo "[*] Repository exists at ${INSTALL_DIR}, pulling latest..."
+    (cd "${INSTALL_DIR}" && git fetch origin && git checkout "${BRANCH}" 2>/dev/null && git pull origin "${BRANCH}" --ff-only 2>/dev/null) || true
+else
+    echo "[*] Cloning ${REPO_URL} → ${INSTALL_DIR}..."
+    git clone --branch "${BRANCH}" --depth 1 "${REPO_URL}" "${INSTALL_DIR}"
+fi
+
+PIPELINE_DIR="${INSTALL_DIR}/scripts/pipeline"
+
+if [[ ! -f "${PIPELINE_DIR}/00_setup_gpu.sh" ]]; then
+    echo "[!] Pipeline scripts not found at ${PIPELINE_DIR}"
+    echo "    Check that REPO_URL and BRANCH are correct."
+    exit 1
+fi
+
+echo "[*] Running pipeline setup..."
+echo ""
+
+# If arguments were passed (e.g. --preset qwen3-14b --gpu --submit), run run_e2e.sh
+# Otherwise, just run setup
+if [[ $# -gt 0 ]]; then
+    exec bash "${PIPELINE_DIR}/run_e2e.sh" "$@"
+else
+    exec bash "${PIPELINE_DIR}/00_setup_gpu.sh"
+fi

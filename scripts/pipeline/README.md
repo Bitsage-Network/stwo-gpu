@@ -75,7 +75,23 @@ The encrypted file (`configs/.secrets.env.enc`) is safe to commit. The decrypted
 
 ## Quick Start
 
+**Fresh GPU machine (one-liner bootstrap):**
+
 ```bash
+# This clones the repo, installs all deps, builds binaries, and runs the full pipeline
+curl -fsSL https://raw.githubusercontent.com/Bitsage-Network/stwo-ml/main/scripts/pipeline/bootstrap.sh | bash -s -- --preset qwen3-14b --gpu --submit
+
+# Or just set up the environment (no prove/verify):
+curl -fsSL https://raw.githubusercontent.com/Bitsage-Network/stwo-ml/main/scripts/pipeline/bootstrap.sh | bash
+```
+
+The bootstrap script clones the repo to `~/obelysk/`, installs dependencies, detects your GPU, builds the proving stack, and optionally runs the full pipeline. During setup you'll be prompted for your email to link proofs to your [marketplace dashboard](https://marketplace.bitsage.network).
+
+**Already have the repo cloned:**
+
+```bash
+cd scripts/pipeline
+
 # Full pipeline: setup -> download -> validate -> capture -> prove -> verify -> audit
 ./run_e2e.sh --preset qwen3-14b --gpu --submit
 

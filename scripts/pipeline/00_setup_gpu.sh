@@ -24,9 +24,9 @@ source "${SCRIPT_DIR}/lib/gpu_detect.sh"
 
 # ─── Configuration ───────────────────────────────────────────────────
 
-REPO_URL="${REPO_URL:-https://github.com/vaamx/bitsage-network.git}"
+REPO_URL="${REPO_URL:-https://github.com/Bitsage-Network/stwo-ml.git}"
 BRANCH="${BRANCH:-main}"
-INSTALL_DIR="${INSTALL_DIR:-$HOME/bitsage-network}"
+INSTALL_DIR="${INSTALL_DIR:-$HOME/obelysk}"
 CUSTOM_CUDA_PATH=""
 
 SKIP_DEPS=false
@@ -58,7 +58,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --skip-drivers      Skip driver/CUDA installation entirely"
             echo "  --skip-llama        Skip llama.cpp build"
             echo "  --branch NAME       Git branch to checkout (default: main)"
-            echo "  --install-dir DIR   Where to clone repo (default: ~/bitsage-network)"
+            echo "  --install-dir DIR   Where to clone repo (default: ~/obelysk)"
             echo "  --cuda-path PATH    Custom CUDA toolkit path (auto-detected if omitted)"
             echo "  -h, --help          Show this help"
             echo ""
@@ -199,7 +199,7 @@ echo ""
 step "5/7" "Building proving stack"
 
 if [[ "$SKIP_BUILD" == "false" ]]; then
-    LIBS_DIR="${INSTALL_DIR}/libs"
+    LIBS_DIR="${INSTALL_DIR}"
 
     # 5a: stwo-ml
     log "Building stwo-ml (GPU + CLI)..."
@@ -310,12 +310,12 @@ echo ""
 
 step "7/7" "Sanity test"
 
-PROVE_BIN=$(find_binary "prove-model" "${INSTALL_DIR}/libs")
-CAIRO_BIN=$(find_binary "cairo-prove" "${INSTALL_DIR}/libs")
+PROVE_BIN=$(find_binary "prove-model" "${INSTALL_DIR}")
+CAIRO_BIN=$(find_binary "cairo-prove" "${INSTALL_DIR}")
 
 if [[ -n "$PROVE_BIN" ]]; then
     log "Running quick test..."
-    if (cd "${INSTALL_DIR}/libs/stwo-ml" && \
+    if (cd "${INSTALL_DIR}/stwo-ml" && \
         RUSTUP_TOOLCHAIN=nightly cargo test --release --lib \
             -- test_matmul_sumcheck_basic --nocapture 2>&1 | tail -5); then
         ok "Sanity test passed"

@@ -108,8 +108,8 @@ mkdir -p "$LOG_DIR"
 
 # ─── Find / Build Binary ────────────────────────────────────────────
 
-INSTALL_DIR=$(get_state "setup_state.env" "INSTALL_DIR" 2>/dev/null || echo "$HOME/bitsage-network")
-LIBS_DIR="${INSTALL_DIR}/libs"
+INSTALL_DIR=$(get_state "setup_state.env" "INSTALL_DIR" 2>/dev/null || echo "$HOME/obelysk")
+LIBS_DIR="${INSTALL_DIR}"
 
 PROVE_BIN=$(get_state "setup_state.env" "PROVE_MODEL_BIN" 2>/dev/null || echo "")
 if [[ -z "$PROVE_BIN" ]] || [[ ! -f "$PROVE_BIN" ]]; then

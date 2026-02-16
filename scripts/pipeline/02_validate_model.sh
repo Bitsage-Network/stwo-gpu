@@ -101,8 +101,8 @@ PROVE_BIN=$(get_state "setup_state.env" "PROVE_MODEL_BIN" 2>/dev/null || echo ""
 
 # Search common locations
 if [[ -z "$PROVE_BIN" ]] || [[ ! -f "$PROVE_BIN" ]]; then
-    INSTALL_DIR=$(get_state "setup_state.env" "INSTALL_DIR" 2>/dev/null || echo "$HOME/bitsage-network")
-    PROVE_BIN=$(find_binary "prove-model" "${INSTALL_DIR}/libs" 2>/dev/null || echo "")
+    INSTALL_DIR=$(get_state "setup_state.env" "INSTALL_DIR" 2>/dev/null || echo "$HOME/obelysk")
+    PROVE_BIN=$(find_binary "prove-model" "${INSTALL_DIR}" 2>/dev/null || echo "")
 fi
 
 # PATH fallback
