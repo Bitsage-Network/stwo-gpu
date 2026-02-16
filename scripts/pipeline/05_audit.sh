@@ -165,11 +165,20 @@ log "Privacy:     ${PRIVACY}"
 log "Evaluate:    ${DO_EVALUATE}"
 log "Submit:      ${DO_SUBMIT}"
 
-if [[ "$PRIVACY" != "public" ]] && [[ "$ENCRYPTION" != "none" ]] && [[ -z "${IRYS_TOKEN:-}" ]]; then
-    # No local IRYS_TOKEN — use the Obelysk audit relay (coordinator EC2 holds the token)
-    RELAY_URL="${OBELYSK_RELAY_URL:-https://relay.obelysk.xyz}"
-    log "No IRYS_TOKEN — audit uploads will route through relay: ${RELAY_URL}"
-    export OBELYSK_RELAY_URL="$RELAY_URL"
+# Export marketplace credentials for Rust binary (if registered)
+if [[ -n "${MARKETPLACE_API_KEY:-}" ]]; then
+    export MARKETPLACE_URL="${MARKETPLACE_URL:-https://marketplace.bitsage.xyz}"
+    export MARKETPLACE_API_KEY
+    log "Storage:     marketplace (${MARKETPLACE_URL})"
+elif [[ -z "${IRYS_TOKEN:-}" ]]; then
+    if [[ "$PRIVACY" != "public" ]] && [[ "$ENCRYPTION" != "none" ]]; then
+        # No local IRYS_TOKEN — use the Obelysk audit relay (coordinator EC2 holds the token)
+        RELAY_URL="${OBELYSK_RELAY_URL:-https://relay.obelysk.xyz}"
+        log "No IRYS_TOKEN — audit uploads will route through relay: ${RELAY_URL}"
+        export OBELYSK_RELAY_URL="$RELAY_URL"
+    fi
+else
+    log "Storage:     irys-direct"
 fi
 echo ""
 

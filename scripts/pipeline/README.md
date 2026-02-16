@@ -16,11 +16,28 @@ Before running the pipeline, ensure the following are available on your machine:
 | **Rust nightly-2025-07-14** | Pinned toolchain matching STWO; installed by `00_setup_gpu.sh` |
 | **`OBELYSK_SECRETS_KEY`** | Single passphrase to unlock all pipeline secrets (see below) |
 
-### Encrypted Secrets
+### Zero-Config Storage (Marketplace)
+
+Audit reports and proofs are stored automatically through the **BitSage Marketplace**:
+
+1. **`00_setup_gpu.sh`** auto-registers your machine with the marketplace
+2. An org + API key are provisioned for your GPU device
+3. Credentials are cached in `~/.obelysk/marketplace.env`
+4. At audit time, reports are encrypted and uploaded to Arweave via the marketplace
+5. **View your proofs** at the marketplace dashboard: `/storage`
+
+No tokens, wallets, or API keys needed from the user.
+
+**Storage priority chain** (first available wins):
+1. `IRYS_TOKEN` — Direct Irys upload (for advanced users with their own Arweave wallet)
+2. `MARKETPLACE_API_KEY` — Auto-provisioned marketplace (default)
+3. Relay fallback — Coordinator EC2 proxy
+
+### Secrets & Tokens
 
 API tokens are managed automatically:
 
-- **`IRYS_TOKEN`** — **Not needed.** Audit uploads route through the Obelysk relay (`relay.obelysk.xyz`) which holds the token server-side.
+- **`IRYS_TOKEN`** — **Not needed.** Marketplace or relay handles Arweave uploads.
 - **`STARKNET_PRIVATE_KEY`** — **Not needed on Sepolia.** The AVNU paymaster handles gas-free submission.
 - **`HF_TOKEN`** — **Not needed for default models** (Qwen, Phi, Mistral). Only required for gated models (Llama, Gemma) where HuggingFace requires license acceptance.
 
@@ -31,12 +48,11 @@ For teams that want to self-host or override: tokens can be shipped encrypted in
 export OBELYSK_SECRETS_KEY="your-passphrase"
 ./run_e2e.sh --preset qwen3-14b --gpu --submit
 
-# Option 2: Interactive prompt (pipeline asks when needed)
-./run_e2e.sh --preset qwen3-14b --gpu --submit
-# → "Enter passphrase to unlock:" prompt appears
-
-# Option 3: Override individual tokens (always takes priority)
+# Option 2: Override individual tokens (always takes priority)
 HF_TOKEN=hf_xxx IRYS_TOKEN=irys_xxx ./run_e2e.sh --preset qwen3-14b --gpu --submit
+
+# Option 3: Custom marketplace URL
+MARKETPLACE_URL=https://my-instance.example.com ./run_e2e.sh --preset qwen3-14b --gpu --submit
 ```
 
 **For pipeline administrators** — create or update the encrypted secrets file:
@@ -77,13 +93,14 @@ STARKNET_PRIVATE_KEY=0x... ./run_e2e.sh --preset qwen3-14b --gpu --submit
 
 | Step | Script | Description |
 |------|--------|-------------|
-| 0 | `00_setup_gpu.sh` | Install deps, drivers, Rust, detect GPU/CUDA, build binaries, build llama.cpp |
+| 0 | `00_setup_gpu.sh` | Install deps, drivers, Rust, detect GPU/CUDA, build binaries, build llama.cpp, register with marketplace |
 | 1 | `01_setup_model.sh` | Download model from HuggingFace (with auth), verify integrity |
 | 2 | `02_validate_model.sh` | Validate model files, dimensions, weights |
 | 2a | `02a_test_inference.sh` | Test inference via llama.cpp (single prompt, chat, benchmark) |
 | 2b | `02b_capture_inference.sh` | Capture inference log via prover forward pass (required for audit) |
 | 3 | `03_prove.sh` | Generate cryptographic proof with local verification |
 | 4 | `04_verify_onchain.sh` | Submit proof to Starknet with TX confirmation + acceptance and assurance classification (`accepted_onchain`, `full_gkr_verified`) |
+| 5 | `05_audit.sh` | Run verifiable inference audit with marketplace storage (encrypt → Arweave → index) |
 | E2E | `run_e2e.sh` | Run all steps in sequence with resume support |
 
 ## Environment Variables
@@ -100,6 +117,8 @@ STARKNET_PRIVATE_KEY=0x... ./run_e2e.sh --preset qwen3-14b --gpu --submit
 | `DRY_RUN` | No | `0` | All scripts |
 | `REPO_URL` | No | GitHub | `00_setup_gpu.sh` |
 | `MAX_FEE` | No | `0.05` ETH | `04_verify_onchain.sh` |
+| `MARKETPLACE_URL` | No | `https://marketplace.bitsage.xyz` | `05_audit.sh`, `lib/common.sh` |
+| `MARKETPLACE_API_KEY` | No | Auto-provisioned | `05_audit.sh` |
 
 ## Model Presets
 
@@ -191,6 +210,16 @@ GPU presets in `configs/4090.env`, `configs/b200.env`, `configs/b300.env`.
 STARKNET_PRIVATE_KEY=0x... ./04_verify_onchain.sh --submit
 ./04_verify_onchain.sh --submit --max-fee 0.1           # Custom fee
 ./04_verify_onchain.sh --submit --contract 0x123...     # Custom contract
+```
+
+### 05_audit.sh
+
+```bash
+./05_audit.sh --evaluate                                # Audit with semantic evaluation
+./05_audit.sh --evaluate --submit                       # Audit + on-chain submission
+./05_audit.sh --evaluate --submit --privacy private     # Encrypted audit
+./05_audit.sh --log-dir /path/to/logs --dry-run         # Custom log dir, dry run
+./05_audit.sh --prove-evals --submit                    # Prove evaluation forward passes
 ```
 
 ### run_e2e.sh

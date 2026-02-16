@@ -327,6 +327,15 @@ else
 fi
 echo ""
 
+# ─── Step 8: Marketplace Registration ────────────────────────────────
+
+step "8/8" "Marketplace registration (zero-config audit storage)"
+
+register_with_marketplace || {
+    warn "Marketplace registration skipped — audit uploads will use relay fallback"
+}
+echo ""
+
 # ─── Save State ──────────────────────────────────────────────────────
 
 ELAPSED=$(timer_elapsed "setup")
