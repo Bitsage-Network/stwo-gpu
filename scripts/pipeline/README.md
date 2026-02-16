@@ -2,6 +2,22 @@
 
 End-to-end pipeline for proving ML model inference and verifying on-chain. Works on any NVIDIA GPU from RTX 4090 to B300.
 
+## Prerequisites
+
+Before running the pipeline, ensure the following are available on your machine:
+
+| Requirement | Notes |
+|-------------|-------|
+| **NVIDIA GPU** | RTX 3090+ recommended; see GPU Compatibility table below |
+| **NVIDIA Driver + CUDA** | Auto-installed by `00_setup_gpu.sh --install-drivers`, or install manually |
+| **Node.js 18+** | Required for paymaster submission (`lib/paymaster_submit.mjs`) |
+| **Python 3.8+** | Used for HuggingFace downloads, config parsing, verification receipts |
+| **git-lfs** | Installed by `00_setup_gpu.sh`; needed for large model downloads |
+| **Rust nightly-2025-07-14** | Pinned toolchain matching STWO; installed by `00_setup_gpu.sh` |
+| **`HF_TOKEN`** | HuggingFace token — required for gated models (Llama, Gemma). Get one at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) |
+| **`IRYS_TOKEN`** | Irys API token — required for `--submit` with `--privacy private`. Get one at [irys.xyz](https://irys.xyz) |
+| **`STARKNET_PRIVATE_KEY`** | For on-chain proof submission (optional on Sepolia with paymaster) |
+
 ## Quick Start
 
 ```bash

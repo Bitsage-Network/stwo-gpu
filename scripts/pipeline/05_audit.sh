@@ -166,8 +166,14 @@ log "Evaluate:    ${DO_EVALUATE}"
 log "Submit:      ${DO_SUBMIT}"
 
 if [[ "$PRIVACY" != "public" ]] && [[ "$ENCRYPTION" != "none" ]] && [[ -z "${IRYS_TOKEN:-}" ]]; then
-    warn "IRYS_TOKEN not set — Arweave upload will fail for private audits"
-    warn "  Set IRYS_TOKEN=<your-token> or get one at https://irys.xyz"
+    if [[ "$DO_SUBMIT" == "true" ]]; then
+        err "IRYS_TOKEN not set — required for private audit submission"
+        err "  Set IRYS_TOKEN=<your-token> or get one at https://irys.xyz"
+        exit 1
+    else
+        warn "IRYS_TOKEN not set — Arweave upload will fail for private audits"
+        warn "  Set IRYS_TOKEN=<your-token> or get one at https://irys.xyz"
+    fi
 fi
 echo ""
 
@@ -212,7 +218,7 @@ fi
 # ─── Run ─────────────────────────────────────────────────────────────
 
 step "5.1" "Running audit pipeline..."
-run_cmd "${AUDIT_CMD[@]}"
+run_cmd "${AUDIT_CMD[@]}" || { err "Audit pipeline failed"; exit 1; }
 
 # ─── Save State ──────────────────────────────────────────────────────
 

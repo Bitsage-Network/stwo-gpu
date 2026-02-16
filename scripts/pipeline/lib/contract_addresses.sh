@@ -100,17 +100,25 @@ get_rpc_url() {
 get_verifier_address() {
     local type="${1:-stark}"
     local network="${2:-sepolia}"
+    local addr=""
 
     case "${type}:${network}" in
-        stark:sepolia)   echo "$STARK_VERIFIER_SEPOLIA" ;;
-        elo:sepolia)     echo "$ELO_VERIFIER_SEPOLIA" ;;
-        stark:mainnet)   echo "$STARK_VERIFIER_MAINNET" ;;
-        elo:mainnet)     echo "$ELO_VERIFIER_MAINNET" ;;
+        stark:sepolia)   addr="$STARK_VERIFIER_SEPOLIA" ;;
+        elo:sepolia)     addr="$ELO_VERIFIER_SEPOLIA" ;;
+        stark:mainnet)   addr="$STARK_VERIFIER_MAINNET" ;;
+        elo:mainnet)     addr="$ELO_VERIFIER_MAINNET" ;;
         *)
             err "Unknown verifier type/network: ${type}:${network}"
             return 1
             ;;
     esac
+
+    if [[ -z "$addr" ]]; then
+        err "No ${type} verifier address configured for ${network}"
+        err "  Deploy the contract first, then update lib/contract_addresses.sh"
+        return 1
+    fi
+    echo "$addr"
 }
 
 get_explorer_url() {
@@ -126,11 +134,17 @@ get_explorer_url() {
 
 get_factory_address() {
     local network="${1:-sepolia}"
+    local addr=""
     case "$network" in
-        sepolia)  echo "$AGENT_FACTORY_SEPOLIA" ;;
-        mainnet)  echo "$AGENT_FACTORY_MAINNET" ;;
+        sepolia)  addr="$AGENT_FACTORY_SEPOLIA" ;;
+        mainnet)  addr="$AGENT_FACTORY_MAINNET" ;;
         *)        err "Unknown network: ${network}"; return 1 ;;
     esac
+    if [[ -z "$addr" ]]; then
+        err "No agent factory address configured for ${network}"
+        return 1
+    fi
+    echo "$addr"
 }
 
 get_paymaster_url() {
@@ -144,29 +158,47 @@ get_paymaster_url() {
 
 get_pool_address() {
     local network="${1:-sepolia}"
+    local addr=""
     case "$network" in
-        sepolia)  echo "$VM31_POOL_SEPOLIA" ;;
-        mainnet)  echo "$VM31_POOL_MAINNET" ;;
+        sepolia)  addr="$VM31_POOL_SEPOLIA" ;;
+        mainnet)  addr="$VM31_POOL_MAINNET" ;;
         *)        err "Unknown network: ${network}"; return 1 ;;
     esac
+    if [[ -z "$addr" ]]; then
+        err "No VM31 pool address configured for ${network}"
+        return 1
+    fi
+    echo "$addr"
 }
 
 get_dark_pool_address() {
     local network="${1:-sepolia}"
+    local addr=""
     case "$network" in
-        sepolia)  echo "$DARK_POOL_SEPOLIA" ;;
-        mainnet)  echo "$DARK_POOL_MAINNET" ;;
+        sepolia)  addr="$DARK_POOL_SEPOLIA" ;;
+        mainnet)  addr="$DARK_POOL_MAINNET" ;;
         *)        err "Unknown network: ${network}"; return 1 ;;
     esac
+    if [[ -z "$addr" ]]; then
+        err "No dark pool address configured for ${network}"
+        return 1
+    fi
+    echo "$addr"
 }
 
 get_bridge_address() {
     local network="${1:-sepolia}"
+    local addr=""
     case "$network" in
-        sepolia)  echo "$VM31_BRIDGE_SEPOLIA" ;;
-        mainnet)  echo "$VM31_BRIDGE_MAINNET" ;;
+        sepolia)  addr="$VM31_BRIDGE_SEPOLIA" ;;
+        mainnet)  addr="$VM31_BRIDGE_MAINNET" ;;
         *)        err "Unknown network: ${network}"; return 1 ;;
     esac
+    if [[ -z "$addr" ]]; then
+        err "No VM31 bridge address configured for ${network}"
+        return 1
+    fi
+    echo "$addr"
 }
 
 get_audit_contract() {

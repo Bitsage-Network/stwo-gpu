@@ -189,6 +189,10 @@ if run_cmd "${PROVE_BIN}" "${VALIDATE_ARGS[@]}" 2>&1; then
 else
     err "Validation failed"
     VALIDATE_OK=false
+    if [[ "$FULL" == "true" ]]; then
+        err "Aborting: validation must pass in --full mode before test proof"
+        exit 1
+    fi
 fi
 echo ""
 
