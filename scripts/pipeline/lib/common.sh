@@ -34,7 +34,7 @@ log()    { echo -e "${CYAN}[INFO]${NC} $*" >&2; }
 ok()     { echo -e "${GREEN}[ OK ]${NC} $*" >&2; }
 err()    { echo -e "${RED}[ERR ]${NC} $*" >&2; }
 warn()   { echo -e "${YELLOW}[WARN]${NC} $*" >&2; }
-debug()  { [[ "${OBELYSK_DEBUG:-0}" == "1" ]] && echo -e "${DIM}[DBG ]${NC} $*" >&2; }
+debug()  { [[ "${OBELYSK_DEBUG:-0}" == "1" ]] && echo -e "${DIM}[DBG ]${NC} $*" >&2 || true; }
 
 header() {
     echo "" >&2
