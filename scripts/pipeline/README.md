@@ -117,7 +117,7 @@ STARKNET_PRIVATE_KEY=0x... ./run_e2e.sh --preset qwen3-14b --gpu --submit
 | `DRY_RUN` | No | `0` | All scripts |
 | `REPO_URL` | No | GitHub | `00_setup_gpu.sh` |
 | `MAX_FEE` | No | `0.05` ETH | `04_verify_onchain.sh` |
-| `MARKETPLACE_URL` | No | `https://marketplace.bitsage.xyz` | `05_audit.sh`, `lib/common.sh` |
+| `MARKETPLACE_URL` | No | `https://marketplace.bitsage.network` | `05_audit.sh`, `lib/common.sh` |
 | `MARKETPLACE_API_KEY` | No | Auto-provisioned | `05_audit.sh` |
 
 ## Model Presets
