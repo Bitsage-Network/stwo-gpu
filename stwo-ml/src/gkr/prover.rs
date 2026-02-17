@@ -43,10 +43,8 @@ pub fn prove_gkr(
     let d = circuit.layers.len();
     let mut layer_proofs = Vec::with_capacity(d);
     let mut weight_commitments = Vec::new();
-    // Weight claims: (eval_point, final_b_eval) per MatMul.
-    // Weight binding uses direct MLE evaluation (both prover and verifier have weights),
-    // avoiding the O(n) Poseidon Merkle commitment that dominates proving time.
-    let mut weight_claims_data: Vec<(Vec<SecureField>, SecureField)> = Vec::new();
+    // Capture (b_mle_evals, eval_point, final_b_eval) per MatMul for post-walk opening proofs
+    let mut weight_data: Vec<(Vec<SecureField>, Vec<SecureField>, SecureField)> = Vec::new();
 
     // Seed channel with circuit metadata
     channel.mix_u64(d as u64);
@@ -87,6 +85,13 @@ pub fn prove_gkr(
                 let b_matrix = weights.get_weight(*weight_node_id)
                     .ok_or(GKRError::MissingWeight { node_id: *weight_node_id })?;
 
+                // Commit weight MLE (col-major, padded to pow2) — matches verifier's expected encoding
+                let b_padded = pad_matrix_pow2(b_matrix);
+                let b_mle = matrix_to_mle_col_major(&b_padded);
+                weight_commitments.push(
+                    crate::crypto::mle_opening::commit_mle_root_only(&b_mle),
+                );
+
                 // Capture r_j before reduction for weight evaluation point
                 let pm = m.next_power_of_two();
                 let log_m = pm.ilog2() as usize;
@@ -100,12 +105,12 @@ pub fn prove_gkr(
                 )?;
 
                 // Weight eval point: [r_j || sumcheck_challenges]
+                // claim.point = [r_i || sumcheck_challenges], so challenges start at log_m
                 let sumcheck_challenges = &claim.point[log_m..];
                 let mut weight_eval_point = r_j;
                 weight_eval_point.extend_from_slice(sumcheck_challenges);
 
-                weight_claims_data.push((weight_eval_point, proof.final_b_eval));
-                weight_commitments.push(starknet_ff::FieldElement::ZERO);
+                weight_data.push((b_mle, weight_eval_point, proof.final_b_eval));
 
                 (LayerProof::MatMul {
                     round_polys: proof.round_polys,
@@ -169,25 +174,11 @@ pub fn prove_gkr(
             }
 
             LayerType::Activation { activation_type, .. } => {
-                // Skip LogUp in GKR — activation correctness verified by unified STARK.
-                // M31 arithmetic can produce input values outside the table range [0, 2^16),
-                // making LogUp infeasible. Same approach as SIMD path.
                 let input_matrix = get_intermediate(execution, layer.node_id)?;
-                let input_padded = pad_matrix_pow2(input_matrix);
-                let input_mle = matrix_to_mle(&input_padded);
-                let input_eval = evaluate_mle(&input_mle, &current_claim.point);
-                mix_secure_field(channel, input_eval);
-                let claim = GKRClaim {
-                    point: current_claim.point.clone(),
-                    value: input_eval,
-                };
-                (LayerProof::Activation {
-                    activation_type: *activation_type,
-                    logup_proof: None,
-                    input_eval,
-                    output_eval: current_claim.value,
-                    table_commitment: starknet_ff::FieldElement::ZERO,
-                }, claim)
+
+                reduce_activation_layer(
+                    &current_claim, input_matrix, *activation_type, channel,
+                )?
             }
 
             LayerType::LayerNorm { dim, .. } => {
@@ -311,15 +302,21 @@ pub fn prove_gkr(
         }
     }
 
-    // Weight verification uses direct MLE evaluation (no Merkle opening proofs).
-    // Both prover and verifier have access to the weight matrices, so the verifier
-    // can directly evaluate the MLE and compare to the claimed value.
-    let weight_claims: Vec<super::types::WeightClaim> = weight_claims_data.into_iter()
-        .map(|(eval_point, expected_value)| super::types::WeightClaim {
-            eval_point,
+    // Generate MLE opening proofs for weight matrices (post-deferred channel state).
+    // This binds each matmul's final_b_eval to its committed weight Merkle root.
+    let mut weight_openings = Vec::with_capacity(weight_data.len());
+    let mut weight_claims = Vec::with_capacity(weight_data.len());
+
+    for (b_mle, eval_point, expected_value) in weight_data {
+        weight_claims.push(super::types::WeightClaim {
+            eval_point: eval_point.clone(),
             expected_value,
-        })
-        .collect();
+        });
+        let opening = crate::crypto::mle_opening::prove_mle_opening(
+            &b_mle, &eval_point, channel,
+        );
+        weight_openings.push(opening);
+    }
 
     // Compute IO commitment from model input and output
     let model_input = execution.intermediates
@@ -336,7 +333,7 @@ pub fn prove_gkr(
         output_claim,
         input_claim: current_claim,
         weight_commitments,
-        weight_openings: Vec::new(),
+        weight_openings,
         weight_claims,
         io_commitment,
         deferred_proofs,
@@ -375,7 +372,7 @@ pub fn prove_gkr_gpu(
     let d = circuit.layers.len();
     let mut layer_proofs = Vec::with_capacity(d);
     let mut weight_commitments = Vec::new();
-    let mut weight_claims_data: Vec<(Vec<SecureField>, SecureField)> = Vec::new();
+    let mut weight_data: Vec<(Vec<SecureField>, Vec<SecureField>, SecureField)> = Vec::new();
     let mut deferred_info: Vec<(GKRClaim, usize)> = Vec::new();
 
     // Seed channel with circuit metadata (same as CPU prover)
@@ -412,6 +409,13 @@ pub fn prove_gkr_gpu(
                 let b_matrix = weights.get_weight(*weight_node_id)
                     .ok_or(GKRError::MissingWeight { node_id: *weight_node_id })?;
 
+                // Commit weight MLE (col-major, padded to pow2) — matches verifier's expected encoding
+                let b_padded = pad_matrix_pow2(b_matrix);
+                let b_mle = matrix_to_mle_col_major(&b_padded);
+                weight_commitments.push(
+                    crate::crypto::mle_opening::commit_mle_root_only(&b_mle),
+                );
+
                 // Capture r_j before reduction for weight evaluation point
                 let pm = m.next_power_of_two();
                 let log_m = pm.ilog2() as usize;
@@ -432,8 +436,7 @@ pub fn prove_gkr_gpu(
                 let sumcheck_challenges = &claim.point[log_m..];
                 let mut weight_eval_point = r_j;
                 weight_eval_point.extend_from_slice(sumcheck_challenges);
-                weight_claims_data.push((weight_eval_point, final_b_eval));
-                weight_commitments.push(starknet_ff::FieldElement::ZERO);
+                weight_data.push((b_mle, weight_eval_point, final_b_eval));
 
                 (proof, claim)
             }
@@ -474,29 +477,10 @@ pub fn prove_gkr_gpu(
             }
 
             LayerType::Activation { activation_type, .. } => {
-                // Skip LogUp in GKR — activation correctness verified by unified STARK.
-                // M31 arithmetic can produce input values outside the table range [0, 2^16),
-                // making LogUp infeasible. Same approach as SIMD path.
                 let input_matrix = get_intermediate(execution, layer.node_id)?;
-                let input_padded = pad_matrix_pow2(input_matrix);
-                let input_mle = matrix_to_mle(&input_padded);
-                let input_eval = gpu.evaluate_mle_gpu(&input_mle, &current_claim.point)
-                    .map_err(|e| GKRError::ReductionError {
-                        layer_idx,
-                        reason: format!("GPU eval_mle activation: {e}"),
-                    })?;
-                mix_secure_field(channel, input_eval);
-                let claim = GKRClaim {
-                    point: current_claim.point.clone(),
-                    value: input_eval,
-                };
-                (LayerProof::Activation {
-                    activation_type: *activation_type,
-                    logup_proof: None,
-                    input_eval,
-                    output_eval: current_claim.value,
-                    table_commitment: starknet_ff::FieldElement::ZERO,
-                }, claim)
+                reduce_activation_layer_gpu(
+                    &gpu, &current_claim, input_matrix, *activation_type, channel,
+                )?
             }
 
             LayerType::LayerNorm { dim, .. } => {
@@ -552,6 +536,10 @@ pub fn prove_gkr_gpu(
                 let a_matrix = get_intermediate(execution, rhs_layer.node_id)?;
                 let b_matrix = weights.get_weight(*weight_node_id)
                     .ok_or(GKRError::MissingWeight { node_id: *weight_node_id })?;
+                let b_padded = pad_matrix_pow2(b_matrix);
+                let b_mle = matrix_to_mle_col_major(&b_padded);
+                let deferred_weight_commitment =
+                    crate::crypto::mle_opening::commit_mle_root_only(&b_mle);
 
                 mix_secure_field(channel, deferred_claim.value);
 
@@ -570,9 +558,12 @@ pub fn prove_gkr_gpu(
                 weight_eval_point.extend_from_slice(sumcheck_challenges);
 
                 let deferred_weight_claim = super::types::WeightClaim {
-                    eval_point: weight_eval_point,
+                    eval_point: weight_eval_point.clone(),
                     expected_value: reduction.final_b_eval,
                 };
+                let deferred_opening = crate::crypto::mle_opening::prove_mle_opening(
+                    &b_mle, &weight_eval_point, channel,
+                );
 
                 deferred_proofs.push(super::types::DeferredProof {
                     claim: deferred_claim.clone(),
@@ -583,8 +574,8 @@ pub fn prove_gkr_gpu(
                         final_b_eval: reduction.final_b_eval,
                     },
                     input_claim,
-                    weight_commitment: starknet_ff::FieldElement::ZERO,
-                    weight_opening: crate::crypto::mle_opening::MleOpeningProof::empty(),
+                    weight_commitment: deferred_weight_commitment,
+                    weight_opening: deferred_opening,
                     weight_claim: deferred_weight_claim,
                 });
             }
@@ -592,13 +583,20 @@ pub fn prove_gkr_gpu(
         }
     }
 
-    // Weight verification uses direct MLE evaluation (no Merkle opening proofs).
-    let weight_claims: Vec<super::types::WeightClaim> = weight_claims_data.into_iter()
-        .map(|(eval_point, expected_value)| super::types::WeightClaim {
-            eval_point,
+    // Generate MLE opening proofs for weight matrices (post-deferred channel state)
+    let mut weight_openings = Vec::with_capacity(weight_data.len());
+    let mut weight_claims = Vec::with_capacity(weight_data.len());
+
+    for (b_mle, eval_point, expected_value) in weight_data {
+        weight_claims.push(super::types::WeightClaim {
+            eval_point: eval_point.clone(),
             expected_value,
-        })
-        .collect();
+        });
+        let opening = crate::crypto::mle_opening::prove_mle_opening(
+            &b_mle, &eval_point, channel,
+        );
+        weight_openings.push(opening);
+    }
 
     let model_input = execution.intermediates
         .first()
@@ -614,7 +612,7 @@ pub fn prove_gkr_gpu(
         output_claim,
         input_claim: current_claim,
         weight_commitments,
-        weight_openings: Vec::new(),
+        weight_openings,
         weight_claims,
         io_commitment,
         deferred_proofs,
@@ -1041,7 +1039,7 @@ pub fn prove_gkr_simd_gpu(
     let d = circuit.layers.len();
     let mut layer_proofs = Vec::with_capacity(d);
     let mut weight_commitments = Vec::new();
-    let mut weight_claims_data: Vec<(Vec<SecureField>, SecureField)> = Vec::new();
+    let mut weight_data: Vec<(Vec<SecureField>, Vec<SecureField>, SecureField)> = Vec::new();
     let mut deferred_info: Vec<(GKRClaim, usize)> = Vec::new();
 
     // Seed channel with circuit + SIMD metadata
@@ -1089,6 +1087,13 @@ pub fn prove_gkr_simd_gpu(
                 let b_matrix = weights.get_weight(*weight_node_id)
                     .ok_or(GKRError::MissingWeight { node_id: *weight_node_id })?;
 
+                // Commit weight MLE (col-major, padded to pow2) — matches verifier's expected encoding
+                let b_padded = pad_matrix_pow2(b_matrix);
+                let b_mle = matrix_to_mle_col_major(&b_padded);
+                weight_commitments.push(
+                    crate::crypto::mle_opening::commit_mle_root_only(&b_mle),
+                );
+
                 // Capture r_j before reduction for weight evaluation point
                 let pm = m.next_power_of_two();
                 let log_m = pm.ilog2() as usize;
@@ -1120,8 +1125,7 @@ pub fn prove_gkr_simd_gpu(
                 let sumcheck_challenges = &claim.point[log_m..];
                 let mut weight_eval_point = r_j;
                 weight_eval_point.extend_from_slice(sumcheck_challenges);
-                weight_claims_data.push((weight_eval_point, final_b_eval));
-                weight_commitments.push(starknet_ff::FieldElement::ZERO);
+                weight_data.push((b_mle, weight_eval_point, final_b_eval));
 
                 (proof, claim)
             }
@@ -1246,13 +1250,20 @@ pub fn prove_gkr_simd_gpu(
         current_claim = next_claim;
     }
 
-    // Weight verification uses direct MLE evaluation (no Merkle opening proofs).
-    let weight_claims: Vec<super::types::WeightClaim> = weight_claims_data.into_iter()
-        .map(|(eval_point, expected_value)| super::types::WeightClaim {
-            eval_point,
+    // Generate MLE opening proofs for weight matrices (post-GKR-walk channel state)
+    let mut weight_openings = Vec::with_capacity(weight_data.len());
+    let mut weight_claims = Vec::with_capacity(weight_data.len());
+
+    for (b_mle, eval_point, expected_value) in weight_data {
+        weight_claims.push(super::types::WeightClaim {
+            eval_point: eval_point.clone(),
             expected_value,
-        })
-        .collect();
+        });
+        let opening = crate::crypto::mle_opening::prove_mle_opening(
+            &b_mle, &eval_point, channel,
+        );
+        weight_openings.push(opening);
+    }
 
     // IO commitment from first block's input and combined output
     let model_input = block_executions[0].intermediates
@@ -1277,7 +1288,7 @@ pub fn prove_gkr_simd_gpu(
         output_claim,
         input_claim: current_claim,
         weight_commitments,
-        weight_openings: Vec::new(),
+        weight_openings,
         weight_claims,
         io_commitment,
         deferred_proofs: vec![],

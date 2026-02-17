@@ -339,92 +339,83 @@ pub fn verify_gkr(
             }
         }
 
-        // Verify deferred weight opening (skip if in direct-evaluation mode)
-        if !deferred.weight_opening.queries.is_empty() {
-            if deferred.weight_opening.final_value != deferred.weight_claim.expected_value {
-                return Err(GKRError::VerificationError {
-                    layer_idx: 0,
-                    reason: format!(
-                        "deferred proof {} weight opening final_value mismatch",
-                        i,
-                    ),
-                });
-            }
-            if !crate::crypto::mle_opening::verify_mle_opening(
-                deferred.weight_commitment,
-                &deferred.weight_opening,
-                &deferred.weight_claim.eval_point,
-                channel,
-            ) {
-                return Err(GKRError::VerificationError {
-                    layer_idx: 0,
-                    reason: format!(
-                        "deferred proof {} weight MLE opening failed verification",
-                        i,
-                    ),
-                });
-            }
+        // Verify deferred weight opening
+        if deferred.weight_opening.final_value != deferred.weight_claim.expected_value {
+            return Err(GKRError::VerificationError {
+                layer_idx: 0,
+                reason: format!(
+                    "deferred proof {} weight opening final_value mismatch",
+                    i,
+                ),
+            });
+        }
+        if !crate::crypto::mle_opening::verify_mle_opening(
+            deferred.weight_commitment,
+            &deferred.weight_opening,
+            &deferred.weight_claim.eval_point,
+            channel,
+        ) {
+            return Err(GKRError::VerificationError {
+                layer_idx: 0,
+                reason: format!(
+                    "deferred proof {} weight MLE opening failed verification",
+                    i,
+                ),
+            });
         }
     }
 
-    // Verify weight claims.
-    // When weight_openings is empty, the prover skipped Merkle commitments
-    // (direct-evaluation mode). Weight binding is covered by the external
-    // weight commitment or will be checked by verify_gkr_with_execution.
-    if proof.weight_openings.is_empty() {
-        // Direct-evaluation mode: weight claims are verified against actual
-        // weight matrices in verify_gkr_with_execution.
-    } else {
-        // Merkle-proof mode: verify each opening against its committed root.
-        if proof.weight_openings.len() != proof.weight_commitments.len() {
+    // Verify weight MLE opening proofs (post-deferred channel state).
+    // Each opening proves: MLE(weight_matrix, eval_point) == expected_value
+    // bound to the committed Poseidon Merkle root.
+    if proof.weight_openings.len() != proof.weight_commitments.len() {
+        return Err(GKRError::VerificationError {
+            layer_idx: 0,
+            reason: format!(
+                "weight_openings count ({}) != weight_commitments count ({})",
+                proof.weight_openings.len(),
+                proof.weight_commitments.len(),
+            ),
+        });
+    }
+    if proof.weight_claims.len() != proof.weight_commitments.len() {
+        return Err(GKRError::VerificationError {
+            layer_idx: 0,
+            reason: format!(
+                "weight_claims count ({}) != weight_commitments count ({})",
+                proof.weight_claims.len(),
+                proof.weight_commitments.len(),
+            ),
+        });
+    }
+
+    for (i, ((opening, commitment), claim)) in proof
+        .weight_openings
+        .iter()
+        .zip(proof.weight_commitments.iter())
+        .zip(proof.weight_claims.iter())
+        .enumerate()
+    {
+        if opening.final_value != claim.expected_value {
             return Err(GKRError::VerificationError {
                 layer_idx: 0,
                 reason: format!(
-                    "weight_openings count ({}) != weight_commitments count ({})",
-                    proof.weight_openings.len(),
-                    proof.weight_commitments.len(),
-                ),
-            });
-        }
-        if proof.weight_claims.len() != proof.weight_commitments.len() {
-            return Err(GKRError::VerificationError {
-                layer_idx: 0,
-                reason: format!(
-                    "weight_claims count ({}) != weight_commitments count ({})",
-                    proof.weight_claims.len(),
-                    proof.weight_commitments.len(),
+                    "weight opening {} final_value mismatch: opening={:?}, claim={:?}",
+                    i, opening.final_value, claim.expected_value,
                 ),
             });
         }
 
-        for (i, ((opening, commitment), claim)) in proof
-            .weight_openings
-            .iter()
-            .zip(proof.weight_commitments.iter())
-            .zip(proof.weight_claims.iter())
-            .enumerate()
-        {
-            if opening.final_value != claim.expected_value {
-                return Err(GKRError::VerificationError {
-                    layer_idx: 0,
-                    reason: format!(
-                        "weight opening {} final_value mismatch: opening={:?}, claim={:?}",
-                        i, opening.final_value, claim.expected_value,
-                    ),
-                });
-            }
-
-            if !crate::crypto::mle_opening::verify_mle_opening(
-                *commitment,
-                opening,
-                &claim.eval_point,
-                channel,
-            ) {
-                return Err(GKRError::VerificationError {
-                    layer_idx: 0,
-                    reason: format!("weight MLE opening proof {} failed verification", i),
-                });
-            }
+        if !crate::crypto::mle_opening::verify_mle_opening(
+            *commitment,
+            opening,
+            &claim.eval_point,
+            channel,
+        ) {
+            return Err(GKRError::VerificationError {
+                layer_idx: 0,
+                reason: format!("weight MLE opening proof {} failed verification", i),
+            });
         }
     }
 
@@ -1060,19 +1051,10 @@ fn verify_activation_reduction(
     layer_idx: usize,
     channel: &mut PoseidonChannel,
 ) -> Result<GKRClaim, GKRError> {
-    // When LogUp is None the prover skipped the lookup proof for this layer
-    // (activation correctness is verified by the unified STARK instead).
-    // Keep the Fiat-Shamir transcript consistent: only mix input_eval.
-    let logup = match logup_proof {
-        Some(l) => l,
-        None => {
-            mix_secure_field(channel, input_eval);
-            return Ok(GKRClaim {
-                point: output_claim.point.clone(),
-                value: input_eval,
-            });
-        }
-    };
+    let logup = logup_proof.ok_or_else(|| GKRError::VerificationError {
+        layer_idx,
+        reason: "activation proof missing LogUp proof".to_string(),
+    })?;
 
     let num_vars = logup.eq_round_polys.len();
     if num_vars == 0 {
