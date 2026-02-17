@@ -257,6 +257,11 @@ if [[ "$SKIP_BUILD" == "false" ]]; then
         cargo build --release --bin prove-model --features "${FEATURES}"); then
         ok "stwo-ml built (features: ${FEATURES})"
     else
+        if [[ "$REQUIRE_GPU" == "true" ]] && [[ "$FEATURES" == *"cuda-runtime"* ]]; then
+            err "GPU build failed and GPU mode is required. Not falling back to CPU."
+            err "Fix the CUDA build errors above and rerun setup."
+            exit 1
+        fi
         warn "GPU build failed, retrying CPU-only..."
         (cd "${LIBS_DIR}/stwo-ml" && \
             cargo build --release --bin prove-model --features "cli")
