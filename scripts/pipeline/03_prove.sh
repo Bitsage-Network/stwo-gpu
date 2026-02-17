@@ -26,6 +26,7 @@ OUTPUT_DIR=""
 MODEL_ID="0x1"
 USE_GPU=true
 MULTI_GPU=false
+GPU_ONLY=false
 CHUNK_BUDGET_GB=16
 SECURITY="auto"
 SKIP_BUILD=false
@@ -48,6 +49,7 @@ while [[ $# -gt 0 ]]; do
         --gpu)              USE_GPU=true; shift ;;
         --no-gpu)           USE_GPU=false; shift ;;
         --multi-gpu)        MULTI_GPU=true; USE_GPU=true; shift ;;
+        --gpu-only)         GPU_ONLY=true; USE_GPU=true; shift ;;
         --chunk-budget-gb)  CHUNK_BUDGET_GB="$2"; shift 2 ;;
         --security)         SECURITY="$2"; shift 2 ;;
         --skip-build)       SKIP_BUILD=true; shift ;;
@@ -76,6 +78,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --gpu                Enable GPU acceleration (default)"
             echo "  --no-gpu             Disable GPU"
             echo "  --multi-gpu          Distribute across all GPUs"
+            echo "  --gpu-only           Fail if any critical proving path falls back to CPU"
             echo "  --chunk-budget-gb N  Memory per chunk in GB (default: 16)"
             echo "  --security LEVEL     auto | tee | zk-only (default: auto)"
             echo "  --skip-build         Skip building binaries"
@@ -125,23 +128,34 @@ check_dir "$MODEL_DIR" "Model directory not found" || exit 1
 
 # ─── Performance Defaults (Safe / Soundness-Preserving) ─────────────
 
-# Keep GPU commitment hardening/strict checks OFF by default for faster proving.
-# Users can opt back in manually per run.
-if [[ -n "${STWO_GPU_COMMIT_HARDEN:-}" ]]; then
-    warn "Overriding STWO_GPU_COMMIT_HARDEN=${STWO_GPU_COMMIT_HARDEN} -> off (default fast mode)"
+# Fast defaults: leave strict/hardening OFF unless caller explicitly sets them.
+GPU_COMMIT_STRICT="${STWO_GPU_COMMIT_STRICT:-off}"
+GPU_COMMIT_HARDEN="${STWO_GPU_COMMIT_HARDEN:-off}"
+GPU_POLY_STRICT="${STWO_GPU_POLY_STRICT:-off}"
+GPU_POLY_HARDEN="${STWO_GPU_POLY_HARDEN:-off}"
+GPU_MLE_MERKLE_REQUIRE="${STWO_GPU_MLE_MERKLE_REQUIRE:-off}"
+GPU_MLE_FOLD_REQUIRE="${STWO_GPU_MLE_FOLD_REQUIRE:-off}"
+
+if [[ "$GPU_ONLY" == "true" ]]; then
+    export STWO_GPU_ONLY=1
+    export STWO_GPU_MLE_MERKLE_REQUIRE=1
+    export STWO_GPU_MLE_FOLD_REQUIRE=1
+    export STWO_GPU_MLE_FOLD=1
+    export STWO_GPU_POLY_STRICT=1
+    GPU_MLE_MERKLE_REQUIRE="on"
+    GPU_MLE_FOLD_REQUIRE="on"
+    GPU_POLY_STRICT="on"
 fi
-if [[ -n "${STWO_GPU_COMMIT_STRICT:-}" ]]; then
-    warn "Overriding STWO_GPU_COMMIT_STRICT=${STWO_GPU_COMMIT_STRICT} -> off (default fast mode)"
-fi
-unset STWO_GPU_COMMIT_HARDEN
-unset STWO_GPU_COMMIT_STRICT
 
 # Single-GPU default: keep commitment/proving serialized to avoid GPU contention.
 if [[ "$USE_GPU" == "true" ]] && [[ "$MULTI_GPU" != "true" ]]; then
-    if [[ "${STWO_PARALLEL_GPU_COMMIT:-}" == "1" ]]; then
-        warn "Overriding STWO_PARALLEL_GPU_COMMIT=1 -> serialized (single-GPU default)"
+    if [[ -n "${STWO_PARALLEL_GPU_COMMIT:-}" ]]; then
+        if [[ "${STWO_PARALLEL_GPU_COMMIT}" == "1" ]]; then
+            warn "STWO_PARALLEL_GPU_COMMIT=1 enabled: overlap can increase contention on single GPU."
+        fi
+    else
+        unset STWO_PARALLEL_GPU_COMMIT
     fi
-    unset STWO_PARALLEL_GPU_COMMIT
 fi
 
 # Thread defaults for CPU fallback sections.
@@ -150,6 +164,17 @@ if [[ -z "${RAYON_NUM_THREADS:-}" ]]; then
 fi
 if [[ -z "${OMP_NUM_THREADS:-}" ]]; then
     export OMP_NUM_THREADS="${RAYON_NUM_THREADS}"
+fi
+
+# Keep progress updates dense so long phases are visibly alive.
+if [[ -z "${STWO_WEIGHT_PROGRESS_EVERY:-}" ]]; then
+    export STWO_WEIGHT_PROGRESS_EVERY=1
+fi
+if [[ -z "${STWO_GKR_OPENINGS_PROGRESS_EVERY:-}" ]]; then
+    export STWO_GKR_OPENINGS_PROGRESS_EVERY=1
+fi
+if [[ -z "${STWO_GKR_OPENING_HEARTBEAT_SEC:-}" ]]; then
+    export STWO_GKR_OPENING_HEARTBEAT_SEC=15
 fi
 
 # ─── Output Directory ───────────────────────────────────────────────
@@ -205,7 +230,11 @@ log "GPU:            ${USE_GPU} (multi: ${MULTI_GPU})"
 log "Output:         ${OUTPUT_DIR}"
 log "prove-model:    ${PROVE_BIN}"
 log "Threads:        RAYON=${RAYON_NUM_THREADS} OMP=${OMP_NUM_THREADS}"
-log "GPU commit:     strict=off harden=off parallel=${GPU_COMMIT_PARALLEL}"
+log "GPU only mode:  ${GPU_ONLY}"
+log "GPU commit:     strict=${GPU_COMMIT_STRICT} harden=${GPU_COMMIT_HARDEN} parallel=${GPU_COMMIT_PARALLEL}"
+log "GPU poly path:  strict=${GPU_POLY_STRICT} harden=${GPU_POLY_HARDEN}"
+log "GPU MLE path:   merkle_require=${GPU_MLE_MERKLE_REQUIRE} fold_require=${GPU_MLE_FOLD_REQUIRE}"
+log "Progress:       weight_every=${STWO_WEIGHT_PROGRESS_EVERY} opening_every=${STWO_GKR_OPENINGS_PROGRESS_EVERY} opening_heartbeat=${STWO_GKR_OPENING_HEARTBEAT_SEC}s"
 echo ""
 
 timer_start "prove_total"

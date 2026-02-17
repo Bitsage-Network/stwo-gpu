@@ -7,27 +7,33 @@
 //! - Mul → degree-2 check
 //! - Activation → placeholder (LogUp integration in next phase)
 
-use stwo::core::fields::m31::M31;
 use num_traits::{One, Zero};
+use stwo::core::fields::m31::M31;
 
 use crate::compiler::graph::{GraphExecution, GraphWeights};
-use crate::components::matmul::{
-    M31Matrix, pad_matrix_pow2,
-    matrix_to_mle_pub as matrix_to_mle,
-    matrix_to_mle_col_major_pub as matrix_to_mle_col_major,
-    evaluate_mle_pub as evaluate_mle,
-    restrict_mle_pub as restrict_mle,
+use crate::components::attention::{
+    attention_forward, split_heads, transpose_m31, AttentionWeights, MultiHeadAttentionConfig,
 };
 #[cfg(feature = "cuda-runtime")]
 use crate::components::matmul::matmul_m31;
-use crate::components::attention::{
-    AttentionWeights, MultiHeadAttentionConfig,
-    attention_forward, split_heads, transpose_m31,
+#[cfg(feature = "cuda-runtime")]
+use crate::components::matmul::matrix_to_mle_col_major_u32_pub as matrix_to_mle_col_major_u32;
+use crate::components::matmul::{
+    evaluate_mle_pub as evaluate_mle, matrix_to_mle_col_major_pub as matrix_to_mle_col_major,
+    matrix_to_mle_pub as matrix_to_mle, pad_matrix_pow2, restrict_mle_pub as restrict_mle,
+    M31Matrix,
 };
 use crate::crypto::poseidon_channel::PoseidonChannel;
 
-use super::circuit::{LayeredCircuit, LayerType};
-use super::types::{GKRProof, GKRClaim, GKRError, LayerProof, SecureField};
+use super::circuit::{LayerType, LayeredCircuit};
+use super::types::{GKRClaim, GKRError, GKRProof, LayerProof, SecureField};
+
+#[cfg(feature = "cuda-runtime")]
+#[inline]
+fn prepare_weight_opening_mle_u32(weight: &M31Matrix) -> Vec<u32> {
+    let padded = pad_matrix_pow2(weight);
+    matrix_to_mle_col_major_u32(&padded)
+}
 
 /// Prove a full model forward pass using the GKR protocol.
 ///
@@ -81,10 +87,19 @@ pub fn prove_gkr(
         let layer = &circuit.layers[layer_idx];
 
         let (proof, next_claim) = match &layer.layer_type {
-            LayerType::MatMul { m, k, n, weight_node_id } => {
+            LayerType::MatMul {
+                m,
+                k,
+                n,
+                weight_node_id,
+            } => {
                 let a_matrix = get_intermediate(execution, layer.node_id)?;
-                let b_matrix = weights.get_weight(*weight_node_id)
-                    .ok_or(GKRError::MissingWeight { node_id: *weight_node_id })?;
+                let b_matrix =
+                    weights
+                        .get_weight(*weight_node_id)
+                        .ok_or(GKRError::MissingWeight {
+                            node_id: *weight_node_id,
+                        })?;
 
                 // Capture r_j before reduction for weight evaluation point
                 let pm = m.next_power_of_two();
@@ -93,10 +108,8 @@ pub fn prove_gkr(
                 let log_n = pn.ilog2() as usize;
                 let r_j = current_claim.point[log_m..log_m + log_n].to_vec();
 
-                let (proof, claim) = reduce_matmul_layer(
-                    &current_claim, a_matrix, b_matrix,
-                    *m, *k, *n, channel,
-                )?;
+                let (proof, claim) =
+                    reduce_matmul_layer(&current_claim, a_matrix, b_matrix, *m, *k, *n, channel)?;
 
                 // Weight eval point: [r_j || sumcheck_challenges]
                 // claim.point = [r_i || sumcheck_challenges], so challenges start at log_m
@@ -106,26 +119,31 @@ pub fn prove_gkr(
 
                 weight_data.push((*weight_node_id, weight_eval_point, proof.final_b_eval));
 
-                (LayerProof::MatMul {
-                    round_polys: proof.round_polys,
-                    final_a_eval: proof.final_a_eval,
-                    final_b_eval: proof.final_b_eval,
-                }, claim)
+                (
+                    LayerProof::MatMul {
+                        round_polys: proof.round_polys,
+                        final_a_eval: proof.final_a_eval,
+                        final_b_eval: proof.final_b_eval,
+                    },
+                    claim,
+                )
             }
 
             LayerType::Add { .. } => {
-                let (lhs_vals, rhs_vals) = get_binary_op_intermediates(
-                    execution, layer, circuit,
-                )?;
+                let (lhs_vals, rhs_vals) = get_binary_op_intermediates(execution, layer, circuit)?;
 
-                let (proof, _claim) = reduce_add_layer(
-                    &current_claim, &lhs_vals, &rhs_vals, channel,
-                )?;
+                let (proof, _claim) =
+                    reduce_add_layer(&current_claim, &lhs_vals, &rhs_vals, channel)?;
 
                 // Determine trunk vs skip: the trunk is the input with the
                 // higher layer index (the one the sequential walk encounters next).
                 // The skip connection gets a deferred proof.
-                let LayerProof::Add { lhs_eval, rhs_eval, .. } = &proof else { unreachable!() };
+                let LayerProof::Add {
+                    lhs_eval, rhs_eval, ..
+                } = &proof
+                else {
+                    unreachable!()
+                };
                 let (trunk_eval, skip_eval, skip_layer_idx, trunk_idx) =
                     if layer.input_layers[1] > layer.input_layers[0] {
                         // rhs (input_layers[1]) is the trunk
@@ -150,45 +168,42 @@ pub fn prove_gkr(
                 };
 
                 // Reconstruct with correct trunk_idx
-                let proof = LayerProof::Add { lhs_eval: *lhs_eval, rhs_eval: *rhs_eval, trunk_idx };
+                let proof = LayerProof::Add {
+                    lhs_eval: *lhs_eval,
+                    rhs_eval: *rhs_eval,
+                    trunk_idx,
+                };
 
                 (proof, claim)
             }
 
             LayerType::Mul { .. } => {
-                let (lhs_vals, rhs_vals) = get_binary_op_intermediates(
-                    execution, layer, circuit,
-                )?;
+                let (lhs_vals, rhs_vals) = get_binary_op_intermediates(execution, layer, circuit)?;
 
-                let (proof, claim) = reduce_mul_layer(
-                    &current_claim, &lhs_vals, &rhs_vals, channel,
-                )?;
+                let (proof, claim) =
+                    reduce_mul_layer(&current_claim, &lhs_vals, &rhs_vals, channel)?;
 
                 (proof, claim)
             }
 
-            LayerType::Activation { activation_type, .. } => {
+            LayerType::Activation {
+                activation_type, ..
+            } => {
                 let input_matrix = get_intermediate(execution, layer.node_id)?;
 
-                reduce_activation_layer(
-                    &current_claim, input_matrix, *activation_type, channel,
-                )?
+                reduce_activation_layer(&current_claim, input_matrix, *activation_type, channel)?
             }
 
             LayerType::LayerNorm { dim, .. } => {
                 let input_matrix = get_intermediate(execution, layer.node_id)?;
 
-                reduce_layernorm_layer(
-                    &current_claim, input_matrix, *dim, channel,
-                )?
+                reduce_layernorm_layer(&current_claim, input_matrix, *dim, channel)?
             }
 
             LayerType::RMSNorm { dim, .. } => {
                 let input_matrix = get_intermediate(execution, layer.node_id)?;
 
-                reduce_rmsnorm_layer(
-                    &current_claim, input_matrix, *dim, channel,
-                )?
+                reduce_rmsnorm_layer(&current_claim, input_matrix, *dim, channel)?
             }
 
             LayerType::Identity => {
@@ -201,16 +216,18 @@ pub fn prove_gkr(
                 let attn_weights = get_attention_weights(weights, layer)?;
 
                 reduce_attention_layer(
-                    &current_claim, input_matrix, &attn_weights, config, channel,
+                    &current_claim,
+                    input_matrix,
+                    &attn_weights,
+                    config,
+                    channel,
                 )?
             }
 
             LayerType::Dequantize { params, .. } => {
                 let input_matrix = get_intermediate(execution, layer.node_id)?;
 
-                reduce_dequantize_layer(
-                    &current_claim, input_matrix, params, channel,
-                )?
+                reduce_dequantize_layer(&current_claim, input_matrix, params, channel)?
             }
 
             LayerType::Input => {
@@ -231,24 +248,27 @@ pub fn prove_gkr(
     for (deferred_claim, rhs_layer_idx) in &deferred_info {
         let rhs_layer = &circuit.layers[*rhs_layer_idx];
         match &rhs_layer.layer_type {
-            LayerType::MatMul { m, k, n, weight_node_id } => {
+            LayerType::MatMul {
+                m,
+                k,
+                n,
+                weight_node_id,
+            } => {
                 // Get the input to the rhs matmul (its data input)
                 let a_matrix = get_intermediate(execution, rhs_layer.node_id)?;
-                let b_matrix = weights.get_weight(*weight_node_id)
-                    .ok_or(GKRError::MissingWeight { node_id: *weight_node_id })?;
-
-                // Build deferred weight MLE for this deferred matmul
-                let b_padded = pad_matrix_pow2(b_matrix);
-                let b_mle = matrix_to_mle_col_major(&b_padded);
+                let b_matrix =
+                    weights
+                        .get_weight(*weight_node_id)
+                        .ok_or(GKRError::MissingWeight {
+                            node_id: *weight_node_id,
+                        })?;
 
                 // Mix deferred claim into channel (Fiat-Shamir binding)
                 mix_secure_field(channel, deferred_claim.value);
 
                 // Run matmul sumcheck at the deferred evaluation point
-                let (reduction, input_claim) = reduce_matmul_layer(
-                    deferred_claim, a_matrix, b_matrix,
-                    *m, *k, *n, channel,
-                )?;
+                let (reduction, input_claim) =
+                    reduce_matmul_layer(deferred_claim, a_matrix, b_matrix, *m, *k, *n, channel)?;
 
                 // Weight opening for the deferred matmul
                 let pm = m.next_power_of_two();
@@ -264,10 +284,26 @@ pub fn prove_gkr(
                     eval_point: weight_eval_point.clone(),
                     expected_value: reduction.final_b_eval,
                 };
-                let (deferred_weight_commitment, deferred_weight_opening) =
+                #[cfg(feature = "cuda-runtime")]
+                let (deferred_weight_commitment, deferred_weight_opening) = {
+                    let b_padded = pad_matrix_pow2(b_matrix);
+                    let b_mle_u32 = matrix_to_mle_col_major_u32(&b_padded);
+                    crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
+                        &b_mle_u32,
+                        &weight_eval_point,
+                        channel,
+                    )
+                };
+                #[cfg(not(feature = "cuda-runtime"))]
+                let (deferred_weight_commitment, deferred_weight_opening) = {
+                    let b_padded = pad_matrix_pow2(b_matrix);
+                    let b_mle = matrix_to_mle_col_major(&b_padded);
                     crate::crypto::mle_opening::prove_mle_opening_with_commitment(
-                    &b_mle, &weight_eval_point, channel,
-                );
+                        &b_mle,
+                        &weight_eval_point,
+                        channel,
+                    )
+                };
 
                 deferred_proofs.push(super::types::DeferredProof {
                     claim: deferred_claim.clone(),
@@ -303,30 +339,45 @@ pub fn prove_gkr(
     for (weight_node_id, eval_point, expected_value) in weight_data {
         let b_matrix = weights
             .get_weight(weight_node_id)
-            .ok_or(GKRError::MissingWeight { node_id: weight_node_id })?;
-        let b_padded = pad_matrix_pow2(b_matrix);
-        let b_mle = matrix_to_mle_col_major(&b_padded);
+            .ok_or(GKRError::MissingWeight {
+                node_id: weight_node_id,
+            })?;
 
         weight_claims.push(super::types::WeightClaim {
             eval_point: eval_point.clone(),
             expected_value,
         });
-        let (commitment, opening) = crate::crypto::mle_opening::prove_mle_opening_with_commitment(
-            &b_mle, &eval_point, channel,
-        );
+        #[cfg(feature = "cuda-runtime")]
+        let (commitment, opening) = {
+            let b_padded = pad_matrix_pow2(b_matrix);
+            let b_mle_u32 = matrix_to_mle_col_major_u32(&b_padded);
+            crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
+                &b_mle_u32,
+                &eval_point,
+                channel,
+            )
+        };
+        #[cfg(not(feature = "cuda-runtime"))]
+        let (commitment, opening) = {
+            let b_padded = pad_matrix_pow2(b_matrix);
+            let b_mle = matrix_to_mle_col_major(&b_padded);
+            crate::crypto::mle_opening::prove_mle_opening_with_commitment(
+                &b_mle,
+                &eval_point,
+                channel,
+            )
+        };
         weight_commitments.push(commitment);
         weight_openings.push(opening);
     }
 
     // Compute IO commitment from model input and output
-    let model_input = execution.intermediates
+    let model_input = execution
+        .intermediates
         .first()
         .map(|(_, m)| m)
         .unwrap_or(&execution.output);
-    let io_commitment = crate::aggregation::compute_io_commitment(
-        model_input,
-        &execution.output,
-    );
+    let io_commitment = crate::aggregation::compute_io_commitment(model_input, &execution.output);
 
     Ok(GKRProof {
         layer_proofs,
@@ -362,11 +413,10 @@ pub fn prove_gkr_gpu(
 ) -> Result<GKRProof, GKRError> {
     use crate::gpu_sumcheck::GpuSumcheckExecutor;
 
-    let gpu = GpuSumcheckExecutor::cached()
-        .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0,
-            reason: format!("GPU init: {e}"),
-        })?;
+    let gpu = GpuSumcheckExecutor::cached().map_err(|e| GKRError::ReductionError {
+        layer_idx: 0,
+        reason: format!("GPU init: {e}"),
+    })?;
 
     let d = circuit.layers.len();
     let mut layer_proofs = Vec::with_capacity(d);
@@ -399,12 +449,16 @@ pub fn prove_gkr_gpu(
     };
     let mut current_claim = output_claim.clone();
 
-    let total_work_layers = circuit.layers.iter().filter(|l| {
-        !matches!(l.layer_type, LayerType::Identity | LayerType::Input)
-    }).count();
-    let total_matmul_layers = circuit.layers.iter().filter(|l| {
-        matches!(l.layer_type, LayerType::MatMul { .. })
-    }).count();
+    let total_work_layers = circuit
+        .layers
+        .iter()
+        .filter(|l| !matches!(l.layer_type, LayerType::Identity | LayerType::Input))
+        .count();
+    let total_matmul_layers = circuit
+        .layers
+        .iter()
+        .filter(|l| matches!(l.layer_type, LayerType::MatMul { .. }))
+        .count();
     let t_gkr_walk = std::time::Instant::now();
     let mut done_work_layers: usize = 0;
     let mut done_matmul_layers: usize = 0;
@@ -415,10 +469,19 @@ pub fn prove_gkr_gpu(
         let layer = &circuit.layers[layer_idx];
 
         let (proof, next_claim) = match &layer.layer_type {
-            LayerType::MatMul { m, k, n, weight_node_id } => {
+            LayerType::MatMul {
+                m,
+                k,
+                n,
+                weight_node_id,
+            } => {
                 let a_matrix = get_intermediate(execution, layer.node_id)?;
-                let b_matrix = weights.get_weight(*weight_node_id)
-                    .ok_or(GKRError::MissingWeight { node_id: *weight_node_id })?;
+                let b_matrix =
+                    weights
+                        .get_weight(*weight_node_id)
+                        .ok_or(GKRError::MissingWeight {
+                            node_id: *weight_node_id,
+                        })?;
 
                 // Capture r_j before reduction for weight evaluation point
                 let pm = m.next_power_of_two();
@@ -428,8 +491,14 @@ pub fn prove_gkr_gpu(
                 let r_j = current_claim.point[log_m..log_m + log_n].to_vec();
 
                 let (proof, claim) = reduce_matmul_layer_gpu(
-                    &gpu, &current_claim, a_matrix, b_matrix,
-                    *m, *k, *n, channel,
+                    &gpu,
+                    &current_claim,
+                    a_matrix,
+                    b_matrix,
+                    *m,
+                    *k,
+                    *n,
+                    channel,
                 )?;
 
                 // Extract final_b_eval and compute weight eval point
@@ -446,14 +515,18 @@ pub fn prove_gkr_gpu(
             }
 
             LayerType::Add { .. } => {
-                let (lhs_vals, rhs_vals) = get_binary_op_intermediates(
-                    execution, layer, circuit,
-                )?;
+                let (lhs_vals, rhs_vals) = get_binary_op_intermediates(execution, layer, circuit)?;
 
-                let (proof, _claim) = reduce_add_layer_gpu(&gpu, &current_claim, &lhs_vals, &rhs_vals, channel)?;
+                let (proof, _claim) =
+                    reduce_add_layer_gpu(&gpu, &current_claim, &lhs_vals, &rhs_vals, channel)?;
 
                 // Determine trunk vs skip (same logic as CPU path)
-                let LayerProof::Add { lhs_eval, rhs_eval, .. } = &proof else { unreachable!() };
+                let LayerProof::Add {
+                    lhs_eval, rhs_eval, ..
+                } = &proof
+                else {
+                    unreachable!()
+                };
                 let (trunk_eval, skip_eval, skip_layer_idx, trunk_idx) =
                     if layer.input_layers[1] > layer.input_layers[0] {
                         (*rhs_eval, *lhs_eval, layer.input_layers[0], 1u8)
@@ -462,53 +535,61 @@ pub fn prove_gkr_gpu(
                     };
 
                 deferred_info.push((
-                    GKRClaim { point: current_claim.point.clone(), value: skip_eval },
+                    GKRClaim {
+                        point: current_claim.point.clone(),
+                        value: skip_eval,
+                    },
                     skip_layer_idx,
                 ));
 
-                let claim = GKRClaim { point: current_claim.point.clone(), value: trunk_eval };
-                let proof = LayerProof::Add { lhs_eval: *lhs_eval, rhs_eval: *rhs_eval, trunk_idx };
+                let claim = GKRClaim {
+                    point: current_claim.point.clone(),
+                    value: trunk_eval,
+                };
+                let proof = LayerProof::Add {
+                    lhs_eval: *lhs_eval,
+                    rhs_eval: *rhs_eval,
+                    trunk_idx,
+                };
 
                 (proof, claim)
             }
 
             LayerType::Mul { .. } => {
-                let (lhs_vals, rhs_vals) = get_binary_op_intermediates(
-                    execution, layer, circuit,
-                )?;
+                let (lhs_vals, rhs_vals) = get_binary_op_intermediates(execution, layer, circuit)?;
 
                 reduce_mul_layer_gpu(&gpu, &current_claim, &lhs_vals, &rhs_vals, channel)?
             }
 
-            LayerType::Activation { activation_type, .. } => {
+            LayerType::Activation {
+                activation_type, ..
+            } => {
                 let input_matrix = get_intermediate(execution, layer.node_id)?;
                 reduce_activation_layer_gpu(
-                    &gpu, &current_claim, input_matrix, *activation_type, channel,
+                    &gpu,
+                    &current_claim,
+                    input_matrix,
+                    *activation_type,
+                    channel,
                 )?
             }
 
             LayerType::LayerNorm { dim, .. } => {
                 // CPU fallback — LayerNorm is memory-bound, not compute-bound
                 let input_matrix = get_intermediate(execution, layer.node_id)?;
-                reduce_layernorm_layer(
-                    &current_claim, input_matrix, *dim, channel,
-                )?
+                reduce_layernorm_layer(&current_claim, input_matrix, *dim, channel)?
             }
 
             LayerType::RMSNorm { dim, .. } => {
                 // CPU fallback — RMSNorm is memory-bound, not compute-bound
                 let input_matrix = get_intermediate(execution, layer.node_id)?;
-                reduce_rmsnorm_layer(
-                    &current_claim, input_matrix, *dim, channel,
-                )?
+                reduce_rmsnorm_layer(&current_claim, input_matrix, *dim, channel)?
             }
 
             LayerType::Dequantize { params, .. } => {
                 // CPU fallback — dequantize is table-lookup, not compute-bound
                 let input_matrix = get_intermediate(execution, layer.node_id)?;
-                reduce_dequantize_layer(
-                    &current_claim, input_matrix, params, channel,
-                )?
+                reduce_dequantize_layer(&current_claim, input_matrix, params, channel)?
             }
 
             LayerType::Identity => continue,
@@ -519,7 +600,11 @@ pub fn prove_gkr_gpu(
                 let attn_weights = get_attention_weights(weights, layer)?;
 
                 reduce_attention_layer(
-                    &current_claim, input_matrix, &attn_weights, config, channel,
+                    &current_claim,
+                    input_matrix,
+                    &attn_weights,
+                    config,
+                    channel,
                 )?
             }
 
@@ -573,19 +658,24 @@ pub fn prove_gkr_gpu(
     for (i, (deferred_claim, rhs_layer_idx)) in deferred_info.iter().enumerate() {
         let rhs_layer = &circuit.layers[*rhs_layer_idx];
         match &rhs_layer.layer_type {
-            LayerType::MatMul { m, k, n, weight_node_id } => {
+            LayerType::MatMul {
+                m,
+                k,
+                n,
+                weight_node_id,
+            } => {
                 let a_matrix = get_intermediate(execution, rhs_layer.node_id)?;
-                let b_matrix = weights.get_weight(*weight_node_id)
-                    .ok_or(GKRError::MissingWeight { node_id: *weight_node_id })?;
-                let b_padded = pad_matrix_pow2(b_matrix);
-                let b_mle = matrix_to_mle_col_major(&b_padded);
+                let b_matrix =
+                    weights
+                        .get_weight(*weight_node_id)
+                        .ok_or(GKRError::MissingWeight {
+                            node_id: *weight_node_id,
+                        })?;
 
                 mix_secure_field(channel, deferred_claim.value);
 
-                let (reduction, input_claim) = reduce_matmul_layer(
-                    deferred_claim, a_matrix, b_matrix,
-                    *m, *k, *n, channel,
-                )?;
+                let (reduction, input_claim) =
+                    reduce_matmul_layer(deferred_claim, a_matrix, b_matrix, *m, *k, *n, channel)?;
 
                 let pm = m.next_power_of_two();
                 let log_m = pm.ilog2() as usize;
@@ -600,10 +690,26 @@ pub fn prove_gkr_gpu(
                     eval_point: weight_eval_point.clone(),
                     expected_value: reduction.final_b_eval,
                 };
-                let (deferred_weight_commitment, deferred_opening) =
+                #[cfg(feature = "cuda-runtime")]
+                let (deferred_weight_commitment, deferred_opening) = {
+                    let b_padded = pad_matrix_pow2(b_matrix);
+                    let b_mle_u32 = matrix_to_mle_col_major_u32(&b_padded);
+                    crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
+                        &b_mle_u32,
+                        &weight_eval_point,
+                        channel,
+                    )
+                };
+                #[cfg(not(feature = "cuda-runtime"))]
+                let (deferred_weight_commitment, deferred_opening) = {
+                    let b_padded = pad_matrix_pow2(b_matrix);
+                    let b_mle = matrix_to_mle_col_major(&b_padded);
                     crate::crypto::mle_opening::prove_mle_opening_with_commitment(
-                    &b_mle, &weight_eval_point, channel,
-                );
+                        &b_mle,
+                        &weight_eval_point,
+                        channel,
+                    )
+                };
 
                 deferred_proofs.push(super::types::DeferredProof {
                     claim: deferred_claim.clone(),
@@ -650,11 +756,146 @@ pub fn prove_gkr_gpu(
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&v| v > 0)
         .unwrap_or(1);
+    let opening_heartbeat_sec = std::env::var("STWO_GKR_OPENING_HEARTBEAT_SEC")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(15);
 
+    #[cfg(feature = "cuda-runtime")]
+    {
+        let weight_data = weight_data;
+        std::thread::scope(|scope| -> Result<(), GKRError> {
+            let mut prefetched_current: Option<Vec<u32>> = None;
+
+            for (i, (weight_node_id, eval_point, expected_value)) in weight_data.iter().enumerate()
+            {
+                let b_matrix =
+                    weights
+                        .get_weight(*weight_node_id)
+                        .ok_or(GKRError::MissingWeight {
+                            node_id: *weight_node_id,
+                        })?;
+                eprintln!(
+                    "  [GKR] weight opening {}/{} start: node={}, shape={}x{}",
+                    i + 1,
+                    total_openings,
+                    *weight_node_id,
+                    b_matrix.rows,
+                    b_matrix.cols,
+                );
+
+                if prefetched_current.is_none() {
+                    prefetched_current = Some(prepare_weight_opening_mle_u32(b_matrix));
+                }
+
+                let next_prefetch = if i + 1 < total_openings {
+                    let next_weight_node_id = weight_data[i + 1].0;
+                    Some(scope.spawn(move || -> Result<Vec<u32>, GKRError> {
+                        let next_weight = weights.get_weight(next_weight_node_id).ok_or(
+                            GKRError::MissingWeight {
+                                node_id: next_weight_node_id,
+                            },
+                        )?;
+                        Ok(prepare_weight_opening_mle_u32(next_weight))
+                    }))
+                } else {
+                    None
+                };
+
+                let b_mle_u32 = prefetched_current
+                    .take()
+                    .expect("prefetched current weight MLE");
+                weight_claims.push(super::types::WeightClaim {
+                    eval_point: eval_point.clone(),
+                    expected_value: *expected_value,
+                });
+                let opening_start = std::time::Instant::now();
+                let opening_hb_stop =
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let opening_hb = if opening_heartbeat_sec > 0 {
+                    let hb_stop = opening_hb_stop.clone();
+                    let hb_node = *weight_node_id;
+                    let hb_rows = b_matrix.rows;
+                    let hb_cols = b_matrix.cols;
+                    let hb_idx = i + 1;
+                    let hb_total = total_openings;
+                    let hb_interval = opening_heartbeat_sec;
+                    Some(std::thread::spawn(move || {
+                        while !hb_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            std::thread::sleep(std::time::Duration::from_secs(hb_interval));
+                            if hb_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
+                            eprintln!(
+                                "  [GKR] weight opening {}/{} still running: node={}, shape={}x{}, elapsed {:.1}s",
+                                hb_idx,
+                                hb_total,
+                                hb_node,
+                                hb_rows,
+                                hb_cols,
+                                opening_start.elapsed().as_secs_f64()
+                            );
+                        }
+                    }))
+                } else {
+                    None
+                };
+                let (commitment, opening) =
+                    crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
+                        &b_mle_u32, eval_point, channel,
+                    );
+                opening_hb_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                if let Some(h) = opening_hb {
+                    let _ = h.join();
+                }
+                weight_commitments.push(commitment);
+                weight_openings.push(opening);
+                eprintln!(
+                    "  [GKR] weight opening {}/{} done in {:.1}s",
+                    i + 1,
+                    total_openings,
+                    opening_start.elapsed().as_secs_f64()
+                );
+
+                if let Some(handle) = next_prefetch {
+                    prefetched_current =
+                        Some(handle.join().map_err(|_| GKRError::ReductionError {
+                            layer_idx: 0,
+                            reason: "weight opening prefetch thread panicked".to_string(),
+                        })??);
+                }
+
+                if total_openings > 0
+                    && (((i + 1) % openings_progress_every == 0) || i + 1 == total_openings)
+                {
+                    let elapsed = t_openings.elapsed().as_secs_f64();
+                    let eta = if i + 1 > 0 {
+                        let per = elapsed / (i + 1) as f64;
+                        per * (total_openings.saturating_sub(i + 1)) as f64
+                    } else {
+                        0.0
+                    };
+                    eprintln!(
+                        "  [GKR] weight openings: {}/{} elapsed {:.1}s, eta ~{:.0}s",
+                        i + 1,
+                        total_openings,
+                        elapsed,
+                        eta,
+                    );
+                }
+            }
+
+            Ok(())
+        })?;
+    }
+
+    #[cfg(not(feature = "cuda-runtime"))]
     for (i, (weight_node_id, eval_point, expected_value)) in weight_data.into_iter().enumerate() {
         let b_matrix = weights
             .get_weight(weight_node_id)
-            .ok_or(GKRError::MissingWeight { node_id: weight_node_id })?;
+            .ok_or(GKRError::MissingWeight {
+                node_id: weight_node_id,
+            })?;
         eprintln!(
             "  [GKR] weight opening {}/{} start: node={}, shape={}x{}",
             i + 1,
@@ -663,15 +904,17 @@ pub fn prove_gkr_gpu(
             b_matrix.rows,
             b_matrix.cols,
         );
-        let b_padded = pad_matrix_pow2(b_matrix);
-        let b_mle = matrix_to_mle_col_major(&b_padded);
 
         weight_claims.push(super::types::WeightClaim {
             eval_point: eval_point.clone(),
             expected_value,
         });
+        let b_padded = pad_matrix_pow2(b_matrix);
+        let b_mle = matrix_to_mle_col_major(&b_padded);
         let (commitment, opening) = crate::crypto::mle_opening::prove_mle_opening_with_commitment(
-            &b_mle, &eval_point, channel,
+            &b_mle,
+            &eval_point,
+            channel,
         );
         weight_commitments.push(commitment);
         weight_openings.push(opening);
@@ -696,14 +939,12 @@ pub fn prove_gkr_gpu(
         }
     }
 
-    let model_input = execution.intermediates
+    let model_input = execution
+        .intermediates
         .first()
         .map(|(_, m)| m)
         .unwrap_or(&execution.output);
-    let io_commitment = crate::aggregation::compute_io_commitment(
-        model_input,
-        &execution.output,
-    );
+    let io_commitment = crate::aggregation::compute_io_commitment(model_input, &execution.output);
 
     Ok(GKRProof {
         layer_proofs,
@@ -724,7 +965,9 @@ fn reduce_matmul_layer_gpu(
     output_claim: &GKRClaim,
     a: &M31Matrix,
     b: &M31Matrix,
-    m: usize, k: usize, n: usize,
+    m: usize,
+    k: usize,
+    n: usize,
     channel: &mut PoseidonChannel,
 ) -> Result<(LayerProof, GKRClaim), GKRError> {
     let pm = m.next_power_of_two();
@@ -741,7 +984,10 @@ fn reduce_matmul_layer_gpu(
             layer_idx: 0,
             reason: format!(
                 "output claim has {} vars, need {} (log_m={} + log_n={})",
-                output_claim.point.len(), total_out_vars, log_m, log_n
+                output_claim.point.len(),
+                total_out_vars,
+                log_m,
+                log_n
             ),
         });
     }
@@ -756,7 +1002,8 @@ fn reduce_matmul_layer_gpu(
     mix_secure_field(channel, output_claim.value);
 
     // GPU-resident sumcheck
-    let reduction = gpu.reduce_matmul_layer_gpu(a, b, r_i, r_j, pk, channel)
+    let reduction = gpu
+        .reduce_matmul_layer_gpu(a, b, r_i, r_j, pk, channel)
         .map_err(|e| GKRError::ReductionError {
             layer_idx: 0,
             reason: format!("GPU matmul reduction: {e}"),
@@ -794,12 +1041,14 @@ fn reduce_add_layer_gpu(
     rhs_vals: &[SecureField],
     channel: &mut PoseidonChannel,
 ) -> Result<(LayerProof, GKRClaim), GKRError> {
-    let lhs_eval = gpu.evaluate_mle_gpu(lhs_vals, &output_claim.point)
+    let lhs_eval = gpu
+        .evaluate_mle_gpu(lhs_vals, &output_claim.point)
         .map_err(|e| GKRError::ReductionError {
             layer_idx: 0,
             reason: format!("GPU eval_mle add lhs: {e}"),
         })?;
-    let rhs_eval = gpu.evaluate_mle_gpu(rhs_vals, &output_claim.point)
+    let rhs_eval = gpu
+        .evaluate_mle_gpu(rhs_vals, &output_claim.point)
         .map_err(|e| GKRError::ReductionError {
             layer_idx: 0,
             reason: format!("GPU eval_mle add rhs: {e}"),
@@ -820,7 +1069,14 @@ fn reduce_add_layer_gpu(
         value: lhs_eval,
     };
 
-    Ok((LayerProof::Add { lhs_eval, rhs_eval, trunk_idx: 0 }, claim))
+    Ok((
+        LayerProof::Add {
+            lhs_eval,
+            rhs_eval,
+            trunk_idx: 0,
+        },
+        claim,
+    ))
 }
 
 /// GPU Mul reduction: falls back to CPU eq-sumcheck.
@@ -871,18 +1127,22 @@ fn reduce_activation_layer_gpu(
     let input_mle = matrix_to_mle(&input_padded);
 
     // Compute output by applying activation to each input element
-    let output_mle: Vec<SecureField> = input_padded.data.iter()
+    let output_mle: Vec<SecureField> = input_padded
+        .data
+        .iter()
         .take(n)
         .map(|&v| SecureField::from(activation_fn(v)))
         .collect();
 
     // GPU MLE evaluations at claim point
-    let input_eval = gpu.evaluate_mle_gpu(&input_mle, &output_claim.point)
+    let input_eval = gpu
+        .evaluate_mle_gpu(&input_mle, &output_claim.point)
         .map_err(|e| GKRError::ReductionError {
             layer_idx: 0,
             reason: format!("GPU eval_mle activation input: {e}"),
         })?;
-    let output_eval = gpu.evaluate_mle_gpu(&output_mle, &output_claim.point)
+    let output_eval = gpu
+        .evaluate_mle_gpu(&output_mle, &output_claim.point)
         .map_err(|e| GKRError::ReductionError {
             layer_idx: 0,
             reason: format!("GPU eval_mle activation output: {e}"),
@@ -890,15 +1150,12 @@ fn reduce_activation_layer_gpu(
 
     // Build activation table
     let table_log_size = activation_type.recommended_table_log_size();
-    let table = PrecomputedTable::build_parallel(
-        |x| activation_fn(x), table_log_size,
-    );
+    let table = PrecomputedTable::build_parallel(|x| activation_fn(x), table_log_size);
 
     // Compute multiplicities (uses hash index for O(1) lookup)
     let trace_inputs_m31: Vec<M31> = input_padded.data[..n].to_vec();
-    let multiplicities_m31 = crate::components::activation::compute_multiplicities(
-        &trace_inputs_m31, &table,
-    );
+    let multiplicities_m31 =
+        crate::components::activation::compute_multiplicities(&trace_inputs_m31, &table);
     let multiplicities: Vec<u32> = multiplicities_m31.iter().map(|m| m.0).collect();
 
     // Draw LogUp encoding challenges
@@ -908,7 +1165,8 @@ fn reduce_activation_layer_gpu(
     let beta = channel.draw_qm31();
 
     // Compute denominators on GPU
-    let d_vals_device = gpu.compute_logup_denominators_gpu(&input_mle, &output_mle, gamma, beta)
+    let d_vals_device = gpu
+        .compute_logup_denominators_gpu(&input_mle, &output_mle, gamma, beta)
         .map_err(|e| GKRError::ReductionError {
             layer_idx: 0,
             reason: format!("GPU logup denominators: {e}"),
@@ -916,12 +1174,14 @@ fn reduce_activation_layer_gpu(
 
     // Download denominators for CPU batch inverse + table sum
     let mut d_vals_flat = vec![0u32; n * 4];
-    gpu.device.dtoh_sync_copy_into(&d_vals_device, &mut d_vals_flat)
+    gpu.device
+        .dtoh_sync_copy_into(&d_vals_device, &mut d_vals_flat)
         .map_err(|e| GKRError::ReductionError {
             layer_idx: 0,
             reason: format!("GPU download denoms: {:?}", e),
         })?;
-    let d_vals: Vec<SecureField> = d_vals_flat.chunks_exact(4)
+    let d_vals: Vec<SecureField> = d_vals_flat
+        .chunks_exact(4)
         .map(|c| u32s_to_secure_field(&[c[0], c[1], c[2], c[3]]))
         .collect();
 
@@ -929,12 +1189,16 @@ fn reduce_activation_layer_gpu(
     let w_vals = SecureField::batch_inverse(&d_vals);
 
     // LogUp trace-side sum
-    let trace_sum: SecureField = w_vals.iter().copied().fold(
-        SecureField::zero(), |acc, w| acc + w,
-    );
+    let trace_sum: SecureField = w_vals
+        .iter()
+        .copied()
+        .fold(SecureField::zero(), |acc, w| acc + w);
 
     // Table-side sum with batch inverse
-    let nonzero_entries: Vec<(usize, SecureField)> = table.inputs.iter().zip(&table.outputs)
+    let nonzero_entries: Vec<(usize, SecureField)> = table
+        .inputs
+        .iter()
+        .zip(&table.outputs)
         .enumerate()
         .filter(|(j, _)| multiplicities[*j] > 0)
         .map(|(j, (&t_in, &t_out))| {
@@ -944,13 +1208,16 @@ fn reduce_activation_layer_gpu(
         .collect();
     let table_denoms: Vec<SecureField> = nonzero_entries.iter().map(|(_, d)| *d).collect();
     let table_inv = SecureField::batch_inverse(&table_denoms);
-    let table_sum: SecureField = nonzero_entries.iter().zip(&table_inv)
+    let table_sum: SecureField = nonzero_entries
+        .iter()
+        .zip(&table_inv)
         .map(|((j, _), &inv)| SecureField::from(M31::from(multiplicities[*j])) * inv)
         .fold(SecureField::zero(), |acc, v| acc + v);
 
     if trace_sum != table_sum {
         return Err(GKRError::LogUpError(format!(
-            "LogUp sum mismatch: trace={}, table={}", trace_sum, table_sum,
+            "LogUp sum mismatch: trace={}, table={}",
+            trace_sum, table_sum,
         )));
     }
 
@@ -961,15 +1228,25 @@ fn reduce_activation_layer_gpu(
     let r = &output_claim.point[..num_vars];
     let eq_evals = build_eq_evals(r);
 
-    let eq_flat: Vec<u32> = eq_evals.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
-    let w_flat: Vec<u32> = w_vals.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
+    let eq_flat: Vec<u32> = eq_evals
+        .iter()
+        .flat_map(|sf| secure_field_to_u32s(*sf))
+        .collect();
+    let w_flat: Vec<u32> = w_vals
+        .iter()
+        .flat_map(|sf| secure_field_to_u32s(*sf))
+        .collect();
 
-    let mut d_eq = gpu.device.htod_sync_copy(&eq_flat)
+    let mut d_eq = gpu
+        .device
+        .htod_sync_copy(&eq_flat)
         .map_err(|e| GKRError::ReductionError {
             layer_idx: 0,
             reason: format!("GPU upload eq: {:?}", e),
         })?;
-    let mut d_w = gpu.device.htod_sync_copy(&w_flat)
+    let mut d_w = gpu
+        .device
+        .htod_sync_copy(&w_flat)
         .map_err(|e| GKRError::ReductionError {
             layer_idx: 0,
             reason: format!("GPU upload w: {:?}", e),
@@ -985,12 +1262,12 @@ fn reduce_activation_layer_gpu(
     for _ in 0..num_vars {
         let mid = cur_n / 2;
 
-        let (s0_u32, s1_u32, s2_u32, s3_u32) = gpu.compute_logup_round_poly_3way(
-            &d_eq, &d_w, &d_d, mid,
-        ).map_err(|e| GKRError::ReductionError {
-            layer_idx: 0,
-            reason: format!("GPU logup round: {e}"),
-        })?;
+        let (s0_u32, s1_u32, s2_u32, s3_u32) = gpu
+            .compute_logup_round_poly_3way(&d_eq, &d_w, &d_d, mid)
+            .map_err(|e| GKRError::ReductionError {
+                layer_idx: 0,
+                reason: format!("GPU logup round: {e}"),
+            })?;
 
         let s0 = u32s_to_secure_field(&s0_u32);
         let s1 = u32s_to_secure_field(&s1_u32);
@@ -1020,12 +1297,12 @@ fn reduce_activation_layer_gpu(
 
         // GPU 3-way fold
         let challenge_u32 = secure_field_to_u32s(challenge);
-        let (new_eq, new_w, new_d) = gpu.logup_3way_fold(
-            &d_eq, &d_w, &d_d, cur_n, &challenge_u32,
-        ).map_err(|e| GKRError::ReductionError {
-            layer_idx: 0,
-            reason: format!("GPU logup fold: {e}"),
-        })?;
+        let (new_eq, new_w, new_d) = gpu
+            .logup_3way_fold(&d_eq, &d_w, &d_d, cur_n, &challenge_u32)
+            .map_err(|e| GKRError::ReductionError {
+                layer_idx: 0,
+                reason: format!("GPU logup fold: {e}"),
+            })?;
         d_eq = new_eq;
         d_w = new_w;
         d_d = new_d;
@@ -1034,7 +1311,8 @@ fn reduce_activation_layer_gpu(
 
     // Download final w_eval (1 QM31)
     let mut w_eval_u32 = [0u32; 4];
-    gpu.device.dtoh_sync_copy_into(&d_w, &mut w_eval_u32)
+    gpu.device
+        .dtoh_sync_copy_into(&d_w, &mut w_eval_u32)
         .map_err(|e| GKRError::ReductionError {
             layer_idx: 0,
             reason: format!("GPU download w_eval: {:?}", e),
@@ -1042,21 +1320,21 @@ fn reduce_activation_layer_gpu(
     let w_eval = u32s_to_secure_field(&w_eval_u32);
 
     // Final evaluations at sumcheck challenge point (GPU)
-    let in_eval_s = gpu.evaluate_mle_gpu(&input_mle, &sumcheck_challenges)
+    let in_eval_s = gpu
+        .evaluate_mle_gpu(&input_mle, &sumcheck_challenges)
         .map_err(|e| GKRError::ReductionError {
             layer_idx: 0,
             reason: format!("GPU eval_mle final input: {e}"),
         })?;
-    let out_eval_s = gpu.evaluate_mle_gpu(&output_mle, &sumcheck_challenges)
+    let out_eval_s = gpu
+        .evaluate_mle_gpu(&output_mle, &sumcheck_challenges)
         .map_err(|e| GKRError::ReductionError {
             layer_idx: 0,
             reason: format!("GPU eval_mle final output: {e}"),
         })?;
 
     // Compute table commitment
-    let table_commitment = compute_activation_table_commitment(
-        activation_type, table_log_size,
-    );
+    let table_commitment = compute_activation_table_commitment(activation_type, table_log_size);
 
     // Mix final evaluations
     mix_secure_field(channel, input_eval);
@@ -1074,13 +1352,16 @@ fn reduce_activation_layer_gpu(
         value: input_eval,
     };
 
-    Ok((LayerProof::Activation {
-        activation_type,
-        logup_proof: Some(logup_proof),
-        input_eval,
-        output_eval,
-        table_commitment,
-    }, claim))
+    Ok((
+        LayerProof::Activation {
+            activation_type,
+            logup_proof: Some(logup_proof),
+            input_eval,
+            output_eval,
+            table_commitment,
+        },
+        claim,
+    ))
 }
 
 // =============================================================================
@@ -1111,27 +1392,26 @@ pub fn prove_gkr_simd_gpu(
     weights: &GraphWeights,
     channel: &mut PoseidonChannel,
 ) -> Result<GKRProof, GKRError> {
-    use crate::gpu_sumcheck::GpuSumcheckExecutor;
     use crate::components::matmul::compute_lagrange_basis_pub;
+    use crate::gpu_sumcheck::GpuSumcheckExecutor;
 
-    let simd_config = circuit.simd_config.as_ref()
-        .ok_or_else(|| GKRError::SimdError(
-            "circuit has no SIMD config — need >= 2 identical blocks".into(),
-        ))?;
+    let simd_config = circuit.simd_config.as_ref().ok_or_else(|| {
+        GKRError::SimdError("circuit has no SIMD config — need >= 2 identical blocks".into())
+    })?;
 
     let n_blocks = simd_config.num_blocks;
     if block_executions.len() != n_blocks {
         return Err(GKRError::SimdError(format!(
             "expected {} block executions, got {}",
-            n_blocks, block_executions.len(),
+            n_blocks,
+            block_executions.len(),
         )));
     }
 
-    let gpu = GpuSumcheckExecutor::cached()
-        .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0,
-            reason: format!("GPU init: {e}"),
-        })?;
+    let gpu = GpuSumcheckExecutor::cached().map_err(|e| GKRError::ReductionError {
+        layer_idx: 0,
+        reason: format!("GPU init: {e}"),
+    })?;
 
     let d = circuit.layers.len();
     let mut layer_proofs = Vec::with_capacity(d);
@@ -1153,9 +1433,8 @@ pub fn prove_gkr_simd_gpu(
     let block_weights = &block_weights[..n_blocks];
 
     // Combine block outputs into single weighted MLE
-    let combined_output = combine_block_intermediates_output(
-        block_executions, &block_weights, &gpu,
-    )?;
+    let combined_output =
+        combine_block_intermediates_output(block_executions, &block_weights, &gpu)?;
 
     // Build initial claim on combined output
     let combined_output_padded = pad_matrix_pow2_sf(&combined_output);
@@ -1180,10 +1459,19 @@ pub fn prove_gkr_simd_gpu(
         let layer = &circuit.layers[layer_idx];
 
         let (proof, next_claim) = match &layer.layer_type {
-            LayerType::MatMul { m, k, n, weight_node_id } => {
+            LayerType::MatMul {
+                m,
+                k,
+                n,
+                weight_node_id,
+            } => {
                 // Shared weight matrix
-                let b_matrix = weights.get_weight(*weight_node_id)
-                    .ok_or(GKRError::MissingWeight { node_id: *weight_node_id })?;
+                let b_matrix =
+                    weights
+                        .get_weight(*weight_node_id)
+                        .ok_or(GKRError::MissingWeight {
+                            node_id: *weight_node_id,
+                        })?;
 
                 // Capture r_j before reduction for weight evaluation point
                 let pm = m.next_power_of_two();
@@ -1195,17 +1483,23 @@ pub fn prove_gkr_simd_gpu(
                 // Per-block input activations
                 let block_a_matrices: Vec<&M31Matrix> = (0..n_blocks)
                     .map(|b| {
-                        let block_layer_idx = circuit.block_ranges[b].start
-                            + (layer_idx - template.start);
+                        let block_layer_idx =
+                            circuit.block_ranges[b].start + (layer_idx - template.start);
                         let block_node_id = circuit.layers[block_layer_idx].node_id;
                         get_intermediate(&block_executions[b], block_node_id)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
 
                 let (proof, claim) = reduce_matmul_layer_simd_gpu(
-                    &gpu, &current_claim,
-                    &block_a_matrices, b_matrix, &block_weights,
-                    *m, *k, *n, channel,
+                    &gpu,
+                    &current_claim,
+                    &block_a_matrices,
+                    b_matrix,
+                    &block_weights,
+                    *m,
+                    *k,
+                    *n,
+                    channel,
                 )?;
 
                 // Extract final_b_eval and compute weight eval point
@@ -1223,13 +1517,23 @@ pub fn prove_gkr_simd_gpu(
 
             LayerType::Add { .. } => {
                 let (lhs_vals, rhs_vals) = get_combined_binary_op_intermediates(
-                    block_executions, layer_idx, template.start,
-                    circuit, &block_weights, &gpu,
+                    block_executions,
+                    layer_idx,
+                    template.start,
+                    circuit,
+                    &block_weights,
+                    &gpu,
                 )?;
-                let (proof, _claim) = reduce_add_layer_gpu(&gpu, &current_claim, &lhs_vals, &rhs_vals, channel)?;
+                let (proof, _claim) =
+                    reduce_add_layer_gpu(&gpu, &current_claim, &lhs_vals, &rhs_vals, channel)?;
 
                 // Determine trunk vs skip (same logic as CPU path)
-                let LayerProof::Add { lhs_eval, rhs_eval, .. } = &proof else { unreachable!() };
+                let LayerProof::Add {
+                    lhs_eval, rhs_eval, ..
+                } = &proof
+                else {
+                    unreachable!()
+                };
                 let (trunk_eval, skip_eval, skip_layer_idx, trunk_idx) =
                     if layer.input_layers[1] > layer.input_layers[0] {
                         (*rhs_eval, *lhs_eval, layer.input_layers[0], 1u8)
@@ -1238,31 +1542,52 @@ pub fn prove_gkr_simd_gpu(
                     };
 
                 deferred_info.push((
-                    GKRClaim { point: current_claim.point.clone(), value: skip_eval },
+                    GKRClaim {
+                        point: current_claim.point.clone(),
+                        value: skip_eval,
+                    },
                     skip_layer_idx,
                 ));
 
-                let claim = GKRClaim { point: current_claim.point.clone(), value: trunk_eval };
-                let proof = LayerProof::Add { lhs_eval: *lhs_eval, rhs_eval: *rhs_eval, trunk_idx };
+                let claim = GKRClaim {
+                    point: current_claim.point.clone(),
+                    value: trunk_eval,
+                };
+                let proof = LayerProof::Add {
+                    lhs_eval: *lhs_eval,
+                    rhs_eval: *rhs_eval,
+                    trunk_idx,
+                };
 
                 (proof, claim)
             }
 
             LayerType::Mul { .. } => {
                 let (lhs_vals, rhs_vals) = get_combined_binary_op_intermediates(
-                    block_executions, layer_idx, template.start,
-                    circuit, &block_weights, &gpu,
+                    block_executions,
+                    layer_idx,
+                    template.start,
+                    circuit,
+                    &block_weights,
+                    &gpu,
                 )?;
                 reduce_mul_layer_gpu(&gpu, &current_claim, &lhs_vals, &rhs_vals, channel)?
             }
 
-            LayerType::Activation { activation_type, .. } => {
+            LayerType::Activation {
+                activation_type, ..
+            } => {
                 let combined_mle = get_combined_intermediate_mle(
-                    block_executions, layer_idx, template.start,
-                    circuit, &block_weights, &gpu,
+                    block_executions,
+                    layer_idx,
+                    template.start,
+                    circuit,
+                    &block_weights,
+                    &gpu,
                 )?;
 
-                let input_eval = gpu.evaluate_mle_gpu(&combined_mle, &current_claim.point)
+                let input_eval = gpu
+                    .evaluate_mle_gpu(&combined_mle, &current_claim.point)
                     .map_err(|e| GKRError::ReductionError {
                         layer_idx,
                         reason: format!("GPU eval_mle simd activation: {e}"),
@@ -1273,45 +1598,42 @@ pub fn prove_gkr_simd_gpu(
                     point: current_claim.point.clone(),
                     value: input_eval,
                 };
-                (LayerProof::Activation {
-                    activation_type: *activation_type,
-                    logup_proof: None,
-                    input_eval,
-                    output_eval: current_claim.value,
-                    table_commitment: starknet_ff::FieldElement::ZERO,
-                }, claim)
+                (
+                    LayerProof::Activation {
+                        activation_type: *activation_type,
+                        logup_proof: None,
+                        input_eval,
+                        output_eval: current_claim.value,
+                        table_commitment: starknet_ff::FieldElement::ZERO,
+                    },
+                    claim,
+                )
             }
 
-            LayerType::LayerNorm { dim } => {
-                reduce_layernorm_layer_simd(
-                    &current_claim,
-                    block_executions,
-                    layer_idx,
-                    template.start,
-                    circuit,
-                    &block_weights,
-                    *dim,
-                    &gpu,
-                    channel,
-                )?
-            }
+            LayerType::LayerNorm { dim } => reduce_layernorm_layer_simd(
+                &current_claim,
+                block_executions,
+                layer_idx,
+                template.start,
+                circuit,
+                &block_weights,
+                *dim,
+                &gpu,
+                channel,
+            )?,
 
             LayerType::RMSNorm { dim } => {
                 // CPU fallback for RMSNorm in SIMD path
                 let first_exec = &block_executions[0];
                 let input_matrix = get_intermediate(first_exec, layer.node_id)?;
-                reduce_rmsnorm_layer(
-                    &current_claim, input_matrix, *dim, channel,
-                )?
+                reduce_rmsnorm_layer(&current_claim, input_matrix, *dim, channel)?
             }
 
             LayerType::Dequantize { params, .. } => {
                 // CPU fallback — dequantize is table-lookup, not compute-bound
                 let first_exec = &block_executions[0];
                 let input_matrix = get_intermediate(first_exec, layer.node_id)?;
-                reduce_dequantize_layer(
-                    &current_claim, input_matrix, params, channel,
-                )?
+                reduce_dequantize_layer(&current_claim, input_matrix, params, channel)?
             }
 
             LayerType::Identity => continue,
@@ -1321,8 +1643,8 @@ pub fn prove_gkr_simd_gpu(
                 // SIMD attention: extract per-block input matrices and decompose
                 let block_input_matrices: Vec<&M31Matrix> = (0..n_blocks)
                     .map(|b| {
-                        let block_layer_idx = circuit.block_ranges[b].start
-                            + (layer_idx - template.start);
+                        let block_layer_idx =
+                            circuit.block_ranges[b].start + (layer_idx - template.start);
                         let block_node_id = circuit.layers[block_layer_idx].node_id;
                         get_intermediate(&block_executions[b], block_node_id)
                     })
@@ -1330,9 +1652,14 @@ pub fn prove_gkr_simd_gpu(
                 let attn_weights = get_attention_weights(weights, layer)?;
 
                 reduce_attention_layer_simd_gpu(
-                    &gpu, &current_claim,
-                    &block_input_matrices, &attn_weights, config,
-                    &block_weights, &r_simd, channel,
+                    &gpu,
+                    &current_claim,
+                    &block_input_matrices,
+                    &attn_weights,
+                    config,
+                    &block_weights,
+                    &r_simd,
+                    channel,
                 )?
             }
         };
@@ -1348,30 +1675,46 @@ pub fn prove_gkr_simd_gpu(
     for (weight_node_id, eval_point, expected_value) in weight_data {
         let b_matrix = weights
             .get_weight(weight_node_id)
-            .ok_or(GKRError::MissingWeight { node_id: weight_node_id })?;
-        let b_padded = pad_matrix_pow2(b_matrix);
-        let b_mle = matrix_to_mle_col_major(&b_padded);
+            .ok_or(GKRError::MissingWeight {
+                node_id: weight_node_id,
+            })?;
 
         weight_claims.push(super::types::WeightClaim {
             eval_point: eval_point.clone(),
             expected_value,
         });
-        let (commitment, opening) = crate::crypto::mle_opening::prove_mle_opening_with_commitment(
-            &b_mle, &eval_point, channel,
-        );
+        #[cfg(feature = "cuda-runtime")]
+        let (commitment, opening) = {
+            let b_padded = pad_matrix_pow2(b_matrix);
+            let b_mle_u32 = matrix_to_mle_col_major_u32(&b_padded);
+            crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
+                &b_mle_u32,
+                &eval_point,
+                channel,
+            )
+        };
+        #[cfg(not(feature = "cuda-runtime"))]
+        let (commitment, opening) = {
+            let b_padded = pad_matrix_pow2(b_matrix);
+            let b_mle = matrix_to_mle_col_major(&b_padded);
+            crate::crypto::mle_opening::prove_mle_opening_with_commitment(
+                &b_mle,
+                &eval_point,
+                channel,
+            )
+        };
         weight_commitments.push(commitment);
         weight_openings.push(opening);
     }
 
     // IO commitment from first block's input and combined output
-    let model_input = block_executions[0].intermediates
+    let model_input = block_executions[0]
+        .intermediates
         .first()
         .map(|(_, m)| m)
         .unwrap_or(&block_executions[0].output);
-    let io_commitment = crate::aggregation::compute_io_commitment(
-        model_input,
-        &block_executions[0].output,
-    );
+    let io_commitment =
+        crate::aggregation::compute_io_commitment(model_input, &block_executions[0].output);
 
     // TODO: Generate deferred proofs for SIMD path (combine per-block skip intermediates)
     // For now, assert no deferred claims in SIMD mode.
@@ -1409,7 +1752,9 @@ fn reduce_matmul_layer_simd_gpu(
     block_a_matrices: &[&M31Matrix],
     b: &M31Matrix,
     block_weights: &[SecureField],
-    m: usize, k: usize, n: usize,
+    m: usize,
+    k: usize,
+    n: usize,
     channel: &mut PoseidonChannel,
 ) -> Result<(LayerProof, GKRClaim), GKRError> {
     let pm = m.next_power_of_two();
@@ -1426,7 +1771,8 @@ fn reduce_matmul_layer_simd_gpu(
             layer_idx: 0,
             reason: format!(
                 "SIMD matmul: claim has {} vars, need {}",
-                output_claim.point.len(), total_out_vars,
+                output_claim.point.len(),
+                total_out_vars,
             ),
         });
     }
@@ -1445,7 +1791,8 @@ fn reduce_matmul_layer_simd_gpu(
     let mut per_block_f_a: Vec<Vec<SecureField>> = Vec::with_capacity(n_blocks);
 
     for a_matrix in block_a_matrices {
-        let d_f_a = gpu.restrict_rows(a_matrix, r_i, pk)
+        let d_f_a = gpu
+            .restrict_rows(a_matrix, r_i, pk)
             .map_err(|e| GKRError::ReductionError {
                 layer_idx: 0,
                 reason: format!("SIMD restrict_rows: {e}"),
@@ -1453,67 +1800,78 @@ fn reduce_matmul_layer_simd_gpu(
 
         // Download restricted vector
         let mut f_a_u32 = vec![0u32; pk * 4];
-        gpu.device.dtoh_sync_copy_into(&d_f_a, &mut f_a_u32)
+        gpu.device
+            .dtoh_sync_copy_into(&d_f_a, &mut f_a_u32)
             .map_err(|e| GKRError::ReductionError {
                 layer_idx: 0,
                 reason: format!("SIMD download f_a: {:?}", e),
             })?;
 
-        let f_a: Vec<SecureField> = f_a_u32.chunks_exact(4)
+        let f_a: Vec<SecureField> = f_a_u32
+            .chunks_exact(4)
             .map(|c| crate::gpu_sumcheck::u32s_to_secure_field(&[c[0], c[1], c[2], c[3]]))
             .collect();
         per_block_f_a.push(f_a);
     }
 
     // Step 2: Combine per-block f_a on GPU
-    let combined_f_a = gpu.combine_blocks(&per_block_f_a, block_weights)
+    let combined_f_a = gpu
+        .combine_blocks(&per_block_f_a, block_weights)
         .map_err(|e| GKRError::ReductionError {
             layer_idx: 0,
             reason: format!("SIMD combine_blocks: {e}"),
         })?;
 
     // Step 3: Restrict shared B (same for all blocks)
-    let d_f_b = gpu.restrict_cols(b, r_j, pk)
+    let d_f_b = gpu
+        .restrict_cols(b, r_j, pk)
         .map_err(|e| GKRError::ReductionError {
             layer_idx: 0,
             reason: format!("SIMD restrict_cols: {e}"),
         })?;
 
     // Upload combined_f_a to GPU for sumcheck
-    let combined_u32: Vec<u32> = combined_f_a.iter()
+    let combined_u32: Vec<u32> = combined_f_a
+        .iter()
         .flat_map(|sf| crate::gpu_sumcheck::secure_field_to_u32s(*sf))
         .collect();
-    let d_combined_f_a = gpu.device.htod_sync_copy(&combined_u32)
-        .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0,
-            reason: format!("SIMD upload combined_f_a: {:?}", e),
-        })?;
+    let d_combined_f_a =
+        gpu.device
+            .htod_sync_copy(&combined_u32)
+            .map_err(|e| GKRError::ReductionError {
+                layer_idx: 0,
+                reason: format!("SIMD upload combined_f_a: {:?}", e),
+            })?;
 
     // Step 4: GPU-resident sumcheck on (combined_f_a, f_b)
-    let (fiat_shamir_fn, d_round_constants) = gpu.get_poseidon_fns()
-        .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0,
-            reason: format!("SIMD Poseidon kernel: {e}"),
-        })?;
+    let (fiat_shamir_fn, d_round_constants) =
+        gpu.get_poseidon_fns()
+            .map_err(|e| GKRError::ReductionError {
+                layer_idx: 0,
+                reason: format!("SIMD Poseidon kernel: {e}"),
+            })?;
 
-    let (mut d_channel_digest, mut d_channel_n_draws) = gpu
-        .upload_channel_state(channel)
-        .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0,
-            reason: format!("SIMD channel upload: {e}"),
-        })?;
+    let (mut d_channel_digest, mut d_channel_n_draws) =
+        gpu.upload_channel_state(channel)
+            .map_err(|e| GKRError::ReductionError {
+                layer_idx: 0,
+                reason: format!("SIMD channel upload: {e}"),
+            })?;
 
     let num_rounds = log_k;
-    let mut d_all_round_polys = unsafe {
-        gpu.device.alloc::<u32>(num_rounds * 12)
-    }.map_err(|e| GKRError::ReductionError {
-        layer_idx: 0, reason: format!("SIMD round_polys alloc: {:?}", e),
-    })?;
+    let mut d_all_round_polys =
+        unsafe { gpu.device.alloc::<u32>(num_rounds * 12) }.map_err(|e| {
+            GKRError::ReductionError {
+                layer_idx: 0,
+                reason: format!("SIMD round_polys alloc: {:?}", e),
+            }
+        })?;
 
-    let mut d_all_challenges = unsafe {
-        gpu.device.alloc::<u32>(num_rounds * 4)
-    }.map_err(|e| GKRError::ReductionError {
-        layer_idx: 0, reason: format!("SIMD challenges alloc: {:?}", e),
+    let mut d_all_challenges = unsafe { gpu.device.alloc::<u32>(num_rounds * 4) }.map_err(|e| {
+        GKRError::ReductionError {
+            layer_idx: 0,
+            reason: format!("SIMD challenges alloc: {:?}", e),
+        }
     })?;
 
     let mut d_f_a_cur = d_combined_f_a;
@@ -1523,40 +1881,49 @@ fn reduce_matmul_layer_simd_gpu(
     for round in 0..num_rounds {
         let mid = cur_n / 2;
 
-        let d_reduction = gpu.compute_round_poly_device(&d_f_a_cur, &d_f_b_cur, mid)
+        let d_reduction = gpu
+            .compute_round_poly_device(&d_f_a_cur, &d_f_b_cur, mid)
             .map_err(|e| GKRError::ReductionError {
                 layer_idx: 0,
                 reason: format!("SIMD round {round}: {e}"),
             })?;
 
-        let mut d_round_poly_slot = d_all_round_polys
-            .slice_mut(round * 12..(round + 1) * 12);
-        let d_challenge = gpu.fiat_shamir_round(
-            &d_reduction,
-            &mut d_channel_digest,
-            &mut d_channel_n_draws,
-            &d_round_constants,
-            &mut d_round_poly_slot,
-            &fiat_shamir_fn,
-        ).map_err(|e| GKRError::ReductionError {
-            layer_idx: 0,
-            reason: format!("SIMD F-S round {round}: {e}"),
-        })?;
-
-        gpu.device.dtod_copy(
-            &d_challenge,
-            &mut d_all_challenges.slice_mut(round * 4..(round + 1) * 4),
-        ).map_err(|e| GKRError::ReductionError {
-            layer_idx: 0, reason: format!("SIMD challenge copy: {:?}", e),
-        })?;
-
-        let new_d_f_a = gpu.mle_fold_device(&d_f_a_cur, cur_n, &d_challenge)
+        let mut d_round_poly_slot = d_all_round_polys.slice_mut(round * 12..(round + 1) * 12);
+        let d_challenge = gpu
+            .fiat_shamir_round(
+                &d_reduction,
+                &mut d_channel_digest,
+                &mut d_channel_n_draws,
+                &d_round_constants,
+                &mut d_round_poly_slot,
+                &fiat_shamir_fn,
+            )
             .map_err(|e| GKRError::ReductionError {
-                layer_idx: 0, reason: format!("SIMD fold f_a: {e}"),
+                layer_idx: 0,
+                reason: format!("SIMD F-S round {round}: {e}"),
             })?;
-        let new_d_f_b = gpu.mle_fold_device(&d_f_b_cur, cur_n, &d_challenge)
+
+        gpu.device
+            .dtod_copy(
+                &d_challenge,
+                &mut d_all_challenges.slice_mut(round * 4..(round + 1) * 4),
+            )
             .map_err(|e| GKRError::ReductionError {
-                layer_idx: 0, reason: format!("SIMD fold f_b: {e}"),
+                layer_idx: 0,
+                reason: format!("SIMD challenge copy: {:?}", e),
+            })?;
+
+        let new_d_f_a = gpu
+            .mle_fold_device(&d_f_a_cur, cur_n, &d_challenge)
+            .map_err(|e| GKRError::ReductionError {
+                layer_idx: 0,
+                reason: format!("SIMD fold f_a: {e}"),
+            })?;
+        let new_d_f_b = gpu
+            .mle_fold_device(&d_f_b_cur, cur_n, &d_challenge)
+            .map_err(|e| GKRError::ReductionError {
+                layer_idx: 0,
+                reason: format!("SIMD fold f_b: {e}"),
             })?;
 
         d_f_a_cur = new_d_f_a;
@@ -1568,27 +1935,35 @@ fn reduce_matmul_layer_simd_gpu(
     let (round_poly_data, challenges) = gpu
         .download_sumcheck_results(&d_all_round_polys, &d_all_challenges, num_rounds)
         .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0, reason: format!("SIMD download: {e}"),
+            layer_idx: 0,
+            reason: format!("SIMD download: {e}"),
         })?;
 
     assert_eq!(cur_n, 1);
     let mut final_a_u32 = [0u32; 4];
     let mut final_b_u32 = [0u32; 4];
-    gpu.device.dtoh_sync_copy_into(&d_f_a_cur, &mut final_a_u32)
+    gpu.device
+        .dtoh_sync_copy_into(&d_f_a_cur, &mut final_a_u32)
         .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0, reason: format!("SIMD final_a: {:?}", e),
+            layer_idx: 0,
+            reason: format!("SIMD final_a: {:?}", e),
         })?;
-    gpu.device.dtoh_sync_copy_into(&d_f_b_cur, &mut final_b_u32)
+    gpu.device
+        .dtoh_sync_copy_into(&d_f_b_cur, &mut final_b_u32)
         .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0, reason: format!("SIMD final_b: {:?}", e),
+            layer_idx: 0,
+            reason: format!("SIMD final_b: {:?}", e),
         })?;
 
     let final_a_eval = crate::gpu_sumcheck::u32s_to_secure_field(&final_a_u32);
     let final_b_eval = crate::gpu_sumcheck::u32s_to_secure_field(&final_b_u32);
 
-    let round_polys = round_poly_data.iter()
+    let round_polys = round_poly_data
+        .iter()
         .map(|[c0, c1, c2]| crate::components::matmul::RoundPoly {
-            c0: *c0, c1: *c1, c2: *c2,
+            c0: *c0,
+            c1: *c1,
+            c2: *c2,
         })
         .collect();
 
@@ -1641,7 +2016,9 @@ fn reduce_matmul_layer_dual_simd_gpu(
     block_a_matrices: &[&M31Matrix],
     block_b_matrices: &[&M31Matrix],
     block_weights: &[SecureField],
-    m: usize, k: usize, n: usize,
+    m: usize,
+    k: usize,
+    n: usize,
     channel: &mut PoseidonChannel,
 ) -> Result<(LayerProof, SecureField), GKRError> {
     use crate::gpu_sumcheck::secure_field_to_u32s;
@@ -1666,7 +2043,8 @@ fn reduce_matmul_layer_dual_simd_gpu(
             layer_idx: 0,
             reason: format!(
                 "dual SIMD matmul: claim has {} vars, need {}",
-                output_claim.point.len(), total_out_vars,
+                output_claim.point.len(),
+                total_out_vars,
             ),
         });
     }
@@ -1695,26 +2073,30 @@ fn reduce_matmul_layer_dual_simd_gpu(
 
     for b_idx in 0..n_blocks {
         // Restrict A_b rows → device vector of pk QM31 elements
-        let d_f_a = gpu.restrict_rows(block_a_matrices[b_idx], r_i, pk)
+        let d_f_a = gpu
+            .restrict_rows(block_a_matrices[b_idx], r_i, pk)
             .map_err(|e| GKRError::ReductionError {
                 layer_idx: 0,
                 reason: format!("dual SIMD restrict_rows block {b_idx}: {e}"),
             })?;
         let mut f_a_u32 = vec![0u32; pk * 4];
-        gpu.device.dtoh_sync_copy_into(&d_f_a, &mut f_a_u32)
+        gpu.device
+            .dtoh_sync_copy_into(&d_f_a, &mut f_a_u32)
             .map_err(|e| GKRError::ReductionError {
                 layer_idx: 0,
                 reason: format!("dual SIMD download f_a {b_idx}: {:?}", e),
             })?;
 
         // Restrict B_b cols → device vector of pk QM31 elements
-        let d_f_b = gpu.restrict_cols(block_b_matrices[b_idx], r_j, pk)
+        let d_f_b = gpu
+            .restrict_cols(block_b_matrices[b_idx], r_j, pk)
             .map_err(|e| GKRError::ReductionError {
                 layer_idx: 0,
                 reason: format!("dual SIMD restrict_cols block {b_idx}: {e}"),
             })?;
         let mut f_b_u32 = vec![0u32; pk * 4];
-        gpu.device.dtoh_sync_copy_into(&d_f_b, &mut f_b_u32)
+        gpu.device
+            .dtoh_sync_copy_into(&d_f_b, &mut f_b_u32)
             .map_err(|e| GKRError::ReductionError {
                 layer_idx: 0,
                 reason: format!("dual SIMD download f_b {b_idx}: {:?}", e),
@@ -1731,24 +2113,31 @@ fn reduce_matmul_layer_dual_simd_gpu(
     }
 
     // Step 2: Upload extended MLEs to GPU
-    let d_ext_w = gpu.device.htod_sync_copy(&ext_w_u32)
+    let d_ext_w = gpu
+        .device
+        .htod_sync_copy(&ext_w_u32)
         .map_err(|e| GKRError::ReductionError {
             layer_idx: 0,
             reason: format!("dual SIMD upload ext_w: {:?}", e),
         })?;
-    let d_ext_a = gpu.device.htod_sync_copy(&ext_a_u32)
+    let d_ext_a = gpu
+        .device
+        .htod_sync_copy(&ext_a_u32)
         .map_err(|e| GKRError::ReductionError {
             layer_idx: 0,
             reason: format!("dual SIMD upload ext_a: {:?}", e),
         })?;
-    let d_ext_b = gpu.device.htod_sync_copy(&ext_b_u32)
+    let d_ext_b = gpu
+        .device
+        .htod_sync_copy(&ext_b_u32)
         .map_err(|e| GKRError::ReductionError {
             layer_idx: 0,
             reason: format!("dual SIMD upload ext_b: {:?}", e),
         })?;
 
     // Step 3: Run full 3-factor sumcheck on GPU
-    let result = gpu.sumcheck_3way(d_ext_w, d_ext_a, d_ext_b, total_vars, channel)
+    let result = gpu
+        .sumcheck_3way(d_ext_w, d_ext_a, d_ext_b, total_vars, channel)
         .map_err(|e| GKRError::ReductionError {
             layer_idx: 0,
             reason: format!("dual SIMD GPU sumcheck: {e}"),
@@ -1779,12 +2168,21 @@ pub fn reduce_matmul_layer_dual_simd_gpu_for_test(
     block_a_matrices: &[&M31Matrix],
     block_b_matrices: &[&M31Matrix],
     block_weights: &[SecureField],
-    m: usize, k: usize, n: usize,
+    m: usize,
+    k: usize,
+    n: usize,
     channel: &mut PoseidonChannel,
 ) -> Result<(LayerProof, SecureField), GKRError> {
     reduce_matmul_layer_dual_simd_gpu(
-        gpu, output_claim, block_a_matrices, block_b_matrices,
-        block_weights, m, k, n, channel,
+        gpu,
+        output_claim,
+        block_a_matrices,
+        block_b_matrices,
+        block_weights,
+        m,
+        k,
+        n,
+        channel,
     )
 }
 
@@ -1803,7 +2201,8 @@ fn combine_block_intermediates_output(
     let cols = block_executions[0].output.cols;
 
     // Build per-block output MLEs
-    let block_mles: Vec<Vec<SecureField>> = block_executions.iter()
+    let block_mles: Vec<Vec<SecureField>> = block_executions
+        .iter()
         .map(|exec| {
             let padded = pad_matrix_pow2(&exec.output);
             matrix_to_mle(&padded)
@@ -1811,7 +2210,8 @@ fn combine_block_intermediates_output(
         .collect();
 
     // Combine on GPU
-    let _combined_mle = gpu.combine_blocks(&block_mles, block_weights)
+    let _combined_mle = gpu
+        .combine_blocks(&block_mles, block_weights)
         .map_err(|e| GKRError::SimdError(format!("combine block outputs: {e}")))?;
 
     // Convert back to M31Matrix (truncated to real output dims)
@@ -1915,9 +2315,11 @@ fn get_combined_binary_op_intermediates(
         })
         .collect::<Result<Vec<_>, GKRError>>()?;
 
-    let combined_lhs = gpu.combine_blocks(&lhs_mles, block_weights)
+    let combined_lhs = gpu
+        .combine_blocks(&lhs_mles, block_weights)
         .map_err(|e| GKRError::SimdError(format!("combine lhs: {e}")))?;
-    let combined_rhs = gpu.combine_blocks(&rhs_mles, block_weights)
+    let combined_rhs = gpu
+        .combine_blocks(&rhs_mles, block_weights)
         .map_err(|e| GKRError::SimdError(format!("combine rhs: {e}")))?;
 
     Ok((combined_lhs, combined_rhs))
@@ -1942,7 +2344,9 @@ fn reduce_matmul_layer(
     output_claim: &GKRClaim,
     a: &M31Matrix,
     b: &M31Matrix,
-    m: usize, k: usize, n: usize,
+    m: usize,
+    k: usize,
+    n: usize,
     channel: &mut PoseidonChannel,
 ) -> Result<(MatMulReduction, GKRClaim), GKRError> {
     use crate::components::matmul::RoundPoly;
@@ -1968,7 +2372,10 @@ fn reduce_matmul_layer(
             layer_idx: 0,
             reason: format!(
                 "output claim has {} vars, need {} (log_m={} + log_n={})",
-                output_claim.point.len(), total_out_vars, log_m, log_n
+                output_claim.point.len(),
+                total_out_vars,
+                log_m,
+                log_n
             ),
         });
     }
@@ -1977,7 +2384,7 @@ fn reduce_matmul_layer(
     let r_j = &output_claim.point[log_m..log_m + log_n];
 
     // Build MLEs
-    let mle_a = matrix_to_mle(&a_padded);        // row-major: (row_bits, col_bits)
+    let mle_a = matrix_to_mle(&a_padded); // row-major: (row_bits, col_bits)
     let mle_b_t = matrix_to_mle_col_major(&b_padded); // col-major: (col_bits, row_bits)
 
     // Restrict to get 1D polynomials over k-dimension
@@ -2051,11 +2458,14 @@ fn reduce_matmul_layer(
         value: final_a_eval,
     };
 
-    Ok((MatMulReduction {
-        round_polys,
-        final_a_eval,
-        final_b_eval,
-    }, input_claim))
+    Ok((
+        MatMulReduction {
+            round_polys,
+            final_a_eval,
+            final_b_eval,
+        },
+        input_claim,
+    ))
 }
 
 /// Reduce an Add layer: c[i] = a[i] + b[i].
@@ -2090,7 +2500,14 @@ fn reduce_add_layer(
         value: lhs_eval,
     };
 
-    Ok((LayerProof::Add { lhs_eval, rhs_eval, trunk_idx: 0 }, claim))
+    Ok((
+        LayerProof::Add {
+            lhs_eval,
+            rhs_eval,
+            trunk_idx: 0,
+        },
+        claim,
+    ))
 }
 
 /// Reduce a Mul layer via eq-sumcheck: c[i] = a[i] * b[i].
@@ -2194,7 +2611,14 @@ fn reduce_mul_layer(
         value: combined,
     };
 
-    Ok((LayerProof::Mul { eq_round_polys, lhs_eval, rhs_eval }, claim))
+    Ok((
+        LayerProof::Mul {
+            eq_round_polys,
+            lhs_eval,
+            rhs_eval,
+        },
+        claim,
+    ))
 }
 
 /// Test-accessible wrapper for `reduce_mul_layer`.
@@ -2237,7 +2661,9 @@ fn reduce_activation_layer(
     let input_mle = matrix_to_mle(&input_padded);
 
     // Compute output by applying activation to each input element
-    let output_mle: Vec<SecureField> = input_padded.data.iter()
+    let output_mle: Vec<SecureField> = input_padded
+        .data
+        .iter()
         .take(n)
         .map(|&v| SecureField::from(activation_fn(v)))
         .collect();
@@ -2248,15 +2674,12 @@ fn reduce_activation_layer(
 
     // Build activation table (deterministic from activation type + log size)
     let table_log_size = activation_type.recommended_table_log_size();
-    let table = PrecomputedTable::build_parallel(
-        |x| activation_fn(x), table_log_size,
-    );
+    let table = PrecomputedTable::build_parallel(|x| activation_fn(x), table_log_size);
 
     // Compute multiplicities (how many trace entries use each table row)
     let trace_inputs_m31: Vec<M31> = input_padded.data[..n].to_vec();
-    let multiplicities_m31 = crate::components::activation::compute_multiplicities(
-        &trace_inputs_m31, &table,
-    );
+    let multiplicities_m31 =
+        crate::components::activation::compute_multiplicities(&trace_inputs_m31, &table);
     let multiplicities: Vec<u32> = multiplicities_m31.iter().map(|m| m.0).collect();
 
     // Draw LogUp encoding challenges
@@ -2266,7 +2689,9 @@ fn reduce_activation_layer(
     let beta = channel.draw_qm31();
 
     // Compute denominators and inverse witnesses
-    let d_vals: Vec<SecureField> = input_mle.iter().zip(&output_mle)
+    let d_vals: Vec<SecureField> = input_mle
+        .iter()
+        .zip(&output_mle)
         .map(|(&inp, &out)| gamma - inp - beta * out)
         .collect();
 
@@ -2274,13 +2699,17 @@ fn reduce_activation_layer(
     let w_vals = SecureField::batch_inverse(&d_vals);
 
     // Compute LogUp trace-side sum: T = Σ w_i
-    let trace_sum: SecureField = w_vals.iter().copied().fold(
-        SecureField::zero(), |acc, w| acc + w,
-    );
+    let trace_sum: SecureField = w_vals
+        .iter()
+        .copied()
+        .fold(SecureField::zero(), |acc, w| acc + w);
 
     // Compute table-side sum: S = Σ mult_j / (γ - table_encode_j)
     // Collect non-zero denominators and batch-inverse them
-    let nonzero_entries: Vec<(usize, SecureField)> = table.inputs.iter().zip(&table.outputs)
+    let nonzero_entries: Vec<(usize, SecureField)> = table
+        .inputs
+        .iter()
+        .zip(&table.outputs)
         .enumerate()
         .filter(|(j, _)| multiplicities[*j] > 0)
         .map(|(j, (&t_in, &t_out))| {
@@ -2290,13 +2719,16 @@ fn reduce_activation_layer(
         .collect();
     let table_denoms: Vec<SecureField> = nonzero_entries.iter().map(|(_, d)| *d).collect();
     let table_inv = SecureField::batch_inverse(&table_denoms);
-    let table_sum: SecureField = nonzero_entries.iter().zip(&table_inv)
+    let table_sum: SecureField = nonzero_entries
+        .iter()
+        .zip(&table_inv)
         .map(|((j, _), &inv)| SecureField::from(M31::from(multiplicities[*j])) * inv)
         .fold(SecureField::zero(), |acc, v| acc + v);
 
     if trace_sum != table_sum {
         return Err(GKRError::LogUpError(format!(
-            "LogUp sum mismatch: trace={}, table={}", trace_sum, table_sum,
+            "LogUp sum mismatch: trace={}, table={}",
+            trace_sum, table_sum,
         )));
     }
 
@@ -2357,9 +2789,7 @@ fn reduce_activation_layer(
     let out_eval_s = evaluate_mle(&output_mle, &sumcheck_challenges);
 
     // Compute table commitment
-    let table_commitment = compute_activation_table_commitment(
-        activation_type, table_log_size,
-    );
+    let table_commitment = compute_activation_table_commitment(activation_type, table_log_size);
 
     // Mix final evaluations into channel
     mix_secure_field(channel, input_eval);
@@ -2377,13 +2807,16 @@ fn reduce_activation_layer(
         value: input_eval,
     };
 
-    Ok((LayerProof::Activation {
-        activation_type,
-        logup_proof: Some(logup_proof),
-        input_eval,
-        output_eval,
-        table_commitment,
-    }, claim))
+    Ok((
+        LayerProof::Activation {
+            activation_type,
+            logup_proof: Some(logup_proof),
+            input_eval,
+            output_eval,
+            table_commitment,
+        },
+        claim,
+    ))
 }
 
 /// Compute a deterministic commitment for an activation table.
@@ -2462,7 +2895,9 @@ fn reduce_dequantize_layer(
         zero_point: 0,
         bits: 31,
     };
-    let output_mle: Vec<SecureField> = input_padded.data.iter()
+    let output_mle: Vec<SecureField> = input_padded
+        .data
+        .iter()
         .take(n)
         .map(|&v| {
             let f = dequantize_value(v, params);
@@ -2479,9 +2914,8 @@ fn reduce_dequantize_layer(
 
     // Compute multiplicities
     let trace_inputs_m31: Vec<M31> = input_padded.data[..n].to_vec();
-    let multiplicities_m31 = crate::components::activation::compute_multiplicities(
-        &trace_inputs_m31, &table,
-    );
+    let multiplicities_m31 =
+        crate::components::activation::compute_multiplicities(&trace_inputs_m31, &table);
     let multiplicities: Vec<u32> = multiplicities_m31.iter().map(|m| m.0).collect();
 
     // Draw LogUp encoding challenges with dequantize-specific tag
@@ -2491,19 +2925,25 @@ fn reduce_dequantize_layer(
     let beta = channel.draw_qm31();
 
     // Compute denominators and inverse witnesses (batch inverse: ~12x faster)
-    let d_vals: Vec<SecureField> = input_mle.iter().zip(&output_mle)
+    let d_vals: Vec<SecureField> = input_mle
+        .iter()
+        .zip(&output_mle)
         .map(|(&inp, &out)| gamma - inp - beta * out)
         .collect();
 
     let w_vals = SecureField::batch_inverse(&d_vals);
 
     // Compute LogUp trace-side sum: T = Σ w_i
-    let trace_sum: SecureField = w_vals.iter().copied().fold(
-        SecureField::zero(), |acc, w| acc + w,
-    );
+    let trace_sum: SecureField = w_vals
+        .iter()
+        .copied()
+        .fold(SecureField::zero(), |acc, w| acc + w);
 
     // Compute table-side sum with batch inverse
-    let nonzero_entries: Vec<(usize, SecureField)> = table.inputs.iter().zip(&table.outputs)
+    let nonzero_entries: Vec<(usize, SecureField)> = table
+        .inputs
+        .iter()
+        .zip(&table.outputs)
         .enumerate()
         .filter(|(j, _)| multiplicities[*j] > 0)
         .map(|(j, (&t_in, &t_out))| {
@@ -2513,13 +2953,16 @@ fn reduce_dequantize_layer(
         .collect();
     let table_denoms: Vec<SecureField> = nonzero_entries.iter().map(|(_, d)| *d).collect();
     let table_inv = SecureField::batch_inverse(&table_denoms);
-    let table_sum: SecureField = nonzero_entries.iter().zip(&table_inv)
+    let table_sum: SecureField = nonzero_entries
+        .iter()
+        .zip(&table_inv)
         .map(|((j, _), &inv)| SecureField::from(M31::from(multiplicities[*j])) * inv)
         .fold(SecureField::zero(), |acc, v| acc + v);
 
     if trace_sum != table_sum {
         return Err(GKRError::LogUpError(format!(
-            "Dequantize LogUp sum mismatch: trace={}, table={}", trace_sum, table_sum,
+            "Dequantize LogUp sum mismatch: trace={}, table={}",
+            trace_sum, table_sum,
         )));
     }
 
@@ -2598,12 +3041,15 @@ fn reduce_dequantize_layer(
         value: input_eval,
     };
 
-    Ok((LayerProof::Dequantize {
-        logup_proof: Some(logup_proof),
-        input_eval,
-        output_eval,
-        table_commitment,
-    }, claim))
+    Ok((
+        LayerProof::Dequantize {
+            logup_proof: Some(logup_proof),
+            input_eval,
+            output_eval,
+            table_commitment,
+        },
+        claim,
+    ))
 }
 
 /// Test-accessible wrapper for `reduce_dequantize_layer`.
@@ -2742,8 +3188,20 @@ fn reduce_layernorm_layer(
     for _ in 0..num_vars {
         let mid = cur_n / 2;
 
-        let s0 = compute_mul_eq_sum_at_t(&eq_evals, &centered_folded, &rsqrt_folded, mid, SecureField::zero());
-        let s1 = compute_mul_eq_sum_at_t(&eq_evals, &centered_folded, &rsqrt_folded, mid, SecureField::one());
+        let s0 = compute_mul_eq_sum_at_t(
+            &eq_evals,
+            &centered_folded,
+            &rsqrt_folded,
+            mid,
+            SecureField::zero(),
+        );
+        let s1 = compute_mul_eq_sum_at_t(
+            &eq_evals,
+            &centered_folded,
+            &rsqrt_folded,
+            mid,
+            SecureField::one(),
+        );
         let two = SecureField::from(M31::from(2u32));
         let three = SecureField::from(M31::from(3u32));
         let s2 = compute_mul_eq_sum_at_t(&eq_evals, &centered_folded, &rsqrt_folded, mid, two);
@@ -2792,13 +3250,14 @@ fn reduce_layernorm_layer(
     let table = &rsqrt_table;
 
     // Compute multiplicities for rsqrt table
-    let var_m31: Vec<M31> = var_mle.iter().map(|v| {
-        // Extract M31 from SecureField (first component)
-        M31::from(v.0 .0 .0)
-    }).collect();
-    let multiplicities_m31 = crate::components::activation::compute_multiplicities(
-        &var_m31, table,
-    );
+    let var_m31: Vec<M31> = var_mle
+        .iter()
+        .map(|v| {
+            // Extract M31 from SecureField (first component)
+            M31::from(v.0 .0 .0)
+        })
+        .collect();
+    let multiplicities_m31 = crate::components::activation::compute_multiplicities(&var_m31, table);
     let multiplicities: Vec<u32> = multiplicities_m31.iter().map(|m| m.0).collect();
 
     // Draw LogUp encoding challenges
@@ -2808,19 +3267,25 @@ fn reduce_layernorm_layer(
     let beta = channel.draw_qm31();
 
     // Compute denominators and inverse witnesses for LogUp (batch inverse: ~12x faster)
-    let d_vals: Vec<SecureField> = var_mle.iter().zip(&rsqrt_mle)
+    let d_vals: Vec<SecureField> = var_mle
+        .iter()
+        .zip(&rsqrt_mle)
         .map(|(&v, &rs)| gamma - v - beta * rs)
         .collect();
 
     let w_vals = SecureField::batch_inverse(&d_vals);
 
     // Trace-side sum
-    let trace_sum: SecureField = w_vals.iter().copied().fold(
-        SecureField::zero(), |acc, w| acc + w,
-    );
+    let trace_sum: SecureField = w_vals
+        .iter()
+        .copied()
+        .fold(SecureField::zero(), |acc, w| acc + w);
 
     // Table-side sum with batch inverse
-    let nonzero_entries: Vec<(usize, SecureField)> = table.inputs.iter().zip(&table.outputs)
+    let nonzero_entries: Vec<(usize, SecureField)> = table
+        .inputs
+        .iter()
+        .zip(&table.outputs)
         .enumerate()
         .filter(|(j, _)| multiplicities[*j] > 0)
         .map(|(j, (&t_in, &t_out))| {
@@ -2830,13 +3295,16 @@ fn reduce_layernorm_layer(
         .collect();
     let table_denoms: Vec<SecureField> = nonzero_entries.iter().map(|(_, d)| *d).collect();
     let table_inv = SecureField::batch_inverse(&table_denoms);
-    let table_sum: SecureField = nonzero_entries.iter().zip(&table_inv)
+    let table_sum: SecureField = nonzero_entries
+        .iter()
+        .zip(&table_inv)
         .map(|((j, _), &inv)| SecureField::from(M31::from(multiplicities[*j])) * inv)
         .fold(SecureField::zero(), |acc, v| acc + v);
 
     if trace_sum != table_sum {
         return Err(GKRError::LogUpError(format!(
-            "LayerNorm LogUp sum mismatch: trace={}, table={}", trace_sum, table_sum,
+            "LayerNorm LogUp sum mismatch: trace={}, table={}",
+            trace_sum, table_sum,
         )));
     }
 
@@ -2854,8 +3322,20 @@ fn reduce_layernorm_layer(
     for _ in 0..num_vars {
         let mid = cur_n_logup / 2;
 
-        let s0 = compute_mul_eq_sum_at_t(&eq_evals_logup, &w_folded, &d_folded, mid, SecureField::zero());
-        let s1 = compute_mul_eq_sum_at_t(&eq_evals_logup, &w_folded, &d_folded, mid, SecureField::one());
+        let s0 = compute_mul_eq_sum_at_t(
+            &eq_evals_logup,
+            &w_folded,
+            &d_folded,
+            mid,
+            SecureField::zero(),
+        );
+        let s1 = compute_mul_eq_sum_at_t(
+            &eq_evals_logup,
+            &w_folded,
+            &d_folded,
+            mid,
+            SecureField::one(),
+        );
         let two = SecureField::from(M31::from(2u32));
         let three = SecureField::from(M31::from(3u32));
         let s2 = compute_mul_eq_sum_at_t(&eq_evals_logup, &w_folded, &d_folded, mid, two);
@@ -2902,9 +3382,7 @@ fn reduce_layernorm_layer(
     };
 
     // Compute rsqrt table commitment
-    let rsqrt_table_commitment = compute_rsqrt_table_commitment(
-        config.rsqrt_table_log_size,
-    );
+    let rsqrt_table_commitment = compute_rsqrt_table_commitment(config.rsqrt_table_log_size);
 
     // Mix final evals
     mix_secure_field(channel, input_eval);
@@ -2915,23 +3393,24 @@ fn reduce_layernorm_layer(
         value: input_eval,
     };
 
-    Ok((LayerProof::LayerNorm {
-        logup_proof: Some(logup_proof),
-        linear_round_polys,
-        linear_final_evals,
-        input_eval,
-        output_eval,
-        mean: mean_eval,
-        rsqrt_var: rsqrt_eval,
-        rsqrt_table_commitment,
-        simd_combined: false,
-    }, claim))
+    Ok((
+        LayerProof::LayerNorm {
+            logup_proof: Some(logup_proof),
+            linear_round_polys,
+            linear_final_evals,
+            input_eval,
+            output_eval,
+            mean: mean_eval,
+            rsqrt_var: rsqrt_eval,
+            rsqrt_table_commitment,
+            simd_combined: false,
+        },
+        claim,
+    ))
 }
 
 /// Compute a deterministic commitment for a rsqrt lookup table.
-pub fn compute_rsqrt_table_commitment(
-    table_log_size: u32,
-) -> starknet_ff::FieldElement {
+pub fn compute_rsqrt_table_commitment(table_log_size: u32) -> starknet_ff::FieldElement {
     starknet_crypto::poseidon_hash_many(&[
         starknet_ff::FieldElement::from(0x5253_u64), // "RS" tag for rsqrt
         starknet_ff::FieldElement::from(table_log_size as u64),
@@ -3004,7 +3483,9 @@ fn reduce_rmsnorm_layer(
         // Reduce rms_sq to rsqrt_table range for LogUp.
         let rms_sq_raw = sq_sum * inv_n;
         let rms_sq = M31::from(rms_sq_raw.0 & ((1u32 << config.rsqrt_table_log_size) - 1));
-        let rsqrt = rsqrt_table.lookup(rms_sq).expect("rms_sq reduced to table range");
+        let rsqrt = rsqrt_table
+            .lookup(rms_sq)
+            .expect("rms_sq reduced to table range");
 
         for col in 0..cols {
             let idx = row * cols + col;
@@ -3040,8 +3521,20 @@ fn reduce_rmsnorm_layer(
 
     for _ in 0..num_vars {
         let mid = cur_n / 2;
-        let s0 = compute_mul_eq_sum_at_t(&eq_evals, &input_folded, &rsqrt_folded, mid, SecureField::zero());
-        let s1 = compute_mul_eq_sum_at_t(&eq_evals, &input_folded, &rsqrt_folded, mid, SecureField::one());
+        let s0 = compute_mul_eq_sum_at_t(
+            &eq_evals,
+            &input_folded,
+            &rsqrt_folded,
+            mid,
+            SecureField::zero(),
+        );
+        let s1 = compute_mul_eq_sum_at_t(
+            &eq_evals,
+            &input_folded,
+            &rsqrt_folded,
+            mid,
+            SecureField::one(),
+        );
         let two = SecureField::from(M31::from(2u32));
         let three = SecureField::from(M31::from(3u32));
         let s2 = compute_mul_eq_sum_at_t(&eq_evals, &input_folded, &rsqrt_folded, mid, two);
@@ -3076,32 +3569,47 @@ fn reduce_rmsnorm_layer(
 
     // Part 2: rsqrt LogUp eq-sumcheck
     let rms_sq_m31: Vec<M31> = rms_sq_mle.iter().map(|v| M31::from(v.0 .0 .0)).collect();
-    let mults_m31 = crate::components::activation::compute_multiplicities(&rms_sq_m31, &rsqrt_table);
+    let mults_m31 =
+        crate::components::activation::compute_multiplicities(&rms_sq_m31, &rsqrt_table);
     let multiplicities: Vec<u32> = mults_m31.iter().map(|m| m.0).collect();
 
     channel.mix_u64(0x4C4F47 as u64); // "LOG"
-    channel.mix_u64(0x524E as u64);   // "RN"
+    channel.mix_u64(0x524E as u64); // "RN"
     let gamma = channel.draw_qm31();
     let beta = channel.draw_qm31();
 
-    let d_vals: Vec<SecureField> = rms_sq_mle.iter().zip(&rsqrt_mle)
-        .map(|(&v, &rs)| gamma - v - beta * rs).collect();
+    let d_vals: Vec<SecureField> = rms_sq_mle
+        .iter()
+        .zip(&rsqrt_mle)
+        .map(|(&v, &rs)| gamma - v - beta * rs)
+        .collect();
     let w_vals = SecureField::batch_inverse(&d_vals);
     let trace_sum: SecureField = w_vals.iter().copied().sum();
 
-    let nonzero: Vec<(usize, SecureField)> = rsqrt_table.inputs.iter().zip(&rsqrt_table.outputs)
+    let nonzero: Vec<(usize, SecureField)> = rsqrt_table
+        .inputs
+        .iter()
+        .zip(&rsqrt_table.outputs)
         .enumerate()
         .filter(|(j, _)| multiplicities[*j] > 0)
-        .map(|(j, (&ti, &to))| (j, gamma - SecureField::from(ti) - beta * SecureField::from(to)))
+        .map(|(j, (&ti, &to))| {
+            (
+                j,
+                gamma - SecureField::from(ti) - beta * SecureField::from(to),
+            )
+        })
         .collect();
     let tbl_inv = SecureField::batch_inverse(&nonzero.iter().map(|(_, d)| *d).collect::<Vec<_>>());
-    let table_sum: SecureField = nonzero.iter().zip(&tbl_inv)
+    let table_sum: SecureField = nonzero
+        .iter()
+        .zip(&tbl_inv)
         .map(|((j, _), &inv)| SecureField::from(M31::from(multiplicities[*j])) * inv)
         .sum();
 
     if trace_sum != table_sum {
         return Err(GKRError::LogUpError(format!(
-            "RMSNorm LogUp sum mismatch: trace={}, table={}", trace_sum, table_sum,
+            "RMSNorm LogUp sum mismatch: trace={}, table={}",
+            trace_sum, table_sum,
         )));
     }
     mix_secure_field(channel, trace_sum);
@@ -3160,20 +3668,23 @@ fn reduce_rmsnorm_layer(
     mix_secure_field(channel, input_eval);
     mix_secure_field(channel, output_eval);
 
-    Ok((LayerProof::RMSNorm {
-        logup_proof: Some(logup_proof),
-        linear_round_polys,
-        linear_final_evals: (input_final, rsqrt_final),
-        input_eval,
-        output_eval,
-        rms_sq_eval,
-        rsqrt_eval,
-        rsqrt_table_commitment,
-        simd_combined: false,
-    }, GKRClaim {
-        point: output_claim.point.clone(),
-        value: input_eval,
-    }))
+    Ok((
+        LayerProof::RMSNorm {
+            logup_proof: Some(logup_proof),
+            linear_round_polys,
+            linear_final_evals: (input_final, rsqrt_final),
+            input_eval,
+            output_eval,
+            rms_sq_eval,
+            rsqrt_eval,
+            rsqrt_table_commitment,
+            simd_combined: false,
+        },
+        GKRClaim {
+            point: output_claim.point.clone(),
+            value: input_eval,
+        },
+    ))
 }
 
 /// Test-accessible wrapper for `reduce_rmsnorm_layer`.
@@ -3257,7 +3768,9 @@ fn reduce_layernorm_layer_simd(
             // Reduce variance to table range for LogUp consistency.
             let variance_raw = var_sum * inv_n;
             let variance = M31::from(variance_raw.0 & ((1u32 << config.rsqrt_table_log_size) - 1));
-            let rsqrt = rsqrt_table.lookup(variance).expect("variance reduced to table range");
+            let rsqrt = rsqrt_table
+                .lookup(variance)
+                .expect("variance reduced to table range");
 
             let mean_sf = SecureField::from(mean);
             let rsqrt_sf = SecureField::from(rsqrt);
@@ -3284,30 +3797,37 @@ fn reduce_layernorm_layer_simd(
     }
 
     // Phase 2: GPU combine
-    let combined_product = gpu.combine_blocks(&block_product_mles, block_weights)
+    let combined_product = gpu
+        .combine_blocks(&block_product_mles, block_weights)
         .map_err(|e| GKRError::SimdError(format!("combine product: {e}")))?;
-    let combined_mean = gpu.combine_blocks(&block_mean_mles, block_weights)
+    let combined_mean = gpu
+        .combine_blocks(&block_mean_mles, block_weights)
         .map_err(|e| GKRError::SimdError(format!("combine mean: {e}")))?;
-    let combined_rsqrt = gpu.combine_blocks(&block_rsqrt_mles, block_weights)
+    let combined_rsqrt = gpu
+        .combine_blocks(&block_rsqrt_mles, block_weights)
         .map_err(|e| GKRError::SimdError(format!("combine rsqrt: {e}")))?;
-    let combined_input = gpu.combine_blocks(&block_input_mles, block_weights)
+    let combined_input = gpu
+        .combine_blocks(&block_input_mles, block_weights)
         .map_err(|e| GKRError::SimdError(format!("combine input: {e}")))?;
 
     let n = combined_product.len();
     let num_vars = n.ilog2() as usize;
 
     // Phase 3: Evaluate at claim point
-    let mean_eval = gpu.evaluate_mle_gpu(&combined_mean, &output_claim.point)
+    let mean_eval = gpu
+        .evaluate_mle_gpu(&combined_mean, &output_claim.point)
         .map_err(|e| GKRError::ReductionError {
             layer_idx,
             reason: format!("GPU eval_mle mean: {e}"),
         })?;
-    let rsqrt_eval = gpu.evaluate_mle_gpu(&combined_rsqrt, &output_claim.point)
+    let rsqrt_eval = gpu
+        .evaluate_mle_gpu(&combined_rsqrt, &output_claim.point)
         .map_err(|e| GKRError::ReductionError {
             layer_idx,
             reason: format!("GPU eval_mle rsqrt: {e}"),
         })?;
-    let input_eval = gpu.evaluate_mle_gpu(&combined_input, &output_claim.point)
+    let input_eval = gpu
+        .evaluate_mle_gpu(&combined_input, &output_claim.point)
         .map_err(|e| GKRError::ReductionError {
             layer_idx,
             reason: format!("GPU eval_mle input: {e}"),
@@ -3332,8 +3852,20 @@ fn reduce_layernorm_layer_simd(
     for _ in 0..num_vars {
         let mid = cur_n / 2;
 
-        let s0 = compute_mul_eq_sum_at_t(&eq_evals, &centered_folded, &rsqrt_folded, mid, SecureField::zero());
-        let s1 = compute_mul_eq_sum_at_t(&eq_evals, &centered_folded, &rsqrt_folded, mid, SecureField::one());
+        let s0 = compute_mul_eq_sum_at_t(
+            &eq_evals,
+            &centered_folded,
+            &rsqrt_folded,
+            mid,
+            SecureField::zero(),
+        );
+        let s1 = compute_mul_eq_sum_at_t(
+            &eq_evals,
+            &centered_folded,
+            &rsqrt_folded,
+            mid,
+            SecureField::one(),
+        );
         let two = SecureField::from(M31::from(2u32));
         let three = SecureField::from(M31::from(3u32));
         let s2 = compute_mul_eq_sum_at_t(&eq_evals, &centered_folded, &rsqrt_folded, mid, two);
@@ -3378,26 +3910,27 @@ fn reduce_layernorm_layer_simd(
     mix_secure_field(channel, input_eval);
     mix_secure_field(channel, output_eval);
 
-    let rsqrt_table_commitment = compute_rsqrt_table_commitment(
-        config.rsqrt_table_log_size,
-    );
+    let rsqrt_table_commitment = compute_rsqrt_table_commitment(config.rsqrt_table_log_size);
 
     let claim = GKRClaim {
         point: output_claim.point.clone(),
         value: input_eval,
     };
 
-    Ok((LayerProof::LayerNorm {
-        logup_proof: None,
-        linear_round_polys,
-        linear_final_evals,
-        input_eval,
-        output_eval,
-        mean: mean_eval,
-        rsqrt_var: rsqrt_eval,
-        rsqrt_table_commitment,
-        simd_combined: true,
-    }, claim))
+    Ok((
+        LayerProof::LayerNorm {
+            logup_proof: None,
+            linear_round_polys,
+            linear_final_evals,
+            input_eval,
+            output_eval,
+            mean: mean_eval,
+            rsqrt_var: rsqrt_eval,
+            rsqrt_table_commitment,
+            simd_combined: true,
+        },
+        claim,
+    ))
 }
 
 /// Test-accessible SIMD LayerNorm reduction (CPU only, no GPU needed).
@@ -3441,8 +3974,20 @@ pub fn reduce_layernorm_simd_for_test(
     for _ in 0..num_vars {
         let mid = cur_n / 2;
 
-        let s0 = compute_mul_eq_sum_at_t(&eq_evals, &centered_folded, &rsqrt_folded, mid, SecureField::zero());
-        let s1 = compute_mul_eq_sum_at_t(&eq_evals, &centered_folded, &rsqrt_folded, mid, SecureField::one());
+        let s0 = compute_mul_eq_sum_at_t(
+            &eq_evals,
+            &centered_folded,
+            &rsqrt_folded,
+            mid,
+            SecureField::zero(),
+        );
+        let s1 = compute_mul_eq_sum_at_t(
+            &eq_evals,
+            &centered_folded,
+            &rsqrt_folded,
+            mid,
+            SecureField::one(),
+        );
         let two = SecureField::from(M31::from(2u32));
         let three = SecureField::from(M31::from(3u32));
         let s2 = compute_mul_eq_sum_at_t(&eq_evals, &centered_folded, &rsqrt_folded, mid, two);
@@ -3485,26 +4030,27 @@ pub fn reduce_layernorm_simd_for_test(
     mix_secure_field(channel, input_eval);
     mix_secure_field(channel, output_eval);
 
-    let rsqrt_table_commitment = compute_rsqrt_table_commitment(
-        config.rsqrt_table_log_size,
-    );
+    let rsqrt_table_commitment = compute_rsqrt_table_commitment(config.rsqrt_table_log_size);
 
     let claim = GKRClaim {
         point: output_claim.point.clone(),
         value: input_eval,
     };
 
-    Ok((LayerProof::LayerNorm {
-        logup_proof: None,
-        linear_round_polys,
-        linear_final_evals,
-        input_eval,
-        output_eval,
-        mean: mean_eval,
-        rsqrt_var: rsqrt_eval,
-        rsqrt_table_commitment,
-        simd_combined: true,
-    }, claim))
+    Ok((
+        LayerProof::LayerNorm {
+            logup_proof: None,
+            linear_round_polys,
+            linear_final_evals,
+            input_eval,
+            output_eval,
+            mean: mean_eval,
+            rsqrt_var: rsqrt_eval,
+            rsqrt_table_commitment,
+            simd_combined: true,
+        },
+        claim,
+    ))
 }
 
 /// Build eq(r, x) for all x ∈ {0,1}^n via tensor product.
@@ -3610,10 +4156,7 @@ fn get_binary_op_intermediates(
     if layer.input_layers.len() < 2 {
         return Err(GKRError::ReductionError {
             layer_idx: 0,
-            reason: format!(
-                "binary op needs 2 inputs, got {}",
-                layer.input_layers.len()
-            ),
+            reason: format!("binary op needs 2 inputs, got {}", layer.input_layers.len()),
         });
     }
 
@@ -3651,16 +4194,20 @@ fn get_attention_weights(
 ) -> Result<AttentionWeights, GKRError> {
     // Try to get 4 weight matrices starting at node_id + 1
     let base = layer.node_id;
-    let w_q = weights.get_weight(base + 1)
+    let w_q = weights
+        .get_weight(base + 1)
         .ok_or(GKRError::MissingWeight { node_id: base + 1 })?
         .clone();
-    let w_k = weights.get_weight(base + 2)
+    let w_k = weights
+        .get_weight(base + 2)
         .ok_or(GKRError::MissingWeight { node_id: base + 2 })?
         .clone();
-    let w_v = weights.get_weight(base + 3)
+    let w_v = weights
+        .get_weight(base + 3)
         .ok_or(GKRError::MissingWeight { node_id: base + 3 })?
         .clone();
-    let w_o = weights.get_weight(base + 4)
+    let w_o = weights
+        .get_weight(base + 4)
         .ok_or(GKRError::MissingWeight { node_id: base + 4 })?
         .clone();
 
@@ -3701,7 +4248,8 @@ fn reduce_attention_layer_simd_gpu(
     let n_blocks = block_inputs.len();
 
     // Run per-block attention forward passes to get all intermediates
-    let block_intermediates: Vec<_> = block_inputs.iter()
+    let block_intermediates: Vec<_> = block_inputs
+        .iter()
         .map(|input_b| attention_forward(input_b, attn_weights, config, config.causal))
         .collect();
 
@@ -3718,26 +4266,36 @@ fn reduce_attention_layer_simd_gpu(
 
     // --- Sub-proof 0: Output projection matmul ---
     // final = concat × W_O — shared weight, so use SIMD matmul
-    let block_concats: Vec<&M31Matrix> = block_intermediates.iter()
+    let block_concats: Vec<&M31Matrix> = block_intermediates
+        .iter()
         .map(|inter| &inter.concat)
         .collect();
 
     let (output_proj_proof, _output_proj_claim) = reduce_matmul_layer_simd_gpu(
-        gpu, output_claim,
-        &block_concats, &attn_weights.w_o, block_weights,
-        seq_len, d_model, d_model, channel,
+        gpu,
+        output_claim,
+        &block_concats,
+        &attn_weights.w_o,
+        block_weights,
+        seq_len,
+        d_model,
+        d_model,
+        channel,
     )?;
     sub_proofs.push(output_proj_proof);
     sub_claim_values.push(output_claim.value);
 
     // Split per-block intermediates into per-head
-    let block_k_heads: Vec<Vec<M31Matrix>> = block_intermediates.iter()
+    let block_k_heads: Vec<Vec<M31Matrix>> = block_intermediates
+        .iter()
         .map(|inter| split_heads(&inter.k, num_heads))
         .collect();
-    let block_v_heads: Vec<Vec<M31Matrix>> = block_intermediates.iter()
+    let block_v_heads: Vec<Vec<M31Matrix>> = block_intermediates
+        .iter()
         .map(|inter| split_heads(&inter.v, num_heads))
         .collect();
-    let block_q_heads: Vec<Vec<M31Matrix>> = block_intermediates.iter()
+    let block_q_heads: Vec<Vec<M31Matrix>> = block_intermediates
+        .iter()
         .map(|inter| split_heads(&inter.q, num_heads))
         .collect();
 
@@ -3745,16 +4303,19 @@ fn reduce_attention_layer_simd_gpu(
     for h in (0..num_heads).rev() {
         // Context matmul: context_h = softmax_h × V_h — dual operand
         // Build combined output MLE for this sub-matmul
-        let block_ctx_outputs: Vec<&M31Matrix> = block_intermediates.iter()
+        let block_ctx_outputs: Vec<&M31Matrix> = block_intermediates
+            .iter()
             .map(|inter| &inter.head_outputs[h])
             .collect();
-        let block_ctx_mles: Vec<Vec<SecureField>> = block_ctx_outputs.iter()
+        let block_ctx_mles: Vec<Vec<SecureField>> = block_ctx_outputs
+            .iter()
             .map(|m| {
                 let padded = pad_matrix_pow2(m);
                 matrix_to_mle(&padded)
             })
             .collect();
-        let combined_ctx_mle = gpu.combine_blocks(&block_ctx_mles, block_weights)
+        let combined_ctx_mle = gpu
+            .combine_blocks(&block_ctx_mles, block_weights)
             .map_err(|e| GKRError::SimdError(format!("combine ctx h={h}: {e}")))?;
 
         // Draw fresh claim for context
@@ -3766,20 +4327,28 @@ fn reduce_attention_layer_simd_gpu(
         let ctx_value = evaluate_mle(&combined_ctx_mle, &r_ctx);
         mix_secure_field(channel, ctx_value);
 
-        let ctx_claim = GKRClaim { point: r_ctx, value: ctx_value };
+        let ctx_claim = GKRClaim {
+            point: r_ctx,
+            value: ctx_value,
+        };
 
         // Dual-operand SIMD matmul: both softmax and V vary per block
-        let block_softmax_h: Vec<&M31Matrix> = block_intermediates.iter()
+        let block_softmax_h: Vec<&M31Matrix> = block_intermediates
+            .iter()
             .map(|inter| &inter.softmax_outputs[h])
             .collect();
-        let block_v_h: Vec<&M31Matrix> = block_v_heads.iter()
-            .map(|heads| &heads[h])
-            .collect();
+        let block_v_h: Vec<&M31Matrix> = block_v_heads.iter().map(|heads| &heads[h]).collect();
 
         let (ctx_proof, _ctx_val) = reduce_matmul_layer_dual_simd_gpu(
-            gpu, &ctx_claim,
-            &block_softmax_h, &block_v_h, block_weights,
-            seq_len, seq_len, d_k, channel,
+            gpu,
+            &ctx_claim,
+            &block_softmax_h,
+            &block_v_h,
+            block_weights,
+            seq_len,
+            seq_len,
+            d_k,
+            channel,
         )?;
         sub_proofs.push(ctx_proof);
         sub_claim_values.push(ctx_value);
@@ -3787,10 +4356,9 @@ fn reduce_attention_layer_simd_gpu(
         // Score matmul: raw_scores_h = Q_h × K_h^T (UNSCALED)
         // IMPORTANT: score_matrices[h] includes 1/√d_k scaling, but the sumcheck
         // operates on unscaled Q_h × K_h^T. Must use the raw product.
-        let block_q_h: Vec<&M31Matrix> = block_q_heads.iter()
-            .map(|heads| &heads[h])
-            .collect();
-        let block_k_h_t: Vec<M31Matrix> = block_k_heads.iter()
+        let block_q_h: Vec<&M31Matrix> = block_q_heads.iter().map(|heads| &heads[h]).collect();
+        let block_k_h_t: Vec<M31Matrix> = block_k_heads
+            .iter()
             .map(|heads| transpose_m31(&heads[h]))
             .collect();
         let block_k_h_t_refs: Vec<&M31Matrix> = block_k_h_t.iter().collect();
@@ -3798,13 +4366,15 @@ fn reduce_attention_layer_simd_gpu(
         let block_raw_scores: Vec<M31Matrix> = (0..n_blocks)
             .map(|b| matmul_m31(block_q_h[b], &block_k_h_t[b]))
             .collect();
-        let block_score_mles: Vec<Vec<SecureField>> = block_raw_scores.iter()
+        let block_score_mles: Vec<Vec<SecureField>> = block_raw_scores
+            .iter()
             .map(|m| {
                 let padded = pad_matrix_pow2(m);
                 matrix_to_mle(&padded)
             })
             .collect();
-        let combined_score_mle = gpu.combine_blocks(&block_score_mles, block_weights)
+        let combined_score_mle = gpu
+            .combine_blocks(&block_score_mles, block_weights)
             .map_err(|e| GKRError::SimdError(format!("combine score h={h}: {e}")))?;
 
         let score_pm = seq_len.next_power_of_two();
@@ -3815,12 +4385,21 @@ fn reduce_attention_layer_simd_gpu(
         let score_value = evaluate_mle(&combined_score_mle, &r_score);
         mix_secure_field(channel, score_value);
 
-        let score_claim = GKRClaim { point: r_score, value: score_value };
+        let score_claim = GKRClaim {
+            point: r_score,
+            value: score_value,
+        };
 
         let (score_proof, _score_val) = reduce_matmul_layer_dual_simd_gpu(
-            gpu, &score_claim,
-            &block_q_h, &block_k_h_t_refs, block_weights,
-            seq_len, d_k, seq_len, channel,
+            gpu,
+            &score_claim,
+            &block_q_h,
+            &block_k_h_t_refs,
+            block_weights,
+            seq_len,
+            d_k,
+            seq_len,
+            channel,
         )?;
         sub_proofs.push(score_proof);
         sub_claim_values.push(score_value);
@@ -3830,13 +4409,15 @@ fn reduce_attention_layer_simd_gpu(
     // Shared weights: use standard SIMD matmul with per-block input matrices
 
     // V projection (fresh claim)
-    let block_v_mles: Vec<Vec<SecureField>> = block_intermediates.iter()
+    let block_v_mles: Vec<Vec<SecureField>> = block_intermediates
+        .iter()
         .map(|inter| {
             let padded = pad_matrix_pow2(&inter.v);
             matrix_to_mle(&padded)
         })
         .collect();
-    let combined_v_mle = gpu.combine_blocks(&block_v_mles, block_weights)
+    let combined_v_mle = gpu
+        .combine_blocks(&block_v_mles, block_weights)
         .map_err(|e| GKRError::SimdError(format!("combine v proj: {e}")))?;
 
     let proj_pm = seq_len.next_power_of_two();
@@ -3848,57 +4429,88 @@ fn reduce_attention_layer_simd_gpu(
     let v_value = evaluate_mle(&combined_v_mle, &r_v);
     mix_secure_field(channel, v_value);
 
-    let v_claim = GKRClaim { point: r_v, value: v_value };
+    let v_claim = GKRClaim {
+        point: r_v,
+        value: v_value,
+    };
     let (v_proof, _v_next) = reduce_matmul_layer_simd_gpu(
-        gpu, &v_claim,
-        block_inputs, &attn_weights.w_v, block_weights,
-        seq_len, d_model, d_model, channel,
+        gpu,
+        &v_claim,
+        block_inputs,
+        &attn_weights.w_v,
+        block_weights,
+        seq_len,
+        d_model,
+        d_model,
+        channel,
     )?;
     sub_proofs.push(v_proof);
     sub_claim_values.push(v_value);
 
     // K projection (fresh claim)
-    let block_k_mles: Vec<Vec<SecureField>> = block_intermediates.iter()
+    let block_k_mles: Vec<Vec<SecureField>> = block_intermediates
+        .iter()
         .map(|inter| {
             let padded = pad_matrix_pow2(&inter.k);
             matrix_to_mle(&padded)
         })
         .collect();
-    let combined_k_mle = gpu.combine_blocks(&block_k_mles, block_weights)
+    let combined_k_mle = gpu
+        .combine_blocks(&block_k_mles, block_weights)
         .map_err(|e| GKRError::SimdError(format!("combine k proj: {e}")))?;
 
     let r_k = channel.draw_qm31s(proj_log_rows + proj_log_cols);
     let k_value = evaluate_mle(&combined_k_mle, &r_k);
     mix_secure_field(channel, k_value);
 
-    let k_claim = GKRClaim { point: r_k, value: k_value };
+    let k_claim = GKRClaim {
+        point: r_k,
+        value: k_value,
+    };
     let (k_proof, _k_next) = reduce_matmul_layer_simd_gpu(
-        gpu, &k_claim,
-        block_inputs, &attn_weights.w_k, block_weights,
-        seq_len, d_model, d_model, channel,
+        gpu,
+        &k_claim,
+        block_inputs,
+        &attn_weights.w_k,
+        block_weights,
+        seq_len,
+        d_model,
+        d_model,
+        channel,
     )?;
     sub_proofs.push(k_proof);
     sub_claim_values.push(k_value);
 
     // Q projection (fresh claim) — determines the final input claim
-    let block_q_mles: Vec<Vec<SecureField>> = block_intermediates.iter()
+    let block_q_mles: Vec<Vec<SecureField>> = block_intermediates
+        .iter()
         .map(|inter| {
             let padded = pad_matrix_pow2(&inter.q);
             matrix_to_mle(&padded)
         })
         .collect();
-    let combined_q_mle = gpu.combine_blocks(&block_q_mles, block_weights)
+    let combined_q_mle = gpu
+        .combine_blocks(&block_q_mles, block_weights)
         .map_err(|e| GKRError::SimdError(format!("combine q proj: {e}")))?;
 
     let r_q = channel.draw_qm31s(proj_log_rows + proj_log_cols);
     let q_value = evaluate_mle(&combined_q_mle, &r_q);
     mix_secure_field(channel, q_value);
 
-    let q_claim = GKRClaim { point: r_q, value: q_value };
+    let q_claim = GKRClaim {
+        point: r_q,
+        value: q_value,
+    };
     let (q_proof, final_input_claim) = reduce_matmul_layer_simd_gpu(
-        gpu, &q_claim,
-        block_inputs, &attn_weights.w_q, block_weights,
-        seq_len, d_model, d_model, channel,
+        gpu,
+        &q_claim,
+        block_inputs,
+        &attn_weights.w_q,
+        block_weights,
+        seq_len,
+        d_model,
+        d_model,
+        channel,
     )?;
     sub_proofs.push(q_proof);
     sub_claim_values.push(q_value);
@@ -3906,7 +4518,13 @@ fn reduce_attention_layer_simd_gpu(
     assert_eq!(sub_proofs.len(), expected_count);
     assert_eq!(sub_claim_values.len(), expected_count);
 
-    Ok((LayerProof::Attention { sub_proofs, sub_claim_values }, final_input_claim))
+    Ok((
+        LayerProof::Attention {
+            sub_proofs,
+            sub_claim_values,
+        },
+        final_input_claim,
+    ))
 }
 
 // =============================================================================
@@ -3941,9 +4559,7 @@ fn reduce_attention_layer(
     let d_k = config.d_k();
 
     // Run the full attention forward pass to get all intermediates
-    let intermediates = attention_forward(
-        input_matrix, attn_weights, config, config.causal,
-    );
+    let intermediates = attention_forward(input_matrix, attn_weights, config, config.causal);
 
     // Mix attention metadata into channel for domain separation
     channel.mix_u64(0x4154544E_u64); // "ATTN" tag
@@ -3958,9 +4574,11 @@ fn reduce_attention_layer(
 
     // Helper: create a fresh claim for a matrix and run matmul reduction
     let prove_sub_matmul = |a: &M31Matrix,
-                                 b: &M31Matrix,
-                                 m: usize, k: usize, n: usize,
-                                 channel: &mut PoseidonChannel|
+                            b: &M31Matrix,
+                            m: usize,
+                            k: usize,
+                            n: usize,
+                            channel: &mut PoseidonChannel|
      -> Result<(LayerProof, GKRClaim, SecureField), GKRError> {
         // Build output MLE
         use crate::components::matmul::matmul_m31;
@@ -3978,12 +4596,13 @@ fn reduce_attention_layer(
         // Mix claimed value into channel (binds it to transcript)
         mix_secure_field(channel, claimed_value);
 
-        let fresh_claim = GKRClaim { point: r, value: claimed_value };
+        let fresh_claim = GKRClaim {
+            point: r,
+            value: claimed_value,
+        };
 
         // Run matmul reduction
-        let (proof, input_claim) = reduce_matmul_layer(
-            &fresh_claim, a, b, m, k, n, channel,
-        )?;
+        let (proof, input_claim) = reduce_matmul_layer(&fresh_claim, a, b, m, k, n, channel)?;
 
         let layer_proof = LayerProof::MatMul {
             round_polys: proof.round_polys,
@@ -4001,7 +4620,9 @@ fn reduce_attention_layer(
         output_claim,
         &intermediates.concat,
         &attn_weights.w_o,
-        seq_len, d_model, d_model,
+        seq_len,
+        d_model,
+        d_model,
         channel,
     )?;
     sub_proofs.push(LayerProof::MatMul {
@@ -4023,7 +4644,9 @@ fn reduce_attention_layer(
         let (ctx_proof, _ctx_input, ctx_value) = prove_sub_matmul(
             &intermediates.softmax_outputs[h],
             &v_heads[h],
-            seq_len, seq_len, d_k,
+            seq_len,
+            seq_len,
+            d_k,
             channel,
         )?;
         sub_proofs.push(ctx_proof);
@@ -4032,12 +4655,8 @@ fn reduce_attention_layer(
         // Score matmul: scores_h = Q_h × K_h^T
         // shape: seq×seq = seq×d_k × d_k×seq
         let k_h_t = transpose_m31(&k_heads[h]);
-        let (score_proof, _score_input, score_value) = prove_sub_matmul(
-            &q_heads[h],
-            &k_h_t,
-            seq_len, d_k, seq_len,
-            channel,
-        )?;
+        let (score_proof, _score_input, score_value) =
+            prove_sub_matmul(&q_heads[h], &k_h_t, seq_len, d_k, seq_len, channel)?;
         sub_proofs.push(score_proof);
         sub_claim_values.push(score_value);
     }
@@ -4045,8 +4664,11 @@ fn reduce_attention_layer(
     // --- Projection matmuls: V, K, Q = input × W_V/K/Q ---
     // V projection
     let (v_proof, _v_input, v_value) = prove_sub_matmul(
-        input_matrix, &attn_weights.w_v,
-        seq_len, d_model, d_model,
+        input_matrix,
+        &attn_weights.w_v,
+        seq_len,
+        d_model,
+        d_model,
         channel,
     )?;
     sub_proofs.push(v_proof);
@@ -4054,8 +4676,11 @@ fn reduce_attention_layer(
 
     // K projection
     let (k_proof, _k_input, k_value) = prove_sub_matmul(
-        input_matrix, &attn_weights.w_k,
-        seq_len, d_model, d_model,
+        input_matrix,
+        &attn_weights.w_k,
+        seq_len,
+        d_model,
+        d_model,
         channel,
     )?;
     sub_proofs.push(k_proof);
@@ -4070,10 +4695,18 @@ fn reduce_attention_layer(
     let r_q = channel.draw_qm31s(log_rows + log_cols);
     let q_value = evaluate_mle(&q_mle, &r_q);
     mix_secure_field(channel, q_value);
-    let q_claim = GKRClaim { point: r_q, value: q_value };
+    let q_claim = GKRClaim {
+        point: r_q,
+        value: q_value,
+    };
     let (q_reduction, final_input_claim) = reduce_matmul_layer(
-        &q_claim, input_matrix, &attn_weights.w_q,
-        seq_len, d_model, d_model, channel,
+        &q_claim,
+        input_matrix,
+        &attn_weights.w_q,
+        seq_len,
+        d_model,
+        d_model,
+        channel,
     )?;
     sub_proofs.push(LayerProof::MatMul {
         round_polys: q_reduction.round_polys,
@@ -4085,7 +4718,13 @@ fn reduce_attention_layer(
     assert_eq!(sub_proofs.len(), expected_count);
     assert_eq!(sub_claim_values.len(), expected_count);
 
-    Ok((LayerProof::Attention { sub_proofs, sub_claim_values }, final_input_claim))
+    Ok((
+        LayerProof::Attention {
+            sub_proofs,
+            sub_claim_values,
+        },
+        final_input_claim,
+    ))
 }
 
 /// Test-accessible wrapper for `reduce_attention_layer`.
@@ -4156,10 +4795,8 @@ mod tests {
         };
 
         // Run matmul reduction
-        let (reduction, _input_claim) = reduce_matmul_layer(
-            &output_claim, &a, &b,
-            2, 4, 2, &mut channel,
-        ).unwrap();
+        let (reduction, _input_claim) =
+            reduce_matmul_layer(&output_claim, &a, &b, 2, 4, 2, &mut channel).unwrap();
 
         // Verify: sum of round polys at 0+1 should match claims
         let log_k = 2; // pad 4 → 4, log2(4)=2
@@ -4169,7 +4806,11 @@ mod tests {
         let product = reduction.final_a_eval * reduction.final_b_eval;
         // The product should be consistent with the sumcheck
         // (full verification requires replaying the Fiat-Shamir)
-        assert_ne!(product, SecureField::zero(), "product should be non-trivial");
+        assert_ne!(
+            product,
+            SecureField::zero(),
+            "product should be non-trivial"
+        );
     }
 
     #[test]
@@ -4183,19 +4824,21 @@ mod tests {
         let r = channel.draw_qm31s(2); // 4 elements → 2 vars
 
         // Compute claimed output
-        let c_vals: Vec<SecureField> = a_vals.iter().zip(&b_vals)
-            .map(|(&a, &b)| a + b)
-            .collect();
+        let c_vals: Vec<SecureField> = a_vals.iter().zip(&b_vals).map(|(&a, &b)| a + b).collect();
         let claimed = evaluate_mle(&c_vals, &r);
 
-        let output_claim = GKRClaim { point: r, value: claimed };
+        let output_claim = GKRClaim {
+            point: r,
+            value: claimed,
+        };
 
-        let (proof, _next_claim) = reduce_add_layer(
-            &output_claim, &a_vals, &b_vals, &mut channel,
-        ).unwrap();
+        let (proof, _next_claim) =
+            reduce_add_layer(&output_claim, &a_vals, &b_vals, &mut channel).unwrap();
 
         match proof {
-            LayerProof::Add { lhs_eval, rhs_eval, .. } => {
+            LayerProof::Add {
+                lhs_eval, rhs_eval, ..
+            } => {
                 // a_eval + b_eval should equal claimed sum
                 let sum = lhs_eval + rhs_eval;
                 assert_eq!(sum, claimed, "add reduction: lhs + rhs != claimed");
@@ -4215,19 +4858,23 @@ mod tests {
         let r = channel.draw_qm31s(2);
 
         // Compute claimed output: element-wise product
-        let c_vals: Vec<SecureField> = a_vals.iter().zip(&b_vals)
-            .map(|(&a, &b)| a * b)
-            .collect();
+        let c_vals: Vec<SecureField> = a_vals.iter().zip(&b_vals).map(|(&a, &b)| a * b).collect();
         let claimed = evaluate_mle(&c_vals, &r);
 
-        let output_claim = GKRClaim { point: r.clone(), value: claimed };
+        let output_claim = GKRClaim {
+            point: r.clone(),
+            value: claimed,
+        };
 
-        let (proof, _next_claim) = reduce_mul_layer(
-            &output_claim, &a_vals, &b_vals, &mut channel,
-        ).unwrap();
+        let (proof, _next_claim) =
+            reduce_mul_layer(&output_claim, &a_vals, &b_vals, &mut channel).unwrap();
 
         match proof {
-            LayerProof::Mul { eq_round_polys, lhs_eval, rhs_eval } => {
+            LayerProof::Mul {
+                eq_round_polys,
+                lhs_eval,
+                rhs_eval,
+            } => {
                 // After eq-sumcheck, lhs_eval and rhs_eval are evaluated at
                 // the sumcheck challenge point, not at r. Verify the final
                 // eq-sumcheck relation: eq(r, challenges) * a(s) * b(s) == claimed
@@ -4246,17 +4893,22 @@ mod tests {
                     challenges.push(replay_channel.draw_qm31());
                 }
 
-                let eq_val = build_eq_evals(&r)[0..1].iter().copied().fold(
-                    SecureField::zero(),
-                    |_acc, _x| SecureField::zero(),
-                );
+                let eq_val = build_eq_evals(&r)[0..1]
+                    .iter()
+                    .copied()
+                    .fold(SecureField::zero(), |_acc, _x| SecureField::zero());
                 // Just verify the sumcheck structure: p(0) + p(1) == current sum
                 let mut current_sum = claimed;
                 for rp in &eq_round_polys {
                     let p0 = rp.c0;
                     let p1 = rp.c0 + rp.c1 + rp.c2 + rp.c3;
                     assert_eq!(p0 + p1, current_sum, "round sum check");
-                    current_sum = rp.eval(challenges[eq_round_polys.iter().position(|x| std::ptr::eq(x, rp)).unwrap()]);
+                    current_sum = rp.eval(
+                        challenges[eq_round_polys
+                            .iter()
+                            .position(|x| std::ptr::eq(x, rp))
+                            .unwrap()],
+                    );
                 }
                 // Final: current_sum == eq(r, challenges) * lhs * rhs
                 let eq_final = {
@@ -4266,7 +4918,11 @@ mod tests {
                     }
                     e
                 };
-                assert_eq!(current_sum, eq_final * lhs_eval * rhs_eval, "final eq-sumcheck relation");
+                assert_eq!(
+                    current_sum,
+                    eq_final * lhs_eval * rhs_eval,
+                    "final eq-sumcheck relation"
+                );
             }
             _ => panic!("expected Mul proof"),
         }
@@ -4277,8 +4933,12 @@ mod tests {
         // Verify that c0 + c1 + c2 = sum at t=1 for each round
         let mut a = M31Matrix::new(2, 4);
         let mut b = M31Matrix::new(4, 2);
-        for i in 0..8 { a.data[i] = M31::from((i + 1) as u32); }
-        for i in 0..8 { b.data[i] = M31::from((i + 10) as u32); }
+        for i in 0..8 {
+            a.data[i] = M31::from((i + 1) as u32);
+        }
+        for i in 0..8 {
+            b.data[i] = M31::from((i + 10) as u32);
+        }
         let c = matmul_forward(&a, &b);
 
         let c_padded = pad_matrix_pow2(&c);
@@ -4290,11 +4950,12 @@ mod tests {
         let r_out = channel.draw_qm31s(log_m + log_n);
         let claimed = evaluate_mle(&c_mle, &r_out);
 
-        let claim = GKRClaim { point: r_out, value: claimed };
+        let claim = GKRClaim {
+            point: r_out,
+            value: claimed,
+        };
 
-        let (reduction, _) = reduce_matmul_layer(
-            &claim, &a, &b, 2, 4, 2, &mut channel,
-        ).unwrap();
+        let (reduction, _) = reduce_matmul_layer(&claim, &a, &b, 2, 4, 2, &mut channel).unwrap();
 
         // Check first round: p(0) + p(1) should equal the claimed sum
         let rp0 = &reduction.round_polys[0];
@@ -4307,13 +4968,18 @@ mod tests {
     // ===== Attention GKR Tests =====
 
     /// Generate deterministic attention weights for testing.
-    fn make_attn_test_weights(d_model: usize, seed: u64) -> crate::components::attention::AttentionWeights {
+    fn make_attn_test_weights(
+        d_model: usize,
+        seed: u64,
+    ) -> crate::components::attention::AttentionWeights {
         fn fill_matrix(rows: usize, cols: usize, seed: u64) -> M31Matrix {
             let mut m = M31Matrix::new(rows, cols);
             let mut state = seed;
             for i in 0..rows {
                 for j in 0..cols {
-                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
                     let val = ((state >> 33) % 9 + 1) as u32;
                     m.set(i, j, M31::from(val));
                 }
@@ -4342,7 +5008,7 @@ mod tests {
     #[test]
     fn test_attention_prove_and_verify() {
         // 1 head, d_model=4, seq_len=4
-        use crate::components::attention::{MultiHeadAttentionConfig, attention_forward};
+        use crate::components::attention::{attention_forward, MultiHeadAttentionConfig};
         use crate::gkr::verifier::verify_attention_reduction_for_test;
 
         let config = MultiHeadAttentionConfig::new(1, 4, 4);
@@ -4371,15 +5037,28 @@ mod tests {
 
         // Prove
         let (proof, input_claim) = reduce_attention_layer(
-            &output_claim, &input, &weights, &config, &mut prover_channel,
-        ).unwrap();
+            &output_claim,
+            &input,
+            &weights,
+            &config,
+            &mut prover_channel,
+        )
+        .unwrap();
 
         // Check proof structure
         match &proof {
-            LayerProof::Attention { sub_proofs, sub_claim_values } => {
+            LayerProof::Attention {
+                sub_proofs,
+                sub_claim_values,
+            } => {
                 let expected = 4 + 2 * 1; // 6 sub-proofs for 1 head
-                assert_eq!(sub_proofs.len(), expected,
-                    "expected {} sub-proofs, got {}", expected, sub_proofs.len());
+                assert_eq!(
+                    sub_proofs.len(),
+                    expected,
+                    "expected {} sub-proofs, got {}",
+                    expected,
+                    sub_proofs.len()
+                );
                 assert_eq!(sub_claim_values.len(), expected);
 
                 // Verify
@@ -4389,14 +5068,23 @@ mod tests {
                 assert_eq!(r_out_v, output_claim.point);
 
                 let verified_claim = verify_attention_reduction_for_test(
-                    &output_claim, &config, sub_proofs, sub_claim_values, 0,
+                    &output_claim,
+                    &config,
+                    sub_proofs,
+                    sub_claim_values,
+                    0,
                     &mut verifier_channel,
-                ).unwrap();
+                )
+                .unwrap();
 
-                assert_eq!(verified_claim.point, input_claim.point,
-                    "verified claim point should match prover's input claim point");
-                assert_eq!(verified_claim.value, input_claim.value,
-                    "verified claim value should match prover's input claim value");
+                assert_eq!(
+                    verified_claim.point, input_claim.point,
+                    "verified claim point should match prover's input claim point"
+                );
+                assert_eq!(
+                    verified_claim.value, input_claim.value,
+                    "verified claim value should match prover's input claim value"
+                );
             }
             _ => panic!("expected Attention proof"),
         }
@@ -4405,7 +5093,7 @@ mod tests {
     #[test]
     fn test_attention_multi_head_prove_verify() {
         // 2 heads, d_model=4, seq_len=4
-        use crate::components::attention::{MultiHeadAttentionConfig, attention_forward};
+        use crate::components::attention::{attention_forward, MultiHeadAttentionConfig};
         use crate::gkr::verifier::verify_attention_reduction_for_test;
 
         let config = MultiHeadAttentionConfig::new(2, 4, 4);
@@ -4423,14 +5111,25 @@ mod tests {
         prover_channel.mix_u64(0xA772);
         let r_out = prover_channel.draw_qm31s(log_rows + log_cols);
         let output_value = evaluate_mle(&output_mle, &r_out);
-        let output_claim = GKRClaim { point: r_out, value: output_value };
+        let output_claim = GKRClaim {
+            point: r_out,
+            value: output_value,
+        };
 
         let (proof, input_claim) = reduce_attention_layer(
-            &output_claim, &input, &weights, &config, &mut prover_channel,
-        ).unwrap();
+            &output_claim,
+            &input,
+            &weights,
+            &config,
+            &mut prover_channel,
+        )
+        .unwrap();
 
         match &proof {
-            LayerProof::Attention { sub_proofs, sub_claim_values } => {
+            LayerProof::Attention {
+                sub_proofs,
+                sub_claim_values,
+            } => {
                 let expected = 4 + 2 * 2; // 8 sub-proofs for 2 heads
                 assert_eq!(sub_proofs.len(), expected);
                 assert_eq!(sub_claim_values.len(), expected);
@@ -4440,9 +5139,14 @@ mod tests {
                 let _ = verifier_channel.draw_qm31s(log_rows + log_cols);
 
                 let verified_claim = verify_attention_reduction_for_test(
-                    &output_claim, &config, sub_proofs, sub_claim_values, 0,
+                    &output_claim,
+                    &config,
+                    sub_proofs,
+                    sub_claim_values,
+                    0,
                     &mut verifier_channel,
-                ).unwrap();
+                )
+                .unwrap();
 
                 assert_eq!(verified_claim.point, input_claim.point);
                 assert_eq!(verified_claim.value, input_claim.value);
@@ -4454,7 +5158,7 @@ mod tests {
     #[test]
     fn test_attention_tampered_sub_proof_fails() {
         // Tamper with a matmul sub-proof and verify the verifier rejects it
-        use crate::components::attention::{MultiHeadAttentionConfig, attention_forward};
+        use crate::components::attention::{attention_forward, MultiHeadAttentionConfig};
         use crate::gkr::verifier::verify_attention_reduction_for_test;
 
         let config = MultiHeadAttentionConfig::new(1, 4, 4);
@@ -4472,16 +5176,31 @@ mod tests {
         prover_channel.mix_u64(0xA773);
         let r_out = prover_channel.draw_qm31s(log_rows + log_cols);
         let output_value = evaluate_mle(&output_mle, &r_out);
-        let output_claim = GKRClaim { point: r_out, value: output_value };
+        let output_claim = GKRClaim {
+            point: r_out,
+            value: output_value,
+        };
 
         let (proof, _) = reduce_attention_layer(
-            &output_claim, &input, &weights, &config, &mut prover_channel,
-        ).unwrap();
+            &output_claim,
+            &input,
+            &weights,
+            &config,
+            &mut prover_channel,
+        )
+        .unwrap();
 
         match proof {
-            LayerProof::Attention { mut sub_proofs, sub_claim_values } => {
+            LayerProof::Attention {
+                mut sub_proofs,
+                sub_claim_values,
+            } => {
                 // Tamper with the first sub-proof (output projection)
-                if let LayerProof::MatMul { ref mut final_a_eval, .. } = sub_proofs[0] {
+                if let LayerProof::MatMul {
+                    ref mut final_a_eval,
+                    ..
+                } = sub_proofs[0]
+                {
                     *final_a_eval = *final_a_eval + SecureField::one();
                 }
 
@@ -4490,7 +5209,11 @@ mod tests {
                 let _ = verifier_channel.draw_qm31s(log_rows + log_cols);
 
                 let result = verify_attention_reduction_for_test(
-                    &output_claim, &config, &sub_proofs, &sub_claim_values, 0,
+                    &output_claim,
+                    &config,
+                    &sub_proofs,
+                    &sub_claim_values,
+                    0,
                     &mut verifier_channel,
                 );
                 assert!(result.is_err(), "tampered proof should fail verification");
@@ -4502,7 +5225,7 @@ mod tests {
     #[test]
     fn test_attention_causal_prove_verify() {
         // Causal masking variant
-        use crate::components::attention::{MultiHeadAttentionConfig, attention_forward};
+        use crate::components::attention::{attention_forward, MultiHeadAttentionConfig};
         use crate::gkr::verifier::verify_attention_reduction_for_test;
 
         let config = MultiHeadAttentionConfig::new_causal(1, 4, 4);
@@ -4520,22 +5243,38 @@ mod tests {
         prover_channel.mix_u64(0xA774);
         let r_out = prover_channel.draw_qm31s(log_rows + log_cols);
         let output_value = evaluate_mle(&output_mle, &r_out);
-        let output_claim = GKRClaim { point: r_out, value: output_value };
+        let output_claim = GKRClaim {
+            point: r_out,
+            value: output_value,
+        };
 
         let (proof, input_claim) = reduce_attention_layer(
-            &output_claim, &input, &weights, &config, &mut prover_channel,
-        ).unwrap();
+            &output_claim,
+            &input,
+            &weights,
+            &config,
+            &mut prover_channel,
+        )
+        .unwrap();
 
         match &proof {
-            LayerProof::Attention { sub_proofs, sub_claim_values } => {
+            LayerProof::Attention {
+                sub_proofs,
+                sub_claim_values,
+            } => {
                 let mut verifier_channel = PoseidonChannel::new();
                 verifier_channel.mix_u64(0xA774);
                 let _ = verifier_channel.draw_qm31s(log_rows + log_cols);
 
                 let verified_claim = verify_attention_reduction_for_test(
-                    &output_claim, &config, sub_proofs, sub_claim_values, 0,
+                    &output_claim,
+                    &config,
+                    sub_proofs,
+                    sub_claim_values,
+                    0,
                     &mut verifier_channel,
-                ).unwrap();
+                )
+                .unwrap();
 
                 assert_eq!(verified_claim.point, input_claim.point);
                 assert_eq!(verified_claim.value, input_claim.value);
@@ -4553,10 +5292,16 @@ mod tests {
     fn cpu_degree2_matmul_sumcheck(
         f_a: &[SecureField],
         f_b: &[SecureField],
-        m: usize, k: usize, n: usize,
+        m: usize,
+        k: usize,
+        n: usize,
         claimed_value: SecureField,
         channel: &mut PoseidonChannel,
-    ) -> (Vec<crate::components::matmul::RoundPoly>, SecureField, SecureField) {
+    ) -> (
+        Vec<crate::components::matmul::RoundPoly>,
+        SecureField,
+        SecureField,
+    ) {
         use crate::components::matmul::RoundPoly;
         use stwo::core::fields::FieldExpOps;
 
@@ -4612,11 +5357,17 @@ mod tests {
         block_weights: &[SecureField],
         pk: usize,
         n_block_vars: usize,
-        m: usize, k: usize, n: usize,
+        m: usize,
+        k: usize,
+        n: usize,
         n_blocks: usize,
         claimed_value: SecureField,
         channel: &mut PoseidonChannel,
-    ) -> (Vec<crate::gkr::types::RoundPolyDeg3>, SecureField, SecureField) {
+    ) -> (
+        Vec<crate::gkr::types::RoundPolyDeg3>,
+        SecureField,
+        SecureField,
+    ) {
         use crate::gkr::types::RoundPolyDeg3;
         use stwo::core::fields::FieldExpOps;
 
@@ -4653,11 +5404,13 @@ mod tests {
             let mid = cur_n / 2;
             let sum_at = |t: SecureField| -> SecureField {
                 let ot = SecureField::one() - t;
-                (0..mid).map(|i| {
-                    (ot * ext_w[i] + t * ext_w[mid + i])
-                    * (ot * ext_a[i] + t * ext_a[mid + i])
-                    * (ot * ext_b[i] + t * ext_b[mid + i])
-                }).fold(SecureField::zero(), |a, b| a + b)
+                (0..mid)
+                    .map(|i| {
+                        (ot * ext_w[i] + t * ext_w[mid + i])
+                            * (ot * ext_a[i] + t * ext_a[mid + i])
+                            * (ot * ext_b[i] + t * ext_b[mid + i])
+                    })
+                    .fold(SecureField::zero(), |a, b| a + b)
             };
             let s0 = sum_at(SecureField::zero());
             let s1 = sum_at(SecureField::one());
@@ -4677,9 +5430,15 @@ mod tests {
             let ch = channel.draw_qm31();
 
             let oc = SecureField::one() - ch;
-            ext_w = (0..mid).map(|i| oc * ext_w[i] + ch * ext_w[mid + i]).collect();
-            ext_a = (0..mid).map(|i| oc * ext_a[i] + ch * ext_a[mid + i]).collect();
-            ext_b = (0..mid).map(|i| oc * ext_b[i] + ch * ext_b[mid + i]).collect();
+            ext_w = (0..mid)
+                .map(|i| oc * ext_w[i] + ch * ext_w[mid + i])
+                .collect();
+            ext_a = (0..mid)
+                .map(|i| oc * ext_a[i] + ch * ext_a[mid + i])
+                .collect();
+            ext_b = (0..mid)
+                .map(|i| oc * ext_b[i] + ch * ext_b[mid + i])
+                .collect();
             cur_n = mid;
         }
 
@@ -4699,9 +5458,7 @@ mod tests {
     /// through `verify_attention_reduction(..., Some(&r_simd), ...)`.
     #[test]
     fn test_simd_attention_dual_operand_prove_verify() {
-        use crate::components::attention::{
-            MultiHeadAttentionConfig, attention_forward,
-        };
+        use crate::components::attention::{attention_forward, MultiHeadAttentionConfig};
         let d_model = 4;
         let seq_len = 4;
         let num_heads = 1;
@@ -4733,16 +5490,18 @@ mod tests {
 
         // Helper: combine two MLEs with SIMD weights
         let combine = |mle_0: &[SecureField], mle_1: &[SecureField]| -> Vec<SecureField> {
-            mle_0.iter().zip(mle_1).map(|(&a, &b)| w_0 * a + w_1 * b).collect()
+            mle_0
+                .iter()
+                .zip(mle_1)
+                .map(|(&a, &b)| w_0 * a + w_1 * b)
+                .collect()
         };
 
         // Combine final outputs
         let out_0_padded = pad_matrix_pow2(&inter_0.final_output);
         let out_1_padded = pad_matrix_pow2(&inter_1.final_output);
-        let combined_out_mle = combine(
-            &matrix_to_mle(&out_0_padded),
-            &matrix_to_mle(&out_1_padded),
-        );
+        let combined_out_mle =
+            combine(&matrix_to_mle(&out_0_padded), &matrix_to_mle(&out_1_padded));
 
         let log_rows = out_0_padded.rows.ilog2() as usize;
         let log_cols = out_0_padded.cols.ilog2() as usize;
@@ -4752,7 +5511,10 @@ mod tests {
         prover_channel.mix_u64(0x51AD_A77E);
         let r_out = prover_channel.draw_qm31s(log_rows + log_cols);
         let output_value = evaluate_mle(&combined_out_mle, &r_out);
-        let output_claim = GKRClaim { point: r_out, value: output_value };
+        let output_claim = GKRClaim {
+            point: r_out,
+            value: output_value,
+        };
 
         // Mix attention metadata (matches verifier lines 1721-1725)
         prover_channel.mix_u64(0x4154544E_u64); // "ATTN"
@@ -4778,12 +5540,18 @@ mod tests {
             // Restrict combined A (row-major) by rows, B (col-major) by cols
             let f_a = restrict_mle(&combined_concat, r_i);
             let f_b = restrict_mle(
-                &matrix_to_mle_col_major(&pad_matrix_pow2(&weights.w_o)), r_j,
+                &matrix_to_mle_col_major(&pad_matrix_pow2(&weights.w_o)),
+                r_j,
             );
 
             let (rps, fa, fb) = cpu_degree2_matmul_sumcheck(
-                &f_a, &f_b, seq_len, d_model, d_model,
-                output_claim.value, &mut prover_channel,
+                &f_a,
+                &f_b,
+                seq_len,
+                d_model,
+                d_model,
+                output_claim.value,
+                &mut prover_channel,
             );
 
             sub_proofs.push(LayerProof::MatMul {
@@ -4820,16 +5588,20 @@ mod tests {
             let v_heads_1 = split_heads(&inter_1.v, num_heads);
 
             let f_a_ctx_0 = restrict_mle(
-                &matrix_to_mle(&pad_matrix_pow2(&inter_0.softmax_outputs[h])), r_i_ctx,
+                &matrix_to_mle(&pad_matrix_pow2(&inter_0.softmax_outputs[h])),
+                r_i_ctx,
             );
             let f_a_ctx_1 = restrict_mle(
-                &matrix_to_mle(&pad_matrix_pow2(&inter_1.softmax_outputs[h])), r_i_ctx,
+                &matrix_to_mle(&pad_matrix_pow2(&inter_1.softmax_outputs[h])),
+                r_i_ctx,
             );
             let f_b_ctx_0 = restrict_mle(
-                &matrix_to_mle_col_major(&pad_matrix_pow2(&v_heads_0[h])), r_j_ctx,
+                &matrix_to_mle_col_major(&pad_matrix_pow2(&v_heads_0[h])),
+                r_j_ctx,
             );
             let f_b_ctx_1 = restrict_mle(
-                &matrix_to_mle_col_major(&pad_matrix_pow2(&v_heads_1[h])), r_j_ctx,
+                &matrix_to_mle_col_major(&pad_matrix_pow2(&v_heads_1[h])),
+                r_j_ctx,
             );
 
             let pk_inner = f_a_ctx_0.len();
@@ -4838,9 +5610,13 @@ mod tests {
                 &[&f_a_ctx_0, &f_a_ctx_1],
                 &[&f_b_ctx_0, &f_b_ctx_1],
                 &block_weights,
-                pk_inner, n_block_vars,
-                seq_len, seq_len, d_k,
-                n_blocks, ctx_value,
+                pk_inner,
+                n_block_vars,
+                seq_len,
+                seq_len,
+                d_k,
+                n_blocks,
+                ctx_value,
                 &mut prover_channel,
             );
 
@@ -4880,17 +5656,15 @@ mod tests {
             let r_i_score = &r_score[..score_log_rows];
             let r_j_score = &r_score[score_log_rows..];
 
-            let f_a_s0 = restrict_mle(
-                &matrix_to_mle(&pad_matrix_pow2(&q_heads_0[h])), r_i_score,
-            );
-            let f_a_s1 = restrict_mle(
-                &matrix_to_mle(&pad_matrix_pow2(&q_heads_1[h])), r_i_score,
-            );
+            let f_a_s0 = restrict_mle(&matrix_to_mle(&pad_matrix_pow2(&q_heads_0[h])), r_i_score);
+            let f_a_s1 = restrict_mle(&matrix_to_mle(&pad_matrix_pow2(&q_heads_1[h])), r_i_score);
             let f_b_s0 = restrict_mle(
-                &matrix_to_mle_col_major(&pad_matrix_pow2(&k_h_t_0)), r_j_score,
+                &matrix_to_mle_col_major(&pad_matrix_pow2(&k_h_t_0)),
+                r_j_score,
             );
             let f_b_s1 = restrict_mle(
-                &matrix_to_mle_col_major(&pad_matrix_pow2(&k_h_t_1)), r_j_score,
+                &matrix_to_mle_col_major(&pad_matrix_pow2(&k_h_t_1)),
+                r_j_score,
             );
 
             let pk_inner_score = f_a_s0.len();
@@ -4899,9 +5673,13 @@ mod tests {
                 &[&f_a_s0, &f_a_s1],
                 &[&f_b_s0, &f_b_s1],
                 &block_weights,
-                pk_inner_score, n_block_vars,
-                seq_len, d_k, seq_len,
-                n_blocks, score_value,
+                pk_inner_score,
+                n_block_vars,
+                seq_len,
+                d_k,
+                seq_len,
+                n_blocks,
+                score_value,
                 &mut prover_channel,
             );
 
@@ -4926,31 +5704,37 @@ mod tests {
         let proj_log_cols = proj_pn.ilog2() as usize;
 
         // Helper: prove a fresh-claim shared-weight projection
-        let mut prove_projection = |combined_out_mle: &[SecureField],
-                                     weight: &M31Matrix|
-         -> (LayerProof, SecureField) {
-            let r = prover_channel.draw_qm31s(proj_log_rows + proj_log_cols);
-            let val = evaluate_mle(combined_out_mle, &r);
-            mix_secure_field(&mut prover_channel, val);
+        let mut prove_projection =
+            |combined_out_mle: &[SecureField], weight: &M31Matrix| -> (LayerProof, SecureField) {
+                let r = prover_channel.draw_qm31s(proj_log_rows + proj_log_cols);
+                let val = evaluate_mle(combined_out_mle, &r);
+                mix_secure_field(&mut prover_channel, val);
 
-            let r_i = &r[..proj_log_rows];
-            let r_j = &r[proj_log_rows..];
+                let r_i = &r[..proj_log_rows];
+                let r_j = &r[proj_log_rows..];
 
-            let f_a = restrict_mle(&combined_input, r_i);
-            let f_b = restrict_mle(
-                &matrix_to_mle_col_major(&pad_matrix_pow2(weight)), r_j,
-            );
+                let f_a = restrict_mle(&combined_input, r_i);
+                let f_b = restrict_mle(&matrix_to_mle_col_major(&pad_matrix_pow2(weight)), r_j);
 
-            let (rps, fa, fb) = cpu_degree2_matmul_sumcheck(
-                &f_a, &f_b, seq_len, d_model, d_model, val, &mut prover_channel,
-            );
+                let (rps, fa, fb) = cpu_degree2_matmul_sumcheck(
+                    &f_a,
+                    &f_b,
+                    seq_len,
+                    d_model,
+                    d_model,
+                    val,
+                    &mut prover_channel,
+                );
 
-            (LayerProof::MatMul {
-                round_polys: rps,
-                final_a_eval: fa,
-                final_b_eval: fb,
-            }, val)
-        };
+                (
+                    LayerProof::MatMul {
+                        round_polys: rps,
+                        final_a_eval: fa,
+                        final_b_eval: fb,
+                    },
+                    val,
+                )
+            };
 
         // V projection
         let combined_v = combine(
@@ -4988,11 +5772,20 @@ mod tests {
         let _r_out_v = verifier_channel.draw_qm31s(log_rows + log_cols);
 
         let result = crate::gkr::verifier::verify_attention_reduction(
-            &output_claim, &config, &sub_proofs, &sub_claim_values,
-            Some(&r_simd), 0, &mut verifier_channel,
+            &output_claim,
+            &config,
+            &sub_proofs,
+            &sub_claim_values,
+            Some(&r_simd),
+            0,
+            &mut verifier_channel,
         );
 
-        assert!(result.is_ok(), "SIMD attention verification failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "SIMD attention verification failed: {:?}",
+            result.err()
+        );
     }
 
     // ===== GPU Tests =====
@@ -5015,8 +5808,12 @@ mod tests {
 
             let mut a = M31Matrix::new(2, 4);
             let mut b = M31Matrix::new(4, 2);
-            for i in 0..8 { a.data[i] = M31::from((i + 1) as u32); }
-            for i in 0..8 { b.data[i] = M31::from((i + 1) as u32); }
+            for i in 0..8 {
+                a.data[i] = M31::from((i + 1) as u32);
+            }
+            for i in 0..8 {
+                b.data[i] = M31::from((i + 1) as u32);
+            }
             let c = matmul_forward(&a, &b);
 
             let mut weights = GraphWeights::new();
@@ -5030,9 +5827,9 @@ mod tests {
 
             // Prove with GPU
             let mut prover_channel = PoseidonChannel::new();
-            let proof = super::super::prove_gkr_gpu(
-                &circuit, &execution, &weights, &mut prover_channel,
-            ).unwrap();
+            let proof =
+                super::super::prove_gkr_gpu(&circuit, &execution, &weights, &mut prover_channel)
+                    .unwrap();
 
             assert_eq!(proof.layer_proofs.len(), 1);
             match &proof.layer_proofs[0] {
@@ -5059,12 +5856,18 @@ mod tests {
 
             let mut w1 = M31Matrix::new(4, 4);
             let mut w2 = M31Matrix::new(4, 2);
-            for i in 0..16 { w1.data[i] = M31::from((i % 5 + 1) as u32); }
-            for i in 0..8 { w2.data[i] = M31::from((i % 3 + 1) as u32); }
+            for i in 0..16 {
+                w1.data[i] = M31::from((i % 5 + 1) as u32);
+            }
+            for i in 0..8 {
+                w2.data[i] = M31::from((i % 3 + 1) as u32);
+            }
 
             let input = {
                 let mut m = M31Matrix::new(2, 4);
-                for i in 0..8 { m.data[i] = M31::from((i + 1) as u32); }
+                for i in 0..8 {
+                    m.data[i] = M31::from((i + 1) as u32);
+                }
                 m
             };
             let hidden = matmul_forward(&input, &w1);
@@ -5097,9 +5900,9 @@ mod tests {
 
             // GPU prove
             let mut prover_channel = PoseidonChannel::new();
-            let proof = super::super::prove_gkr_gpu(
-                &circuit, &execution, &weights, &mut prover_channel,
-            ).unwrap();
+            let proof =
+                super::super::prove_gkr_gpu(&circuit, &execution, &weights, &mut prover_channel)
+                    .unwrap();
             assert_eq!(proof.layer_proofs.len(), 3); // MatMul + Activation + MatMul
 
             // CPU verify
@@ -5117,8 +5920,12 @@ mod tests {
 
             let mut a = M31Matrix::new(2, 4);
             let mut b = M31Matrix::new(4, 2);
-            for i in 0..8 { a.data[i] = M31::from((i * 3 + 7) as u32 % 31); }
-            for i in 0..8 { b.data[i] = M31::from((i * 5 + 11) as u32 % 31); }
+            for i in 0..8 {
+                a.data[i] = M31::from((i * 3 + 7) as u32 % 31);
+            }
+            for i in 0..8 {
+                b.data[i] = M31::from((i * 5 + 11) as u32 % 31);
+            }
             let c = matmul_forward(&a, &b);
 
             let mut weights = GraphWeights::new();
@@ -5132,23 +5939,29 @@ mod tests {
 
             // CPU proof
             let mut cpu_channel = PoseidonChannel::new();
-            let cpu_proof = prove_gkr(
-                &circuit, &execution, &weights, &mut cpu_channel,
-            ).unwrap();
+            let cpu_proof = prove_gkr(&circuit, &execution, &weights, &mut cpu_channel).unwrap();
 
             // GPU proof
             let mut gpu_channel = PoseidonChannel::new();
-            let gpu_proof = super::super::prove_gkr_gpu(
-                &circuit, &execution, &weights, &mut gpu_channel,
-            ).unwrap();
+            let gpu_proof =
+                super::super::prove_gkr_gpu(&circuit, &execution, &weights, &mut gpu_channel)
+                    .unwrap();
 
             // Compare proof structure
             assert_eq!(cpu_proof.layer_proofs.len(), gpu_proof.layer_proofs.len());
 
             match (&cpu_proof.layer_proofs[0], &gpu_proof.layer_proofs[0]) {
                 (
-                    LayerProof::MatMul { round_polys: cpu_rp, final_a_eval: cpu_a, final_b_eval: cpu_b },
-                    LayerProof::MatMul { round_polys: gpu_rp, final_a_eval: gpu_a, final_b_eval: gpu_b },
+                    LayerProof::MatMul {
+                        round_polys: cpu_rp,
+                        final_a_eval: cpu_a,
+                        final_b_eval: cpu_b,
+                    },
+                    LayerProof::MatMul {
+                        round_polys: gpu_rp,
+                        final_a_eval: gpu_a,
+                        final_b_eval: gpu_b,
+                    },
                 ) => {
                     assert_eq!(cpu_rp.len(), gpu_rp.len());
                     for (i, (cr, gr)) in cpu_rp.iter().zip(gpu_rp).enumerate() {
@@ -5176,13 +5989,19 @@ mod tests {
 
             // Shared weight matrix B (4×2)
             let mut b = M31Matrix::new(4, 2);
-            for i in 0..8 { b.data[i] = M31::from((i + 1) as u32); }
+            for i in 0..8 {
+                b.data[i] = M31::from((i + 1) as u32);
+            }
 
             // Two different activation matrices A0, A1 (2×4)
             let mut a0 = M31Matrix::new(2, 4);
-            for i in 0..8 { a0.data[i] = M31::from((i * 3 + 5) as u32 % 31); }
+            for i in 0..8 {
+                a0.data[i] = M31::from((i * 3 + 5) as u32 % 31);
+            }
             let mut a1 = M31Matrix::new(2, 4);
-            for i in 0..8 { a1.data[i] = M31::from((i * 7 + 2) as u32 % 31); }
+            for i in 0..8 {
+                a1.data[i] = M31::from((i * 7 + 2) as u32 % 31);
+            }
 
             // Compute outputs C0 = A0×B, C1 = A1×B
             let c0 = matmul_forward(&a0, &b);
@@ -5198,7 +6017,9 @@ mod tests {
             let c1_padded = pad_matrix_pow2(&c1);
             let c0_mle = matrix_to_mle(&c0_padded);
             let c1_mle = matrix_to_mle(&c1_padded);
-            let combined_output: Vec<SecureField> = c0_mle.iter().zip(&c1_mle)
+            let combined_output: Vec<SecureField> = c0_mle
+                .iter()
+                .zip(&c1_mle)
                 .map(|(&v0, &v1)| block_weights[0] * v0 + block_weights[1] * v1)
                 .collect();
 
@@ -5209,7 +6030,10 @@ mod tests {
             channel.mix_u64(0x51BD as u64);
             let r_out = channel.draw_qm31s(log_m + log_n);
             let claimed = evaluate_mle(&combined_output, &r_out);
-            let output_claim = GKRClaim { point: r_out, value: claimed };
+            let output_claim = GKRClaim {
+                point: r_out,
+                value: claimed,
+            };
 
             // Run SIMD matmul reduction
             let block_a_matrices: Vec<&M31Matrix> = vec![&a0, &a1];
@@ -5219,13 +6043,20 @@ mod tests {
                 &block_a_matrices,
                 &b,
                 &block_weights,
-                2, 4, 2, // m, k, n
+                2,
+                4,
+                2, // m, k, n
                 &mut channel,
-            ).unwrap();
+            )
+            .unwrap();
 
             // Verify proof structure
             match &proof {
-                LayerProof::MatMul { round_polys, final_a_eval, final_b_eval } => {
+                LayerProof::MatMul {
+                    round_polys,
+                    final_a_eval,
+                    final_b_eval,
+                } => {
                     let pk = 4usize.next_power_of_two();
                     let log_k = pk.ilog2() as usize;
                     assert_eq!(round_polys.len(), log_k, "should have log2(k) rounds");
@@ -5252,8 +6083,11 @@ mod tests {
                     }
 
                     // Final: current_sum == final_a_eval * final_b_eval
-                    assert_eq!(current_sum, *final_a_eval * *final_b_eval,
-                        "final sumcheck relation");
+                    assert_eq!(
+                        current_sum,
+                        *final_a_eval * *final_b_eval,
+                        "final sumcheck relation"
+                    );
                 }
                 _ => panic!("expected MatMul proof"),
             }
@@ -5261,8 +6095,10 @@ mod tests {
             // Verify next claim has expected dimensionality
             let pm = 2usize.next_power_of_two();
             let pk = 4usize.next_power_of_two();
-            assert!(next_claim.point.len() >= (pm.ilog2() as usize) + (pk.ilog2() as usize),
-                "next claim should have log_m + log_k dimensions");
+            assert!(
+                next_claim.point.len() >= (pm.ilog2() as usize) + (pk.ilog2() as usize),
+                "next claim should have log_m + log_k dimensions"
+            );
         }
 
         #[test]
@@ -5312,8 +6148,8 @@ mod tests {
         fn test_gpu_cpu_activation_proof_match() {
             // Cross-validate: GPU and CPU activation reduction must produce
             // byte-identical LogUp proofs given the same inputs.
-            use crate::gpu_sumcheck::GpuSumcheckExecutor;
             use super::super::types::LogUpProof;
+            use crate::gpu_sumcheck::GpuSumcheckExecutor;
 
             let gpu = std::sync::Arc::new(GpuSumcheckExecutor::new().unwrap());
 
@@ -5330,7 +6166,9 @@ mod tests {
 
             let input_mle = matrix_to_mle(&padded);
             let activation_fn = ActivationType::ReLU.as_fn();
-            let output_mle: Vec<SecureField> = padded.data.iter()
+            let output_mle: Vec<SecureField> = padded
+                .data
+                .iter()
                 .take(n)
                 .map(|&v| SecureField::from(activation_fn(v)))
                 .collect();
@@ -5340,35 +6178,57 @@ mod tests {
             setup_channel.mix_u64(0xACT1 as u64);
             let claim_point = setup_channel.draw_qm31s(num_vars);
             let claimed_value = evaluate_mle(&output_mle, &claim_point);
-            let output_claim = GKRClaim { point: claim_point, value: claimed_value };
+            let output_claim = GKRClaim {
+                point: claim_point,
+                value: claimed_value,
+            };
 
             // --- CPU proof ---
             let mut cpu_channel = PoseidonChannel::new();
             let (cpu_proof, cpu_next_claim) = reduce_activation_layer_for_test(
-                &output_claim, &input, ActivationType::ReLU, &mut cpu_channel,
-            ).unwrap();
+                &output_claim,
+                &input,
+                ActivationType::ReLU,
+                &mut cpu_channel,
+            )
+            .unwrap();
 
             // --- GPU proof ---
             let mut gpu_channel = PoseidonChannel::new();
             let (gpu_proof, gpu_next_claim) = super::super::reduce_activation_layer_gpu_for_test(
-                &gpu, &output_claim, &input, ActivationType::ReLU, &mut gpu_channel,
-            ).unwrap();
+                &gpu,
+                &output_claim,
+                &input,
+                ActivationType::ReLU,
+                &mut gpu_channel,
+            )
+            .unwrap();
 
             // Compare next claims
-            assert_eq!(cpu_next_claim.point, gpu_next_claim.point, "next claim point mismatch");
-            assert_eq!(cpu_next_claim.value, gpu_next_claim.value, "next claim value mismatch");
+            assert_eq!(
+                cpu_next_claim.point, gpu_next_claim.point,
+                "next claim point mismatch"
+            );
+            assert_eq!(
+                cpu_next_claim.value, gpu_next_claim.value,
+                "next claim value mismatch"
+            );
 
             // Compare proof structure
             match (&cpu_proof, &gpu_proof) {
                 (
                     LayerProof::Activation {
-                        activation_type: cpu_at, logup_proof: Some(cpu_lp),
-                        input_eval: cpu_ie, output_eval: cpu_oe,
+                        activation_type: cpu_at,
+                        logup_proof: Some(cpu_lp),
+                        input_eval: cpu_ie,
+                        output_eval: cpu_oe,
                         table_commitment: cpu_tc,
                     },
                     LayerProof::Activation {
-                        activation_type: gpu_at, logup_proof: Some(gpu_lp),
-                        input_eval: gpu_ie, output_eval: gpu_oe,
+                        activation_type: gpu_at,
+                        logup_proof: Some(gpu_lp),
+                        input_eval: gpu_ie,
+                        output_eval: gpu_oe,
                         table_commitment: gpu_tc,
                     },
                 ) => {
@@ -5378,15 +6238,30 @@ mod tests {
                     assert_eq!(cpu_tc, gpu_tc, "table_commitment mismatch");
 
                     // Compare LogUp proof fields
-                    assert_eq!(cpu_lp.claimed_sum, gpu_lp.claimed_sum, "claimed_sum mismatch");
-                    assert_eq!(cpu_lp.multiplicities, gpu_lp.multiplicities, "multiplicities mismatch");
-                    assert_eq!(cpu_lp.final_evals, gpu_lp.final_evals, "final_evals mismatch");
+                    assert_eq!(
+                        cpu_lp.claimed_sum, gpu_lp.claimed_sum,
+                        "claimed_sum mismatch"
+                    );
+                    assert_eq!(
+                        cpu_lp.multiplicities, gpu_lp.multiplicities,
+                        "multiplicities mismatch"
+                    );
+                    assert_eq!(
+                        cpu_lp.final_evals, gpu_lp.final_evals,
+                        "final_evals mismatch"
+                    );
 
                     // Compare round polynomials
-                    assert_eq!(cpu_lp.eq_round_polys.len(), gpu_lp.eq_round_polys.len(),
-                        "round poly count mismatch");
-                    for (i, (cr, gr)) in cpu_lp.eq_round_polys.iter()
-                        .zip(&gpu_lp.eq_round_polys).enumerate()
+                    assert_eq!(
+                        cpu_lp.eq_round_polys.len(),
+                        gpu_lp.eq_round_polys.len(),
+                        "round poly count mismatch"
+                    );
+                    for (i, (cr, gr)) in cpu_lp
+                        .eq_round_polys
+                        .iter()
+                        .zip(&gpu_lp.eq_round_polys)
+                        .enumerate()
                     {
                         assert_eq!(cr.c0, gr.c0, "round {i} c0 mismatch");
                         assert_eq!(cr.c1, gr.c1, "round {i} c1 mismatch");
@@ -5399,7 +6274,11 @@ mod tests {
 
             // Verify round polynomial sumcheck relation: p(0) + p(1) == current_claim
             // This replays the Fiat-Shamir transcript for the eq-sumcheck portion.
-            if let LayerProof::Activation { logup_proof: Some(ref lp), .. } = cpu_proof {
+            if let LayerProof::Activation {
+                logup_proof: Some(ref lp),
+                ..
+            } = cpu_proof
+            {
                 let mut replay = PoseidonChannel::new();
                 // Replay pre-sumcheck channel state: LOG tag + type_tag + gamma/beta draws
                 replay.mix_u64(0x4C4F47 as u64);
@@ -5413,18 +6292,25 @@ mod tests {
                 for (i, rp) in lp.eq_round_polys.iter().enumerate() {
                     let p0 = rp.c0;
                     let p1 = rp.c0 + rp.c1 + rp.c2 + rp.c3; // p(1) = c0 + c1 + c2 + c3
-                    assert_eq!(p0 + p1, running_sum,
-                        "round {i}: p(0) + p(1) != running_sum");
+                    assert_eq!(
+                        p0 + p1,
+                        running_sum,
+                        "round {i}: p(0) + p(1) != running_sum"
+                    );
                     replay.mix_poly_coeffs_deg3(rp.c0, rp.c1, rp.c2, rp.c3);
                     let challenge = replay.draw_qm31();
-                    running_sum = rp.c0 + rp.c1 * challenge
+                    running_sum = rp.c0
+                        + rp.c1 * challenge
                         + rp.c2 * challenge * challenge
                         + rp.c3 * challenge * challenge * challenge;
                 }
 
                 // Final sumcheck value should be non-trivially non-zero
-                assert_ne!(running_sum, SecureField::zero(),
-                    "final sumcheck value should be non-zero for non-trivial activation");
+                assert_ne!(
+                    running_sum,
+                    SecureField::zero(),
+                    "final sumcheck value should be non-zero for non-trivial activation"
+                );
             }
         }
     }

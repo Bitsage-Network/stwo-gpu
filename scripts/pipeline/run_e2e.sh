@@ -28,6 +28,7 @@ DO_DRY_RUN=false
 DO_CHAT=false
 DO_GPU=true
 DO_MULTI_GPU=false
+DO_GPU_ONLY=false
 DO_AUDIT=true
 SKIP_SETUP=false
 SKIP_INFERENCE=false
@@ -58,6 +59,7 @@ while [[ $# -gt 0 ]]; do
         --gpu)             DO_GPU=true; shift ;;
         --no-gpu)          DO_GPU=false; shift ;;
         --multi-gpu)       DO_MULTI_GPU=true; DO_GPU=true; shift ;;
+        --gpu-only)        DO_GPU_ONLY=true; DO_GPU=true; shift ;;
         --no-audit)        DO_AUDIT=false; shift ;;
         --skip-setup)      SKIP_SETUP=true; shift ;;
         --skip-inference)  SKIP_INFERENCE=true; shift ;;
@@ -96,6 +98,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --mode MODE          Proof mode: gkr (default: gkr)"
             echo "  --gpu / --no-gpu     Enable/disable GPU (default: on)"
             echo "  --multi-gpu          Use all GPUs"
+            echo "  --gpu-only           Fail if any critical proving path falls back to CPU"
             echo "  --hf-token TOKEN     HuggingFace API token"
             echo "  --max-fee ETH        Max TX fee (default: 0.05)"
             echo "  --model-id ID        On-chain model ID (default: 0x1)"
@@ -158,6 +161,7 @@ log "Run ID:      ${RUN_ID}"
 log "Model:       ${PRESET:-${HF_MODEL}}"
 log "Mode:        ${MODE}"
 log "GPU:         ${DO_GPU} (multi: ${DO_MULTI_GPU})"
+log "GPU only:    ${DO_GPU_ONLY}"
 log "Layers:      ${LAYERS:-all}"
 log "Action:      $(if [[ "$DO_SUBMIT" == "true" ]]; then echo "SUBMIT"; else echo "DRY RUN"; fi)"
 log "Run dir:     ${RUN_DIR}"
@@ -224,9 +228,14 @@ CURRENT=1
 # ─── Step 1: GPU Setup ──────────────────────────────────────────────
 
 if (( START_IDX <= 0 )); then
+    _SETUP_ARGS=("${SETUP_ARGS[@]}")
+    if [[ "$SKIP_INFERENCE" == "true" ]]; then
+        _SETUP_ARGS+=("--skip-llama")
+        log "Skipping llama.cpp build in setup (--skip-inference enabled)."
+    fi
     run_step "GPU Setup" "$CURRENT" "$TOTAL_STEPS" \
         env OBELYSK_REQUIRE_GPU="${DO_GPU}" \
-        bash "${SCRIPT_DIR}/00_setup_gpu.sh" "${SETUP_ARGS[@]}" || exit 1
+        bash "${SCRIPT_DIR}/00_setup_gpu.sh" "${_SETUP_ARGS[@]}" || exit 1
     (( CURRENT++ ))
 fi
 
@@ -296,6 +305,7 @@ if (( START_IDX <= 5 )); then
     [[ -n "$LAYERS" ]] && _PROVE_ARGS+=("--layers" "$LAYERS")
     [[ "$DO_GPU" == "true" ]] && _PROVE_ARGS+=("--gpu")
     [[ "$DO_MULTI_GPU" == "true" ]] && _PROVE_ARGS+=("--multi-gpu")
+    [[ "$DO_GPU_ONLY" == "true" ]] && _PROVE_ARGS+=("--gpu-only")
 
     run_step "Proof Generation" "$CURRENT" "$TOTAL_STEPS" \
         bash "${SCRIPT_DIR}/03_prove.sh" "${_PROVE_ARGS[@]}" || exit 1

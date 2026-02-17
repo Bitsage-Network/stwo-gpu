@@ -92,6 +92,8 @@ nvcc --version
 | `--skip-build` | Skip building Rust binaries (already built) |
 | `--skip-llama` | Skip building llama.cpp |
 
+If you plan to skip inference testing (`run_e2e.sh --skip-inference`), llama.cpp build is now skipped automatically.
+
 **Example — cloud instance with pre-installed drivers:**
 ```bash
 ./00_setup_gpu.sh --skip-drivers
@@ -206,6 +208,9 @@ The log is saved to `~/.obelysk/logs/<model_name>/` and contains:
 
 # Multi-GPU (if you have multiple GPUs)
 ./03_prove.sh --model-name qwen3-14b --gpu --multi-gpu
+
+# Enforce GPU-only proving (fail fast on CPU fallback)
+./03_prove.sh --model-name qwen3-14b --gpu --gpu-only
 ```
 
 **Proof modes:**
@@ -217,6 +222,34 @@ The log is saved to `~/.obelysk/logs/<model_name>/` and contains:
 | `recursive` | Slowest | Highest | `--mode recursive` |
 
 The proof is saved to `~/.obelysk/proofs/`.
+
+**Important runtime behavior (qwen3-14b):**
+- First run computes and caches a model weight commitment (typically a few minutes).
+- Later runs reuse the cache immediately if weights are unchanged.
+- Phase 2 has two subphases:
+  - GKR layer reductions (usually fast, tens of seconds)
+  - Weight opening proofs (can dominate runtime)
+
+The pipeline now prints dense progress + heartbeat messages during long openings so it does not appear frozen.
+
+**Default fast-safe tuning (no soundness downgrade):**
+- `STWO_GPU_COMMIT_STRICT` and `STWO_GPU_COMMIT_HARDEN` stay off unless you explicitly set them.
+- CPU fallback sections use all CPU threads by default:
+  - `RAYON_NUM_THREADS=$(nproc)`
+  - `OMP_NUM_THREADS=$(nproc)`
+
+**Useful knobs:**
+```bash
+# Fail if critical paths fall back to CPU
+./03_prove.sh --model-name qwen3-14b --gpu --gpu-only
+
+# Keep strict/hardening checks explicitly enabled (slower)
+export STWO_GPU_COMMIT_STRICT=1
+export STWO_GPU_COMMIT_HARDEN=1
+export STWO_GPU_POLY_STRICT=1
+export STWO_GPU_POLY_HARDEN=1
+./03_prove.sh --model-name qwen3-14b --gpu
+```
 
 ---
 

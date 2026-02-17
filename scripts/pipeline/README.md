@@ -98,6 +98,9 @@ cd scripts/pipeline
 # Dry run (no on-chain submission)
 ./run_e2e.sh --preset phi3-mini --gpu --dry-run
 
+# Enforce GPU-only proving (fail if critical proving paths fallback to CPU)
+./run_e2e.sh --preset qwen3-14b --gpu --gpu-only --dry-run
+
 # With HuggingFace auth (for gated models like Llama)
 HF_TOKEN=hf_xxx ./run_e2e.sh --preset llama3-8b --gpu --submit
 
@@ -135,6 +138,16 @@ STARKNET_PRIVATE_KEY=0x... ./run_e2e.sh --preset qwen3-14b --gpu --submit
 | `MAX_FEE` | No | `0.05` ETH | `04_verify_onchain.sh` |
 | `MARKETPLACE_URL` | No | `https://marketplace.bitsage.network` | `05_audit.sh`, `lib/common.sh` |
 | `MARKETPLACE_API_KEY` | No | Auto-provisioned | `05_audit.sh` |
+| `STWO_GPU_COMMIT_STRICT` | No | Off | `03_prove.sh`, `prove-model` |
+| `STWO_GPU_COMMIT_HARDEN` | No | Off | `03_prove.sh`, `prove-model` |
+| `STWO_GPU_POLY_STRICT` | No | Off | STWO GPU poly backend |
+| `STWO_GPU_POLY_HARDEN` | No | Off | STWO GPU poly backend |
+| `STWO_PARALLEL_GPU_COMMIT` | No | Off (single GPU default) | `03_prove.sh`, `prove-model` |
+| `STWO_WEIGHT_PROGRESS_EVERY` | No | `1` | Weight commitment progress cadence |
+| `STWO_GKR_OPENINGS_PROGRESS_EVERY` | No | `1` | Weight-opening progress cadence |
+| `STWO_GKR_OPENING_HEARTBEAT_SEC` | No | `15` | Per-opening heartbeat seconds |
+| `STWO_GPU_MLE_MERKLE_REQUIRE` | No | Off | Fail if MLE Merkle falls back to CPU |
+| `STWO_GPU_MLE_FOLD_REQUIRE` | No | Off | Fail if MLE fold falls back to CPU |
 
 ## Model Presets
 
@@ -216,6 +229,7 @@ GPU presets in `configs/4090.env`, `configs/b200.env`, `configs/b300.env`.
 ```bash
 ./03_prove.sh --model-name qwen3-14b --layers 1 --mode gkr --gpu
 ./03_prove.sh --model-name qwen3-14b --mode gkr --multi-gpu
+./03_prove.sh --model-name qwen3-14b --mode gkr --gpu --gpu-only
 ./03_prove.sh --model-name qwen3-14b --server http://prover:8080
 ```
 
@@ -243,6 +257,7 @@ STARKNET_PRIVATE_KEY=0x... ./04_verify_onchain.sh --submit
 ```bash
 ./run_e2e.sh --preset qwen3-14b --gpu --submit
 ./run_e2e.sh --preset phi3-mini --gpu --dry-run
+./run_e2e.sh --preset qwen3-14b --gpu --gpu-only --dry-run
 ./run_e2e.sh --preset qwen3-14b --resume-from prove --submit
 ./run_e2e.sh --preset llama3-8b --chat --submit         # Pause for chat
 ./run_e2e.sh --preset qwen3-14b --resume-from capture --submit  # Resume from capture
@@ -386,6 +401,14 @@ prove-model --verify-proof ~/.obelysk/proofs/latest/ml_proof.json
 # Check TX status
 sncast tx-status 0xTX_HASH
 ```
+
+**Looks stuck after `layer reductions complete ... entering opening phase`:**
+```bash
+# Tail raw prover log (full, unfiltered)
+LATEST=$(ls -td ~/.obelysk/proofs/* | head -1)
+tail -f "$LATEST/prove_model.raw.log"
+```
+Weight-opening proofs can be the longest part for large models. Progress + heartbeat logs should continue during this phase.
 
 **Insufficient disk space:**
 Pipeline needs: model_size x 1.5 (download) + ~10GB (build) + proof output.

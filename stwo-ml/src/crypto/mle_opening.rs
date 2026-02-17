@@ -8,20 +8,54 @@
 //! building intermediate Merkle commitments at each layer. Queries are
 //! drawn from the Poseidon channel for soundness.
 
-use starknet_ff::FieldElement;
-use stwo::core::fields::qm31::SecureField;
-use crate::crypto::poseidon_channel::{PoseidonChannel, securefield_to_felt};
-use crate::crypto::poseidon_merkle::{PoseidonMerkleTree, MerkleAuthPath};
-use rayon::prelude::*;
+use crate::crypto::poseidon_channel::{securefield_to_felt, PoseidonChannel};
+use crate::crypto::poseidon_merkle::{MerkleAuthPath, PoseidonMerkleTree};
 #[cfg(feature = "cuda-runtime")]
-use std::sync::atomic::{AtomicBool, Ordering};
+use crate::gpu_sumcheck::u32s_to_secure_field;
 #[cfg(feature = "cuda-runtime")]
 use crate::gpu_sumcheck::GpuSumcheckExecutor;
+use rayon::prelude::*;
+use starknet_ff::FieldElement;
+#[cfg(feature = "cuda-runtime")]
+use std::sync::atomic::{AtomicBool, Ordering};
+use stwo::core::fields::qm31::SecureField;
 
 /// Number of queries for MLE opening (matching STARK FRI query count).
 pub const MLE_N_QUERIES: usize = 14;
 #[cfg(feature = "cuda-runtime")]
 static GPU_MLE_FOLD_BACKEND_LOGGED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "cuda-runtime")]
+#[derive(Debug, Clone)]
+enum MleLayerValues {
+    Secure(Vec<SecureField>),
+    #[cfg(feature = "cuda-runtime")]
+    Qm31U32Aos(Vec<u32>),
+}
+
+#[cfg(feature = "cuda-runtime")]
+impl MleLayerValues {
+    #[inline]
+    fn len_points(&self) -> usize {
+        match self {
+            Self::Secure(v) => v.len(),
+            #[cfg(feature = "cuda-runtime")]
+            Self::Qm31U32Aos(v) => v.len() / 4,
+        }
+    }
+
+    #[inline]
+    fn point_at(&self, idx: usize) -> SecureField {
+        match self {
+            Self::Secure(v) => v[idx],
+            #[cfg(feature = "cuda-runtime")]
+            Self::Qm31U32Aos(v) => {
+                let s = idx * 4;
+                u32s_to_secure_field(&[v[s], v[s + 1], v[s + 2], v[s + 3]])
+            }
+        }
+    }
+}
 
 #[cfg(feature = "cuda-runtime")]
 fn gpu_mle_fold_enabled() -> bool {
@@ -37,23 +71,33 @@ fn gpu_mle_fold_enabled() -> bool {
 }
 
 #[cfg(feature = "cuda-runtime")]
+fn gpu_mle_fold_required() -> bool {
+    let explicit = match std::env::var("STWO_GPU_MLE_FOLD_REQUIRE") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false" && v != "off"
+        }
+        Err(_) => false,
+    };
+    if explicit {
+        return true;
+    }
+    match std::env::var("STWO_GPU_ONLY") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false" && v != "off"
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(feature = "cuda-runtime")]
 fn gpu_mle_fold_min_points() -> usize {
     std::env::var("STWO_GPU_MLE_FOLD_MIN_POINTS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&v| v.is_power_of_two() && v >= 2)
         .unwrap_or(1 << 20)
-}
-
-#[cfg(feature = "cuda-runtime")]
-#[inline(always)]
-fn securefield_to_felt_and_limbs(sf: SecureField) -> (FieldElement, [u64; 4]) {
-    let packed = (1u128 << 124)
-        | ((sf.0 .0 .0 as u128) << 93)
-        | ((sf.0 .1 .0 as u128) << 62)
-        | ((sf.1 .0 .0 as u128) << 31)
-        | (sf.1 .1 .0 as u128);
-    (FieldElement::from(packed), [packed as u64, (packed >> 64) as u64, 0, 0])
 }
 
 /// MLE opening proof matching Cairo's `MleOpeningProof`.
@@ -91,31 +135,53 @@ pub struct MleQueryRoundData {
 ///
 /// Returns (root, tree).
 pub fn commit_mle(evals: &[SecureField]) -> (FieldElement, PoseidonMerkleTree) {
-    #[cfg(feature = "cuda-runtime")]
-    if evals.len() >= 256 {
-        // Prepack once so GPU Merkle can reuse limbs directly.
-        let mut leaves = vec![FieldElement::ZERO; evals.len()];
-        let mut leaf_limbs = vec![0u64; evals.len() * 4];
-        leaves
-            .par_iter_mut()
-            .zip(leaf_limbs.par_chunks_mut(4))
-            .zip(evals.par_iter())
-            .for_each(|((leaf, limbs), &sf)| {
-                let (felt, limb4) = securefield_to_felt_and_limbs(sf);
-                *leaf = felt;
-                limbs.copy_from_slice(&limb4);
-            });
-        let tree = PoseidonMerkleTree::build_parallel_prepacked(leaves, Some(leaf_limbs));
+    // Fast path: bypass FieldElement Montgomery conversions entirely.
+    // Goes SecureField → u64 limbs → GPU Poseidon, storing all layers as raw
+    // limbs. Saves ~225ns/element (3 Montgomery ops) and avoids 8GB leaf clone.
+    if evals.len().is_power_of_two() && evals.len() >= 256 {
+        let tree = PoseidonMerkleTree::build_parallel_from_secure(evals);
         return (tree.root(), tree);
     }
 
     let leaves: Vec<FieldElement> = if evals.len() >= 256 {
-        evals.par_iter().map(|&sf| securefield_to_felt(sf)).collect()
+        evals
+            .par_iter()
+            .map(|&sf| securefield_to_felt(sf))
+            .collect()
     } else {
         evals.iter().map(|&sf| securefield_to_felt(sf)).collect()
     };
     let tree = PoseidonMerkleTree::build_parallel(leaves);
     (tree.root(), tree)
+}
+
+#[cfg(feature = "cuda-runtime")]
+fn commit_mle_from_qm31_u32_aos(evals_u32: &[u32]) -> (FieldElement, PoseidonMerkleTree) {
+    let tree = PoseidonMerkleTree::build_parallel_from_qm31_u32_aos(evals_u32);
+    (tree.root(), tree)
+}
+
+#[cfg(feature = "cuda-runtime")]
+fn fold_layer_cpu(layer: &MleLayerValues, r: SecureField) -> Vec<SecureField> {
+    let mid = layer.len_points() / 2;
+    if mid >= 1 << 16 {
+        (0..mid)
+            .into_par_iter()
+            .map(|j| {
+                let left = layer.point_at(j);
+                let right = layer.point_at(mid + j);
+                left + r * (right - left)
+            })
+            .collect()
+    } else {
+        let mut v = Vec::with_capacity(mid);
+        for j in 0..mid {
+            let left = layer.point_at(j);
+            let right = layer.point_at(mid + j);
+            v.push(left + r * (right - left));
+        }
+        v
+    }
 }
 
 /// Compute only the MLE commitment root without storing the full tree.
@@ -127,7 +193,10 @@ pub fn commit_mle_root_only(evals: &[SecureField]) -> FieldElement {
     use rayon::prelude::*;
 
     let leaves: Vec<FieldElement> = if evals.len() >= 256 {
-        evals.par_iter().map(|&sf| securefield_to_felt(sf)).collect()
+        evals
+            .par_iter()
+            .map(|&sf| securefield_to_felt(sf))
+            .collect()
     } else {
         evals.iter().map(|&sf| securefield_to_felt(sf)).collect()
     };
@@ -156,6 +225,198 @@ pub fn prove_mle_opening(
     proof
 }
 
+/// Generate an MLE opening proof from QM31 AoS u32 words.
+///
+/// Input layout: `[a0,b0,c0,d0, a1,b1,c1,d1, ...]`.
+#[cfg(feature = "cuda-runtime")]
+pub fn prove_mle_opening_with_commitment_qm31_u32(
+    evals_u32: &[u32],
+    challenges: &[SecureField],
+    channel: &mut PoseidonChannel,
+) -> (FieldElement, MleOpeningProof) {
+    assert!(!evals_u32.is_empty());
+    assert!(evals_u32.len() % 4 == 0);
+    let n_points = evals_u32.len() / 4;
+    assert!(n_points.is_power_of_two());
+    let n_vars = n_points.ilog2() as usize;
+    assert_eq!(challenges.len(), n_vars);
+
+    let (initial_root, initial_tree) = commit_mle_from_qm31_u32_aos(evals_u32);
+    channel.mix_felt(initial_root);
+
+    let mut layer_evals: Vec<MleLayerValues> = vec![MleLayerValues::Qm31U32Aos(evals_u32.to_vec())];
+    let mut layer_trees: Vec<PoseidonMerkleTree> = vec![initial_tree];
+    let mut intermediate_roots: Vec<FieldElement> = Vec::new();
+
+    let gpu_fold_strict = gpu_mle_fold_required();
+    let mut gpu_fold_session = {
+        if gpu_mle_fold_enabled() && n_points >= gpu_mle_fold_min_points() {
+            match GpuSumcheckExecutor::cached() {
+                Ok(gpu) => match gpu.start_mle_fold_session_u32(evals_u32) {
+                    Ok(session) => {
+                        if !GPU_MLE_FOLD_BACKEND_LOGGED.swap(true, Ordering::Relaxed) {
+                            eprintln!("[GKR] MLE fold backend: GPU session");
+                        }
+                        Some((gpu, session))
+                    }
+                    Err(e) => {
+                        if gpu_fold_strict {
+                            panic!(
+                                "GPU MLE fold strict mode enabled, but session init failed: {}",
+                                e
+                            );
+                        }
+                        if !GPU_MLE_FOLD_BACKEND_LOGGED.swap(true, Ordering::Relaxed) {
+                            eprintln!("[GKR] MLE fold backend: CPU fallback (session init: {e})");
+                        }
+                        None
+                    }
+                },
+                Err(e) => {
+                    if gpu_fold_strict {
+                        panic!(
+                            "GPU MLE fold strict mode enabled, but GPU executor init failed: {}",
+                            e
+                        );
+                    }
+                    if !GPU_MLE_FOLD_BACKEND_LOGGED.swap(true, Ordering::Relaxed) {
+                        eprintln!("[GKR] MLE fold backend: CPU fallback (GPU init: {e})");
+                    }
+                    None
+                }
+            }
+        } else {
+            if gpu_fold_strict {
+                if !gpu_mle_fold_enabled() {
+                    panic!("GPU MLE fold strict mode enabled, but STWO_GPU_MLE_FOLD is disabled");
+                }
+                if n_points < gpu_mle_fold_min_points() {
+                    panic!(
+                        "GPU MLE fold strict mode enabled, but opening size {} is below min {}",
+                        n_points,
+                        gpu_mle_fold_min_points()
+                    );
+                }
+            }
+            None
+        }
+    };
+
+    for &r in challenges.iter() {
+        let next_layer = if gpu_fold_session.is_some() {
+            let gpu_folded = {
+                let (gpu, session) = gpu_fold_session.as_mut().expect("checked is_some");
+                gpu.mle_fold_session_step_u32(session, r)
+            };
+            match gpu_folded {
+                Ok(folded_u32) => MleLayerValues::Qm31U32Aos(folded_u32),
+                Err(e) => {
+                    if gpu_fold_strict {
+                        panic!(
+                            "GPU MLE fold strict mode enabled, but GPU folding failed mid-proof: {}",
+                            e
+                        );
+                    }
+                    eprintln!("[GKR] MLE fold backend: GPU step failed, switching to CPU ({e})");
+                    gpu_fold_session = None;
+                    let current = layer_evals.last().expect("layer_evals is never empty");
+                    MleLayerValues::Secure(fold_layer_cpu(current, r))
+                }
+            }
+        } else {
+            let current = layer_evals.last().expect("layer_evals is never empty");
+            MleLayerValues::Secure(fold_layer_cpu(current, r))
+        };
+
+        if next_layer.len_points() > 1 {
+            let (root, tree) = match &next_layer {
+                MleLayerValues::Secure(vals) => commit_mle(vals),
+                MleLayerValues::Qm31U32Aos(words) => commit_mle_from_qm31_u32_aos(words),
+            };
+            channel.mix_felt(root);
+            intermediate_roots.push(root);
+            layer_trees.push(tree);
+        }
+        layer_evals.push(next_layer);
+    }
+
+    let final_value = layer_evals
+        .last()
+        .expect("layer_evals has final layer")
+        .point_at(0);
+
+    // Draw query indices (each query selects an index in [0, n/2))
+    let half_n = n_points / 2;
+    let n_queries = MLE_N_QUERIES.min(half_n);
+
+    let mut query_indices: Vec<usize> = Vec::with_capacity(n_queries);
+    for _ in 0..n_queries {
+        let felt = channel.draw_felt252();
+        let bytes = felt.to_bytes_be();
+        let raw = u64::from_be_bytes([
+            bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29], bytes[30], bytes[31],
+        ]);
+        let pair_idx = (raw as usize) % half_n;
+        query_indices.push(pair_idx);
+    }
+
+    let mut queries = Vec::with_capacity(n_queries);
+    for &pair_idx in &query_indices {
+        let mut rounds = Vec::with_capacity(n_vars);
+        let mut current_idx = pair_idx;
+
+        for round in 0..n_vars {
+            let layer = &layer_evals[round];
+            let mid = layer.len_points() / 2;
+            let left_idx = current_idx;
+            let right_idx = mid + current_idx;
+
+            let left_value = layer.point_at(left_idx.min(layer.len_points() - 1));
+            let right_value = layer.point_at(right_idx.min(layer.len_points() - 1));
+
+            let tree = &layer_trees[round.min(layer_trees.len() - 1)];
+            let left_path = if left_idx < tree.num_leaves() {
+                tree.prove(left_idx)
+            } else {
+                MerkleAuthPath {
+                    siblings: Vec::new(),
+                }
+            };
+            let right_path = if right_idx < tree.num_leaves() {
+                tree.prove(right_idx)
+            } else {
+                MerkleAuthPath {
+                    siblings: Vec::new(),
+                }
+            };
+
+            rounds.push(MleQueryRoundData {
+                left_value,
+                right_value,
+                left_siblings: left_path.siblings,
+                right_siblings: right_path.siblings,
+            });
+
+            let next_half = (mid / 2).max(1);
+            current_idx %= next_half;
+        }
+
+        queries.push(MleQueryProof {
+            initial_pair_index: pair_idx as u32,
+            rounds,
+        });
+    }
+
+    (
+        initial_root,
+        MleOpeningProof {
+            intermediate_roots,
+            queries,
+            final_value,
+        },
+    )
+}
+
 /// Generate an MLE opening proof and return the initial commitment root used
 /// in the Fiat-Shamir transcript.
 ///
@@ -180,6 +441,8 @@ pub fn prove_mle_opening_with_commitment(
     let mut layer_trees: Vec<PoseidonMerkleTree> = vec![initial_tree];
     let mut intermediate_roots: Vec<FieldElement> = Vec::new();
     #[cfg(feature = "cuda-runtime")]
+    let gpu_fold_strict = gpu_mle_fold_required();
+    #[cfg(feature = "cuda-runtime")]
     let mut gpu_fold_session = {
         if gpu_mle_fold_enabled() && evals.len() >= gpu_mle_fold_min_points() {
             match GpuSumcheckExecutor::cached() {
@@ -191,6 +454,12 @@ pub fn prove_mle_opening_with_commitment(
                         Some((gpu, session))
                     }
                     Err(e) => {
+                        if gpu_fold_strict {
+                            panic!(
+                                "GPU MLE fold strict mode enabled, but session init failed: {}",
+                                e
+                            );
+                        }
                         if !GPU_MLE_FOLD_BACKEND_LOGGED.swap(true, Ordering::Relaxed) {
                             eprintln!("[GKR] MLE fold backend: CPU fallback (session init: {e})");
                         }
@@ -198,6 +467,12 @@ pub fn prove_mle_opening_with_commitment(
                     }
                 },
                 Err(e) => {
+                    if gpu_fold_strict {
+                        panic!(
+                            "GPU MLE fold strict mode enabled, but GPU executor init failed: {}",
+                            e
+                        );
+                    }
                     if !GPU_MLE_FOLD_BACKEND_LOGGED.swap(true, Ordering::Relaxed) {
                         eprintln!("[GKR] MLE fold backend: CPU fallback (GPU init: {e})");
                     }
@@ -205,6 +480,18 @@ pub fn prove_mle_opening_with_commitment(
                 }
             }
         } else {
+            if gpu_fold_strict {
+                if !gpu_mle_fold_enabled() {
+                    panic!("GPU MLE fold strict mode enabled, but STWO_GPU_MLE_FOLD is disabled");
+                }
+                if evals.len() < gpu_mle_fold_min_points() {
+                    panic!(
+                        "GPU MLE fold strict mode enabled, but opening size {} is below min {}",
+                        evals.len(),
+                        gpu_mle_fold_min_points()
+                    );
+                }
+            }
             None
         }
     };
@@ -223,7 +510,15 @@ pub fn prove_mle_opening_with_commitment(
                     match gpu_folded {
                         Ok(vals) => vals,
                         Err(e) => {
-                            eprintln!("[GKR] MLE fold backend: GPU step failed, switching to CPU ({e})");
+                            if gpu_fold_strict {
+                                panic!(
+                                    "GPU MLE fold strict mode enabled, but GPU folding failed mid-proof: {}",
+                                    e
+                                );
+                            }
+                            eprintln!(
+                                "[GKR] MLE fold backend: GPU step failed, switching to CPU ({e})"
+                            );
                             gpu_fold_session = None;
                             let current = layer_evals.last().expect("layer_evals is never empty");
                             let mid = current.len() / 2;
@@ -287,9 +582,7 @@ pub fn prove_mle_opening_with_commitment(
         layer_evals.push(folded);
     }
 
-    let final_value = layer_evals
-        .last()
-        .expect("layer_evals has final layer")[0];
+    let final_value = layer_evals.last().expect("layer_evals has final layer")[0];
 
     // Draw query indices (each query selects an index in [0, n/2))
     let initial_n = evals.len();
@@ -301,8 +594,7 @@ pub fn prove_mle_opening_with_commitment(
         let felt = channel.draw_felt252();
         let bytes = felt.to_bytes_be();
         let raw = u64::from_be_bytes([
-            bytes[24], bytes[25], bytes[26], bytes[27],
-            bytes[28], bytes[29], bytes[30], bytes[31],
+            bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29], bytes[30], bytes[31],
         ]);
         let pair_idx = (raw as usize) % half_n;
         query_indices.push(pair_idx);
@@ -329,12 +621,16 @@ pub fn prove_mle_opening_with_commitment(
             let left_path = if left_idx < tree.num_leaves() {
                 tree.prove(left_idx)
             } else {
-                MerkleAuthPath { siblings: Vec::new() }
+                MerkleAuthPath {
+                    siblings: Vec::new(),
+                }
             };
             let right_path = if right_idx < tree.num_leaves() {
                 tree.prove(right_idx)
             } else {
-                MerkleAuthPath { siblings: Vec::new() }
+                MerkleAuthPath {
+                    siblings: Vec::new(),
+                }
             };
 
             rounds.push(MleQueryRoundData {
@@ -405,8 +701,7 @@ pub fn verify_mle_opening(
         let felt = channel.draw_felt252();
         let bytes = felt.to_bytes_be();
         let raw = u64::from_be_bytes([
-            bytes[24], bytes[25], bytes[26], bytes[27],
-            bytes[28], bytes[29], bytes[30], bytes[31],
+            bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29], bytes[30], bytes[31],
         ]);
         query_indices.push((raw as usize) % half_n);
     }
@@ -445,8 +740,12 @@ pub fn verify_mle_opening(
                 let left_leaf = securefield_to_felt(round_data.left_value);
                 let right_leaf = securefield_to_felt(round_data.right_value);
 
-                let left_path = MerkleAuthPath { siblings: round_data.left_siblings.clone() };
-                let right_path = MerkleAuthPath { siblings: round_data.right_siblings.clone() };
+                let left_path = MerkleAuthPath {
+                    siblings: round_data.left_siblings.clone(),
+                };
+                let right_path = MerkleAuthPath {
+                    siblings: round_data.right_siblings.clone(),
+                };
 
                 if !PoseidonMerkleTree::verify(layer_root, left_idx, left_leaf, &left_path) {
                     return false;
@@ -458,7 +757,8 @@ pub fn verify_mle_opening(
 
             // 3b. Algebraic fold: f(r) = left + r * (right - left)
             let r = challenges[round];
-            let folded = round_data.left_value + r * (round_data.right_value - round_data.left_value);
+            let folded =
+                round_data.left_value + r * (round_data.right_value - round_data.left_value);
 
             // Last round: folded value must equal final_value
             if round == n_rounds - 1 && folded != proof.final_value {
@@ -495,8 +795,8 @@ pub fn evaluate_mle_at(evals: &[SecureField], point: &[SecureField]) -> SecureFi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stwo::core::fields::m31::M31;
     use stwo::core::fields::cm31::CM31;
+    use stwo::core::fields::m31::M31;
     use stwo::core::fields::qm31::QM31;
 
     fn make_evals(n: usize) -> Vec<SecureField> {
@@ -527,7 +827,12 @@ mod tests {
         let (commitment, _) = commit_mle(&evals);
         let mut ch_v = PoseidonChannel::new();
         ch_v.mix_u64(42);
-        assert!(verify_mle_opening(commitment, &proof, &challenges, &mut ch_v));
+        assert!(verify_mle_opening(
+            commitment,
+            &proof,
+            &challenges,
+            &mut ch_v
+        ));
     }
 
     #[test]
@@ -568,7 +873,12 @@ mod tests {
         let (commitment, _) = commit_mle(&evals);
         let mut ch_v = PoseidonChannel::new();
         ch_v.mix_u64(42);
-        assert!(!verify_mle_opening(commitment, &proof, &challenges, &mut ch_v));
+        assert!(!verify_mle_opening(
+            commitment,
+            &proof,
+            &challenges,
+            &mut ch_v
+        ));
     }
 
     #[test]
@@ -598,10 +908,22 @@ mod tests {
     fn test_mle_opening_roundtrip() {
         // Prove then verify — must be consistent
         let evals: Vec<SecureField> = vec![
-            QM31(CM31(M31::from(10), M31::from(0)), CM31(M31::from(0), M31::from(0))),
-            QM31(CM31(M31::from(20), M31::from(0)), CM31(M31::from(0), M31::from(0))),
-            QM31(CM31(M31::from(30), M31::from(0)), CM31(M31::from(0), M31::from(0))),
-            QM31(CM31(M31::from(40), M31::from(0)), CM31(M31::from(0), M31::from(0))),
+            QM31(
+                CM31(M31::from(10), M31::from(0)),
+                CM31(M31::from(0), M31::from(0)),
+            ),
+            QM31(
+                CM31(M31::from(20), M31::from(0)),
+                CM31(M31::from(0), M31::from(0)),
+            ),
+            QM31(
+                CM31(M31::from(30), M31::from(0)),
+                CM31(M31::from(0), M31::from(0)),
+            ),
+            QM31(
+                CM31(M31::from(40), M31::from(0)),
+                CM31(M31::from(0), M31::from(0)),
+            ),
         ];
 
         let challenges = vec![
@@ -621,6 +943,11 @@ mod tests {
         let (commitment, _) = commit_mle(&evals);
         let mut ch_v = PoseidonChannel::new();
         ch_v.mix_u64(7);
-        assert!(verify_mle_opening(commitment, &proof, &challenges, &mut ch_v));
+        assert!(verify_mle_opening(
+            commitment,
+            &proof,
+            &challenges,
+            &mut ch_v
+        ));
     }
 }
