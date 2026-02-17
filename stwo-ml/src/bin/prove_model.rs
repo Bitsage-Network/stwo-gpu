@@ -3553,6 +3553,32 @@ fn u64_limbs_to_field_element(limbs: &[u64]) -> Result<FieldElement, String> {
     FieldElement::from_bytes_be(&bytes).map_err(|_| "invalid felt252 limbs".to_string())
 }
 
+fn pack_m31_chunk_to_felt(values: &[M31]) -> FieldElement {
+    // Pack little-endian base-2^31 digits:
+    // felt = v0 + v1*2^31 + v2*2^62 + ...
+    // This is mathematically identical to the previous Horner packing, but
+    // avoids expensive field multiplications on CPU.
+    let mut limbs = [0u64; 4]; // little-endian 256-bit
+    for (i, &v) in values.iter().enumerate() {
+        let bit_pos = i * 31;
+        let limb_idx = bit_pos / 64;
+        let bit_off = bit_pos % 64;
+        let val = v.0 as u64;
+
+        limbs[limb_idx] |= val << bit_off;
+        if bit_off + 31 > 64 && limb_idx + 1 < 4 {
+            limbs[limb_idx + 1] |= val >> (64 - bit_off);
+        }
+    }
+
+    let mut bytes = [0u8; 32];
+    for i in 0..4 {
+        let limb = limbs[3 - i];
+        bytes[i * 8..(i + 1) * 8].copy_from_slice(&limb.to_be_bytes());
+    }
+    FieldElement::from_bytes_be(&bytes).expect("packed 217-bit value always fits felt252 field")
+}
+
 #[cfg(feature = "cuda-runtime")]
 struct GpuCommitHasher {
     d_round_constants: cudarc::driver::CudaSlice<u64>,
@@ -3663,16 +3689,6 @@ fn compute_weight_commitment(
         }
     });
 
-    // Pack 7 M31 values (7×31=217 bits) into one FieldElement via Horner's method.
-    let pack_m31 = |values: &[M31]| -> FieldElement {
-        let base = FieldElement::from(1u64 << 31);
-        let mut result = FieldElement::ZERO;
-        for &v in values.iter().rev() {
-            result = result * base + FieldElement::from(v.0 as u64);
-        }
-        result
-    };
-
     let n_segments = 64usize;
     let chunk_size = 4096usize;
 
@@ -3729,7 +3745,7 @@ fn compute_weight_commitment(
         let seg_size = (w.data.len() + n_segments - 1) / n_segments;
         let packed_segments: Vec<Vec<FieldElement>> = w.data
             .par_chunks(seg_size.max(1))
-            .map(|segment| segment.chunks(7).map(|c| pack_m31(c)).collect())
+            .map(|segment| segment.chunks(7).map(pack_m31_chunk_to_felt).collect())
             .collect();
 
         let cpu_hash_segments = || -> Vec<FieldElement> {
