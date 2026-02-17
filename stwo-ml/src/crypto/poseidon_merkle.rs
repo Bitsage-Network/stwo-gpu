@@ -248,10 +248,14 @@ fn try_build_parallel_gpu(leaves: &[FieldElement]) -> Result<Option<Vec<Vec<Fiel
     let d_round_constants = upload_poseidon252_round_constants(&executor.device)
         .map_err(|e| format!("upload round constants: {e}"))?;
 
-    let mut leaf_limbs = Vec::with_capacity(leaves.len() * 4);
-    for fe in leaves {
-        leaf_limbs.extend_from_slice(&field_element_to_u64_limbs(fe));
-    }
+    let mut leaf_limbs = vec![0u64; leaves.len() * 4];
+    leaf_limbs
+        .par_chunks_mut(4)
+        .zip(leaves.par_iter())
+        .for_each(|(dst, fe)| {
+            let limbs = field_element_to_u64_limbs(fe);
+            dst.copy_from_slice(&limbs);
+        });
     let d_prev_leaf = executor
         .device
         .htod_sync_copy(&leaf_limbs)
