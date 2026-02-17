@@ -146,6 +146,8 @@ STARKNET_PRIVATE_KEY=0x... ./run_e2e.sh --preset qwen3-14b --gpu --submit
 | `STWO_WEIGHT_PROGRESS_EVERY` | No | `1` | Weight commitment progress cadence |
 | `STWO_GKR_OPENINGS_PROGRESS_EVERY` | No | `1` | Weight-opening progress cadence |
 | `STWO_GKR_OPENING_HEARTBEAT_SEC` | No | `15` | Per-opening heartbeat seconds |
+| `STWO_GPU_MLE_FOLD` | No | `1` (pipeline default) | GPU fold for MLE openings |
+| `STWO_GPU_MLE_FOLD_MIN_POINTS` | No | `1048576` (pipeline default) | Min MLE size to start GPU fold |
 | `STWO_GPU_MLE_MERKLE_REQUIRE` | No | Off | Fail if MLE Merkle falls back to CPU |
 | `STWO_GPU_MLE_FOLD_REQUIRE` | No | Off | Fail if MLE fold falls back to CPU |
 

@@ -18,7 +18,13 @@ use rayon::prelude::*;
 use starknet_ff::FieldElement;
 #[cfg(feature = "cuda-runtime")]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "cuda-runtime")]
+use stwo::core::fields::cm31::CM31;
+#[cfg(feature = "cuda-runtime")]
+use stwo::core::fields::m31::M31;
 use stwo::core::fields::qm31::SecureField;
+#[cfg(feature = "cuda-runtime")]
+use stwo::core::fields::qm31::QM31;
 
 /// Number of queries for MLE opening (matching STARK FRI query count).
 pub const MLE_N_QUERIES: usize = 14;
@@ -64,9 +70,9 @@ fn gpu_mle_fold_enabled() -> bool {
             let v = v.trim().to_ascii_lowercase();
             !v.is_empty() && v != "0" && v != "false" && v != "off"
         }
-        // Default OFF: GPU fold currently requires per-round D2H for Merkle/query
-        // construction, which can negate speedups. Keep as explicit opt-in.
-        Err(_) => false,
+        // Default ON for proving workloads with very large MLEs.
+        // If GPU fold is unavailable/fails, prover falls back to CPU unless strict mode is enabled.
+        Err(_) => true,
     }
 }
 
@@ -98,6 +104,26 @@ fn gpu_mle_fold_min_points() -> usize {
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&v| v.is_power_of_two() && v >= 2)
         .unwrap_or(1 << 20)
+}
+
+#[cfg(feature = "cuda-runtime")]
+#[inline]
+fn felt_to_securefield_packed(fe: FieldElement) -> SecureField {
+    let bytes = fe.to_bytes_be();
+    let mut low = [0u8; 16];
+    low.copy_from_slice(&bytes[16..]);
+    let v = u128::from_be_bytes(low);
+
+    let mask = (1u128 << 31) - 1;
+    let d = (v & mask) as u32;
+    let c = ((v >> 31) & mask) as u32;
+    let b = ((v >> 62) & mask) as u32;
+    let a = ((v >> 93) & mask) as u32;
+
+    QM31(
+        CM31(M31::from(a), M31::from(b)),
+        CM31(M31::from(c), M31::from(d)),
+    )
 }
 
 /// MLE opening proof matching Cairo's `MleOpeningProof`.
@@ -244,7 +270,7 @@ pub fn prove_mle_opening_with_commitment_qm31_u32(
     let (initial_root, initial_tree) = commit_mle_from_qm31_u32_aos(evals_u32);
     channel.mix_felt(initial_root);
 
-    let mut layer_evals: Vec<MleLayerValues> = vec![MleLayerValues::Qm31U32Aos(evals_u32.to_vec())];
+    let mut current_layer = MleLayerValues::Qm31U32Aos(evals_u32.to_vec());
     let mut layer_trees: Vec<PoseidonMerkleTree> = vec![initial_tree];
     let mut intermediate_roots: Vec<FieldElement> = Vec::new();
 
@@ -319,13 +345,11 @@ pub fn prove_mle_opening_with_commitment_qm31_u32(
                     }
                     eprintln!("[GKR] MLE fold backend: GPU step failed, switching to CPU ({e})");
                     gpu_fold_session = None;
-                    let current = layer_evals.last().expect("layer_evals is never empty");
-                    MleLayerValues::Secure(fold_layer_cpu(current, r))
+                    MleLayerValues::Secure(fold_layer_cpu(&current_layer, r))
                 }
             }
         } else {
-            let current = layer_evals.last().expect("layer_evals is never empty");
-            MleLayerValues::Secure(fold_layer_cpu(current, r))
+            MleLayerValues::Secure(fold_layer_cpu(&current_layer, r))
         };
 
         if next_layer.len_points() > 1 {
@@ -337,13 +361,9 @@ pub fn prove_mle_opening_with_commitment_qm31_u32(
             intermediate_roots.push(root);
             layer_trees.push(tree);
         }
-        layer_evals.push(next_layer);
+        current_layer = next_layer;
     }
-
-    let final_value = layer_evals
-        .last()
-        .expect("layer_evals has final layer")
-        .point_at(0);
+    let final_value = current_layer.point_at(0);
 
     // Draw query indices (each query selects an index in [0, n/2))
     let half_n = n_points / 2;
@@ -364,31 +384,19 @@ pub fn prove_mle_opening_with_commitment_qm31_u32(
     for &pair_idx in &query_indices {
         let mut rounds = Vec::with_capacity(n_vars);
         let mut current_idx = pair_idx;
+        let mut layer_size = n_points;
 
         for round in 0..n_vars {
-            let layer = &layer_evals[round];
-            let mid = layer.len_points() / 2;
+            let mid = layer_size / 2;
             let left_idx = current_idx;
             let right_idx = mid + current_idx;
 
-            let left_value = layer.point_at(left_idx.min(layer.len_points() - 1));
-            let right_value = layer.point_at(right_idx.min(layer.len_points() - 1));
+            let tree = &layer_trees[round];
+            let left_value = felt_to_securefield_packed(tree.leaf_at(left_idx));
+            let right_value = felt_to_securefield_packed(tree.leaf_at(right_idx));
 
-            let tree = &layer_trees[round.min(layer_trees.len() - 1)];
-            let left_path = if left_idx < tree.num_leaves() {
-                tree.prove(left_idx)
-            } else {
-                MerkleAuthPath {
-                    siblings: Vec::new(),
-                }
-            };
-            let right_path = if right_idx < tree.num_leaves() {
-                tree.prove(right_idx)
-            } else {
-                MerkleAuthPath {
-                    siblings: Vec::new(),
-                }
-            };
+            let left_path = tree.prove(left_idx);
+            let right_path = tree.prove(right_idx);
 
             rounds.push(MleQueryRoundData {
                 left_value,
@@ -399,6 +407,7 @@ pub fn prove_mle_opening_with_commitment_qm31_u32(
 
             let next_half = (mid / 2).max(1);
             current_idx %= next_half;
+            layer_size = mid;
         }
 
         queries.push(MleQueryProof {

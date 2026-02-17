@@ -231,6 +231,14 @@ impl PoseidonMerkleTree {
         self.layers[0].len()
     }
 
+    /// Return the leaf value at `index` as a felt.
+    ///
+    /// Works for both felt-backed and limb-backed layers.
+    pub fn leaf_at(&self, index: usize) -> FieldElement {
+        assert!(index < self.layers[0].len(), "leaf index out of bounds");
+        self.layers[0].at(index)
+    }
+
     /// Generate an authentication path for the leaf at `index`.
     pub fn prove(&self, index: usize) -> MerkleAuthPath {
         assert!(index < self.layers[0].len(), "index out of bounds");

@@ -234,6 +234,9 @@ The pipeline now prints dense progress + heartbeat messages during long openings
 
 **Default fast-safe tuning (no soundness downgrade):**
 - `STWO_GPU_COMMIT_STRICT` and `STWO_GPU_COMMIT_HARDEN` stay off unless you explicitly set them.
+- GPU fold is enabled by default for large MLE openings:
+  - `STWO_GPU_MLE_FOLD=1`
+  - `STWO_GPU_MLE_FOLD_MIN_POINTS=1048576`
 - CPU fallback sections use all CPU threads by default:
   - `RAYON_NUM_THREADS=$(nproc)`
   - `OMP_NUM_THREADS=$(nproc)`
