@@ -8,6 +8,7 @@
 //! building intermediate Merkle commitments at each layer. Queries are
 //! drawn from the Poseidon channel for soundness.
 
+use num_traits::Zero;
 use starknet_ff::FieldElement;
 use stwo::core::fields::qm31::SecureField;
 use crate::crypto::poseidon_channel::{PoseidonChannel, securefield_to_felt};
@@ -25,6 +26,17 @@ pub struct MleOpeningProof {
     pub queries: Vec<MleQueryProof>,
     /// Final single value after all folding rounds.
     pub final_value: SecureField,
+}
+
+impl MleOpeningProof {
+    /// Placeholder proof for direct-evaluation verification (no Merkle tree needed).
+    pub fn empty() -> Self {
+        Self {
+            intermediate_roots: Vec::new(),
+            queries: Vec::new(),
+            final_value: SecureField::zero(),
+        }
+    }
 }
 
 /// Proof for a single query through all folding layers.

@@ -1796,12 +1796,12 @@ mod tests {
         assert!(!gkr_sn.gkr_calldata.is_empty());
         assert!(!gkr_sn.io_calldata.is_empty());
 
-        // Weight opening calldata should contain actual MLE opening proofs
-        // (one per MatMul layer: count + eval_point + expected_value + MLE proof)
+        // Weight claims should be populated (one per MatMul layer).
+        // In direct-evaluation mode, weight_opening_calldata contains just the
+        // weight claims (eval_point + expected_value) without Merkle opening proofs.
         assert!(
-            gkr_sn.weight_opening_calldata.len() > 1,
-            "weight openings should be populated (got {} felts)",
-            gkr_sn.weight_opening_calldata.len(),
+            !gkr_sn.weight_opening_calldata.is_empty(),
+            "weight opening calldata should not be empty",
         );
     }
 
