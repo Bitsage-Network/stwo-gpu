@@ -15,13 +15,20 @@ use crate::gpu_sumcheck::u32s_to_secure_field;
 #[cfg(feature = "cuda-runtime")]
 use crate::gpu_sumcheck::GpuSumcheckExecutor;
 #[cfg(feature = "cuda-runtime")]
+use cudarc::driver::CudaSlice;
+#[cfg(feature = "cuda-runtime")]
+use cudarc::driver::DeviceSlice;
+#[cfg(feature = "cuda-runtime")]
 use stwo::prover::backend::gpu::cuda_executor::{
-    get_cuda_executor, is_cuda_available, upload_poseidon252_round_constants, Poseidon252MerkleGpuTree,
+    get_cuda_executor, is_cuda_available, upload_poseidon252_round_constants, CudaFftExecutor,
+    Poseidon252MerkleGpuTree,
 };
 use rayon::prelude::*;
 use starknet_ff::FieldElement;
 #[cfg(feature = "cuda-runtime")]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "cuda-runtime")]
+use std::time::Instant;
 #[cfg(feature = "cuda-runtime")]
 use stwo::core::fields::cm31::CM31;
 #[cfg(feature = "cuda-runtime")]
@@ -304,6 +311,71 @@ fn build_gpu_opening_tree_from_qm31_u32(
 }
 
 #[cfg(feature = "cuda-runtime")]
+fn build_gpu_opening_tree_from_qm31_u32_device(
+    d_qm31_aos: &CudaSlice<u32>,
+    n_points: usize,
+) -> Result<(FieldElement, Poseidon252MerkleGpuTree), String> {
+    let executor = get_cuda_executor().map_err(|e| format!("cuda init: {e}"))?;
+    let d_rc = upload_poseidon252_round_constants(&executor.device)
+        .map_err(|e| format!("upload round constants: {e}"))?;
+    let d_dummy_columns = executor
+        .device
+        .htod_sync_copy(&[0u32])
+        .map_err(|e| format!("H2D dummy columns: {:?}", e))?;
+    build_gpu_opening_tree_from_qm31_u32_device_with_ctx(
+        executor,
+        &d_rc,
+        &d_dummy_columns,
+        d_qm31_aos,
+        n_points,
+    )
+}
+
+#[cfg(feature = "cuda-runtime")]
+fn build_gpu_opening_tree_from_qm31_u32_device_with_ctx(
+    executor: &CudaFftExecutor,
+    d_rc: &CudaSlice<u64>,
+    d_dummy_columns: &CudaSlice<u32>,
+    d_qm31_aos: &CudaSlice<u32>,
+    n_points: usize,
+) -> Result<(FieldElement, Poseidon252MerkleGpuTree), String> {
+    assert!(n_points > 0);
+    assert!(n_points.is_power_of_two());
+    if d_qm31_aos.len() != n_points * 4 {
+        return Err(format!(
+            "device QM31 AoS size mismatch: expected {} words, got {}",
+            n_points * 4,
+            d_qm31_aos.len()
+        ));
+    }
+
+    let n_leaf_hashes = n_points / 2;
+    if n_leaf_hashes == 0 {
+        return Err("cannot build gpu opening tree for single-point input".to_string());
+    }
+
+    let d_prev_leaf = executor
+        .execute_qm31_aos_to_felt252_gpu(d_qm31_aos, n_points)
+        .map_err(|e| format!("qm31->felt252 gpu packing: {e}"))?;
+
+    let tree = executor
+        .execute_poseidon252_merkle_full_tree_gpu_layers(
+            d_dummy_columns,
+            0,
+            Some(&d_prev_leaf),
+            n_leaf_hashes,
+            d_rc,
+        )
+        .map_err(|e| format!("execute full-tree gpu layers: {e}"))?;
+    let root_limbs = tree
+        .root_u64()
+        .map_err(|e| format!("download gpu root: {e}"))?;
+    let root = u64_limbs_to_felt252(&root_limbs)
+        .ok_or_else(|| "invalid root limbs from gpu merkle tree".to_string())?;
+    Ok((root, tree))
+}
+
+#[cfg(feature = "cuda-runtime")]
 fn build_gpu_opening_tree_from_secure(
     evals: &[SecureField],
 ) -> Result<(FieldElement, Poseidon252MerkleGpuTree), String> {
@@ -378,26 +450,9 @@ fn build_gpu_merkle_path(
     leaf_idx: usize,
     n_leaves: usize,
 ) -> Result<Vec<FieldElement>, String> {
-    let mut siblings = Vec::with_capacity(n_leaves.ilog2() as usize);
-
     let leaf_sibling_idx = leaf_idx ^ 1;
     let leaf_sibling = leaf_value_from_layer(layer_values, leaf_sibling_idx);
-    siblings.push(securefield_to_felt(leaf_sibling));
-
-    let mut node_idx = leaf_idx / 2;
-    let internal_levels = tree.num_layers().saturating_sub(1);
-    for layer_idx in 0..internal_levels {
-        let sib_idx = node_idx ^ 1;
-        let limbs = tree
-            .node_u64(layer_idx, sib_idx)
-            .map_err(|e| format!("download gpu merkle sibling: {e}"))?;
-        let felt = u64_limbs_to_felt252(&limbs)
-            .ok_or_else(|| "invalid sibling limbs from gpu merkle tree".to_string())?;
-        siblings.push(felt);
-        node_idx >>= 1;
-    }
-
-    Ok(siblings)
+    build_gpu_merkle_path_with_leaf_sibling(tree, leaf_idx, n_leaves, leaf_sibling)
 }
 
 #[cfg(feature = "cuda-runtime")]
@@ -407,10 +462,19 @@ fn build_gpu_merkle_path_from_words(
     leaf_idx: usize,
     n_leaves: usize,
 ) -> Result<Vec<FieldElement>, String> {
-    let mut siblings = Vec::with_capacity(n_leaves.ilog2() as usize);
-
     let leaf_sibling_idx = leaf_idx ^ 1;
     let leaf_sibling = leaf_value_from_words(words, leaf_sibling_idx);
+    build_gpu_merkle_path_with_leaf_sibling(tree, leaf_idx, n_leaves, leaf_sibling)
+}
+
+#[cfg(feature = "cuda-runtime")]
+fn build_gpu_merkle_path_with_leaf_sibling(
+    tree: &Poseidon252MerkleGpuTree,
+    leaf_idx: usize,
+    n_leaves: usize,
+    leaf_sibling: SecureField,
+) -> Result<Vec<FieldElement>, String> {
+    let mut siblings = Vec::with_capacity(n_leaves.ilog2() as usize);
     siblings.push(securefield_to_felt(leaf_sibling));
 
     let mut node_idx = leaf_idx / 2;
@@ -525,27 +589,8 @@ fn prove_mle_opening_with_commitment_qm31_u32_gpu_tree(
         return Err("cuda unavailable".to_string());
     }
 
-    let (initial_root, initial_tree) = build_gpu_opening_tree_from_qm31_u32(evals_u32)?;
-    channel.mix_felt(initial_root);
-
-    if !GPU_MLE_OPENING_TREE_BACKEND_LOGGED.swap(true, Ordering::Relaxed) {
-        eprintln!("[GKR] MLE opening tree backend: GPU-resident (no bulk D2H)");
-    }
-
-    // layer_trees[round] corresponds to the tree of the round's current layer.
-    // round 0 uses the original `evals_u32` layer.
-    let mut layer_trees: Vec<Poseidon252MerkleGpuTree> = Vec::with_capacity(n_vars);
-    layer_trees.push(initial_tree);
-    // Stores round>=1 layers (after 1st fold, 2nd fold, ...), each with >1 leaves.
-    let mut stored_layers: Vec<MleLayerValues> = Vec::with_capacity(n_vars.saturating_sub(1));
-    let mut intermediate_roots: Vec<FieldElement> = Vec::new();
-
-    // Current folding state
-    let mut current_u32_layer: Option<Vec<u32>> = None;
-    let mut current_secure_layer: Option<Vec<SecureField>> = None;
-
     let gpu_fold_strict = gpu_mle_fold_required();
-    let mut gpu_fold_session = {
+    let gpu_fold_session = {
         if gpu_mle_fold_enabled() && n_points >= gpu_mle_fold_min_points() {
             match GpuSumcheckExecutor::cached() {
                 Ok(gpu) => match gpu.start_mle_fold_session_u32(evals_u32) {
@@ -599,97 +644,90 @@ fn prove_mle_opening_with_commitment_qm31_u32_gpu_tree(
         }
     };
 
-    for &r in challenges.iter() {
-        let next_layer = if gpu_fold_session.is_some() {
-            let gpu_folded = {
-                let (gpu, session) = gpu_fold_session.as_mut().expect("checked is_some");
-                gpu.mle_fold_session_step_u32(session, r)
-            };
-            match gpu_folded {
-                Ok(folded_u32) => MleLayerValues::Qm31U32Aos(folded_u32),
-                Err(e) => {
-                    if gpu_fold_strict {
-                        return Err(format!(
-                            "GPU MLE fold strict mode enabled, but GPU folding failed mid-proof: {e}"
-                        ));
-                    }
-                    eprintln!("[GKR] MLE fold backend: GPU step failed, switching to CPU ({e})");
-                    gpu_fold_session = None;
-                    let folded = if let Some(cur_secure) = current_secure_layer.as_ref() {
-                        let mid = cur_secure.len() / 2;
-                        if mid >= 1 << 16 {
-                            (0..mid)
-                                .into_par_iter()
-                                .map(|j| cur_secure[j] + r * (cur_secure[mid + j] - cur_secure[j]))
-                                .collect()
-                        } else {
-                            let mut v = Vec::with_capacity(mid);
-                            for j in 0..mid {
-                                v.push(cur_secure[j] + r * (cur_secure[mid + j] - cur_secure[j]));
-                            }
-                            v
-                        }
-                    } else if let Some(cur_u32) = current_u32_layer.as_ref() {
-                        fold_layer_cpu_qm31_words(cur_u32, r)
-                    } else {
-                        fold_layer_cpu_qm31_words(evals_u32, r)
-                    };
-                    MleLayerValues::Secure(folded)
-                }
-            }
-        } else {
-            let folded = if let Some(cur_secure) = current_secure_layer.as_ref() {
-                let mid = cur_secure.len() / 2;
-                if mid >= 1 << 16 {
-                    (0..mid)
-                        .into_par_iter()
-                        .map(|j| cur_secure[j] + r * (cur_secure[mid + j] - cur_secure[j]))
-                        .collect()
-                } else {
-                    let mut v = Vec::with_capacity(mid);
-                    for j in 0..mid {
-                        v.push(cur_secure[j] + r * (cur_secure[mid + j] - cur_secure[j]));
-                    }
-                    v
-                }
-            } else if let Some(cur_u32) = current_u32_layer.as_ref() {
-                fold_layer_cpu_qm31_words(cur_u32, r)
-            } else {
-                fold_layer_cpu_qm31_words(evals_u32, r)
-            };
-            MleLayerValues::Secure(folded)
-        };
+    let (gpu, mut fold_session) = match gpu_fold_session {
+        Some(v) => v,
+        None => {
+            return Err(
+                "GPU-resident opening path requires GPU fold session (falling back)".to_string()
+            )
+        }
+    };
 
-        if next_layer.len_points() > 1 {
-            let (root, tree) = match &next_layer {
-                MleLayerValues::Qm31U32Aos(words) => build_gpu_opening_tree_from_qm31_u32(words)?,
-                MleLayerValues::Secure(vals) => build_gpu_opening_tree_from_secure(vals)?,
-            };
+    let executor = get_cuda_executor().map_err(|e| format!("cuda init: {e}"))?;
+    let d_rc = upload_poseidon252_round_constants(&executor.device)
+        .map_err(|e| format!("upload round constants: {e}"))?;
+    let d_dummy_columns = executor
+        .device
+        .htod_sync_copy(&[0u32])
+        .map_err(|e| format!("H2D dummy columns: {:?}", e))?;
+
+    let (d_initial, initial_n) = gpu.mle_fold_session_current_device(&fold_session);
+    let (initial_root, initial_tree) = build_gpu_opening_tree_from_qm31_u32_device_with_ctx(
+        executor,
+        &d_rc,
+        &d_dummy_columns,
+        d_initial,
+        initial_n,
+    )?;
+    channel.mix_felt(initial_root);
+
+    if !GPU_MLE_OPENING_TREE_BACKEND_LOGGED.swap(true, Ordering::Relaxed) {
+        eprintln!("[GKR] MLE opening tree backend: GPU-resident (no bulk D2H)");
+    }
+
+    let tree_phase_start = Instant::now();
+    let mut layer_trees: Vec<Poseidon252MerkleGpuTree> = Vec::with_capacity(n_vars);
+    layer_trees.push(initial_tree);
+    let mut intermediate_roots: Vec<FieldElement> = Vec::with_capacity(n_vars.saturating_sub(1));
+
+    for (round, &r) in challenges.iter().enumerate() {
+        gpu.mle_fold_session_step_in_place(&mut fold_session, r)
+            .map_err(|e| {
+                if gpu_fold_strict {
+                    format!(
+                        "GPU MLE fold strict mode enabled, but GPU folding failed at round {}: {}",
+                        round, e
+                    )
+                } else {
+                    format!("GPU MLE folding failed at round {}: {}", round, e)
+                }
+            })?;
+
+        if gpu.mle_fold_session_len(&fold_session) > 1 {
+            let (d_current, cur_n) = gpu.mle_fold_session_current_device(&fold_session);
+            let (root, tree) = build_gpu_opening_tree_from_qm31_u32_device_with_ctx(
+                executor,
+                &d_rc,
+                &d_dummy_columns,
+                d_current,
+                cur_n,
+            )?;
             channel.mix_felt(root);
             intermediate_roots.push(root);
             layer_trees.push(tree);
-            stored_layers.push(next_layer.clone());
-        }
-
-        match next_layer {
-            MleLayerValues::Secure(vals) => {
-                current_secure_layer = Some(vals);
-                current_u32_layer = None;
-            }
-            MleLayerValues::Qm31U32Aos(words) => {
-                current_u32_layer = Some(words);
-                current_secure_layer = None;
-            }
         }
     }
+    let tree_phase_elapsed = tree_phase_start.elapsed();
 
-    let final_value = if let Some(cur_secure) = current_secure_layer.as_ref() {
-        cur_secure[0]
-    } else if let Some(cur_u32) = current_u32_layer.as_ref() {
-        u32s_to_secure_field(&[cur_u32[0], cur_u32[1], cur_u32[2], cur_u32[3]])
-    } else {
-        u32s_to_secure_field(&[evals_u32[0], evals_u32[1], evals_u32[2], evals_u32[3]])
-    };
+    if layer_trees.len() != n_vars {
+        return Err(format!(
+            "GPU opening tree construction produced {} layer trees, expected {}",
+            layer_trees.len(),
+            n_vars
+        ));
+    }
+
+    let (_, final_n) = gpu.mle_fold_session_current_device(&fold_session);
+    if final_n != 1 {
+        return Err(format!(
+            "GPU fold session ended with {} points (expected 1)",
+            final_n
+        ));
+    }
+    let final_words = gpu
+        .mle_fold_session_read_qm31_at(&fold_session, 0)
+        .map_err(|e| format!("download final folded value: {e}"))?;
+    let final_value = u32s_to_secure_field(&final_words);
 
     let half_n = n_points / 2;
     let n_queries = MLE_N_QUERIES.min(half_n);
@@ -701,58 +739,101 @@ fn prove_mle_opening_with_commitment_qm31_u32_gpu_tree(
         let raw = u64::from_be_bytes([
             bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29], bytes[30], bytes[31],
         ]);
-        let pair_idx = (raw as usize) % half_n;
-        query_indices.push(pair_idx);
+        query_indices.push((raw as usize) % half_n);
     }
 
-    let mut queries = Vec::with_capacity(n_queries);
-    for &pair_idx in &query_indices {
-        let mut rounds = Vec::with_capacity(n_vars);
-        let mut current_idx = pair_idx;
-        let mut layer_size = n_points;
+    // Precompute per-round pair indices for each query once, then replay only
+    // lightweight folds to extract the queried leaf pairs.
+    let mut round_pair_indices: Vec<Vec<usize>> =
+        (0..n_vars).map(|_| Vec::with_capacity(n_queries)).collect();
+    let mut cur_query_indices = query_indices.clone();
+    let mut layer_size = n_points;
+    for round in 0..n_vars {
+        round_pair_indices[round].extend(cur_query_indices.iter().copied());
+        let mid = layer_size / 2;
+        let next_half = (mid / 2).max(1);
+        for idx in cur_query_indices.iter_mut() {
+            *idx %= next_half;
+        }
+        layer_size = mid;
+    }
 
-        for round in 0..n_vars {
-            let mid = layer_size / 2;
-            let left_idx = current_idx;
-            let right_idx = mid + current_idx;
+    let query_phase_start = Instant::now();
+    let mut replay_session = gpu
+        .start_mle_fold_session_u32(evals_u32)
+        .map_err(|e| format!("start replay MLE fold session: {e}"))?;
+    let mut query_rounds: Vec<Vec<MleQueryRoundData>> =
+        (0..n_queries).map(|_| Vec::with_capacity(n_vars)).collect();
+    let mut replay_layer_size = n_points;
 
-            let tree = &layer_trees[round];
-            let (left_value, right_value, left_siblings, right_siblings) = if round == 0 {
-                let left_value = leaf_value_from_words(evals_u32, left_idx);
-                let right_value = leaf_value_from_words(evals_u32, right_idx);
-                let left_siblings =
-                    build_gpu_merkle_path_from_words(tree, evals_u32, left_idx, layer_size)?;
-                let right_siblings =
-                    build_gpu_merkle_path_from_words(tree, evals_u32, right_idx, layer_size)?;
-                (left_value, right_value, left_siblings, right_siblings)
-            } else {
-                let layer_values = &stored_layers[round - 1];
-                let left_value = leaf_value_from_layer(layer_values, left_idx);
-                let right_value = leaf_value_from_layer(layer_values, right_idx);
-                let left_siblings =
-                    build_gpu_merkle_path(tree, layer_values, left_idx, layer_size)?;
-                let right_siblings =
-                    build_gpu_merkle_path(tree, layer_values, right_idx, layer_size)?;
-                (left_value, right_value, left_siblings, right_siblings)
-            };
+    for round in 0..n_vars {
+        let mid = replay_layer_size / 2;
+        let (_, cur_n) = gpu.mle_fold_session_current_device(&replay_session);
+        if cur_n != replay_layer_size {
+            return Err(format!(
+                "replay fold size mismatch at round {}: expected {}, got {}",
+                round, replay_layer_size, cur_n
+            ));
+        }
 
-            rounds.push(MleQueryRoundData {
+        let tree = &layer_trees[round];
+        for q in 0..n_queries {
+            let left_idx = round_pair_indices[round][q];
+            let right_idx = mid + left_idx;
+
+            let left_words = gpu
+                .mle_fold_session_read_qm31_at(&replay_session, left_idx)
+                .map_err(|e| format!("download left query value (round {}, query {}): {}", round, q, e))?;
+            let right_words = gpu
+                .mle_fold_session_read_qm31_at(&replay_session, right_idx)
+                .map_err(|e| format!("download right query value (round {}, query {}): {}", round, q, e))?;
+
+            let left_value = u32s_to_secure_field(&left_words);
+            let right_value = u32s_to_secure_field(&right_words);
+            let left_siblings =
+                build_gpu_merkle_path_with_leaf_sibling(tree, left_idx, replay_layer_size, right_value)?;
+            let right_siblings =
+                build_gpu_merkle_path_with_leaf_sibling(tree, right_idx, replay_layer_size, left_value)?;
+
+            query_rounds[q].push(MleQueryRoundData {
                 left_value,
                 right_value,
                 left_siblings,
                 right_siblings,
             });
-
-            let next_half = (mid / 2).max(1);
-            current_idx %= next_half;
-            layer_size = mid;
         }
 
-        queries.push(MleQueryProof {
+        if round + 1 < n_vars {
+            gpu.mle_fold_session_step_in_place(&mut replay_session, challenges[round])
+                .map_err(|e| format!("replay GPU fold step failed at round {}: {}", round, e))?;
+            replay_layer_size = mid;
+        }
+    }
+    let query_phase_elapsed = query_phase_start.elapsed();
+
+    let timing_enabled = std::env::var("STWO_GPU_MLE_OPENING_TIMING")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false" && v != "off"
+        })
+        .unwrap_or(false);
+    if timing_enabled {
+        eprintln!(
+            "[GKR] opening gpu timing: tree_build={:.2}s query_extract={:.2}s",
+            tree_phase_elapsed.as_secs_f64(),
+            query_phase_elapsed.as_secs_f64()
+        );
+    }
+
+    let queries: Vec<MleQueryProof> = query_indices
+        .into_iter()
+        .zip(query_rounds.into_iter())
+        .map(|(pair_idx, rounds)| MleQueryProof {
             initial_pair_index: pair_idx as u32,
             rounds,
-        });
-    }
+        })
+        .collect();
 
     Ok((
         initial_root,

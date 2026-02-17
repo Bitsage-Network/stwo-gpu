@@ -137,6 +137,7 @@ GPU_MLE_MERKLE_REQUIRE="${STWO_GPU_MLE_MERKLE_REQUIRE:-off}"
 GPU_MLE_FOLD_REQUIRE="${STWO_GPU_MLE_FOLD_REQUIRE:-off}"
 GPU_MLE_OPENING_TREE="${STWO_GPU_MLE_OPENING_TREE:-on}"
 GPU_MLE_OPENING_TREE_REQUIRE="${STWO_GPU_MLE_OPENING_TREE_REQUIRE:-off}"
+GPU_MLE_OPENING_TIMING="${STWO_GPU_MLE_OPENING_TIMING:-off}"
 
 # Favor GPU fold for heavy weight-opening phases unless caller overrides.
 if [[ "$USE_GPU" == "true" ]] && [[ -z "${STWO_GPU_MLE_FOLD:-}" ]]; then
@@ -253,6 +254,8 @@ log "GPU only mode:  ${GPU_ONLY}"
 log "GPU commit:     strict=${GPU_COMMIT_STRICT} harden=${GPU_COMMIT_HARDEN} parallel=${GPU_COMMIT_PARALLEL}"
 log "GPU poly path:  strict=${GPU_POLY_STRICT} harden=${GPU_POLY_HARDEN}"
 log "GPU MLE path:   fold=${GPU_MLE_FOLD} fold_min_points=${GPU_MLE_FOLD_MIN_POINTS} opening_tree=${GPU_MLE_OPENING_TREE} merkle_require=${GPU_MLE_MERKLE_REQUIRE} fold_require=${GPU_MLE_FOLD_REQUIRE} opening_tree_require=${GPU_MLE_OPENING_TREE_REQUIRE}"
+log "GPU opening:    qm31_pack=device (enabled by default)"
+log "GPU opening dbg: timing=${GPU_MLE_OPENING_TIMING}"
 log "Progress:       weight_every=${STWO_WEIGHT_PROGRESS_EVERY} opening_every=${STWO_GKR_OPENINGS_PROGRESS_EVERY} opening_heartbeat=${STWO_GKR_OPENING_HEARTBEAT_SEC}s"
 echo ""
 

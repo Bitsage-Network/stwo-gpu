@@ -230,6 +230,8 @@ The proof is saved to `~/.obelysk/proofs/`.
   - GKR layer reductions (usually fast, tens of seconds)
   - Weight opening proofs (can dominate runtime)
 - Opening prep now avoids an extra full padded-matrix copy, reducing CPU RAM pressure during large openings.
+- GPU opening trees now use device-side QM31 packing, removing per-round CPU repack/upload overhead in large weight openings.
+- Opening query extraction now replays folds on GPU and downloads only queried leaf pairs, avoiding full-layer per-round downloads.
 
 The pipeline now prints dense progress + heartbeat messages during long openings so it does not appear frozen.
 
@@ -251,6 +253,8 @@ Use GPU-only fail-fast mode to catch this immediately:
 - GPU opening-tree path is enabled by default to avoid bulk Merkle layer downloads:
   - `STWO_GPU_MLE_OPENING_TREE=1`
   - (with `--gpu-only`, pipeline also enforces `STWO_GPU_MLE_OPENING_TREE_REQUIRE=1`)
+- Optional timing debug for opening internals:
+  - `STWO_GPU_MLE_OPENING_TIMING=1`
 - CPU fallback sections use all CPU threads by default:
   - `RAYON_NUM_THREADS=$(nproc)`
   - `OMP_NUM_THREADS=$(nproc)`
