@@ -302,14 +302,28 @@ echo ""
 if [[ "$DRY_RUN" == "1" ]]; then
     run_cmd "${PROVE_CMD[@]}"
 else
-    # Run proving and display progress lines
-    "${PROVE_CMD[@]}" 2>&1 | while IFS= read -r line; do
-        # Show layer progress lines
-        if echo "$line" | grep -qE '\[layer|\[BG\]|Proving|Weight commit'; then
+    RAW_LOG="${OUTPUT_DIR}/prove_model.raw.log"
+    log "Raw prover log: ${RAW_LOG}"
+
+    # Run proving, keep a full raw log, and stream key lines live.
+    # We intentionally disable `set -e` around the pipeline so we can surface
+    # the real prover exit code + error tail instead of silently exiting.
+    set +e
+    "${PROVE_CMD[@]}" 2>&1 | tee "$RAW_LOG" | while IFS= read -r line; do
+        # Show progress + fatal diagnostics lines
+        if echo "$line" | grep -qE '\[layer|\[BG\]|Proving|Weight commit|Error:|error:|panic|thread .+ panicked|Segmentation fault'; then
             log "$line"
         fi
     done
-    # Check if proof was generated (pipe swallows exit code)
+    PROVE_RC=${PIPESTATUS[0]}
+    set -e
+
+    if [[ ${PROVE_RC} -ne 0 ]]; then
+        err "prove-model failed (exit ${PROVE_RC})"
+        err "Last 120 lines from raw log:"
+        tail -120 "$RAW_LOG" | sed 's/^/[prove-model] /'
+        exit ${PROVE_RC}
+    fi
 fi
 
 PHASE1_SEC=$(timer_elapsed "phase1")
