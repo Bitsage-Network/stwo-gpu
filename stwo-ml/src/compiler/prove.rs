@@ -924,11 +924,16 @@ pub(crate) fn apply_layernorm_detailed(input: &M31Matrix, dim: usize) -> LayerNo
             let diff = input.data[row_start + col] - mean;
             var_sum += diff * diff;
         }
-        let variance = var_sum * inv_n;
+        // Reduce variance to rsqrt_table range [0, 2^16) so the LogUp
+        // lookup always succeeds.  M31 modular arithmetic can produce
+        // variance values anywhere in [0, P-1]; masking to 16 bits keeps
+        // the computation deterministic and provable.
+        let variance_raw = var_sum * inv_n;
+        let variance = M31::from(variance_raw.0 & ((1u32 << 16) - 1));
 
         let rsqrt = rsqrt_table
             .lookup(variance)
-            .unwrap_or(M31::from(1u32 << 16));
+            .expect("variance reduced to table range; lookup must succeed");
 
         let mut row_out = Vec::with_capacity(cols);
         let mut row_inputs = Vec::with_capacity(cols);
@@ -1034,11 +1039,13 @@ pub(crate) fn apply_rmsnorm_detailed(input: &M31Matrix, dim: usize) -> RMSNormIn
             let x = input.data[row_start + col];
             sq_sum += x * x;
         }
-        let rms_sq = sq_sum * inv_n;
+        // Reduce rms_sq to rsqrt_table range [0, 2^16) for provable LogUp.
+        let rms_sq_raw = sq_sum * inv_n;
+        let rms_sq = M31::from(rms_sq_raw.0 & ((1u32 << 16) - 1));
 
         let rsqrt = rsqrt_table
             .lookup(rms_sq)
-            .unwrap_or(M31::from(1u32 << 16));
+            .expect("rms_sq reduced to table range; lookup must succeed");
 
         let mut row_out = Vec::with_capacity(cols);
         let mut row_inputs = Vec::with_capacity(cols);
@@ -2031,10 +2038,10 @@ mod tests {
         let inputs = vec![M31::from(10), M31::from(20), M31::from(30), M31::from(40)];
         let mean = M31::from(25); // simplified
         let means = vec![mean; 4];
-        // variance ≈ simplified
-        let var = M31::from(125);
+        // variance reduced to table range (log_size=4 → [0,15])
+        let var = M31::from(125u32 & ((1u32 << 4) - 1)); // 125 & 0xF = 13
         let variances = vec![var; 4];
-        let rsqrt = rsqrt_table.lookup(var).unwrap_or(M31::from(1u32 << 16));
+        let rsqrt = rsqrt_table.lookup(var).expect("variance reduced to table range");
         let rsqrt_vals = vec![rsqrt; 4];
         let outputs: Vec<M31> = inputs.iter().map(|&x| (x - mean) * rsqrt).collect();
 

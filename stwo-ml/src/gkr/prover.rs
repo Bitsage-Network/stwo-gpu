@@ -192,7 +192,7 @@ pub fn prove_gkr(
             LayerType::RMSNorm { dim, .. } => {
                 let input_matrix = get_intermediate(execution, layer.node_id)?;
 
-                reduce_layernorm_layer(
+                reduce_rmsnorm_layer(
                     &current_claim, input_matrix, *dim, channel,
                 )?
             }
@@ -2591,12 +2591,14 @@ fn reduce_layernorm_layer(
             let diff = input_padded.get(row, col) - mean;
             var_sum = var_sum + diff * diff;
         }
-        let variance = var_sum * inv_n;
+        // Reduce variance to rsqrt_table range [0, 2^table_log_size) for LogUp.
+        let variance_raw = var_sum * inv_n;
+        let variance = M31::from(variance_raw.0 & ((1u32 << config.rsqrt_table_log_size) - 1));
         let variance_sf = SecureField::from(variance);
 
         let rsqrt = rsqrt_table
             .lookup(variance)
-            .unwrap_or(M31::from(1u32 << 16));
+            .expect("variance reduced to table range");
         let rsqrt_sf = SecureField::from(rsqrt);
 
         for col in 0..cols {
@@ -2903,8 +2905,10 @@ fn reduce_rmsnorm_layer(
             let x = input_padded.get(row, col);
             sq_sum = sq_sum + x * x;
         }
-        let rms_sq = sq_sum * inv_n;
-        let rsqrt = rsqrt_table.lookup(rms_sq).unwrap_or(M31::from(1u32 << 16));
+        // Reduce rms_sq to rsqrt_table range for LogUp.
+        let rms_sq_raw = sq_sum * inv_n;
+        let rms_sq = M31::from(rms_sq_raw.0 & ((1u32 << config.rsqrt_table_log_size) - 1));
+        let rsqrt = rsqrt_table.lookup(rms_sq).expect("rms_sq reduced to table range");
 
         for col in 0..cols {
             let idx = row * cols + col;
@@ -3154,8 +3158,10 @@ fn reduce_layernorm_layer_simd(
                 let diff = padded.get(row, col) - mean;
                 var_sum = var_sum + diff * diff;
             }
-            let variance = var_sum * inv_n;
-            let rsqrt = rsqrt_table.lookup(variance).unwrap_or(M31::from(1u32 << 16));
+            // Reduce variance to table range for LogUp consistency.
+            let variance_raw = var_sum * inv_n;
+            let variance = M31::from(variance_raw.0 & ((1u32 << config.rsqrt_table_log_size) - 1));
+            let rsqrt = rsqrt_table.lookup(variance).expect("variance reduced to table range");
 
             let mean_sf = SecureField::from(mean);
             let rsqrt_sf = SecureField::from(rsqrt);

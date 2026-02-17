@@ -1114,7 +1114,9 @@ where
     let mut layernorm_mults: Vec<Vec<M31>> = Vec::new();
     for layer in &layernorm_layers {
         let layer_size = 1usize << layer.log_size;
-        let mults = compute_multiplicities(&layer.variances, &layer.rsqrt_table);
+        let padding = layer_size.saturating_sub(layer.variances.len());
+        let mut mults = compute_multiplicities(&layer.variances, &layer.rsqrt_table);
+        if padding > 0 { mults[0] += M31::from(padding as u32); }
         let cols = build_layernorm_trace_columns(
             &layer.inputs, &layer.means, &layer.variances,
             &layer.rsqrt_vals, &layer.outputs, &mults,
@@ -1126,7 +1128,9 @@ where
     let mut rmsnorm_mults: Vec<Vec<M31>> = Vec::new();
     for layer in &rmsnorm_layers {
         let layer_size = 1usize << layer.log_size;
-        let mults = compute_multiplicities(&layer.rms_sq_vals, &layer.rsqrt_table);
+        let padding = layer_size.saturating_sub(layer.rms_sq_vals.len());
+        let mut mults = compute_multiplicities(&layer.rms_sq_vals, &layer.rsqrt_table);
+        if padding > 0 { mults[0] += M31::from(padding as u32); }
         let cols = build_rmsnorm_trace_columns(
             &layer.inputs, &layer.rms_sq_vals,
             &layer.rsqrt_vals, &layer.outputs, &mults,
@@ -2866,7 +2870,9 @@ where
     let mut layernorm_mults: Vec<Vec<M31>> = Vec::new();
     for layer in &layernorm_layers {
         let layer_size = 1usize << layer.log_size;
-        let mults = compute_multiplicities(&layer.variances, &layer.rsqrt_table);
+        let padding = layer_size.saturating_sub(layer.variances.len());
+        let mut mults = compute_multiplicities(&layer.variances, &layer.rsqrt_table);
+        if padding > 0 { mults[0] += M31::from(padding as u32); }
         let cols = build_layernorm_trace_columns(
             &layer.inputs, &layer.means, &layer.variances,
             &layer.rsqrt_vals, &layer.outputs, &mults,
@@ -2878,7 +2884,9 @@ where
     let mut rmsnorm_mults: Vec<Vec<M31>> = Vec::new();
     for layer in &rmsnorm_layers {
         let layer_size = 1usize << layer.log_size;
-        let mults = compute_multiplicities(&layer.rms_sq_vals, &layer.rsqrt_table);
+        let padding = layer_size.saturating_sub(layer.rms_sq_vals.len());
+        let mut mults = compute_multiplicities(&layer.rms_sq_vals, &layer.rsqrt_table);
+        if padding > 0 { mults[0] += M31::from(padding as u32); }
         let cols = build_rmsnorm_trace_columns(
             &layer.inputs, &layer.rms_sq_vals,
             &layer.rsqrt_vals, &layer.outputs, &mults,
@@ -4913,7 +4921,9 @@ where
     let mut layernorm_mults: Vec<Vec<M31>> = Vec::new();
     for layer in layernorm_layers {
         let sz = 1usize << layer.log_size;
-        let mults = compute_multiplicities(&layer.variances, &layer.rsqrt_table);
+        let padding = sz.saturating_sub(layer.variances.len());
+        let mut mults = compute_multiplicities(&layer.variances, &layer.rsqrt_table);
+        if padding > 0 { mults[0] += M31::from(padding as u32); }
         let cols = build_layernorm_trace_columns(
             &layer.inputs, &layer.means, &layer.variances,
             &layer.rsqrt_vals, &layer.outputs, &mults,

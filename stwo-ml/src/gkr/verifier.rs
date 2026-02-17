@@ -2690,8 +2690,10 @@ mod tests {
                 let diff = padded.get(row, col) - mean;
                 var_sum = var_sum + diff * diff;
             }
-            let variance = var_sum * inv_n;
-            let rsqrt = rsqrt_table.lookup(variance).unwrap_or(M31::from(1u32 << 16));
+            // Reduce variance to table range (must match prover).
+            let variance_raw = var_sum * inv_n;
+            let variance = M31::from(variance_raw.0 & ((1u32 << config.rsqrt_table_log_size) - 1));
+            let rsqrt = rsqrt_table.lookup(variance).expect("variance reduced to table range");
             for col in 0..padded.cols {
                 if col < n_active {
                     let centered = padded.get(row, col) - mean;
@@ -3072,8 +3074,10 @@ mod tests {
                 let diff = padded.get(row, col) - mean;
                 var_sum = var_sum + diff * diff;
             }
-            let variance = var_sum * inv_n;
-            let rsqrt = rsqrt_table.lookup(variance).unwrap_or(M31::from(1u32 << 16));
+            // Reduce variance to table range (must match prover).
+            let variance_raw = var_sum * inv_n;
+            let variance = M31::from(variance_raw.0 & ((1u32 << config.rsqrt_table_log_size) - 1));
+            let rsqrt = rsqrt_table.lookup(variance).expect("variance reduced to table range");
 
             let mean_sf = SecureField::from(mean);
             let rsqrt_sf = SecureField::from(rsqrt);
