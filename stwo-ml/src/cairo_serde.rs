@@ -1151,6 +1151,8 @@ pub fn serialize_gkr_model_proof(
                         weight_commitments: vec![],
                         weight_openings: vec![],
                         weight_claims: vec![],
+                        weight_opening_transcript_mode:
+                            crate::gkr::types::WeightOpeningTranscriptMode::Sequential,
                         io_commitment: proof.io_commitment,
                         deferred_proofs: vec![],
                     };
@@ -1364,6 +1366,8 @@ pub fn serialize_gkr_proof_data_only(
                         weight_commitments: vec![],
                         weight_openings: vec![],
                         weight_claims: vec![],
+                        weight_opening_transcript_mode:
+                            crate::gkr::types::WeightOpeningTranscriptMode::Sequential,
                         io_commitment: proof.io_commitment,
                         deferred_proofs: vec![],
                     };

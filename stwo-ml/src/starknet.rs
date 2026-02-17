@@ -678,7 +678,7 @@ pub struct GkrStarknetProof {
     /// Always populated for artifact completeness, including batched weight-binding mode.
     pub weight_claim_calldata: Vec<FieldElement>,
     /// Transcript mode used for weight binding/openings.
-    pub weight_opening_mode: crate::gkr::WeightOpeningTranscriptMode,
+    pub weight_opening_mode: crate::gkr::types::WeightOpeningTranscriptMode,
     /// True when the proof passes strict Starknet soundness gates and can be submitted
     /// with `verify_model_gkr` calldata as-is.
     pub submission_ready: bool,
@@ -702,7 +702,8 @@ pub struct GkrStarknetProof {
 /// - Activation layers must include LogUp proofs.
 /// - All MatMul weight claims must have matching non-empty opening proofs.
 fn enforce_gkr_soundness_gates(proof: &crate::gkr::GKRProof) -> Result<(), StarknetModelError> {
-    use crate::gkr::{LayerProof, WeightOpeningTranscriptMode};
+    use crate::gkr::types::WeightOpeningTranscriptMode;
+    use crate::gkr::LayerProof;
 
     for (layer_idx, layer_proof) in proof.layer_proofs.iter().enumerate() {
         if let LayerProof::Activation { logup_proof, .. } = layer_proof {
