@@ -52,7 +52,11 @@ pub struct MleQueryRoundData {
 ///
 /// Returns (root, tree).
 pub fn commit_mle(evals: &[SecureField]) -> (FieldElement, PoseidonMerkleTree) {
-    let leaves: Vec<FieldElement> = evals.iter().map(|&sf| securefield_to_felt(sf)).collect();
+    let leaves: Vec<FieldElement> = if evals.len() >= 256 {
+        evals.par_iter().map(|&sf| securefield_to_felt(sf)).collect()
+    } else {
+        evals.iter().map(|&sf| securefield_to_felt(sf)).collect()
+    };
     let tree = PoseidonMerkleTree::build_parallel(leaves);
     (tree.root(), tree)
 }
