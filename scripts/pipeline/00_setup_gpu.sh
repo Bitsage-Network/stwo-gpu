@@ -215,12 +215,12 @@ if [[ "$SKIP_BUILD" == "false" ]]; then
     fi
 
     if (cd "${LIBS_DIR}/stwo-ml" && \
-        RUSTUP_TOOLCHAIN=nightly cargo build --release --bin prove-model --features "${FEATURES}" 2>&1 | tail -5); then
+        cargo build --release --bin prove-model --features "${FEATURES}" 2>&1 | tail -5); then
         ok "stwo-ml built (features: ${FEATURES})"
     else
         warn "GPU build failed, retrying CPU-only..."
         (cd "${LIBS_DIR}/stwo-ml" && \
-            RUSTUP_TOOLCHAIN=nightly cargo build --release --bin prove-model --features "cli" 2>&1 | tail -5)
+            cargo build --release --bin prove-model --features "cli" 2>&1 | tail -5)
         ok "stwo-ml built (CPU-only)"
     fi
 
@@ -228,7 +228,7 @@ if [[ "$SKIP_BUILD" == "false" ]]; then
     if [[ -d "${LIBS_DIR}/stwo-cairo/cairo-prove" ]]; then
         log "Building cairo-prove..."
         if (cd "${LIBS_DIR}/stwo-cairo/cairo-prove" && \
-            RUSTUP_TOOLCHAIN=nightly cargo build --release 2>&1 | tail -5); then
+            cargo build --release 2>&1 | tail -5); then
             ok "cairo-prove built"
         else
             warn "cairo-prove build failed (recursive proving unavailable)"
@@ -322,7 +322,7 @@ CAIRO_BIN=$(find_binary "cairo-prove" "${INSTALL_DIR}")
 if [[ -n "$PROVE_BIN" ]]; then
     log "Running quick test..."
     if (cd "${INSTALL_DIR}/stwo-ml" && \
-        RUSTUP_TOOLCHAIN=nightly cargo test --release --lib \
+        cargo test --release --lib \
             -- test_matmul_sumcheck_basic --nocapture 2>&1 | tail -5); then
         ok "Sanity test passed"
     else
