@@ -22,9 +22,8 @@ use starknet_ff::FieldElement;
 use stwo::core::pcs::PcsConfig;
 
 use crate::aggregation::{
-    AggregatedModelProof, AggregatedModelProofOnChain,
-    AggregationError, LayerClaim,
-    prove_model_aggregated_auto, prove_model_aggregated_onchain_auto,
+    prove_model_aggregated_auto, prove_model_aggregated_onchain_auto, AggregatedModelProof,
+    AggregatedModelProofOnChain, AggregationError, LayerClaim,
 };
 use crate::cairo_serde::{
     serialize_gkr_proof_data_only, serialize_matmul_sumcheck_proof, serialize_proof,
@@ -196,9 +195,7 @@ pub fn prepare_model_registration(
         starknet_crypto::poseidon_hash_many(&desc_data)
     };
 
-    let model_id = starknet_crypto::poseidon_hash_many(&[
-        arch_hash, weight_commitment, desc_felt,
-    ]);
+    let model_id = starknet_crypto::poseidon_hash_many(&[arch_hash, weight_commitment, desc_felt]);
 
     ModelRegistration {
         model_id,
@@ -238,10 +235,7 @@ pub fn register_model_calldata(registration: &ModelRegistration) -> Vec<FieldEle
 ///
 /// Returns `[model_id, weight_commitment]`.
 pub fn register_model_calldata_sumcheck(registration: &ModelRegistration) -> Vec<FieldElement> {
-    vec![
-        registration.model_id,
-        registration.weight_commitment,
-    ]
+    vec![registration.model_id, registration.weight_commitment]
 }
 
 /// Error type for Starknet proof generation.
@@ -302,7 +296,10 @@ pub fn prove_for_starknet_onchain_cached(
     weight_cache: &crate::weight_cache::SharedWeightCache,
 ) -> Result<StarknetModelProof, StarknetModelError> {
     let proof = crate::aggregation::prove_model_aggregated_onchain_auto_cached(
-        graph, input, weights, weight_cache,
+        graph,
+        input,
+        weights,
+        weight_cache,
     )?;
     Ok(build_starknet_proof_onchain(&proof, input))
 }
@@ -487,7 +484,9 @@ pub fn build_starknet_proof_onchain(
     }
 
     // LayerNorm mean/var commitments
-    combined.push(FieldElement::from(proof.layernorm_mean_var_commitments.len() as u64));
+    combined.push(FieldElement::from(
+        proof.layernorm_mean_var_commitments.len() as u64,
+    ));
     for commitment in &proof.layernorm_mean_var_commitments {
         combined.push(*commitment);
     }
@@ -599,12 +598,17 @@ pub fn prove_for_starknet_direct_multi_gpu(
     memory_budget: usize,
 ) -> Result<DirectStarknetProof, StarknetModelError> {
     let chunks = crate::compiler::chunked::prove_model_chunked_multi_gpu(
-        graph, input, weights, memory_budget,
-    ).map_err(|e| StarknetModelError::SerializationError(format!("Multi-GPU chunked proving: {e}")))?;
+        graph,
+        input,
+        weights,
+        memory_budget,
+    )
+    .map_err(|e| {
+        StarknetModelError::SerializationError(format!("Multi-GPU chunked proving: {e}"))
+    })?;
 
-    let proof = crate::compiler::chunked::compose_chunk_proofs_auto(
-        &chunks, graph, input, weights,
-    ).map_err(|e| StarknetModelError::SerializationError(format!("Chunk composition: {e}")))?;
+    let proof = crate::compiler::chunked::compose_chunk_proofs_auto(&chunks, graph, input, weights)
+        .map_err(|e| StarknetModelError::SerializationError(format!("Chunk composition: {e}")))?;
 
     Ok(build_starknet_proof_direct(&proof, input, metadata))
 }
@@ -670,6 +674,16 @@ pub struct GkrStarknetProof {
     /// Already serialized as Cairo `Array<MleOpeningProof>`:
     /// `[num_openings, opening_0..., opening_1..., ...]`.
     pub weight_opening_calldata: Vec<FieldElement>,
+    /// Weight claims (node id + eval point + expected value) in stable serialized form.
+    /// Always populated for artifact completeness, including batched weight-binding mode.
+    pub weight_claim_calldata: Vec<FieldElement>,
+    /// Transcript mode used for weight binding/openings.
+    pub weight_opening_mode: crate::gkr::WeightOpeningTranscriptMode,
+    /// True when the proof passes strict Starknet soundness gates and can be submitted
+    /// with `verify_model_gkr` calldata as-is.
+    pub submission_ready: bool,
+    /// If `submission_ready == false`, contains the strict gate failure reason.
+    pub soundness_gate_error: Option<String>,
     /// IO commitment: Poseidon(input_data || output_data).
     pub io_commitment: FieldElement,
     /// Layer chain commitment from the proving pipeline.
@@ -688,7 +702,7 @@ pub struct GkrStarknetProof {
 /// - Activation layers must include LogUp proofs.
 /// - All MatMul weight claims must have matching non-empty opening proofs.
 fn enforce_gkr_soundness_gates(proof: &crate::gkr::GKRProof) -> Result<(), StarknetModelError> {
-    use crate::gkr::LayerProof;
+    use crate::gkr::{LayerProof, WeightOpeningTranscriptMode};
 
     for (layer_idx, layer_proof) in proof.layer_proofs.iter().enumerate() {
         if let LayerProof::Activation { logup_proof, .. } = layer_proof {
@@ -699,6 +713,13 @@ fn enforce_gkr_soundness_gates(proof: &crate::gkr::GKRProof) -> Result<(), Stark
                 )));
             }
         }
+    }
+
+    if proof.weight_opening_transcript_mode != WeightOpeningTranscriptMode::Sequential {
+        return Err(StarknetModelError::SoundnessGate(format!(
+            "unsupported weight opening transcript mode for Starknet serialization: {:?}",
+            proof.weight_opening_transcript_mode
+        )));
     }
 
     let n_main = proof.weight_claims.len();
@@ -736,6 +757,113 @@ fn enforce_gkr_soundness_gates(proof: &crate::gkr::GKRProof) -> Result<(), Stark
     Ok(())
 }
 
+fn serialize_weight_claim(claim: &crate::gkr::types::WeightClaim, output: &mut Vec<FieldElement>) {
+    crate::cairo_serde::serialize_u32(claim.weight_node_id as u32, output);
+    crate::cairo_serde::serialize_u32(claim.eval_point.len() as u32, output);
+    for &p in &claim.eval_point {
+        crate::cairo_serde::serialize_qm31(p, output);
+    }
+    crate::cairo_serde::serialize_qm31(claim.expected_value, output);
+}
+
+fn serialize_weight_claims_for_artifact(proof: &crate::gkr::GKRProof) -> Vec<FieldElement> {
+    // Order mirrors verifier-side claim walk:
+    //   1) main walk MatMul claims
+    //   2) deferred MatMul claims
+    let total_claims = proof.weight_claims.len() + proof.deferred_proofs.len();
+    let mut out = Vec::new();
+    crate::cairo_serde::serialize_u32(total_claims as u32, &mut out);
+    for claim in &proof.weight_claims {
+        serialize_weight_claim(claim, &mut out);
+    }
+    for deferred in &proof.deferred_proofs {
+        serialize_weight_claim(&deferred.weight_claim, &mut out);
+    }
+    out
+}
+
+fn build_gkr_serialized_proof_inner(
+    proof: &AggregatedModelProofOnChain,
+    model_id: FieldElement,
+    input: &M31Matrix,
+    require_starknet_soundness: bool,
+) -> Result<GkrStarknetProof, StarknetModelError> {
+    let gkr_proof = proof.gkr_proof.as_ref().ok_or_else(|| {
+        StarknetModelError::SerializationError("No GKR proof in aggregated proof".to_string())
+    })?;
+
+    let soundness_gate_error = match enforce_gkr_soundness_gates(gkr_proof) {
+        Ok(()) => None,
+        Err(e) => {
+            if require_starknet_soundness {
+                return Err(e);
+            }
+            Some(e.to_string())
+        }
+    };
+
+    // Serialize ONLY proof_data for verify_model_gkr(proof_data: Array<felt252>).
+    // Full serialize_gkr_model_proof includes header/footer fields that the
+    // contract passes separately and would break parser alignment.
+    let mut gkr_calldata = Vec::new();
+    serialize_gkr_proof_data_only(gkr_proof, &mut gkr_calldata);
+
+    // Serialize raw IO for on-chain IO commitment recomputation.
+    let io_calldata = crate::cairo_serde::serialize_raw_io(input, &proof.execution.output);
+
+    // Weight commitments are a separate parameter to verify_model_gkr.
+    // Include both main-walk matmuls and deferred matmul branches.
+    let mut weight_commitments = gkr_proof.weight_commitments.clone();
+    for deferred in &gkr_proof.deferred_proofs {
+        weight_commitments.push(deferred.weight_commitment);
+    }
+
+    // Serialize weight MLE opening proofs as Array<MleOpeningProof> for Cairo Serde.
+    // Order must match Cairo verifier weight_claims:
+    //   1) main walk matmul claims
+    //   2) deferred matmul claims (DAG Add skip branches)
+    let total_openings = gkr_proof.weight_openings.len() + gkr_proof.deferred_proofs.len();
+    let mut weight_opening_calldata = Vec::new();
+    crate::cairo_serde::serialize_u32(total_openings as u32, &mut weight_opening_calldata);
+    for opening in &gkr_proof.weight_openings {
+        crate::cairo_serde::serialize_mle_opening_proof(opening, &mut weight_opening_calldata);
+    }
+    for deferred in &gkr_proof.deferred_proofs {
+        crate::cairo_serde::serialize_mle_opening_proof(
+            &deferred.weight_opening,
+            &mut weight_opening_calldata,
+        );
+    }
+
+    let weight_claim_calldata = serialize_weight_claims_for_artifact(gkr_proof);
+
+    let total_calldata_size = 1
+        + gkr_calldata.len()
+        + io_calldata.len()
+        + (1 + weight_commitments.len())
+        + weight_opening_calldata.len()
+        + weight_claim_calldata.len();
+    let num_layer_proofs = gkr_proof.layer_proofs.len();
+    let estimated_gas = estimate_gkr_verification_gas(num_layer_proofs);
+
+    Ok(GkrStarknetProof {
+        model_id,
+        gkr_calldata,
+        io_calldata,
+        weight_commitments,
+        weight_opening_calldata,
+        weight_claim_calldata,
+        weight_opening_mode: gkr_proof.weight_opening_transcript_mode,
+        submission_ready: soundness_gate_error.is_none(),
+        soundness_gate_error,
+        io_commitment: proof.io_commitment,
+        layer_chain_commitment: proof.layer_chain_commitment,
+        num_layer_proofs,
+        estimated_gas,
+        total_calldata_size,
+    })
+}
+
 /// Build GKR model calldata for the `verify_model_gkr()` contract entry point.
 ///
 /// Wraps `serialize_gkr_model_proof()` output with the `model_id` parameter.
@@ -761,61 +889,20 @@ pub fn build_gkr_starknet_proof(
     model_id: FieldElement,
     input: &M31Matrix,
 ) -> Result<GkrStarknetProof, StarknetModelError> {
-    let gkr_proof = proof.gkr_proof.as_ref().ok_or_else(|| {
-        StarknetModelError::SerializationError("No GKR proof in aggregated proof".to_string())
-    })?;
-    enforce_gkr_soundness_gates(gkr_proof)?;
+    build_gkr_serialized_proof_inner(proof, model_id, input, true)
+}
 
-    // Serialize ONLY proof_data for verify_model_gkr(proof_data: Array<felt252>).
-    // Full serialize_gkr_model_proof includes header/footer fields that the
-    // contract passes separately and would break parser alignment.
-    let mut gkr_calldata = Vec::new();
-    serialize_gkr_proof_data_only(gkr_proof, &mut gkr_calldata);
-
-    // Serialize raw IO for on-chain IO commitment recomputation
-    let io_calldata = crate::cairo_serde::serialize_raw_io(input, &proof.execution.output);
-
-    // Weight commitments are a separate parameter to verify_model_gkr.
-    // Include both main-walk matmuls and deferred matmul branches.
-    let mut weight_commitments = gkr_proof.weight_commitments.clone();
-    for deferred in &gkr_proof.deferred_proofs {
-        weight_commitments.push(deferred.weight_commitment);
-    }
-
-    // Serialize weight MLE opening proofs as Array<MleOpeningProof> for Cairo Serde.
-    // Order must match Cairo verifier weight_claims:
-    //   1) main walk matmul claims
-    //   2) deferred matmul claims (DAG Add skip branches)
-    let total_openings = gkr_proof.weight_openings.len() + gkr_proof.deferred_proofs.len();
-    let mut weight_opening_calldata = Vec::new();
-    crate::cairo_serde::serialize_u32(total_openings as u32, &mut weight_opening_calldata);
-    for opening in &gkr_proof.weight_openings {
-        crate::cairo_serde::serialize_mle_opening_proof(opening, &mut weight_opening_calldata);
-    }
-    for deferred in &gkr_proof.deferred_proofs {
-        crate::cairo_serde::serialize_mle_opening_proof(&deferred.weight_opening, &mut weight_opening_calldata);
-    }
-
-    let total_calldata_size = 1
-        + gkr_calldata.len()
-        + io_calldata.len()
-        + (1 + weight_commitments.len())
-        + weight_opening_calldata.len();
-    let num_layer_proofs = gkr_proof.layer_proofs.len();
-    let estimated_gas = estimate_gkr_verification_gas(num_layer_proofs);
-
-    Ok(GkrStarknetProof {
-        model_id,
-        gkr_calldata,
-        io_calldata,
-        weight_commitments,
-        weight_opening_calldata,
-        io_commitment: proof.io_commitment,
-        layer_chain_commitment: proof.layer_chain_commitment,
-        num_layer_proofs,
-        estimated_gas,
-        total_calldata_size,
-    })
+/// Build a serialized GKR artifact even when strict Starknet soundness gates fail.
+///
+/// This preserves proof data for benchmarking/off-chain verification workflows
+/// (e.g., batched weight-binding transcript modes) while clearly marking
+/// `submission_ready=false` and carrying a gate error message.
+pub fn build_gkr_serializable_proof(
+    proof: &AggregatedModelProofOnChain,
+    model_id: FieldElement,
+    input: &M31Matrix,
+) -> Result<GkrStarknetProof, StarknetModelError> {
+    build_gkr_serialized_proof_inner(proof, model_id, input, false)
 }
 
 /// Prove a computation graph via pure GKR and produce Starknet-ready calldata.
@@ -1064,7 +1151,6 @@ pub fn build_verify_model_gkr_calldata(
     })
 }
 
-
 /// Build flat calldata for `verify_model_direct()`.
 ///
 /// Layout matches EloVerifier's signature:
@@ -1197,11 +1283,17 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w.set(i, j, M31::from((i * 2 + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
         weights.add_weight(0, w);
 
         let result = prove_for_starknet(&graph, &input, &weights);
@@ -1227,17 +1319,31 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w2.set(i, j, M31::from(((i * j) % 5 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w2.set(i, j, M31::from(((i * j) % 5 + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
         let mut w4 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w4.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w4.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(4, w4);
 
         let result = prove_for_starknet(&graph, &input, &weights);
@@ -1245,7 +1351,10 @@ mod tests {
         let proof = result.unwrap();
 
         // Has unified STARK calldata
-        assert!(!proof.unified_calldata.is_empty(), "should have unified calldata");
+        assert!(
+            !proof.unified_calldata.is_empty(),
+            "should have unified calldata"
+        );
         assert_eq!(proof.layer_claims.len(), 2, "2 activation layers");
         assert_eq!(proof.num_matmul_proofs, 3, "3 matmul sumchecks");
         assert_eq!(proof.num_proven_layers, 5, "5 total layers");
@@ -1253,7 +1362,10 @@ mod tests {
 
         // Gas estimate should include DA cost
         let gas_with_da = estimate_gas_from_proof(&proof);
-        assert!(gas_with_da > proof.estimated_gas, "DA cost should increase gas");
+        assert!(
+            gas_with_da > proof.estimated_gas,
+            "DA cost should increase gas"
+        );
     }
 
     #[test]
@@ -1265,14 +1377,24 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w2.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
 
         // Prove aggregated, then convert to Starknet format
@@ -1297,7 +1419,9 @@ mod tests {
     #[test]
     fn test_io_commitment_deterministic() {
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
         let mut output = M31Matrix::new(1, 2);
         output.set(0, 0, M31::from(10));
         output.set(0, 1, M31::from(20));
@@ -1311,9 +1435,13 @@ mod tests {
     #[test]
     fn test_io_commitment_different_inputs() {
         let mut input1 = M31Matrix::new(1, 4);
-        for j in 0..4 { input1.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input1.set(0, j, M31::from((j + 1) as u32));
+        }
         let mut input2 = M31Matrix::new(1, 4);
-        for j in 0..4 { input2.set(0, j, M31::from((j + 10) as u32)); }
+        for j in 0..4 {
+            input2.set(0, j, M31::from((j + 10) as u32));
+        }
 
         let mut output = M31Matrix::new(1, 2);
         output.set(0, 0, M31::from(10));
@@ -1321,7 +1449,10 @@ mod tests {
 
         let hash1 = compute_io_commitment(&input1, &output);
         let hash2 = compute_io_commitment(&input2, &output);
-        assert_ne!(hash1, hash2, "different inputs should produce different hashes");
+        assert_ne!(
+            hash1, hash2,
+            "different inputs should produce different hashes"
+        );
     }
 
     #[test]
@@ -1333,11 +1464,17 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w.set(i, j, M31::from((i * 2 + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
         weights.add_weight(0, w);
 
         let agg_proof = prove_model_aggregated_onchain(&graph, &input, &weights)
@@ -1346,15 +1483,20 @@ mod tests {
 
         // Raw IO data is at index [4] as a length-prefixed Array<felt252>.
         // Index [4] is the length, then [5..5+len] are the raw IO elements.
-        assert!(starknet_proof.combined_calldata.len() > 5, "combined calldata too small");
+        assert!(
+            starknet_proof.combined_calldata.len() > 5,
+            "combined calldata too small"
+        );
         let raw_io_len: u64 = starknet_proof.combined_calldata[4].try_into().unwrap();
         assert!(raw_io_len > 0, "raw_io_data length should be > 0");
 
         // Verify that Poseidon(raw_io_data) matches the io_commitment
         let raw_io_slice = &starknet_proof.combined_calldata[5..5 + raw_io_len as usize];
         let recomputed = starknet_crypto::poseidon_hash_many(raw_io_slice);
-        assert_eq!(recomputed, starknet_proof.io_commitment,
-            "Poseidon(raw_io_data) must equal io_commitment");
+        assert_eq!(
+            recomputed, starknet_proof.io_commitment,
+            "Poseidon(raw_io_data) must equal io_commitment"
+        );
         assert_ne!(starknet_proof.io_commitment, FieldElement::ZERO);
 
         // PCS config at [0..4] must have real security parameters (not zeros)
@@ -1365,7 +1507,8 @@ mod tests {
             "combined_calldata[0] must be pow_bits (matmul-only falls back to default)"
         );
         assert_ne!(
-            starknet_proof.combined_calldata[3], FieldElement::ZERO,
+            starknet_proof.combined_calldata[3],
+            FieldElement::ZERO,
             "combined_calldata[3] (n_queries) must not be zero"
         );
     }
@@ -1380,20 +1523,33 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w2.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
 
         let agg_proof = prove_model_aggregated_onchain(&graph, &input, &weights)
             .expect("on-chain proving should succeed");
 
-        assert!(agg_proof.unified_stark.is_some(), "should have unified STARK");
+        assert!(
+            agg_proof.unified_stark.is_some(),
+            "should have unified STARK"
+        );
 
         let starknet_proof = build_starknet_proof_onchain(&agg_proof, &input);
 
@@ -1422,31 +1578,47 @@ mod tests {
 
         // pcs_config field on the struct should match too
         assert_eq!(starknet_proof.pcs_config.pow_bits, actual_config.pow_bits);
-        assert_eq!(starknet_proof.pcs_config.fri_config.n_queries, actual_config.fri_config.n_queries);
+        assert_eq!(
+            starknet_proof.pcs_config.fri_config.n_queries,
+            actual_config.fri_config.n_queries
+        );
 
         // Security sanity: pow_bits > 0 and n_queries > 0
-        assert!(starknet_proof.pcs_config.pow_bits > 0, "pow_bits must be > 0 for soundness");
-        assert!(starknet_proof.pcs_config.fri_config.n_queries > 0, "n_queries must be > 0 for soundness");
+        assert!(
+            starknet_proof.pcs_config.pow_bits > 0,
+            "pow_bits must be > 0 for soundness"
+        );
+        assert!(
+            starknet_proof.pcs_config.fri_config.n_queries > 0,
+            "n_queries must be > 0 for soundness"
+        );
     }
 
     #[test]
     fn test_prove_for_starknet_onchain_mlp() {
         let mut builder = GraphBuilder::new((1, 4));
-        builder
-            .linear(4)
-            .activation(ActivationType::ReLU)
-            .linear(2);
+        builder.linear(4).activation(ActivationType::ReLU).linear(2);
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w2.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
 
         let result = prove_for_starknet_onchain(&graph, &input, &weights);
@@ -1471,11 +1643,17 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w.set(i, j, M31::from((i * 2 + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
         weights.add_weight(0, w);
 
         let result = prove_for_starknet_onchain(&graph, &input, &weights);
@@ -1502,17 +1680,31 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 8);
-        for j in 0..8 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..8 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(8, 8);
-        for i in 0..8 { for j in 0..8 { w0.set(i, j, M31::from(((i + j) % 5 + 1) as u32)); } }
+        for i in 0..8 {
+            for j in 0..8 {
+                w0.set(i, j, M31::from(((i + j) % 5 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(8, 8);
-        for i in 0..8 { for j in 0..8 { w2.set(i, j, M31::from(((i * j) % 7 + 1) as u32)); } }
+        for i in 0..8 {
+            for j in 0..8 {
+                w2.set(i, j, M31::from(((i * j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
         let mut w4 = M31Matrix::new(8, 4);
-        for i in 0..8 { for j in 0..4 { w4.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..8 {
+            for j in 0..4 {
+                w4.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(4, w4);
 
         let agg_proof = prove_model_aggregated_onchain(&graph, &input, &weights)
@@ -1522,7 +1714,10 @@ mod tests {
         // Add claim should be in the unified STARK
         assert_eq!(starknet_proof.num_add_claims, 1, "should have 1 Add claim");
         // Unified calldata covers activation + add together
-        assert!(!starknet_proof.unified_calldata.is_empty(), "unified calldata should be non-empty");
+        assert!(
+            !starknet_proof.unified_calldata.is_empty(),
+            "unified calldata should be non-empty"
+        );
 
         // mul and layernorm should be empty
         assert_eq!(starknet_proof.num_mul_claims, 0);
@@ -1556,29 +1751,55 @@ mod tests {
         let graph_no_add = builder_no_add.build();
 
         let mut input = M31Matrix::new(1, 8);
-        for j in 0..8 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..8 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(8, 8);
-        for i in 0..8 { for j in 0..8 { w0.set(i, j, M31::from(((i + j) % 5 + 1) as u32)); } }
+        for i in 0..8 {
+            for j in 0..8 {
+                w0.set(i, j, M31::from(((i + j) % 5 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w1 = M31Matrix::new(8, 8);
-        for i in 0..8 { for j in 0..8 { w1.set(i, j, M31::from(((i * j) % 7 + 1) as u32)); } }
+        for i in 0..8 {
+            for j in 0..8 {
+                w1.set(i, j, M31::from(((i * j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(1, w1);
         let mut w2 = M31Matrix::new(8, 4);
-        for i in 0..8 { for j in 0..4 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..8 {
+            for j in 0..4 {
+                w2.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
 
         // For the add graph, we need weights at different node IDs
         let mut weights_add = GraphWeights::new();
         let mut wa0 = M31Matrix::new(8, 8);
-        for i in 0..8 { for j in 0..8 { wa0.set(i, j, M31::from(((i + j) % 5 + 1) as u32)); } }
+        for i in 0..8 {
+            for j in 0..8 {
+                wa0.set(i, j, M31::from(((i + j) % 5 + 1) as u32));
+            }
+        }
         weights_add.add_weight(0, wa0);
         let mut wa1 = M31Matrix::new(8, 8);
-        for i in 0..8 { for j in 0..8 { wa1.set(i, j, M31::from(((i * j) % 7 + 1) as u32)); } }
+        for i in 0..8 {
+            for j in 0..8 {
+                wa1.set(i, j, M31::from(((i * j) % 7 + 1) as u32));
+            }
+        }
         weights_add.add_weight(1, wa1);
         let mut wa3 = M31Matrix::new(8, 4);
-        for i in 0..8 { for j in 0..4 { wa3.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..8 {
+            for j in 0..4 {
+                wa3.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights_add.add_weight(3, wa3);
 
         let proof_add = prove_model_aggregated_onchain(&graph_add, &input, &weights_add)
@@ -1590,11 +1811,17 @@ mod tests {
         let sn_no_add = build_starknet_proof_onchain(&proof_no_add, &input);
 
         // Model with Add should have unified STARK (includes Add component)
-        assert!(!sn_add.unified_calldata.is_empty(), "Add model should have unified STARK calldata");
+        assert!(
+            !sn_add.unified_calldata.is_empty(),
+            "Add model should have unified STARK calldata"
+        );
         assert_eq!(sn_add.num_add_claims, 1, "should have 1 Add claim");
 
         // Model without Add should have no unified STARK (matmul only)
-        assert!(sn_no_add.unified_calldata.is_empty(), "matmul-only model should have no unified STARK");
+        assert!(
+            sn_no_add.unified_calldata.is_empty(),
+            "matmul-only model should have no unified STARK"
+        );
         assert_eq!(sn_no_add.num_add_claims, 0);
     }
 
@@ -1615,17 +1842,31 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w2.set(i, j, M31::from(((i * j) % 5 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w2.set(i, j, M31::from(((i * j) % 5 + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
         let mut w4 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w4.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w4.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(4, w4);
 
         let proof = prove_model_pure_gkr(&graph, &input, &weights)
@@ -1636,7 +1877,10 @@ mod tests {
         let starknet_proof = build_starknet_proof_onchain(&proof, &input);
 
         // GKR calldata should be present and non-empty
-        assert!(starknet_proof.gkr_calldata.is_some(), "GKR calldata should be Some");
+        assert!(
+            starknet_proof.gkr_calldata.is_some(),
+            "GKR calldata should be Some"
+        );
         let gkr_cd = starknet_proof.gkr_calldata.as_ref().unwrap();
         assert!(!gkr_cd.is_empty(), "GKR calldata should be non-empty");
 
@@ -1644,7 +1888,9 @@ mod tests {
         let combined = &starknet_proof.combined_calldata;
         assert!(!combined.is_empty());
         // Find has_gkr flag (should be 1 somewhere near the end)
-        let _has_gkr_flag = combined.iter().rev()
+        let _has_gkr_flag = combined
+            .iter()
+            .rev()
             .skip(gkr_cd.len() + 1) // skip gkr_buf + its length prefix
             .next();
         // The flag value 1 should appear before the GKR data
@@ -1654,7 +1900,10 @@ mod tests {
         );
 
         // No individual matmul proofs in calldata
-        assert_eq!(starknet_proof.num_matmul_proofs, 0, "GKR mode has no individual matmul proofs");
+        assert_eq!(
+            starknet_proof.num_matmul_proofs, 0,
+            "GKR mode has no individual matmul proofs"
+        );
 
         // IO commitment should be valid — raw_io_data at index [4] as length-prefixed array
         assert_ne!(starknet_proof.io_commitment, FieldElement::ZERO);
@@ -1672,11 +1921,17 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w.set(i, j, M31::from((i * 2 + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
         weights.add_weight(0, w);
 
         let proof = prove_model_pure_gkr(&graph, &input, &weights)
@@ -1685,8 +1940,14 @@ mod tests {
         let starknet_proof = build_starknet_proof_onchain(&proof, &input);
 
         // GKR calldata present, unified STARK absent
-        assert!(starknet_proof.gkr_calldata.is_some(), "GKR calldata should be present");
-        assert!(starknet_proof.unified_calldata.is_empty(), "no unified STARK for matmul-only");
+        assert!(
+            starknet_proof.gkr_calldata.is_some(),
+            "GKR calldata should be present"
+        );
+        assert!(
+            starknet_proof.unified_calldata.is_empty(),
+            "no unified STARK for matmul-only"
+        );
         assert_eq!(starknet_proof.num_matmul_proofs, 0);
     }
 
@@ -1700,18 +1961,27 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w2.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
 
-        let proof = prove_model_pure_gkr(&graph, &input, &weights)
-            .expect("proving should succeed");
+        let proof = prove_model_pure_gkr(&graph, &input, &weights).expect("proving should succeed");
 
         // Serialize directly to buffer
         let mut direct_buf = Vec::new();
@@ -1725,7 +1995,11 @@ mod tests {
         let pipeline_buf = starknet_proof.gkr_calldata.unwrap();
 
         // Both paths should produce identical output
-        assert_eq!(direct_buf.len(), pipeline_buf.len(), "serialization length mismatch");
+        assert_eq!(
+            direct_buf.len(),
+            pipeline_buf.len(),
+            "serialization length mismatch"
+        );
         assert_eq!(direct_buf, pipeline_buf, "serialization content mismatch");
 
         // First felt should be num_layer_proofs (3 layers: matmul, relu, matmul)
@@ -1749,15 +2023,21 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w.set(i, j, M31::from((i * 2 + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
         weights.add_weight(0, w);
 
-        let agg_proof = prove_model_pure_gkr(&graph, &input, &weights)
-            .expect("GKR proving should succeed");
+        let agg_proof =
+            prove_model_pure_gkr(&graph, &input, &weights).expect("GKR proving should succeed");
         let gkr_proof = agg_proof.gkr_proof.as_ref().unwrap();
 
         let model_id = FieldElement::from(0xDEADBEEFu64);
@@ -1786,28 +2066,47 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w2.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
 
         let model_id = FieldElement::from(0xCAFEu64);
-        let agg_proof = prove_model_pure_gkr(&graph, &input, &weights)
-            .expect("GKR proving should succeed");
+        let agg_proof =
+            prove_model_pure_gkr(&graph, &input, &weights).expect("GKR proving should succeed");
 
         let gkr_sn = build_gkr_starknet_proof(&agg_proof, model_id, &input)
             .expect("GKR starknet proof should succeed");
 
         // Verify all fields are populated
         assert_eq!(gkr_sn.model_id, model_id);
-        assert!(!gkr_sn.gkr_calldata.is_empty(), "GKR calldata should be non-empty");
-        assert!(!gkr_sn.io_calldata.is_empty(), "IO calldata should be non-empty");
-        assert_eq!(gkr_sn.num_layer_proofs, 3, "3 layers: matmul + relu + matmul");
+        assert!(
+            !gkr_sn.gkr_calldata.is_empty(),
+            "GKR calldata should be non-empty"
+        );
+        assert!(
+            !gkr_sn.io_calldata.is_empty(),
+            "IO calldata should be non-empty"
+        );
+        assert_eq!(
+            gkr_sn.num_layer_proofs, 3,
+            "3 layers: matmul + relu + matmul"
+        );
         assert_ne!(gkr_sn.io_commitment, FieldElement::ZERO);
         assert!(gkr_sn.estimated_gas > 0);
         assert!(gkr_sn.total_calldata_size > 0);
@@ -1828,11 +2127,17 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w.set(i, j, M31::from((i * 2 + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
         weights.add_weight(0, w);
 
         let model_id = FieldElement::from(0xABCDu64);
@@ -1864,18 +2169,27 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w.set(i, j, M31::from((i * 2 + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
         weights.add_weight(0, w);
 
         let agg_proof = prove_model_aggregated_onchain(&graph, &input, &weights)
             .expect("standard proving should succeed");
 
         let result = build_gkr_starknet_proof(&agg_proof, FieldElement::from(1u64), &input);
-        assert!(result.is_err(), "should fail: no GKR proof in standard pipeline");
+        assert!(
+            result.is_err(),
+            "should fail: no GKR proof in standard pipeline"
+        );
     }
 
     #[test]
@@ -1888,18 +2202,28 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w0 = M31Matrix::new(4, 4);
-        for i in 0..4 { for j in 0..4 { w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32));
+            }
+        }
         weights.add_weight(0, w0);
         let mut w2 = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w2.set(i, j, M31::from((i + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w2.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
         weights.add_weight(2, w2);
 
-        let mut agg_proof = prove_model_pure_gkr(&graph, &input, &weights)
-            .expect("GKR proving should succeed");
+        let mut agg_proof =
+            prove_model_pure_gkr(&graph, &input, &weights).expect("GKR proving should succeed");
         let gkr = agg_proof.gkr_proof.as_mut().expect("GKR proof expected");
         for layer in &mut gkr.layer_proofs {
             if let LayerProof::Activation { logup_proof, .. } = layer {
@@ -1925,17 +2249,26 @@ mod tests {
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 4);
-        for j in 0..4 { input.set(0, j, M31::from((j + 1) as u32)); }
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
 
         let mut weights = GraphWeights::new();
         let mut w = M31Matrix::new(4, 2);
-        for i in 0..4 { for j in 0..2 { w.set(i, j, M31::from((i * 2 + j + 1) as u32)); } }
+        for i in 0..4 {
+            for j in 0..2 {
+                w.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
         weights.add_weight(0, w);
 
-        let mut agg_proof = prove_model_pure_gkr(&graph, &input, &weights)
-            .expect("GKR proving should succeed");
+        let mut agg_proof =
+            prove_model_pure_gkr(&graph, &input, &weights).expect("GKR proving should succeed");
         let gkr = agg_proof.gkr_proof.as_mut().expect("GKR proof expected");
-        assert!(!gkr.weight_openings.is_empty(), "test setup requires weight openings");
+        assert!(
+            !gkr.weight_openings.is_empty(),
+            "test setup requires weight openings"
+        );
         gkr.weight_openings.clear();
 
         let err = build_gkr_starknet_proof(&agg_proof, FieldElement::from(9u64), &input)
@@ -1944,5 +2277,49 @@ mod tests {
             StarknetModelError::SoundnessGate(_) => {}
             other => panic!("expected SoundnessGate error, got: {other}"),
         }
+    }
+
+    #[test]
+    fn test_build_gkr_serializable_proof_keeps_artifact_when_not_submission_ready() {
+        use crate::aggregation::prove_model_pure_gkr;
+
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(2);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
+
+        let mut weights = GraphWeights::new();
+        let mut w = M31Matrix::new(4, 2);
+        for i in 0..4 {
+            for j in 0..2 {
+                w.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
+        weights.add_weight(0, w);
+
+        let mut agg_proof =
+            prove_model_pure_gkr(&graph, &input, &weights).expect("GKR proving should succeed");
+        let gkr = agg_proof.gkr_proof.as_mut().expect("GKR proof expected");
+        gkr.weight_openings.clear();
+
+        let serialized =
+            build_gkr_serializable_proof(&agg_proof, FieldElement::from(10u64), &input)
+                .expect("serializable builder should not fail when soundness gates fail");
+        assert!(
+            !serialized.submission_ready,
+            "must be marked non-submit-ready"
+        );
+        assert!(
+            serialized.soundness_gate_error.is_some(),
+            "gate failure reason should be preserved"
+        );
+        assert!(
+            !serialized.weight_claim_calldata.is_empty(),
+            "weight claims must still be serialized for off-chain verification"
+        );
     }
 }

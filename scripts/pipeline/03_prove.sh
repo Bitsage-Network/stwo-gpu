@@ -138,6 +138,7 @@ GPU_MLE_FOLD_REQUIRE="${STWO_GPU_MLE_FOLD_REQUIRE:-off}"
 GPU_MLE_OPENING_TREE="${STWO_GPU_MLE_OPENING_TREE:-on}"
 GPU_MLE_OPENING_TREE_REQUIRE="${STWO_GPU_MLE_OPENING_TREE_REQUIRE:-off}"
 GPU_MLE_OPENING_TIMING="${STWO_GPU_MLE_OPENING_TIMING:-off}"
+GKR_AGG_WEIGHT_BINDING="${STWO_GKR_AGGREGATE_WEIGHT_BINDING:-off}"
 
 # Favor GPU fold for heavy weight-opening phases unless caller overrides.
 if [[ "$USE_GPU" == "true" ]] && [[ -z "${STWO_GPU_MLE_FOLD:-}" ]]; then
@@ -195,6 +196,14 @@ if [[ -z "${STWO_GKR_OPENINGS_PROGRESS_EVERY:-}" ]]; then
 fi
 if [[ -z "${STWO_GKR_OPENING_HEARTBEAT_SEC:-}" ]]; then
     export STWO_GKR_OPENING_HEARTBEAT_SEC=15
+fi
+
+# Optional protocol-level speed mode (off by default).
+# This removes per-weight Merkle openings and uses a batched RLC weight-binding check.
+# Proof artifacts remain serializable, but Starknet submission is disabled by soundness gates.
+if [[ "${GKR_AGG_WEIGHT_BINDING,,}" == "1" || "${GKR_AGG_WEIGHT_BINDING,,}" == "true" || "${GKR_AGG_WEIGHT_BINDING,,}" == "on" ]]; then
+    warn "STWO_GKR_AGGREGATE_WEIGHT_BINDING is enabled."
+    warn "This mode is off-chain only today: artifact is serialized, but Starknet submission is rejected by soundness gates."
 fi
 
 # ─── Output Directory ───────────────────────────────────────────────
@@ -256,6 +265,7 @@ log "GPU poly path:  strict=${GPU_POLY_STRICT} harden=${GPU_POLY_HARDEN}"
 log "GPU MLE path:   fold=${GPU_MLE_FOLD} fold_min_points=${GPU_MLE_FOLD_MIN_POINTS} opening_tree=${GPU_MLE_OPENING_TREE} merkle_require=${GPU_MLE_MERKLE_REQUIRE} fold_require=${GPU_MLE_FOLD_REQUIRE} opening_tree_require=${GPU_MLE_OPENING_TREE_REQUIRE}"
 log "GPU opening:    qm31_pack=device (enabled by default)"
 log "GPU opening dbg: timing=${GPU_MLE_OPENING_TIMING}"
+log "Weight binding: aggregate_rlc=${GKR_AGG_WEIGHT_BINDING}"
 log "Progress:       weight_every=${STWO_WEIGHT_PROGRESS_EVERY} opening_every=${STWO_GKR_OPENINGS_PROGRESS_EVERY} opening_heartbeat=${STWO_GKR_OPENING_HEARTBEAT_SEC}s"
 echo ""
 
@@ -539,14 +549,27 @@ if fmt != 'ml_gkr':
 vc = proof.get('verify_calldata')
 assert isinstance(vc, dict), 'Missing verify_calldata object'
 assert vc.get('schema_version') == 1, 'verify_calldata.schema_version must be 1'
-assert vc.get('entrypoint') == 'verify_model_gkr', 'verify_calldata.entrypoint must be verify_model_gkr'
+entrypoint = vc.get('entrypoint')
+assert isinstance(entrypoint, str) and len(entrypoint) > 0, 'verify_calldata.entrypoint must be non-empty string'
 calldata = vc.get('calldata')
 chunks = vc.get('upload_chunks', [])
-assert isinstance(calldata, list) and len(calldata) > 0, 'verify_calldata.calldata must be non-empty array'
 assert isinstance(chunks, list), 'verify_calldata.upload_chunks must be an array'
-assert len(chunks) == 0, 'verify_model_gkr should not include upload chunks'
-assert all(str(v) != '__SESSION_ID__' for v in calldata), 'verify_model_gkr calldata must not include __SESSION_ID__ placeholder'
-print(f'  verify_calldata: {len(calldata)} felts', file=sys.stderr)
+if entrypoint == 'verify_model_gkr':
+    assert isinstance(calldata, list) and len(calldata) > 0, 'verify_calldata.calldata must be non-empty array'
+    assert len(chunks) == 0, 'verify_model_gkr should not include upload chunks'
+    assert all(str(v) != '__SESSION_ID__' for v in calldata), 'verify_model_gkr calldata must not include __SESSION_ID__ placeholder'
+    print(f'  verify_calldata: {len(calldata)} felts', file=sys.stderr)
+else:
+    # Off-chain / experimental transcript modes are serializable but not submit-ready.
+    assert entrypoint == 'unsupported', f'unsupported verify_calldata.entrypoint: {entrypoint}'
+    assert isinstance(calldata, list), 'verify_calldata.calldata must be an array'
+    mode = proof.get('weight_opening_mode', 'unknown')
+    ready = bool(proof.get('submission_ready', False))
+    reason = vc.get('reason') or proof.get('soundness_gate_error') or 'unspecified'
+    assert ready is False, 'unsupported verify_calldata must correspond to submission_ready=false'
+    claims = proof.get('weight_claim_calldata', [])
+    assert isinstance(claims, list) and len(claims) > 0, 'weight_claim_calldata must be present in unsupported mode'
+    print(f'  verify_calldata unavailable for submission (mode={mode}): {reason}', file=sys.stderr)
 print(f'  model_id: {proof.get("model_id", "?")}', file=sys.stderr)
 " 2>&1; then
                 ok "GKR proof structure valid"

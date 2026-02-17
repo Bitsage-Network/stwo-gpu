@@ -272,6 +272,18 @@ export STWO_GPU_POLY_HARDEN=1
 ./03_prove.sh --model-name qwen3-14b --gpu
 ```
 
+**Experimental (off-chain only) weight-binding aggregation:**
+```bash
+export STWO_GKR_AGGREGATE_WEIGHT_BINDING=1
+./03_prove.sh --model-name qwen3-14b --gpu
+```
+This replaces per-weight Merkle openings with a batched RLC weight-binding check.
+Current Starknet soundness gates reject this mode for on-chain submission.
+`ml_gkr` output remains serializable and includes:
+- `submission_ready: false`
+- `weight_opening_mode: "BatchedRlcDirectEvalV1"`
+- `weight_claim_calldata` for off-chain verification/auditing.
+
 ---
 
 ### Step 4 — Verify On-Chain
@@ -292,6 +304,11 @@ STARKNET_PRIVATE_KEY=0x... STARKNET_ACCOUNT_ADDRESS=0x... ./04_verify_onchain.sh
 # Legacy mode (you pay gas in STRK, uses sncast)
 STARKNET_PRIVATE_KEY=0x_your_key ./04_verify_onchain.sh --submit --no-paymaster
 ```
+
+If your proof artifact has `submission_ready: false` (for example with
+`STWO_GKR_AGGREGATE_WEIGHT_BINDING=1`), `04_verify_onchain.sh` will print the
+exact soundness-gate reason. In dry-run it exits cleanly; in submit mode it
+fails fast before any transaction is sent.
 
 The script will:
 1. Auto-detect submission mode (paymaster on Sepolia when no key, sncast otherwise)

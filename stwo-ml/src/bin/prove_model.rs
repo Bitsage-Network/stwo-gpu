@@ -36,18 +36,18 @@ use stwo::prover::backend::gpu::cuda_executor::{
     get_cuda_executor, upload_poseidon252_round_constants,
 };
 
+use stwo_ml::aggregation::compute_io_commitment;
 use stwo_ml::cairo_serde::{
-    DirectProofMetadata, MLClaimMetadata, serialize_ml_proof_for_recursive,
-    serialize_ml_proof_to_file,
+    serialize_ml_proof_for_recursive, serialize_ml_proof_to_file, DirectProofMetadata,
+    MLClaimMetadata,
 };
 use stwo_ml::compiler::inspect::summarize_model;
 use stwo_ml::compiler::onnx::{load_onnx, OnnxModel};
 use stwo_ml::components::matmul::M31Matrix;
-use stwo_ml::gadgets::quantize::{QuantStrategy, quantize_tensor};
+use stwo_ml::gadgets::quantize::{quantize_tensor, QuantStrategy};
 use stwo_ml::json_serde;
-use stwo_ml::aggregation::compute_io_commitment;
 use stwo_ml::starknet::build_starknet_proof_direct;
-use stwo_ml::tee::{SecurityLevel, detect_tee_capability};
+use stwo_ml::tee::{detect_tee_capability, SecurityLevel};
 
 /// Output format for the proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,9 +55,10 @@ enum OutputFormat {
     CairoSerde,
     Json,
     Direct,
-    /// Full ML GKR model proof for on-chain `verify_model_gkr()`.
-    /// Uses `prove_model_pure_gkr_auto` → `build_gkr_starknet_proof` pipeline.
-    /// Output: JSON with GKR calldata, IO calldata, weight openings.
+    /// Full ML GKR model proof artifact.
+    /// Uses `prove_model_pure_gkr_auto` → `build_gkr_serializable_proof` pipeline.
+    /// Output: JSON with GKR calldata, IO calldata, weight openings/claims, and
+    /// submission readiness metadata.
     MlGkr,
 }
 
@@ -157,7 +158,10 @@ struct Cli {
     submit_gkr: bool,
 
     /// Contract address for --submit-gkr (hex).
-    #[arg(long, default_value = "0x00c7845a80d01927826b17032a432ad9cd36ea61be17fe8cc089d9b68c57e710")]
+    #[arg(
+        long,
+        default_value = "0x00c7845a80d01927826b17032a432ad9cd36ea61be17fe8cc089d9b68c57e710"
+    )]
     contract: String,
 
     /// sncast account name for --submit-gkr.
@@ -284,7 +288,10 @@ struct AuditCmd {
     submit: bool,
 
     /// Contract address for on-chain submission.
-    #[arg(long, default_value = "0x03f937cb00db86933c94a680ce2cb2df3296e7680df3547c610aa929ffba860c")]
+    #[arg(
+        long,
+        default_value = "0x03f937cb00db86933c94a680ce2cb2df3296e7680df3547c610aa929ffba860c"
+    )]
     contract: String,
 
     /// Starknet network for on-chain submission.
@@ -690,11 +697,10 @@ fn load_model(cli: &Cli) -> OnnxModel {
     if let Some(ref model_dir) = cli.model_dir {
         // HuggingFace directory mode — validation is built into load_hf_model
         eprintln!("Loading HuggingFace model from: {}", model_dir.display());
-        stwo_ml::compiler::hf_loader::load_hf_model(model_dir, cli.layers)
-            .unwrap_or_else(|e| {
-                eprintln!("Error loading model directory: {e}");
-                process::exit(1);
-            })
+        stwo_ml::compiler::hf_loader::load_hf_model(model_dir, cli.layers).unwrap_or_else(|e| {
+            eprintln!("Error loading model directory: {e}");
+            process::exit(1);
+        })
     } else if let Some(ref model_path) = cli.model {
         // ONNX mode
         eprintln!("Loading ONNX model: {}", model_path.display());
@@ -703,7 +709,9 @@ fn load_model(cli: &Cli) -> OnnxModel {
             process::exit(1);
         })
     } else {
-        eprintln!("Error: specify either --model (ONNX file) or --model-dir (HuggingFace directory)");
+        eprintln!(
+            "Error: specify either --model (ONNX file) or --model-dir (HuggingFace directory)"
+        );
         process::exit(1);
     }
 }
@@ -760,7 +768,10 @@ fn main() {
     if let Some(ref proof_path) = cli.verify_proof {
         eprintln!("Verifying proof: {}", proof_path.display());
         let contents = std::fs::read_to_string(proof_path).unwrap_or_else(|e| {
-            eprintln!("Error: cannot read proof file '{}': {e}", proof_path.display());
+            eprintln!(
+                "Error: cannot read proof file '{}': {e}",
+                proof_path.display()
+            );
             process::exit(1);
         });
 
@@ -769,7 +780,10 @@ fn main() {
             process::exit(1);
         });
 
-        let format = proof_json.get("format").and_then(|v| v.as_str()).unwrap_or("");
+        let format = proof_json
+            .get("format")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
 
         match format {
             "ml_gkr" => {
@@ -796,7 +810,10 @@ fn main() {
                     || proof_json.get("gkr_calldata").is_some()
                     || proof_json.get("model_id").is_some();
                 if has_matmul {
-                    eprintln!("  format: {}", if format.is_empty() { "unknown" } else { format });
+                    eprintln!(
+                        "  format: {}",
+                        if format.is_empty() { "unknown" } else { format }
+                    );
                     eprintln!("Proof structure valid.");
                     process::exit(0);
                 } else {
@@ -810,10 +827,8 @@ fn main() {
     // --validate: run validation only and exit
     if cli.validate {
         if let Some(ref model_dir) = cli.model_dir {
-            let report = stwo_ml::compiler::hf_loader::validate_model_directory(
-                model_dir,
-                cli.layers,
-            );
+            let report =
+                stwo_ml::compiler::hf_loader::validate_model_directory(model_dir, cli.layers);
             eprintln!();
             eprintln!("  ── Model Validation ──");
             eprintln!("{}", report.format_report());
@@ -887,9 +902,9 @@ fn main() {
         .nodes
         .iter()
         .find_map(|n| match &n.op {
-            stwo_ml::compiler::graph::GraphOp::Activation { activation_type, .. } => {
-                Some(*activation_type as u8)
-            }
+            stwo_ml::compiler::graph::GraphOp::Activation {
+                activation_type, ..
+            } => Some(*activation_type as u8),
             _ => None,
         })
         .unwrap_or(0);
@@ -934,9 +949,11 @@ fn main() {
         for d in &devices {
             eprintln!(
                 "  GPU {}: {} ({:.1} GB, SM {}.{}, {} SMs)",
-                d.ordinal, d.name,
+                d.ordinal,
+                d.name,
                 d.total_memory as f64 / 1e9,
-                d.compute_capability.0, d.compute_capability.1,
+                d.compute_capability.0,
+                d.compute_capability.1,
                 d.sm_count,
             );
         }
@@ -948,22 +965,25 @@ fn main() {
         if cli.format == OutputFormat::MlGkr {
             // Full ML GKR pipeline: all layers via GKR sumcheck (no individual matmul proofs)
             eprintln!("Using full ML GKR pipeline (--format ml_gkr)");
-            stwo_ml::aggregation::prove_model_pure_gkr_auto(
-                &model.graph,
-                &input,
-                &model.weights,
-            )
+            stwo_ml::aggregation::prove_model_pure_gkr_auto(&model.graph, &input, &model.weights)
         } else if cli.multi_gpu {
             // Multi-GPU path: chunk model and distribute across GPUs
             #[cfg(feature = "multi-gpu")]
             {
                 let memory_budget = (cli.chunk_budget_gb * 1e9) as usize;
-                let (chunks, metrics) = stwo_ml::compiler::chunked::prove_model_chunked_multi_gpu_with_metrics(
-                    &model.graph, &input, &model.weights, memory_budget,
-                ).map_err(|e| stwo_ml::compiler::prove::ModelError::ProvingError {
-                    layer: 0,
-                    message: format!("Multi-GPU chunked proving: {e}"),
-                })?;
+                let (chunks, metrics) =
+                    stwo_ml::compiler::chunked::prove_model_chunked_multi_gpu_with_metrics(
+                        &model.graph,
+                        &input,
+                        &model.weights,
+                        memory_budget,
+                    )
+                    .map_err(|e| {
+                        stwo_ml::compiler::prove::ModelError::ProvingError {
+                            layer: 0,
+                            message: format!("Multi-GPU chunked proving: {e}"),
+                        }
+                    })?;
 
                 eprintln!(
                     "Multi-GPU proving: {:.2}s total, {} chunks across {} devices",
@@ -982,8 +1002,12 @@ fn main() {
                 }
 
                 stwo_ml::compiler::chunked::compose_chunk_proofs_auto(
-                    &chunks, &model.graph, &input, &model.weights,
-                ).map_err(|e| stwo_ml::compiler::prove::ModelError::ProvingError {
+                    &chunks,
+                    &model.graph,
+                    &input,
+                    &model.weights,
+                )
+                .map_err(|e| stwo_ml::compiler::prove::ModelError::ProvingError {
                     layer: 0,
                     message: format!("Chunk composition: {e}"),
                 })
@@ -1038,18 +1062,14 @@ fn main() {
     // On single-GPU runs, do GPU commitment before proving by default.
     // Parallel overlap made sense when commitment was CPU-bound, but now both
     // proving and commitment are GPU-heavy and can contend on one device.
-    let serialize_gpu_commit = cached_commitment.is_none()
-        && use_gpu
-        && !cli.multi_gpu
-        && !allow_parallel_gpu_commit;
+    let serialize_gpu_commit =
+        cached_commitment.is_none() && use_gpu && !cli.multi_gpu && !allow_parallel_gpu_commit;
 
     let (proof_result, weight_commitment, commit_elapsed) = if serialize_gpu_commit {
         eprintln!(
             "[BG] Single-GPU mode: running weight commitment before proving to avoid GPU contention."
         );
-        eprintln!(
-            "[BG] Set STWO_PARALLEL_GPU_COMMIT=1 to force overlapping commitment + proving."
-        );
+        eprintln!("[BG] Set STWO_PARALLEL_GPU_COMMIT=1 to force overlapping commitment + proving.");
         let t_commit = Instant::now();
         let commitment = compute_weight_commitment(&model.weights, cli.model_dir.as_deref());
         let commit_time = t_commit.elapsed();
@@ -1061,10 +1081,8 @@ fn main() {
             let commit_handle = if cached_commitment.is_none() {
                 Some(s.spawn(|| {
                     let t_commit = Instant::now();
-                    let commitment = compute_weight_commitment(
-                        &model.weights,
-                        cli.model_dir.as_deref(),
-                    );
+                    let commitment =
+                        compute_weight_commitment(&model.weights, cli.model_dir.as_deref());
                     (commitment, t_commit.elapsed())
                 }))
             } else {
@@ -1167,57 +1185,94 @@ fn main() {
             len
         }
         OutputFormat::MlGkr => {
-            use stwo_ml::starknet::{build_gkr_starknet_proof, build_verify_model_gkr_calldata};
+            use stwo_ml::starknet::{
+                build_gkr_serializable_proof, build_verify_model_gkr_calldata,
+            };
 
-            let gkr_proof = build_gkr_starknet_proof(&proof, model_id, &input)
-                .unwrap_or_else(|e| {
-                    eprintln!("Error building GKR starknet proof: {e}");
-                    eprintln!("Hint: --format ml_gkr requires the ML GKR pipeline (pure GKR proving).");
+            let gkr_proof =
+                build_gkr_serializable_proof(&proof, model_id, &input).unwrap_or_else(|e| {
+                    eprintln!("Error building GKR proof artifact: {e}");
+                    eprintln!(
+                        "Hint: --format ml_gkr requires the ML GKR pipeline (pure GKR proving)."
+                    );
                     process::exit(1);
                 });
 
             eprintln!(
-                "  gkr_calldata: {} felts, io_calldata: {} felts, weight_openings: {} felts",
+                "  gkr_calldata: {} felts, io_calldata: {} felts, weight_openings: {} felts, weight_claims: {} felts",
                 gkr_proof.gkr_calldata.len(),
                 gkr_proof.io_calldata.len(),
                 gkr_proof.weight_opening_calldata.len(),
+                gkr_proof.weight_claim_calldata.len(),
             );
             eprintln!(
                 "  num_layer_proofs: {}, estimated_gas: {}, total_calldata: {} felts",
-                gkr_proof.num_layer_proofs,
-                gkr_proof.estimated_gas,
-                gkr_proof.total_calldata_size,
+                gkr_proof.num_layer_proofs, gkr_proof.estimated_gas, gkr_proof.total_calldata_size,
             );
+            eprintln!(
+                "  weight_opening_mode: {:?}, submission_ready: {}",
+                gkr_proof.weight_opening_mode, gkr_proof.submission_ready,
+            );
+            if let Some(reason) = &gkr_proof.soundness_gate_error {
+                eprintln!("  Warning: Starknet soundness gate status: {reason}");
+            }
 
             // Build complete verify_model_gkr calldata (all parameters pre-assembled)
             let verify_calldata_obj = if let Some(gkr_p) = proof.gkr_proof.as_ref() {
                 match stwo_ml::gkr::LayeredCircuit::from_graph(&model.graph) {
                     Ok(circuit) => {
-                        let raw_io = stwo_ml::cairo_serde::serialize_raw_io(&input, &proof.execution.output);
+                        let raw_io =
+                            stwo_ml::cairo_serde::serialize_raw_io(&input, &proof.execution.output);
                         match build_verify_model_gkr_calldata(gkr_p, &circuit, model_id, &raw_io) {
                             Ok(vc) => {
-                                eprintln!("  verify_calldata: {} parts (ready for submission)", vc.total_felts);
-                                Some(serde_json::json!({
+                                eprintln!(
+                                    "  verify_calldata: {} parts (ready for submission)",
+                                    vc.total_felts
+                                );
+                                serde_json::json!({
                                     "schema_version": 1,
                                     "entrypoint": "verify_model_gkr",
                                     "calldata": vc.calldata_parts,
                                     "total_felts": vc.total_felts,
                                     "upload_chunks": Vec::<Vec<String>>::new(),
-                                }))
+                                })
                             }
                             Err(e) => {
-                                eprintln!("  Warning: soundness gate rejected verify_calldata: {e}");
-                                None
+                                eprintln!(
+                                    "  Warning: soundness gate rejected verify_calldata: {e}"
+                                );
+                                serde_json::json!({
+                                    "schema_version": 1,
+                                    "entrypoint": "unsupported",
+                                    "calldata": Vec::<String>::new(),
+                                    "total_felts": 0,
+                                    "upload_chunks": Vec::<Vec<String>>::new(),
+                                    "reason": e.to_string(),
+                                })
                             }
                         }
                     }
                     Err(e) => {
                         eprintln!("  Warning: could not build verify_calldata: {e}");
-                        None
+                        serde_json::json!({
+                            "schema_version": 1,
+                            "entrypoint": "unsupported",
+                            "calldata": Vec::<String>::new(),
+                            "total_felts": 0,
+                            "upload_chunks": Vec::<Vec<String>>::new(),
+                            "reason": e.to_string(),
+                        })
                     }
                 }
             } else {
-                None
+                serde_json::json!({
+                    "schema_version": 1,
+                    "entrypoint": "unsupported",
+                    "calldata": Vec::<String>::new(),
+                    "total_felts": 0,
+                    "upload_chunks": Vec::<Vec<String>>::new(),
+                    "reason": "missing GKR proof in aggregated artifact",
+                })
             };
 
             let json_obj = serde_json::json!({
@@ -1240,6 +1295,12 @@ fn main() {
                 "weight_opening_calldata": gkr_proof.weight_opening_calldata.iter()
                     .map(|f| format!("0x{:x}", f))
                     .collect::<Vec<_>>(),
+                "weight_claim_calldata": gkr_proof.weight_claim_calldata.iter()
+                    .map(|f| format!("0x{:x}", f))
+                    .collect::<Vec<_>>(),
+                "weight_opening_mode": format!("{:?}", gkr_proof.weight_opening_mode),
+                "submission_ready": gkr_proof.submission_ready,
+                "soundness_gate_error": gkr_proof.soundness_gate_error,
                 "verify_calldata": verify_calldata_obj,
             });
             let output_str = serde_json::to_string_pretty(&json_obj).unwrap();
@@ -1272,8 +1333,7 @@ fn main() {
             );
             eprintln!(
                 "  estimated_gas: {}, total_calldata: {} felts",
-                direct_proof.estimated_gas,
-                direct_proof.total_calldata_size,
+                direct_proof.estimated_gas, direct_proof.total_calldata_size,
             );
             eprintln!(
                 "  verify_calldata: {} parts, {} upload chunks",
@@ -1345,9 +1405,7 @@ fn main() {
         let hash_felt = att.report_hash_felt();
         eprintln!(
             "  tee: hw={}, report_hash=0x{:x}, timestamp={}",
-            att.hw_model,
-            hash_felt,
-            att.timestamp,
+            att.hw_model, hash_felt, att.timestamp,
         );
     } else {
         eprintln!("  tee: none (zk-only)");
@@ -1375,8 +1433,7 @@ fn submit_gkr_onchain(
     _io_commitment: FieldElement,
 ) {
     use stwo_ml::starknet::{
-        build_verify_model_gkr_calldata, build_register_gkr_calldata,
-        build_circuit_descriptor,
+        build_circuit_descriptor, build_register_gkr_calldata, build_verify_model_gkr_calldata,
     };
 
     if cli.format != OutputFormat::MlGkr {
@@ -1393,11 +1450,10 @@ fn submit_gkr_onchain(
     };
 
     // Compile the LayeredCircuit for dimension extraction
-    let circuit = stwo_ml::gkr::LayeredCircuit::from_graph(&model.graph)
-        .unwrap_or_else(|e| {
-            eprintln!("Error compiling GKR circuit: {e}");
-            process::exit(1);
-        });
+    let circuit = stwo_ml::gkr::LayeredCircuit::from_graph(&model.graph).unwrap_or_else(|e| {
+        eprintln!("Error compiling GKR circuit: {e}");
+        process::exit(1);
+    });
 
     eprintln!();
     eprintln!("=== On-Chain GKR Submission ===");
@@ -1408,20 +1464,26 @@ fn submit_gkr_onchain(
 
     // Step 1: Build verify_model_gkr calldata (raw IO data for on-chain recomputation)
     let raw_io_data = stwo_ml::cairo_serde::serialize_raw_io(input, &proof.execution.output);
-    let verify_calldata = build_verify_model_gkr_calldata(
-        gkr_proof, &circuit, model_id, &raw_io_data,
-    ).unwrap_or_else(|e| {
-        eprintln!("Error: soundness gate rejected GKR calldata: {e}");
-        process::exit(1);
-    });
+    let verify_calldata =
+        build_verify_model_gkr_calldata(gkr_proof, &circuit, model_id, &raw_io_data)
+            .unwrap_or_else(|e| {
+                eprintln!("Error: soundness gate rejected GKR calldata: {e}");
+                process::exit(1);
+            });
 
-    eprintln!("  Calldata: {} parts ({} estimated felts)", verify_calldata.total_felts, verify_calldata.total_felts);
+    eprintln!(
+        "  Calldata: {} parts ({} estimated felts)",
+        verify_calldata.total_felts, verify_calldata.total_felts
+    );
 
     // Write calldata to temp file (may exceed shell arg limit for large proofs)
     let calldata_path = cli.output.with_extension("calldata.txt");
     let calldata_str = verify_calldata.calldata_parts.join(" ");
     std::fs::write(&calldata_path, &calldata_str).unwrap_or_else(|e| {
-        eprintln!("Error writing calldata to '{}': {e}", calldata_path.display());
+        eprintln!(
+            "Error writing calldata to '{}': {e}",
+            calldata_path.display()
+        );
         process::exit(1);
     });
     eprintln!("  Calldata written to: {}", calldata_path.display());
@@ -1430,12 +1492,17 @@ fn submit_gkr_onchain(
     eprintln!("  Checking model registration...");
     let check_result = std::process::Command::new("sncast")
         .args([
-            "--account", &cli.account,
-            "--network", &cli.network,
+            "--account",
+            &cli.account,
+            "--network",
+            &cli.network,
             "call",
-            "--contract-address", &cli.contract,
-            "--function", "get_model_circuit_hash",
-            "--calldata", &format!("0x{:x}", model_id),
+            "--contract-address",
+            &cli.contract,
+            "--function",
+            "get_model_circuit_hash",
+            "--calldata",
+            &format!("0x{:x}", model_id),
         ])
         .output();
 
@@ -1459,22 +1526,25 @@ fn submit_gkr_onchain(
         for deferred in &gkr_proof.deferred_proofs {
             register_weight_commitments.push(deferred.weight_commitment);
         }
-        let register_calldata = build_register_gkr_calldata(
-            model_id,
-            &register_weight_commitments,
-            &circuit_desc,
-        );
+        let register_calldata =
+            build_register_gkr_calldata(model_id, &register_weight_commitments, &circuit_desc);
         let register_str = register_calldata.join(" ");
 
         let register_result = std::process::Command::new("sncast")
             .args([
-                "--account", &cli.account,
-                "--network", &cli.network,
+                "--account",
+                &cli.account,
+                "--network",
+                &cli.network,
                 "invoke",
-                "--contract-address", &cli.contract,
-                "--function", "register_model_gkr",
-                "--calldata", &register_str,
-                "--max-fee", &cli.max_fee,
+                "--contract-address",
+                &cli.contract,
+                "--function",
+                "register_model_gkr",
+                "--calldata",
+                &register_str,
+                "--max-fee",
+                &cli.max_fee,
             ])
             .output();
 
@@ -1538,7 +1608,10 @@ fn submit_gkr_onchain(
             eprintln!("  Error: verification submission failed");
             eprintln!("    stdout: {}", stdout.trim());
             eprintln!("    stderr: {}", stderr.trim());
-            eprintln!("  Calldata saved to: {} (retry manually)", calldata_path.display());
+            eprintln!(
+                "  Calldata saved to: {} (retry manually)",
+                calldata_path.display()
+            );
             process::exit(1);
         }
         Err(e) => {
@@ -1594,10 +1667,12 @@ fn run_wallet_command(cmd: &WalletCmd) {
             eprintln!();
             eprintln!("  prove-model wallet generate");
             eprintln!("  ───────────────────────────");
-            wallet.save(&output_path, cmd.password.as_deref()).unwrap_or_else(|e| {
-                eprintln!("Error: {e}");
-                process::exit(1);
-            });
+            wallet
+                .save(&output_path, cmd.password.as_deref())
+                .unwrap_or_else(|e| {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                });
             eprintln!("  address:  {}", wallet.address());
             eprintln!("  saved:    {}", output_path.display());
             if cmd.password.is_some() {
@@ -1613,11 +1688,10 @@ fn run_wallet_command(cmd: &WalletCmd) {
         }
         "show" => {
             let wallet_path = resolve_wallet_path(&cmd.wallet);
-            let wallet =
-                Wallet::load(&wallet_path, cmd.password.as_deref()).unwrap_or_else(|e| {
-                    eprintln!("Error loading wallet: {e}");
-                    process::exit(1);
-                });
+            let wallet = Wallet::load(&wallet_path, cmd.password.as_deref()).unwrap_or_else(|e| {
+                eprintln!("Error loading wallet: {e}");
+                process::exit(1);
+            });
 
             eprintln!();
             eprintln!("  prove-model wallet show");
@@ -1625,16 +1699,20 @@ fn run_wallet_command(cmd: &WalletCmd) {
             eprintln!("  address:     {}", wallet.address());
             eprintln!(
                 "  viewing_key: 0x{:08x}{:08x}{:08x}{:08x}",
-                wallet.viewing_key[0].0, wallet.viewing_key[1].0,
-                wallet.viewing_key[2].0, wallet.viewing_key[3].0,
+                wallet.viewing_key[0].0,
+                wallet.viewing_key[1].0,
+                wallet.viewing_key[2].0,
+                wallet.viewing_key[3].0,
             );
             eprintln!("  wallet:      {}", wallet_path.display());
 
             println!(
                 "{{\"address\":\"{}\",\"viewing_key\":\"0x{:08x}{:08x}{:08x}{:08x}\"}}",
                 wallet.address(),
-                wallet.viewing_key[0].0, wallet.viewing_key[1].0,
-                wallet.viewing_key[2].0, wallet.viewing_key[3].0,
+                wallet.viewing_key[0].0,
+                wallet.viewing_key[1].0,
+                wallet.viewing_key[2].0,
+                wallet.viewing_key[3].0,
             );
         }
         "import" => {
@@ -1652,26 +1730,33 @@ fn run_wallet_command(cmd: &WalletCmd) {
                 .map(|p| PathBuf::from(p))
                 .unwrap_or_else(Wallet::default_path);
 
-            wallet.save(&output_path, cmd.password.as_deref()).unwrap_or_else(|e| {
-                eprintln!("Error: {e}");
-                process::exit(1);
-            });
-
-            eprintln!("Wallet imported: {}", wallet.address());
-            eprintln!("Saved to: {}", output_path.display());
-            println!("{{\"address\":\"{}\",\"path\":\"{}\"}}", wallet.address(), output_path.display());
-        }
-        "export-viewing-key" => {
-            let wallet_path = resolve_wallet_path(&cmd.wallet);
-            let wallet =
-                Wallet::load(&wallet_path, cmd.password.as_deref()).unwrap_or_else(|e| {
+            wallet
+                .save(&output_path, cmd.password.as_deref())
+                .unwrap_or_else(|e| {
                     eprintln!("Error: {e}");
                     process::exit(1);
                 });
+
+            eprintln!("Wallet imported: {}", wallet.address());
+            eprintln!("Saved to: {}", output_path.display());
+            println!(
+                "{{\"address\":\"{}\",\"path\":\"{}\"}}",
+                wallet.address(),
+                output_path.display()
+            );
+        }
+        "export-viewing-key" => {
+            let wallet_path = resolve_wallet_path(&cmd.wallet);
+            let wallet = Wallet::load(&wallet_path, cmd.password.as_deref()).unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            });
             let vk = format!(
                 "0x{:08x}{:08x}{:08x}{:08x}",
-                wallet.viewing_key[0].0, wallet.viewing_key[1].0,
-                wallet.viewing_key[2].0, wallet.viewing_key[3].0,
+                wallet.viewing_key[0].0,
+                wallet.viewing_key[1].0,
+                wallet.viewing_key[2].0,
+                wallet.viewing_key[3].0,
             );
             println!("{vk}");
         }
@@ -1683,10 +1768,10 @@ fn run_wallet_command(cmd: &WalletCmd) {
 }
 
 fn run_deposit_command(cmd: &DepositCmd) {
-    use stwo_ml::privacy::wallet::Wallet;
-    use stwo_ml::privacy::tx_builder::TxBuilder;
-    use stwo_ml::privacy::serde_utils::{build_batch_proof_output, batch_proof_to_json};
     use stwo_ml::privacy::note_store::NoteStore;
+    use stwo_ml::privacy::serde_utils::{batch_proof_to_json, build_batch_proof_output};
+    use stwo_ml::privacy::tx_builder::TxBuilder;
+    use stwo_ml::privacy::wallet::Wallet;
 
     let wallet_path = resolve_wallet_path(&cmd.wallet);
     let wallet = Wallet::load(&wallet_path, cmd.password.as_deref()).unwrap_or_else(|e| {
@@ -1714,7 +1799,10 @@ fn run_deposit_command(cmd: &DepositCmd) {
     eprintln!("  ────────────────────");
     eprintln!("  amount:    {}", cmd.amount);
     eprintln!("  asset:     {}", cmd.asset);
-    eprintln!("  recipient: 0x{:08x}{:08x}...", recipient_pk[0].0, recipient_pk[1].0);
+    eprintln!(
+        "  recipient: 0x{:08x}{:08x}...",
+        recipient_pk[0].0, recipient_pk[1].0
+    );
 
     let t0 = Instant::now();
     eprintln!();
@@ -1749,10 +1837,19 @@ fn run_deposit_command(cmd: &DepositCmd) {
     let notes_path = NoteStore::default_path();
     let mut note_store = NoteStore::load(&notes_path).unwrap_or_else(|e| {
         eprintln!("Warning: could not load note store: {e}");
-        NoteStore { notes: Vec::new(), path: notes_path.clone() }
+        NoteStore {
+            notes: Vec::new(),
+            path: notes_path.clone(),
+        }
     });
     for (commitment, note) in &result.new_commitments {
-        let hex = format!("0x{}", commitment.iter().map(|m| format!("{:08x}", m.0)).collect::<String>());
+        let hex = format!(
+            "0x{}",
+            commitment
+                .iter()
+                .map(|m| format!("{:08x}", m.0))
+                .collect::<String>()
+        );
         note_store.add_note(note, &hex, 0);
     }
     note_store.save().ok();
@@ -1766,18 +1863,22 @@ fn run_deposit_command(cmd: &DepositCmd) {
     // JSON on stdout
     println!(
         "{{\"commitment\":\"{}\",\"proof_hash\":\"{}\",\"prove_time_ms\":{}}}",
-        output.deposits.first().map(|d| d.commitment.as_str()).unwrap_or(""),
+        output
+            .deposits
+            .first()
+            .map(|d| d.commitment.as_str())
+            .unwrap_or(""),
         output.proof_hash,
         output.prove_time_ms,
     );
 }
 
 fn run_withdraw_command(cmd: &WithdrawCmd) {
-    use stwo_ml::privacy::wallet::Wallet;
-    use stwo_ml::privacy::tx_builder::TxBuilder;
-    use stwo_ml::privacy::relayer::compute_withdrawal_binding_digest;
-    use stwo_ml::privacy::serde_utils::{build_batch_proof_output, batch_proof_to_json};
     use stwo_ml::privacy::note_store::NoteStore;
+    use stwo_ml::privacy::relayer::compute_withdrawal_binding_digest;
+    use stwo_ml::privacy::serde_utils::{batch_proof_to_json, build_batch_proof_output};
+    use stwo_ml::privacy::tx_builder::TxBuilder;
+    use stwo_ml::privacy::wallet::Wallet;
 
     let wallet_path = resolve_wallet_path(&cmd.wallet);
     let wallet = Wallet::load(&wallet_path, cmd.password.as_deref()).unwrap_or_else(|e| {
@@ -1801,7 +1902,10 @@ fn run_withdraw_command(cmd: &WithdrawCmd) {
 
     let balance = note_store.balance(cmd.asset);
     if balance < cmd.amount {
-        eprintln!("Error: insufficient balance. Have {balance}, need {}", cmd.amount);
+        eprintln!(
+            "Error: insufficient balance. Have {balance}, need {}",
+            cmd.amount
+        );
         process::exit(1);
     }
 
@@ -1809,8 +1913,11 @@ fn run_withdraw_command(cmd: &WithdrawCmd) {
     let spendable = note_store.spendable_notes(cmd.asset);
     let note_entry = spendable.iter().find(|n| n.note.amount() >= cmd.amount);
     let note_entry = note_entry.unwrap_or_else(|| {
-        eprintln!("Error: no single note covers amount {}. Largest note: {}", cmd.amount,
-            spendable.first().map(|n| n.note.amount()).unwrap_or(0));
+        eprintln!(
+            "Error: no single note covers amount {}. Largest note: {}",
+            cmd.amount,
+            spendable.first().map(|n| n.note.amount()).unwrap_or(0)
+        );
         eprintln!("Hint: use 'transfer' for splitting/merging notes");
         process::exit(1);
     });
@@ -1853,8 +1960,8 @@ fn run_withdraw_command(cmd: &WithdrawCmd) {
     // Sync Merkle tree from on-chain pool
     #[cfg(feature = "audit-http")]
     let (path, root) = {
-        use stwo_ml::privacy::tree_sync::TreeSync;
         use stwo_ml::privacy::pool_client::PoolClient;
+        use stwo_ml::privacy::tree_sync::TreeSync;
 
         let pool_config = build_pool_config(&cmd.priv_network, cmd.pool_contract.as_deref());
         if pool_config.pool_address.is_empty() {
@@ -1875,7 +1982,10 @@ fn run_withdraw_command(cmd: &WithdrawCmd) {
             eprintln!("Error: Merkle tree sync failed: {e}");
             process::exit(1);
         });
-        eprintln!("  Synced: {} leaves ({} new)", sync_result.total_leaves, sync_result.events_added);
+        eprintln!(
+            "  Synced: {} leaves ({} new)",
+            sync_result.total_leaves, sync_result.events_added
+        );
 
         let path = tree_sync.prove(leaf_index).unwrap_or_else(|e| {
             eprintln!("Error: Merkle proof failed for index {leaf_index}: {e}");
@@ -1944,7 +2054,10 @@ fn run_withdraw_command(cmd: &WithdrawCmd) {
     });
 
     // Mark note as spent
-    let mut note_store = NoteStore::load(&notes_path).unwrap_or_else(|_| NoteStore { notes: Vec::new(), path: notes_path.clone() });
+    let mut note_store = NoteStore::load(&notes_path).unwrap_or_else(|_| NoteStore {
+        notes: Vec::new(),
+        path: notes_path.clone(),
+    });
     for c in &result.spent_commitments {
         note_store.mark_spent(c);
     }
@@ -1964,10 +2077,10 @@ fn run_withdraw_command(cmd: &WithdrawCmd) {
 }
 
 fn run_transfer_command(cmd: &TransferCmd) {
-    use stwo_ml::privacy::wallet::Wallet;
-    use stwo_ml::privacy::tx_builder::TxBuilder;
-    use stwo_ml::privacy::serde_utils::{build_batch_proof_output, batch_proof_to_json};
     use stwo_ml::privacy::note_store::NoteStore;
+    use stwo_ml::privacy::serde_utils::{batch_proof_to_json, build_batch_proof_output};
+    use stwo_ml::privacy::tx_builder::TxBuilder;
+    use stwo_ml::privacy::wallet::Wallet;
 
     let wallet_path = resolve_wallet_path(&cmd.wallet);
     let wallet = Wallet::load(&wallet_path, cmd.password.as_deref()).unwrap_or_else(|e| {
@@ -1995,12 +2108,18 @@ fn run_transfer_command(cmd: &TransferCmd) {
     let selection = note_store.select_notes(cmd.asset, cmd.amount);
     let (selected, change) = selection.unwrap_or_else(|| {
         let balance = note_store.balance(cmd.asset);
-        eprintln!("Error: insufficient balance. Have {balance}, need {}", cmd.amount);
+        eprintln!(
+            "Error: insufficient balance. Have {balance}, need {}",
+            cmd.amount
+        );
         process::exit(1);
     });
 
     if selected.len() < 2 {
-        eprintln!("Error: need at least 2 notes for transfer, have {}", selected.len());
+        eprintln!(
+            "Error: need at least 2 notes for transfer, have {}",
+            selected.len()
+        );
         eprintln!("Hint: deposit more notes or use a single withdraw");
         process::exit(1);
     }
@@ -2015,8 +2134,8 @@ fn run_transfer_command(cmd: &TransferCmd) {
     // Sync Merkle tree from on-chain pool
     #[cfg(feature = "audit-http")]
     let (path1, path2, root) = {
-        use stwo_ml::privacy::tree_sync::TreeSync;
         use stwo_ml::privacy::pool_client::PoolClient;
+        use stwo_ml::privacy::tree_sync::TreeSync;
 
         let pool_config = build_pool_config(&cmd.priv_network, cmd.pool_contract.as_deref());
         if pool_config.pool_address.is_empty() {
@@ -2037,7 +2156,10 @@ fn run_transfer_command(cmd: &TransferCmd) {
             eprintln!("Error: Merkle tree sync failed: {e}");
             process::exit(1);
         });
-        eprintln!("  Synced: {} leaves ({} new)", sync_result.total_leaves, sync_result.events_added);
+        eprintln!(
+            "  Synced: {} leaves ({} new)",
+            sync_result.total_leaves, sync_result.events_added
+        );
 
         let p1 = tree_sync.prove(idx1).unwrap_or_else(|e| {
             eprintln!("Error: Merkle proof failed for index {idx1}: {e}");
@@ -2090,7 +2212,10 @@ fn run_transfer_command(cmd: &TransferCmd) {
         recipient_pk,
         recipient_vk,
         wallet.viewing_key,
-        [(note1, wallet.spending_key, path1), (note2, wallet.spending_key, path2)],
+        [
+            (note1, wallet.spending_key, path1),
+            (note2, wallet.spending_key, path2),
+        ],
         root,
     );
 
@@ -2115,12 +2240,21 @@ fn run_transfer_command(cmd: &TransferCmd) {
     });
 
     // Update note store
-    let mut note_store = NoteStore::load(&notes_path).unwrap_or_else(|_| NoteStore { notes: Vec::new(), path: notes_path.clone() });
+    let mut note_store = NoteStore::load(&notes_path).unwrap_or_else(|_| NoteStore {
+        notes: Vec::new(),
+        path: notes_path.clone(),
+    });
     for c in &result.spent_commitments {
         note_store.mark_spent(c);
     }
     for (commitment, note) in &result.new_commitments {
-        let hex = format!("0x{}", commitment.iter().map(|m| format!("{:08x}", m.0)).collect::<String>());
+        let hex = format!(
+            "0x{}",
+            commitment
+                .iter()
+                .map(|m| format!("{:08x}", m.0))
+                .collect::<String>()
+        );
         note_store.add_note_pending(note, &hex);
     }
     note_store.save().ok();
@@ -2133,10 +2267,12 @@ fn run_transfer_command(cmd: &TransferCmd) {
 }
 
 fn run_batch_command(cmd: &BatchCmd) {
-    use stwo_ml::privacy::wallet::Wallet;
-    use stwo_ml::privacy::tx_builder::TxBuilder;
-    use stwo_ml::privacy::serde_utils::{build_batch_proof_output, batch_proof_to_json, parse_tx_file};
     use stwo_ml::privacy::note_store::NoteStore;
+    use stwo_ml::privacy::serde_utils::{
+        batch_proof_to_json, build_batch_proof_output, parse_tx_file,
+    };
+    use stwo_ml::privacy::tx_builder::TxBuilder;
+    use stwo_ml::privacy::wallet::Wallet;
 
     let wallet_path = resolve_wallet_path(&cmd.wallet);
     let wallet = Wallet::load(&wallet_path, cmd.password.as_deref()).unwrap_or_else(|e| {
@@ -2220,9 +2356,18 @@ fn run_batch_command(cmd: &BatchCmd) {
 
     // Update note store
     let notes_path = NoteStore::default_path();
-    let mut note_store = NoteStore::load(&notes_path).unwrap_or_else(|_| NoteStore { notes: Vec::new(), path: notes_path.clone() });
+    let mut note_store = NoteStore::load(&notes_path).unwrap_or_else(|_| NoteStore {
+        notes: Vec::new(),
+        path: notes_path.clone(),
+    });
     for (commitment, note) in &result.new_commitments {
-        let hex = format!("0x{}", commitment.iter().map(|m| format!("{:08x}", m.0)).collect::<String>());
+        let hex = format!(
+            "0x{}",
+            commitment
+                .iter()
+                .map(|m| format!("{:08x}", m.0))
+                .collect::<String>()
+        );
         note_store.add_note(note, &hex, 0);
     }
     note_store.save().ok();
@@ -2230,21 +2375,15 @@ fn run_batch_command(cmd: &BatchCmd) {
     eprintln!("  proof saved: {}", cmd.output.display());
     println!(
         "{{\"num_deposits\":{},\"num_withdrawals\":{},\"num_spends\":{},\"prove_time_ms\":{}}}",
-        output.num_deposits,
-        output.num_withdrawals,
-        output.num_spends,
-        output.prove_time_ms,
+        output.num_deposits, output.num_withdrawals, output.num_spends, output.prove_time_ms,
     );
 }
 
 fn run_pool_status_command(cmd: &PoolStatusCmd) {
-    use stwo_ml::privacy::pool_client::{PoolClientConfig, format_pool_status};
+    use stwo_ml::privacy::pool_client::{format_pool_status, PoolClientConfig};
 
     let config = PoolClientConfig::from_env(&cmd.priv_network);
-    let pool_addr = cmd
-        .pool_contract
-        .as_deref()
-        .unwrap_or(&config.pool_address);
+    let pool_addr = cmd.pool_contract.as_deref().unwrap_or(&config.pool_address);
 
     eprintln!();
     eprintln!("  prove-model pool-status");
@@ -2340,16 +2479,16 @@ fn parse_m31_digest_hex(hex: &str) -> Result<[M31; 8], String> {
     let mut result = [M31::from(0u32); 8];
     for i in 0..8 {
         let chunk = &hex[i * 8..(i + 1) * 8];
-        let val = u32::from_str_radix(chunk, 16)
-            .map_err(|e| format!("invalid hex '{chunk}': {e}"))?;
+        let val =
+            u32::from_str_radix(chunk, 16).map_err(|e| format!("invalid hex '{chunk}': {e}"))?;
         result[i] = M31::from_u32_unchecked(val & 0x7FFFFFFF);
     }
     Ok(result)
 }
 
 fn run_scan_command(cmd: &ScanCmd) {
-    use stwo_ml::privacy::wallet::Wallet;
     use stwo_ml::privacy::note_store::NoteStore;
+    use stwo_ml::privacy::wallet::Wallet;
 
     let wallet_path = resolve_wallet_path(&cmd.wallet);
     let wallet = Wallet::load(&wallet_path, cmd.password.as_deref()).unwrap_or_else(|e| {
@@ -2359,12 +2498,14 @@ fn run_scan_command(cmd: &ScanCmd) {
 
     let notes_path = NoteStore::default_path();
     #[cfg(feature = "audit-http")]
-    let mut note_store = NoteStore::load(&notes_path).unwrap_or_else(|_| {
-        NoteStore { notes: Vec::new(), path: notes_path.clone() }
+    let mut note_store = NoteStore::load(&notes_path).unwrap_or_else(|_| NoteStore {
+        notes: Vec::new(),
+        path: notes_path.clone(),
     });
     #[cfg(not(feature = "audit-http"))]
-    let note_store = NoteStore::load(&notes_path).unwrap_or_else(|_| {
-        NoteStore { notes: Vec::new(), path: notes_path.clone() }
+    let note_store = NoteStore::load(&notes_path).unwrap_or_else(|_| NoteStore {
+        notes: Vec::new(),
+        path: notes_path.clone(),
     });
 
     eprintln!();
@@ -2375,8 +2516,8 @@ fn run_scan_command(cmd: &ScanCmd) {
     // Sync tree and update pending note indices
     #[cfg(feature = "audit-http")]
     {
-        use stwo_ml::privacy::tree_sync::TreeSync;
         use stwo_ml::privacy::pool_client::PoolClient;
+        use stwo_ml::privacy::tree_sync::TreeSync;
 
         let pool_config = build_pool_config(&cmd.priv_network, cmd.pool_contract.as_deref());
         if !pool_config.pool_address.is_empty() {
@@ -2395,9 +2536,8 @@ fn run_scan_command(cmd: &ScanCmd) {
                     eprintln!("  new_events: {}", sync_result.events_added);
 
                     // Update pending notes with correct merkle indices
-                    note_store.update_merkle_indices(|commitment| {
-                        tree_sync.find_commitment(commitment)
-                    });
+                    note_store
+                        .update_merkle_indices(|commitment| tree_sync.find_commitment(commitment));
                     note_store.save().ok();
                 }
                 Err(e) => {
@@ -2430,7 +2570,10 @@ fn run_scan_command(cmd: &ScanCmd) {
 fn parse_pubkey_hex(hex: &str) -> [M31; 4] {
     let hex = hex.strip_prefix("0x").unwrap_or(hex);
     if hex.len() != 32 {
-        eprintln!("Error: public key hex must be 32 chars (4 x 8), got {}", hex.len());
+        eprintln!(
+            "Error: public key hex must be 32 chars (4 x 8), got {}",
+            hex.len()
+        );
         process::exit(1);
     }
     let mut result = [M31::from(0u32); 4];
@@ -2479,7 +2622,9 @@ fn parse_time_spec(spec: &str) -> u64 {
         } else if trimmed.ends_with('s') {
             (&trimmed[..trimmed.len() - 1], 1_000_000_000u64)
         } else {
-            eprintln!("Error: invalid relative time '{spec}'. Use Xh/Xm/Xd/Xs ago (e.g., '1h ago')");
+            eprintln!(
+                "Error: invalid relative time '{spec}'. Use Xh/Xm/Xd/Xs ago (e.g., '1h ago')"
+            );
             process::exit(1);
         };
 
@@ -2523,7 +2668,9 @@ fn generate_diverse_input(rows: usize, cols: usize, iteration: usize) -> M31Matr
         // Scale to a reasonable input range (values 0..2^20 like quantized inputs)
         matrix.data[i] = M31::from(val % (1 << 20));
         // Extra mixing per element
-        state = state.wrapping_add(i as u64).wrapping_mul(0x517C_C1B7_2722_0A95);
+        state = state
+            .wrapping_add(i as u64)
+            .wrapping_mul(0x517C_C1B7_2722_0A95);
     }
     matrix
 }
@@ -2541,11 +2688,10 @@ fn run_capture_command(cmd: &CaptureCmd) {
     // ── Load model ──────────────────────────────────────────────────────
     let onnx = if let Some(ref model_dir) = cmd.model_dir {
         eprintln!("Loading model: {} (HuggingFace)", model_dir.display());
-        stwo_ml::compiler::hf_loader::load_hf_model(model_dir, cmd.layers)
-            .unwrap_or_else(|e| {
-                eprintln!("Error loading model directory: {e}");
-                process::exit(1);
-            })
+        stwo_ml::compiler::hf_loader::load_hf_model(model_dir, cmd.layers).unwrap_or_else(|e| {
+            eprintln!("Error loading model directory: {e}");
+            process::exit(1);
+        })
     } else if let Some(ref model_path) = cmd.model {
         eprintln!("Loading model: {} (ONNX)", model_path.display());
         load_onnx(model_path).unwrap_or_else(|e| {
@@ -2560,7 +2706,9 @@ fn run_capture_command(cmd: &CaptureCmd) {
     let graph = &onnx.graph;
     let weights = &onnx.weights;
     let (input_rows, input_cols) = onnx.input_shape;
-    let model_name = cmd.model_name.as_deref()
+    let model_name = cmd
+        .model_name
+        .as_deref()
         .unwrap_or(&onnx.metadata.name)
         .to_string();
 
@@ -2624,7 +2772,7 @@ fn run_capture_command(cmd: &CaptureCmd) {
             .as_nanos() as u64;
 
         hook.record(CaptureJob {
-            input_tokens: vec![],  // No tokenization in capture mode.
+            input_tokens: vec![], // No tokenization in capture mode.
             output_tokens: vec![],
             input_m31: input,
             output_m31: output,
@@ -2637,12 +2785,7 @@ fn run_capture_command(cmd: &CaptureCmd) {
             output_preview: None,
         });
 
-        eprintln!(
-            "  [{}/{}] forward pass: {}ms",
-            i + 1,
-            cmd.count,
-            latency_ms
-        );
+        eprintln!("  [{}/{}] forward pass: {}ms", i + 1, cmd.count, latency_ms);
     }
 
     // ── Flush and report ────────────────────────────────────────────────
@@ -2667,7 +2810,7 @@ fn run_capture_command(cmd: &CaptureCmd) {
 fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
     use stwo_ml::audit::log::InferenceLog;
     use stwo_ml::audit::orchestrator::{run_audit, run_audit_dry, AuditPipelineConfig};
-    use stwo_ml::audit::submit::{SubmitConfig, explorer_url};
+    use stwo_ml::audit::submit::{explorer_url, SubmitConfig};
     use stwo_ml::audit::types::{AuditRequest, ModelInfo};
 
     eprintln!();
@@ -2677,7 +2820,10 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
     // ── Load inference log ────────────────────────────────────────────────
     eprintln!("Loading inference log: {}", cmd.log_dir.display());
     let log = InferenceLog::load(&cmd.log_dir).unwrap_or_else(|e| {
-        eprintln!("Error: cannot load inference log from '{}': {e}", cmd.log_dir.display());
+        eprintln!(
+            "Error: cannot load inference log from '{}': {e}",
+            cmd.log_dir.display()
+        );
         eprintln!("Hint: the directory should contain meta.json, log.jsonl, and matrices.bin");
         process::exit(1);
     });
@@ -2698,11 +2844,10 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
     // ── Load model ───────────────────────────────────────────────────────
     let onnx = if let Some(ref model_dir) = cmd.model_dir {
         eprintln!("Loading model: {} (HuggingFace)", model_dir.display());
-        stwo_ml::compiler::hf_loader::load_hf_model(model_dir, cmd.layers)
-            .unwrap_or_else(|e| {
-                eprintln!("Error loading model directory: {e}");
-                process::exit(1);
-            })
+        stwo_ml::compiler::hf_loader::load_hf_model(model_dir, cmd.layers).unwrap_or_else(|e| {
+            eprintln!("Error loading model directory: {e}");
+            process::exit(1);
+        })
     } else if let Some(ref model_path) = cmd.model {
         eprintln!("Loading model: {} (ONNX)", model_path.display());
         load_onnx(model_path).unwrap_or_else(|e| {
@@ -2710,7 +2855,9 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
             process::exit(1);
         })
     } else {
-        eprintln!("Error: specify --model (ONNX) or --model-dir (HuggingFace) for replay verification");
+        eprintln!(
+            "Error: specify --model (ONNX) or --model-dir (HuggingFace) for replay verification"
+        );
         process::exit(1);
     };
 
@@ -2734,8 +2881,16 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
     eprintln!(
         "Audit window: {} inferences [{} → {}]",
         preview.entries.len(),
-        if start_ns == 0 { "beginning".to_string() } else { format_ns(start_ns) },
-        if end_ns == u64::MAX { "now".to_string() } else { format_ns(end_ns) },
+        if start_ns == 0 {
+            "beginning".to_string()
+        } else {
+            format_ns(start_ns)
+        },
+        if end_ns == u64::MAX {
+            "now".to_string()
+        } else {
+            format_ns(end_ns)
+        },
     );
 
     if preview.entries.is_empty() {
@@ -2744,10 +2899,14 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
     }
 
     // ── Build model info ─────────────────────────────────────────────────
-    let model_id = cmd.model_id.as_deref()
+    let model_id = cmd
+        .model_id
+        .as_deref()
         .unwrap_or(&model_id_from_log)
         .to_string();
-    let model_name = cmd.model_name.as_deref()
+    let model_name = cmd
+        .model_name
+        .as_deref()
         .unwrap_or(&onnx.metadata.name)
         .to_string();
 
@@ -2778,11 +2937,10 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
         // Dry-run: prove + evaluate + report, skip storage/on-chain
         eprintln!();
         eprintln!("Running dry-run audit...");
-        let report = run_audit_dry(&log, graph, weights, request, model_info)
-            .unwrap_or_else(|e| {
-                eprintln!("Error: audit failed: {e}");
-                process::exit(1);
-            });
+        let report = run_audit_dry(&log, graph, weights, request, model_info).unwrap_or_else(|e| {
+            eprintln!("Error: audit failed: {e}");
+            process::exit(1);
+        });
 
         let elapsed = t0.elapsed();
         print_audit_report(&report, elapsed, &cmd.output);
@@ -2813,30 +2971,30 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
         };
 
         // Construct encryption backend
-        let encryption_backend: Option<Box<dyn stwo_ml::audit::types::AuditEncryption>> =
-            match cmd.encryption.as_str() {
-                "poseidon2" | "poseidon2_m31" => {
-                    Some(Box::new(stwo_ml::audit::encryption::Poseidon2M31Encryption))
+        let encryption_backend: Option<Box<dyn stwo_ml::audit::types::AuditEncryption>> = match cmd
+            .encryption
+            .as_str()
+        {
+            "poseidon2" | "poseidon2_m31" => {
+                Some(Box::new(stwo_ml::audit::encryption::Poseidon2M31Encryption))
+            }
+            "aes" => {
+                #[cfg(feature = "aes-fallback")]
+                {
+                    Some(Box::new(stwo_ml::audit::encryption::Aes256GcmEncryption))
                 }
-                "aes" => {
-                    #[cfg(feature = "aes-fallback")]
-                    {
-                        Some(Box::new(
-                            stwo_ml::audit::encryption::Aes256GcmEncryption,
-                        ))
-                    }
-                    #[cfg(not(feature = "aes-fallback"))]
-                    {
-                        eprintln!("Error: --encryption aes requires the 'aes-fallback' feature");
-                        process::exit(1);
-                    }
+                #[cfg(not(feature = "aes-fallback"))]
+                {
+                    eprintln!("Error: --encryption aes requires the 'aes-fallback' feature");
+                    process::exit(1);
                 }
-                "noop" => {
-                    eprintln!("Warning: --encryption noop is for testing only, NOT production-safe");
-                    Some(Box::new(stwo_ml::audit::encryption::NoopEncryption))
-                }
-                _ => None, // "none"
-            };
+            }
+            "noop" => {
+                eprintln!("Warning: --encryption noop is for testing only, NOT production-safe");
+                Some(Box::new(stwo_ml::audit::encryption::NoopEncryption))
+            }
+            _ => None, // "none"
+        };
 
         // Construct storage client for private audits
         #[allow(unused_assignments, unused_mut)]
@@ -2894,8 +3052,7 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
             graph,
             weights,
             &config,
-            encryption_backend
-                .as_deref(),
+            encryption_backend.as_deref(),
             storage_client.as_ref(),
         )
         .unwrap_or_else(|e| {
@@ -2916,18 +3073,24 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
 
         // Write calldata and submit on-chain
         if let Some(ref calldata) = result.calldata {
-            let calldata_strs: Vec<String> = calldata.iter()
-                .map(|f| format!("0x{:x}", f))
-                .collect();
+            let calldata_strs: Vec<String> =
+                calldata.iter().map(|f| format!("0x{:x}", f)).collect();
 
             // Write calldata JSON for reference
             let calldata_path = cmd.output.with_extension("calldata.json");
             let calldata_json = serde_json::to_string_pretty(&calldata_strs).unwrap();
             std::fs::write(&calldata_path, &calldata_json).unwrap_or_else(|e| {
-                eprintln!("Error writing calldata to '{}': {e}", calldata_path.display());
+                eprintln!(
+                    "Error writing calldata to '{}': {e}",
+                    calldata_path.display()
+                );
                 process::exit(1);
             });
-            eprintln!("Calldata written to: {} ({} felts)", calldata_path.display(), calldata.len());
+            eprintln!(
+                "Calldata written to: {} ({} felts)",
+                calldata_path.display(),
+                calldata.len()
+            );
 
             // Submit via sncast
             eprintln!();
@@ -2970,8 +3133,8 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
 
                     // Try to extract tx hash from sncast output
                     let stdout_str = stdout.to_string();
-                    if let Some(tx_line) = stdout_str.lines()
-                        .find(|l| l.contains("transaction_hash"))
+                    if let Some(tx_line) =
+                        stdout_str.lines().find(|l| l.contains("transaction_hash"))
                     {
                         let tx_hash = tx_line.split_whitespace().last().unwrap_or("");
                         let explorer = explorer_url(&cmd.network, tx_hash);
@@ -3014,7 +3177,6 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
             result.total_time_ms,
         );
     }
-
 }
 
 // ─── Retrieve Subcommand ─────────────────────────────────────────────────
@@ -3029,7 +3191,9 @@ fn run_retrieve_command(cmd: &RetrieveCmd) {
         eprintln!("  prove-model retrieve");
         eprintln!("  ─────────────────────");
         eprintln!("Error: audit-http feature not enabled.");
-        eprintln!("Build with: cargo build --release --bin prove-model --features cli,audit,audit-http");
+        eprintln!(
+            "Build with: cargo build --release --bin prove-model --features cli,audit,audit-http"
+        );
         process::exit(1);
     }
 
@@ -3071,7 +3235,9 @@ fn run_retrieve_command(cmd: &RetrieveCmd) {
             .unwrap_or_else(|| privkey.clone()); // Fallback: use privkey as address
 
         // Build encryption backend
-        let encryption: Box<dyn stwo_ml::audit::types::AuditEncryption> = match cmd.encryption.as_str()
+        let encryption: Box<dyn stwo_ml::audit::types::AuditEncryption> = match cmd
+            .encryption
+            .as_str()
         {
             "poseidon2" | "poseidon2_m31" => {
                 Box::new(stwo_ml::audit::encryption::Poseidon2M31Encryption)
@@ -3134,7 +3300,10 @@ fn run_retrieve_command(cmd: &RetrieveCmd) {
         });
 
         eprintln!();
-        eprintln!("Audit report decrypted and written to: {}", cmd.output.display());
+        eprintln!(
+            "Audit report decrypted and written to: {}",
+            cmd.output.display()
+        );
         eprintln!("  Audit ID:     {}", report.audit_id);
         eprintln!("  Model:        {}", report.model.name);
         eprintln!(
@@ -3186,11 +3355,19 @@ fn duration_human(secs: u64) -> String {
     } else if secs < 3600 {
         let m = secs / 60;
         let s = secs % 60;
-        if s == 0 { format!("{}m", m) } else { format!("{}m {}s", m, s) }
+        if s == 0 {
+            format!("{}m", m)
+        } else {
+            format!("{}m {}s", m, s)
+        }
     } else {
         let h = secs / 3600;
         let m = (secs % 3600) / 60;
-        if m == 0 { format!("{}h", h) } else { format!("{}h {}m", h, m) }
+        if m == 0 {
+            format!("{}h", h)
+        } else {
+            format!("{}h {}m", h, m)
+        }
     }
 }
 
@@ -3222,7 +3399,12 @@ fn print_audit_report(
     let pad = inner.saturating_sub(title.len());
     let lpad = pad / 2;
     let rpad = pad - lpad;
-    eprintln!("\u{2551}{}{}{}\u{2551}", " ".repeat(lpad), title, " ".repeat(rpad));
+    eprintln!(
+        "\u{2551}{}{}{}\u{2551}",
+        " ".repeat(lpad),
+        title,
+        " ".repeat(rpad)
+    );
     eprintln!("\u{255a}{}\u{255d}", border); // ╚═══╝
 
     eprintln!();
@@ -3258,16 +3440,20 @@ fn print_audit_report(
     eprintln!();
     eprintln!(
         "  {:<38}Throughput  {:.1} tok/s",
-        format!("Tokens    {} in \u{00b7} {} out", s.total_input_tokens, s.total_output_tokens),
+        format!(
+            "Tokens    {} in \u{00b7} {} out",
+            s.total_input_tokens, s.total_output_tokens
+        ),
         s.throughput_tokens_per_sec,
     );
-    let latency_str = format!("Latency   avg {}ms \u{00b7} p95 {}ms", s.avg_latency_ms, s.p95_latency_ms);
+    let latency_str = format!(
+        "Latency   avg {}ms \u{00b7} p95 {}ms",
+        s.avg_latency_ms, s.p95_latency_ms
+    );
     if !s.categories.is_empty() {
         let mut cats: Vec<_> = s.categories.iter().collect();
         cats.sort_by(|a, b| b.1.cmp(a.1));
-        let cat_str: Vec<String> = cats.iter()
-            .map(|(k, v)| format!("{} ({})", k, v))
-            .collect();
+        let cat_str: Vec<String> = cats.iter().map(|(k, v)| format!("{} ({})", k, v)).collect();
         eprintln!("  {:<38}Categories  {}", latency_str, cat_str.join(", "));
     } else {
         eprintln!("  {}", latency_str);
@@ -3286,23 +3472,42 @@ fn print_audit_report(
         eprintln!();
 
         // Bar chart — scale bars to max bucket
-        let max_bucket = sem.excellent_count
+        let max_bucket = sem
+            .excellent_count
             .max(sem.good_count)
             .max(sem.fair_count)
             .max(sem.poor_count)
             .max(1); // avoid div-by-zero in display; bars are all empty if max=1 and val=0
         let bw = 20;
-        eprintln!("  Excellent  {}  {:>3}", bar_chart(sem.excellent_count, max_bucket, bw), sem.excellent_count);
-        eprintln!("  Good       {}  {:>3}", bar_chart(sem.good_count, max_bucket, bw), sem.good_count);
-        eprintln!("  Fair       {}  {:>3}", bar_chart(sem.fair_count, max_bucket, bw), sem.fair_count);
-        eprintln!("  Poor       {}  {:>3}", bar_chart(sem.poor_count, max_bucket, bw), sem.poor_count);
+        eprintln!(
+            "  Excellent  {}  {:>3}",
+            bar_chart(sem.excellent_count, max_bucket, bw),
+            sem.excellent_count
+        );
+        eprintln!(
+            "  Good       {}  {:>3}",
+            bar_chart(sem.good_count, max_bucket, bw),
+            sem.good_count
+        );
+        eprintln!(
+            "  Fair       {}  {:>3}",
+            bar_chart(sem.fair_count, max_bucket, bw),
+            sem.fair_count
+        );
+        eprintln!(
+            "  Poor       {}  {:>3}",
+            bar_chart(sem.poor_count, max_bucket, bw),
+            sem.poor_count
+        );
 
         eprintln!();
         let det_total = sem.deterministic_pass + sem.deterministic_fail;
         if det_total > 0 {
             let pct = if det_total > 0 {
                 (sem.deterministic_pass as f64 / det_total as f64 * 100.0) as u32
-            } else { 0 };
+            } else {
+                0
+            };
             eprintln!(
                 "  Deterministic   {} pass \u{00b7} {} fail ({}% pass rate)",
                 sem.deterministic_pass, sem.deterministic_fail, pct,
@@ -3319,19 +3524,38 @@ fn print_audit_report(
         if !sem.per_inference.is_empty() {
             let show_count = sem.per_inference.len().min(10);
             eprintln!();
-            eprintln!("  Per-Inference ({}/{}):", show_count, sem.per_inference.len());
-            eprintln!("  {:>4}  {:>5}  {:>7}  {:>5}  {}", "#", "Seq", "Score", "Det", "Status");
-            eprintln!("  {:─>4}  {:─>5}  {:─>7}  {:─>5}  {:─>8}", "", "", "", "", "");
+            eprintln!(
+                "  Per-Inference ({}/{}):",
+                show_count,
+                sem.per_inference.len()
+            );
+            eprintln!(
+                "  {:>4}  {:>5}  {:>7}  {:>5}  {}",
+                "#", "Seq", "Score", "Det", "Status"
+            );
+            eprintln!(
+                "  {:─>4}  {:─>5}  {:─>7}  {:─>5}  {:─>8}",
+                "", "", "", "", ""
+            );
 
             for eval in sem.per_inference.iter().take(show_count) {
-                let score_str = eval.semantic_score
+                let score_str = eval
+                    .semantic_score
                     .map(|sc| format!("{:.1}%", sc * 100.0))
                     .unwrap_or_else(|| "\u{2014}".to_string()); // —
-                let det_pass = eval.deterministic_checks.iter().filter(|c| c.passed).count();
+                let det_pass = eval
+                    .deterministic_checks
+                    .iter()
+                    .filter(|c| c.passed)
+                    .count();
                 let det_total = eval.deterministic_checks.len();
                 let det_str = format!("{}/{}", det_pass, det_total);
                 let status = if eval.deterministic_checks.iter().all(|c| c.passed) {
-                    if eval.evaluation_proved { "proved" } else { "ok" }
+                    if eval.evaluation_proved {
+                        "proved"
+                    } else {
+                        "ok"
+                    }
                 } else {
                     "FAIL"
                 };
@@ -3353,7 +3577,11 @@ fn print_audit_report(
                 }
             }
             if sem.per_inference.len() > show_count {
-                eprintln!("  {:>4}  ... {} more (see report JSON)", "", sem.per_inference.len() - show_count);
+                eprintln!(
+                    "  {:>4}  ... {} more (see report JSON)",
+                    "",
+                    sem.per_inference.len() - show_count
+                );
             }
         }
     } else {
@@ -3389,7 +3617,11 @@ fn print_audit_report(
         format!("Proof       {}", proof_parts.join(" \u{00b7} ")),
         gpu_str,
     );
-    let tee_str = if infra.tee_active { "active" } else { "inactive" };
+    let tee_str = if infra.tee_active {
+        "active"
+    } else {
+        "inactive"
+    };
     eprintln!(
         "  {:<38}TEE         {}",
         format!("Prover      stwo-ml v{}", infra.prover_version),
@@ -3428,9 +3660,15 @@ fn print_audit_report(
     eprintln!("{}", section_line("COMMITMENTS"));
     eprintln!();
     eprintln!("  IO root      {}", report.commitments.io_merkle_root);
-    eprintln!("  Log root     {}", report.commitments.inference_log_merkle_root);
+    eprintln!(
+        "  Log root     {}",
+        report.commitments.inference_log_merkle_root
+    );
     eprintln!("  Weight       {}", report.commitments.weight_commitment);
-    eprintln!("  Chain        {}", report.commitments.combined_chain_commitment);
+    eprintln!(
+        "  Chain        {}",
+        report.commitments.combined_chain_commitment
+    );
     eprintln!("  Report hash  {}", report.commitments.audit_report_hash);
 
     // ── Inferences ───────────────────────────────────────────────────────
@@ -3442,12 +3680,14 @@ fn print_audit_report(
 
         for entry in report.inferences.iter().take(show_count) {
             eprintln!();
-            let score_str = entry.semantic_score
+            let score_str = entry
+                .semantic_score
                 .map(|sc| format!("  score {:.0}%", sc * 100.0))
                 .unwrap_or_default();
             let cat = entry.category.as_deref().unwrap_or("-");
             // Extract just the time portion from ISO timestamp
-            let time_short = entry.timestamp
+            let time_short = entry
+                .timestamp
                 .find('T')
                 .map(|i| &entry.timestamp[i + 1..entry.timestamp.len().min(i + 9)])
                 .unwrap_or(&entry.timestamp);
@@ -3456,11 +3696,19 @@ fn print_audit_report(
                 entry.index, time_short, entry.latency_ms, cat, score_str,
             );
             if let Some(ref preview) = entry.input_preview {
-                let truncated = if preview.len() > 64 { &preview[..64] } else { preview.as_str() };
+                let truncated = if preview.len() > 64 {
+                    &preview[..64]
+                } else {
+                    preview.as_str()
+                };
                 eprintln!("       \u{25b8} {}", truncated);
             }
             if let Some(ref preview) = entry.output_preview {
-                let truncated = if preview.len() > 64 { &preview[..64] } else { preview.as_str() };
+                let truncated = if preview.len() > 64 {
+                    &preview[..64]
+                } else {
+                    preview.as_str()
+                };
                 eprintln!("       \u{25c2} {}", truncated);
             }
         }
@@ -3528,7 +3776,8 @@ fn compute_fingerprint(model_dir: &std::path::Path) -> Option<String> {
     std::env::var("STWO_WEIGHT_COMMIT_SEGMENTS")
         .unwrap_or_else(|_| "".to_string())
         .hash(&mut hasher);
-    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(model_dir).ok()?
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(model_dir)
+        .ok()?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().map_or(false, |ext| ext == "safetensors"))
         .collect();
@@ -3742,11 +3991,14 @@ fn compute_weight_commitment(
     model_dir: Option<&std::path::Path>,
 ) -> FieldElement {
     use rayon::prelude::*;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     let n_weights = weights.weights.len();
-    eprintln!("[BG] Computing weight commitment ({} matrices, packed 7:1, parallel)...", n_weights);
+    eprintln!(
+        "[BG] Computing weight commitment ({} matrices, packed 7:1, parallel)...",
+        n_weights
+    );
     eprintln!("[BG]   First run — will cache with fingerprint for instant validated reuse.");
     let t_commit = Instant::now();
     let progress_every = std::env::var("STWO_WEIGHT_PROGRESS_EVERY")
@@ -3758,7 +4010,10 @@ fn compute_weight_commitment(
     let weight_list: Vec<_> = weights.weights.iter().collect();
     let done_count = Arc::new(AtomicUsize::new(0));
     let total = weight_list.len();
-    eprintln!("[BG]   Progress update cadence: every {} matrix/matrices", progress_every);
+    eprintln!(
+        "[BG]   Progress update cadence: every {} matrix/matrices",
+        progress_every
+    );
     let ticker_stop = Arc::new(AtomicBool::new(false));
     let ticker_done_count = Arc::clone(&done_count);
     let ticker_stop_flag = Arc::clone(&ticker_stop);
@@ -4010,7 +4265,10 @@ fn compute_weight_commitment(
             starknet_crypto::poseidon_hash_many(&per_matrix_hashes)
         }
     };
-    eprintln!("[BG] Weight commitment computed in {:.2}s", t_commit.elapsed().as_secs_f64());
+    eprintln!(
+        "[BG] Weight commitment computed in {:.2}s",
+        t_commit.elapsed().as_secs_f64()
+    );
 
     // Cache with fingerprint for validated reuse
     if let Some(d) = model_dir {
@@ -4018,9 +4276,15 @@ fn compute_weight_commitment(
             let cache_path = d.join(format!(".weight_commitment_{fp}.hex"));
             let hex = format!("0x{:064x}", commitment);
             if let Err(e) = std::fs::write(&cache_path, &hex) {
-                eprintln!("[BG]   Warning: could not cache to {}: {e}", cache_path.display());
+                eprintln!(
+                    "[BG]   Warning: could not cache to {}: {e}",
+                    cache_path.display()
+                );
             } else {
-                eprintln!("[BG]   Cached to {} (auto-invalidates if weights change)", cache_path.display());
+                eprintln!(
+                    "[BG]   Cached to {} (auto-invalidates if weights change)",
+                    cache_path.display()
+                );
             }
         }
     }

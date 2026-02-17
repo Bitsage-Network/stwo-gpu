@@ -152,10 +152,12 @@ STARKNET_PRIVATE_KEY=0x... ./run_e2e.sh --preset qwen3-14b --gpu --submit
 | `STWO_GPU_MLE_FOLD_REQUIRE` | No | Off | Fail if MLE fold falls back to CPU |
 | `STWO_GPU_MLE_OPENING_TREE_REQUIRE` | No | Off | Fail if GPU-resident opening-tree path fails |
 | `STWO_GPU_MLE_OPENING_TIMING` | No | Off | Print per-opening tree/query timing breakdown |
+| `STWO_GKR_AGGREGATE_WEIGHT_BINDING` | No | Off | Experimental batched RLC weight-binding mode (serializable artifact, not submit-ready for Starknet `verify_model_gkr`) |
 
 Notes:
 - The opening path now packs QM31 leaves to felt252 on GPU (no per-round CPU repack/upload), which reduces weight-opening overhead on large models.
 - Query extraction now replays folds on GPU and downloads only queried leaf pairs (instead of full folded layers), reducing opening-phase host transfer pressure.
+- In aggregated weight-binding mode, `ml_gkr` output still serializes full proof artifacts with `submission_ready=false`, `weight_opening_mode`, and `weight_claim_calldata`.
 
 ## Model Presets
 
@@ -249,6 +251,12 @@ STARKNET_PRIVATE_KEY=0x... ./04_verify_onchain.sh --submit
 ./04_verify_onchain.sh --submit --max-fee 0.1           # Custom fee
 ./04_verify_onchain.sh --submit --contract 0x123...     # Custom contract
 ```
+
+Notes:
+- If `verify_calldata.entrypoint` is `unsupported` (e.g. aggregated RLC
+  weight-binding mode), the script prints `weight_opening_mode` + gate reason.
+- In `--dry-run`, unsupported artifacts are reported and skipped cleanly.
+- In `--submit`, unsupported artifacts fail fast before submitting any tx.
 
 ### 05_audit.sh
 

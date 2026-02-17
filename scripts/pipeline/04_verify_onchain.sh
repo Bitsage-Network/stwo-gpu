@@ -171,6 +171,23 @@ if [[ -z "$PROOF_MODE" ]]; then
     if [[ "$ENTRYPOINT_IN_PROOF" == "verify_model_gkr" ]]; then
         PROOF_MODE="gkr"
         log "Inferred mode: gkr (from verify_calldata.entrypoint)"
+    elif [[ "$ENTRYPOINT_IN_PROOF" == "unsupported" ]]; then
+        SUBMISSION_READY=$(parse_json_field "$PROOF_FILE" "submission_ready")
+        WEIGHT_OPENING_MODE=$(parse_json_field "$PROOF_FILE" "weight_opening_mode")
+        UNSUPPORTED_REASON=$(parse_json_field "$PROOF_FILE" "verify_calldata.reason")
+        if [[ -z "$UNSUPPORTED_REASON" ]]; then
+            UNSUPPORTED_REASON=$(parse_json_field "$PROOF_FILE" "soundness_gate_error")
+        fi
+        warn "Proof artifact is not Starknet submit-ready."
+        warn "  weight_opening_mode: ${WEIGHT_OPENING_MODE:-unknown}"
+        warn "  submission_ready: ${SUBMISSION_READY:-false}"
+        warn "  reason: ${UNSUPPORTED_REASON:-unspecified}"
+        if [[ "$DO_SUBMIT" == "true" ]]; then
+            err "On-chain submission requested, but proof is marked unsupported."
+            exit 1
+        fi
+        ok "Dry run: skipping on-chain verification for unsupported proof artifact."
+        exit 0
     elif [[ "$ENTRYPOINT_IN_PROOF" == "verify_model_direct" ]]; then
         err "Direct proofs are disabled in the hardened pipeline. Regenerate proof with --mode gkr."
         exit 1
@@ -348,7 +365,14 @@ entrypoint = vc.get('entrypoint')
 if not isinstance(entrypoint, str) or not entrypoint:
     fail("verify_calldata.entrypoint must be a non-empty string")
 if entrypoint != 'verify_model_gkr':
-    fail(f'Only verify_model_gkr is supported in the hardened pipeline (got: {entrypoint})')
+    mode = proof.get('weight_opening_mode', 'unknown')
+    reason = vc.get('reason') or proof.get('soundness_gate_error') or 'unspecified'
+    ready = bool(proof.get('submission_ready', False))
+    fail(
+        'Only verify_model_gkr is supported in the hardened pipeline '
+        f'(got: {entrypoint}, submission_ready={ready}, '
+        f'weight_opening_mode={mode}, reason={reason})'
+    )
 
 calldata = vc.get('calldata')
 if not isinstance(calldata, list) or len(calldata) == 0:
@@ -584,7 +608,14 @@ else
 
             ENTRYPOINT=$(cat "$VERIFY_TMP/entrypoint.txt")
             if [[ "$ENTRYPOINT" != "verify_model_gkr" ]]; then
+                UNSUPPORTED_REASON=$(parse_json_field "$PROOF_FILE" "verify_calldata.reason")
+                if [[ -z "$UNSUPPORTED_REASON" ]]; then
+                    UNSUPPORTED_REASON=$(parse_json_field "$PROOF_FILE" "soundness_gate_error")
+                fi
+                WEIGHT_OPENING_MODE=$(parse_json_field "$PROOF_FILE" "weight_opening_mode")
                 err "verify_calldata.entrypoint must be verify_model_gkr in gkr mode (got: ${ENTRYPOINT})"
+                err "  weight_opening_mode: ${WEIGHT_OPENING_MODE:-unknown}"
+                err "  reason: ${UNSUPPORTED_REASON:-unspecified}"
                 rm -rf "$VERIFY_TMP"
                 exit 1
             fi

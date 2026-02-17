@@ -8,6 +8,8 @@
 //! - Activation → placeholder (LogUp integration in next phase)
 
 use num_traits::{One, Zero};
+#[cfg(feature = "cuda-runtime")]
+use rayon::prelude::*;
 use stwo::core::fields::m31::M31;
 
 use crate::compiler::graph::{GraphExecution, GraphWeights};
@@ -16,6 +18,8 @@ use crate::components::attention::{
 };
 #[cfg(feature = "cuda-runtime")]
 use crate::components::matmul::matmul_m31;
+#[cfg(not(feature = "cuda-runtime"))]
+use crate::components::matmul::matrix_to_mle_col_major_padded_pub as matrix_to_mle_col_major_padded;
 #[cfg(feature = "cuda-runtime")]
 use crate::components::matmul::matrix_to_mle_col_major_u32_padded_pub as matrix_to_mle_col_major_u32_padded;
 use crate::components::matmul::{
@@ -23,17 +27,48 @@ use crate::components::matmul::{
     matrix_to_mle_pub as matrix_to_mle, pad_matrix_pow2, restrict_mle_pub as restrict_mle,
     M31Matrix,
 };
-#[cfg(not(feature = "cuda-runtime"))]
-use crate::components::matmul::matrix_to_mle_col_major_padded_pub as matrix_to_mle_col_major_padded;
 use crate::crypto::poseidon_channel::PoseidonChannel;
 
 use super::circuit::{LayerType, LayeredCircuit};
+#[cfg(feature = "cuda-runtime")]
+use super::types::derive_weight_opening_subchannel;
+use super::types::WeightOpeningTranscriptMode;
 use super::types::{GKRClaim, GKRError, GKRProof, LayerProof, SecureField};
 
 #[cfg(feature = "cuda-runtime")]
 #[inline]
 fn prepare_weight_opening_mle_u32(weight: &M31Matrix) -> Vec<u32> {
     matrix_to_mle_col_major_u32_padded(weight)
+}
+
+#[cfg(feature = "cuda-runtime")]
+fn gkr_batch_weight_openings_enabled() -> bool {
+    match std::env::var("STWO_GKR_BATCH_WEIGHT_OPENINGS") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false" && v != "off"
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(feature = "cuda-runtime")]
+fn gkr_batch_weight_opening_jobs() -> usize {
+    std::env::var("STWO_GKR_BATCH_WEIGHT_OPENING_JOBS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(2)
+}
+
+fn gkr_aggregate_weight_binding_enabled() -> bool {
+    match std::env::var("STWO_GKR_AGGREGATE_WEIGHT_BINDING") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false" && v != "off"
+        }
+        Err(_) => false,
+    }
 }
 
 /// Prove a full model forward pass using the GKR protocol.
@@ -282,6 +317,7 @@ pub fn prove_gkr(
                 weight_eval_point.extend_from_slice(sumcheck_challenges);
 
                 let deferred_weight_claim = super::types::WeightClaim {
+                    weight_node_id: *weight_node_id,
                     eval_point: weight_eval_point.clone(),
                     expected_value: reduction.final_b_eval,
                 };
@@ -330,42 +366,67 @@ pub fn prove_gkr(
         }
     }
 
-    // Generate MLE opening proofs for weight matrices (post-deferred channel state).
-    // This binds each matmul's final_b_eval to its committed weight Merkle root.
+    // Generate MLE opening proofs for weight matrices (post-deferred channel state),
+    // or use aggregated RLC weight binding (off-chain verification mode).
     let mut weight_openings = Vec::with_capacity(weight_data.len());
     let mut weight_claims = Vec::with_capacity(weight_data.len());
+    let mut weight_opening_transcript_mode = WeightOpeningTranscriptMode::Sequential;
+    let aggregate_weight_binding = gkr_aggregate_weight_binding_enabled() && !weight_data.is_empty();
 
-    for (weight_node_id, eval_point, expected_value) in weight_data {
-        let b_matrix = weights
-            .get_weight(weight_node_id)
-            .ok_or(GKRError::MissingWeight {
-                node_id: weight_node_id,
-            })?;
+    if aggregate_weight_binding {
+        weight_opening_transcript_mode = WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1;
+        let rho = channel.draw_qm31();
+        let mut rho_pow = SecureField::one();
+        let mut combined_expected = SecureField::zero();
+        for (weight_node_id, eval_point, expected_value) in weight_data.iter() {
+            weight_claims.push(super::types::WeightClaim {
+                weight_node_id: *weight_node_id,
+                eval_point: eval_point.clone(),
+                expected_value: *expected_value,
+            });
+            combined_expected = combined_expected + rho_pow * *expected_value;
+            rho_pow = rho_pow * rho;
+        }
+        mix_secure_field(channel, combined_expected);
+        eprintln!(
+            "  [GKR] aggregated weight binding enabled (RLC): {} claims, {} openings eliminated",
+            weight_data.len(),
+            weight_data.len()
+        );
+    } else {
+        for (weight_node_id, eval_point, expected_value) in weight_data {
+            let b_matrix = weights
+                .get_weight(weight_node_id)
+                .ok_or(GKRError::MissingWeight {
+                    node_id: weight_node_id,
+                })?;
 
-        weight_claims.push(super::types::WeightClaim {
-            eval_point: eval_point.clone(),
-            expected_value,
-        });
-        #[cfg(feature = "cuda-runtime")]
-        let (commitment, opening) = {
-            let b_mle_u32 = matrix_to_mle_col_major_u32_padded(b_matrix);
-            crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
-                &b_mle_u32,
-                &eval_point,
-                channel,
-            )
-        };
-        #[cfg(not(feature = "cuda-runtime"))]
-        let (commitment, opening) = {
-            let b_mle = matrix_to_mle_col_major_padded(b_matrix);
-            crate::crypto::mle_opening::prove_mle_opening_with_commitment(
-                &b_mle,
-                &eval_point,
-                channel,
-            )
-        };
-        weight_commitments.push(commitment);
-        weight_openings.push(opening);
+            weight_claims.push(super::types::WeightClaim {
+                weight_node_id,
+                eval_point: eval_point.clone(),
+                expected_value,
+            });
+            #[cfg(feature = "cuda-runtime")]
+            let (commitment, opening) = {
+                let b_mle_u32 = matrix_to_mle_col_major_u32_padded(b_matrix);
+                crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
+                    &b_mle_u32,
+                    &eval_point,
+                    channel,
+                )
+            };
+            #[cfg(not(feature = "cuda-runtime"))]
+            let (commitment, opening) = {
+                let b_mle = matrix_to_mle_col_major_padded(b_matrix);
+                crate::crypto::mle_opening::prove_mle_opening_with_commitment(
+                    &b_mle,
+                    &eval_point,
+                    channel,
+                )
+            };
+            weight_commitments.push(commitment);
+            weight_openings.push(opening);
+        }
     }
 
     // Compute IO commitment from model input and output
@@ -383,6 +444,7 @@ pub fn prove_gkr(
         weight_commitments,
         weight_openings,
         weight_claims,
+        weight_opening_transcript_mode,
         io_commitment,
         deferred_proofs,
     })
@@ -684,6 +746,7 @@ pub fn prove_gkr_gpu(
                 weight_eval_point.extend_from_slice(sumcheck_challenges);
 
                 let deferred_weight_claim = super::types::WeightClaim {
+                    weight_node_id: *weight_node_id,
                     eval_point: weight_eval_point.clone(),
                     expected_value: reduction.final_b_eval,
                 };
@@ -744,6 +807,7 @@ pub fn prove_gkr_gpu(
     // Generate MLE opening proofs for weight matrices (post-deferred channel state)
     let mut weight_openings = Vec::with_capacity(weight_data.len());
     let mut weight_claims = Vec::with_capacity(weight_data.len());
+    let mut weight_opening_transcript_mode = WeightOpeningTranscriptMode::Sequential;
     let total_openings = weight_data.len();
     let t_openings = std::time::Instant::now();
     let openings_progress_every = std::env::var("STWO_GKR_OPENINGS_PROGRESS_EVERY")
@@ -755,181 +819,284 @@ pub fn prove_gkr_gpu(
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(15);
+    let aggregate_weight_binding = gkr_aggregate_weight_binding_enabled() && total_openings > 0;
 
-    #[cfg(feature = "cuda-runtime")]
-    {
-        let weight_data = weight_data;
-        std::thread::scope(|scope| -> Result<(), GKRError> {
-            let mut prefetched_current: Option<Vec<u32>> = None;
+    if aggregate_weight_binding {
+        weight_opening_transcript_mode = WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1;
+        let rho = channel.draw_qm31();
+        let mut rho_pow = SecureField::one();
+        let mut combined_expected = SecureField::zero();
+        for (weight_node_id, eval_point, expected_value) in weight_data.iter() {
+            weight_claims.push(super::types::WeightClaim {
+                weight_node_id: *weight_node_id,
+                eval_point: eval_point.clone(),
+                expected_value: *expected_value,
+            });
+            combined_expected = combined_expected + rho_pow * *expected_value;
+            rho_pow = rho_pow * rho;
+        }
+        mix_secure_field(channel, combined_expected);
+        eprintln!(
+            "  [GKR] aggregated weight binding enabled (RLC): {} claims, {} openings eliminated",
+            total_openings, total_openings
+        );
+    } else {
+        #[cfg(feature = "cuda-runtime")]
+        {
+            let weight_data = weight_data;
+            let batched = gkr_batch_weight_openings_enabled() && total_openings > 0;
+            if batched {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                use std::sync::Arc;
 
-            for (i, (weight_node_id, eval_point, expected_value)) in weight_data.iter().enumerate()
-            {
-                let b_matrix =
-                    weights
-                        .get_weight(*weight_node_id)
-                        .ok_or(GKRError::MissingWeight {
-                            node_id: *weight_node_id,
-                        })?;
+                weight_opening_transcript_mode = WeightOpeningTranscriptMode::BatchedSubchannelV1;
+                let opening_seed = channel.draw_felt252();
+                let jobs = gkr_batch_weight_opening_jobs().min(total_openings.max(1));
                 eprintln!(
-                    "  [GKR] weight opening {}/{} start: node={}, shape={}x{}",
-                    i + 1,
-                    total_openings,
-                    *weight_node_id,
-                    b_matrix.rows,
-                    b_matrix.cols,
+                    "  [GKR] batched weight openings enabled: {} jobs, {} openings",
+                    jobs, total_openings
                 );
 
-                if prefetched_current.is_none() {
-                    prefetched_current = Some(prepare_weight_opening_mle_u32(b_matrix));
-                }
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(jobs)
+                    .build()
+                    .map_err(|e| GKRError::ReductionError {
+                        layer_idx: 0,
+                        reason: format!("failed to build weight-opening thread pool: {e}"),
+                    })?;
 
-                let next_prefetch = if i + 1 < total_openings {
-                    let next_weight_node_id = weight_data[i + 1].0;
-                    Some(scope.spawn(move || -> Result<Vec<u32>, GKRError> {
-                        let next_weight = weights.get_weight(next_weight_node_id).ok_or(
-                            GKRError::MissingWeight {
-                                node_id: next_weight_node_id,
-                            },
-                        )?;
-                        Ok(prepare_weight_opening_mle_u32(next_weight))
-                    }))
-                } else {
-                    None
-                };
+                let done = Arc::new(AtomicUsize::new(0));
+                let results = pool.install(|| {
+                weight_data
+                    .par_iter()
+                    .enumerate()
+                    .map(|(i, (weight_node_id, eval_point, expected_value))| {
+                        let claim = super::types::WeightClaim {
+                            weight_node_id: *weight_node_id,
+                            eval_point: eval_point.clone(),
+                            expected_value: *expected_value,
+                        };
+                        let b_matrix =
+                            weights
+                                .get_weight(*weight_node_id)
+                                .ok_or(GKRError::MissingWeight {
+                                    node_id: *weight_node_id,
+                                })?;
+                        let b_mle_u32 = prepare_weight_opening_mle_u32(b_matrix);
+                        let mut sub_channel =
+                            derive_weight_opening_subchannel(opening_seed, i, &claim);
+                        let (commitment, opening) =
+                            crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
+                                &b_mle_u32,
+                                &claim.eval_point,
+                                &mut sub_channel,
+                            );
 
-                let b_mle_u32 = prefetched_current
-                    .take()
-                    .expect("prefetched current weight MLE");
-                weight_claims.push(super::types::WeightClaim {
-                    eval_point: eval_point.clone(),
-                    expected_value: *expected_value,
-                });
-                let opening_start = std::time::Instant::now();
-                let opening_hb_stop =
-                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let opening_hb = if opening_heartbeat_sec > 0 {
-                    let hb_stop = opening_hb_stop.clone();
-                    let hb_node = *weight_node_id;
-                    let hb_rows = b_matrix.rows;
-                    let hb_cols = b_matrix.cols;
-                    let hb_idx = i + 1;
-                    let hb_total = total_openings;
-                    let hb_interval = opening_heartbeat_sec;
-                    Some(std::thread::spawn(move || {
-                        while !hb_stop.load(std::sync::atomic::Ordering::Relaxed) {
-                            std::thread::sleep(std::time::Duration::from_secs(hb_interval));
-                            if hb_stop.load(std::sync::atomic::Ordering::Relaxed) {
-                                break;
-                            }
+                        let finished = done.fetch_add(1, Ordering::Relaxed) + 1;
+                        if (finished % openings_progress_every == 0) || finished == total_openings {
+                            let elapsed = t_openings.elapsed().as_secs_f64();
+                            let eta = if finished > 0 {
+                                let per = elapsed / finished as f64;
+                                per * (total_openings.saturating_sub(finished)) as f64
+                            } else {
+                                0.0
+                            };
                             eprintln!(
-                                "  [GKR] weight opening {}/{} still running: node={}, shape={}x{}, elapsed {:.1}s",
-                                hb_idx,
-                                hb_total,
-                                hb_node,
-                                hb_rows,
-                                hb_cols,
-                                opening_start.elapsed().as_secs_f64()
+                                "  [GKR] batched weight openings: {}/{} elapsed {:.1}s, eta ~{:.0}s",
+                                finished, total_openings, elapsed, eta,
                             );
                         }
-                    }))
-                } else {
-                    None
-                };
-                let (commitment, opening) =
-                    crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
-                        &b_mle_u32, eval_point, channel,
-                    );
-                opening_hb_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                if let Some(h) = opening_hb {
-                    let _ = h.join();
+
+                        Ok::<_, GKRError>((commitment, opening, claim))
+                    })
+                    .collect::<Vec<Result<_, GKRError>>>()
+            });
+
+                for item in results {
+                    let (commitment, opening, claim) = item?;
+                    weight_commitments.push(commitment);
+                    weight_openings.push(opening);
+                    weight_claims.push(claim);
                 }
-                weight_commitments.push(commitment);
-                weight_openings.push(opening);
-                eprintln!(
-                    "  [GKR] weight opening {}/{} done in {:.1}s",
-                    i + 1,
-                    total_openings,
-                    opening_start.elapsed().as_secs_f64()
-                );
-
-                if let Some(handle) = next_prefetch {
-                    prefetched_current =
-                        Some(handle.join().map_err(|_| GKRError::ReductionError {
-                            layer_idx: 0,
-                            reason: "weight opening prefetch thread panicked".to_string(),
-                        })??);
-                }
-
-                if total_openings > 0
-                    && (((i + 1) % openings_progress_every == 0) || i + 1 == total_openings)
-                {
-                    let elapsed = t_openings.elapsed().as_secs_f64();
-                    let eta = if i + 1 > 0 {
-                        let per = elapsed / (i + 1) as f64;
-                        per * (total_openings.saturating_sub(i + 1)) as f64
-                    } else {
-                        0.0
-                    };
-                    eprintln!(
-                        "  [GKR] weight openings: {}/{} elapsed {:.1}s, eta ~{:.0}s",
-                        i + 1,
-                        total_openings,
-                        elapsed,
-                        eta,
-                    );
-                }
-            }
-
-            Ok(())
-        })?;
-    }
-
-    #[cfg(not(feature = "cuda-runtime"))]
-    for (i, (weight_node_id, eval_point, expected_value)) in weight_data.into_iter().enumerate() {
-        let b_matrix = weights
-            .get_weight(weight_node_id)
-            .ok_or(GKRError::MissingWeight {
-                node_id: weight_node_id,
-            })?;
-        eprintln!(
-            "  [GKR] weight opening {}/{} start: node={}, shape={}x{}",
-            i + 1,
-            total_openings,
-            weight_node_id,
-            b_matrix.rows,
-            b_matrix.cols,
-        );
-
-        weight_claims.push(super::types::WeightClaim {
-            eval_point: eval_point.clone(),
-            expected_value,
-        });
-        let b_mle = matrix_to_mle_col_major_padded(b_matrix);
-        let (commitment, opening) = crate::crypto::mle_opening::prove_mle_opening_with_commitment(
-            &b_mle,
-            &eval_point,
-            channel,
-        );
-        weight_commitments.push(commitment);
-        weight_openings.push(opening);
-
-        if total_openings > 0
-            && (((i + 1) % openings_progress_every == 0) || i + 1 == total_openings)
-        {
-            let elapsed = t_openings.elapsed().as_secs_f64();
-            let eta = if i + 1 > 0 {
-                let per = elapsed / (i + 1) as f64;
-                per * (total_openings.saturating_sub(i + 1)) as f64
             } else {
-                0.0
-            };
+                std::thread::scope(|scope| -> Result<(), GKRError> {
+                    let mut prefetched_current: Option<Vec<u32>> = None;
+
+                    for (i, (weight_node_id, eval_point, expected_value)) in
+                        weight_data.iter().enumerate()
+                    {
+                        let b_matrix =
+                            weights
+                                .get_weight(*weight_node_id)
+                                .ok_or(GKRError::MissingWeight {
+                                    node_id: *weight_node_id,
+                                })?;
+                        eprintln!(
+                            "  [GKR] weight opening {}/{} start: node={}, shape={}x{}",
+                            i + 1,
+                            total_openings,
+                            *weight_node_id,
+                            b_matrix.rows,
+                            b_matrix.cols,
+                        );
+
+                        if prefetched_current.is_none() {
+                            prefetched_current = Some(prepare_weight_opening_mle_u32(b_matrix));
+                        }
+
+                        let next_prefetch = if i + 1 < total_openings {
+                            let next_weight_node_id = weight_data[i + 1].0;
+                            Some(scope.spawn(move || -> Result<Vec<u32>, GKRError> {
+                                let next_weight = weights.get_weight(next_weight_node_id).ok_or(
+                                    GKRError::MissingWeight {
+                                        node_id: next_weight_node_id,
+                                    },
+                                )?;
+                                Ok(prepare_weight_opening_mle_u32(next_weight))
+                            }))
+                        } else {
+                            None
+                        };
+
+                        let b_mle_u32 = prefetched_current
+                            .take()
+                            .expect("prefetched current weight MLE");
+                        weight_claims.push(super::types::WeightClaim {
+                            weight_node_id: *weight_node_id,
+                            eval_point: eval_point.clone(),
+                            expected_value: *expected_value,
+                        });
+                        let opening_start = std::time::Instant::now();
+                        let opening_hb_stop =
+                            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let opening_hb = if opening_heartbeat_sec > 0 {
+                            let hb_stop = opening_hb_stop.clone();
+                            let hb_node = *weight_node_id;
+                            let hb_rows = b_matrix.rows;
+                            let hb_cols = b_matrix.cols;
+                            let hb_idx = i + 1;
+                            let hb_total = total_openings;
+                            let hb_interval = opening_heartbeat_sec;
+                            Some(std::thread::spawn(move || {
+                                while !hb_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                                    std::thread::sleep(std::time::Duration::from_secs(hb_interval));
+                                    if hb_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                                        break;
+                                    }
+                                    eprintln!(
+                                    "  [GKR] weight opening {}/{} still running: node={}, shape={}x{}, elapsed {:.1}s",
+                                    hb_idx,
+                                    hb_total,
+                                    hb_node,
+                                    hb_rows,
+                                    hb_cols,
+                                    opening_start.elapsed().as_secs_f64()
+                                );
+                                }
+                            }))
+                        } else {
+                            None
+                        };
+                        let (commitment, opening) =
+                            crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
+                                &b_mle_u32, eval_point, channel,
+                            );
+                        opening_hb_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(h) = opening_hb {
+                            let _ = h.join();
+                        }
+                        weight_commitments.push(commitment);
+                        weight_openings.push(opening);
+                        eprintln!(
+                            "  [GKR] weight opening {}/{} done in {:.1}s",
+                            i + 1,
+                            total_openings,
+                            opening_start.elapsed().as_secs_f64()
+                        );
+
+                        if let Some(handle) = next_prefetch {
+                            prefetched_current =
+                                Some(handle.join().map_err(|_| GKRError::ReductionError {
+                                    layer_idx: 0,
+                                    reason: "weight opening prefetch thread panicked".to_string(),
+                                })??);
+                        }
+
+                        if total_openings > 0
+                            && (((i + 1) % openings_progress_every == 0) || i + 1 == total_openings)
+                        {
+                            let elapsed = t_openings.elapsed().as_secs_f64();
+                            let eta = if i + 1 > 0 {
+                                let per = elapsed / (i + 1) as f64;
+                                per * (total_openings.saturating_sub(i + 1)) as f64
+                            } else {
+                                0.0
+                            };
+                            eprintln!(
+                                "  [GKR] weight openings: {}/{} elapsed {:.1}s, eta ~{:.0}s",
+                                i + 1,
+                                total_openings,
+                                elapsed,
+                                eta,
+                            );
+                        }
+                    }
+
+                    Ok(())
+                })?;
+            }
+        }
+
+        #[cfg(not(feature = "cuda-runtime"))]
+        for (i, (weight_node_id, eval_point, expected_value)) in weight_data.into_iter().enumerate()
+        {
+            let b_matrix = weights
+                .get_weight(weight_node_id)
+                .ok_or(GKRError::MissingWeight {
+                    node_id: weight_node_id,
+                })?;
             eprintln!(
-                "  [GKR] weight openings: {}/{} elapsed {:.1}s, eta ~{:.0}s",
+                "  [GKR] weight opening {}/{} start: node={}, shape={}x{}",
                 i + 1,
                 total_openings,
-                elapsed,
-                eta,
+                weight_node_id,
+                b_matrix.rows,
+                b_matrix.cols,
             );
+
+            weight_claims.push(super::types::WeightClaim {
+                weight_node_id,
+                eval_point: eval_point.clone(),
+                expected_value,
+            });
+            let b_mle = matrix_to_mle_col_major_padded(b_matrix);
+            let (commitment, opening) =
+                crate::crypto::mle_opening::prove_mle_opening_with_commitment(
+                    &b_mle,
+                    &eval_point,
+                    channel,
+                );
+            weight_commitments.push(commitment);
+            weight_openings.push(opening);
+
+            if total_openings > 0
+                && (((i + 1) % openings_progress_every == 0) || i + 1 == total_openings)
+            {
+                let elapsed = t_openings.elapsed().as_secs_f64();
+                let eta = if i + 1 > 0 {
+                    let per = elapsed / (i + 1) as f64;
+                    per * (total_openings.saturating_sub(i + 1)) as f64
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "  [GKR] weight openings: {}/{} elapsed {:.1}s, eta ~{:.0}s",
+                    i + 1,
+                    total_openings,
+                    elapsed,
+                    eta,
+                );
+            }
         }
     }
 
@@ -947,6 +1114,7 @@ pub fn prove_gkr_gpu(
         weight_commitments,
         weight_openings,
         weight_claims,
+        weight_opening_transcript_mode,
         io_commitment,
         deferred_proofs,
     })
@@ -1662,41 +1830,67 @@ pub fn prove_gkr_simd_gpu(
         current_claim = next_claim;
     }
 
-    // Generate MLE opening proofs for weight matrices (post-GKR-walk channel state)
+    // Generate MLE opening proofs for weight matrices (post-GKR-walk channel state),
+    // or use aggregated RLC weight binding (off-chain verification mode).
     let mut weight_openings = Vec::with_capacity(weight_data.len());
     let mut weight_claims = Vec::with_capacity(weight_data.len());
+    let mut weight_opening_transcript_mode = WeightOpeningTranscriptMode::Sequential;
+    let aggregate_weight_binding = gkr_aggregate_weight_binding_enabled() && !weight_data.is_empty();
 
-    for (weight_node_id, eval_point, expected_value) in weight_data {
-        let b_matrix = weights
-            .get_weight(weight_node_id)
-            .ok_or(GKRError::MissingWeight {
-                node_id: weight_node_id,
-            })?;
+    if aggregate_weight_binding {
+        weight_opening_transcript_mode = WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1;
+        let rho = channel.draw_qm31();
+        let mut rho_pow = SecureField::one();
+        let mut combined_expected = SecureField::zero();
+        for (weight_node_id, eval_point, expected_value) in weight_data.iter() {
+            weight_claims.push(super::types::WeightClaim {
+                weight_node_id: *weight_node_id,
+                eval_point: eval_point.clone(),
+                expected_value: *expected_value,
+            });
+            combined_expected = combined_expected + rho_pow * *expected_value;
+            rho_pow = rho_pow * rho;
+        }
+        mix_secure_field(channel, combined_expected);
+        eprintln!(
+            "  [GKR] aggregated weight binding enabled (RLC): {} claims, {} openings eliminated",
+            weight_data.len(),
+            weight_data.len()
+        );
+    } else {
+        for (weight_node_id, eval_point, expected_value) in weight_data {
+            let b_matrix = weights
+                .get_weight(weight_node_id)
+                .ok_or(GKRError::MissingWeight {
+                    node_id: weight_node_id,
+                })?;
 
-        weight_claims.push(super::types::WeightClaim {
-            eval_point: eval_point.clone(),
-            expected_value,
-        });
-        #[cfg(feature = "cuda-runtime")]
-        let (commitment, opening) = {
-            let b_mle_u32 = matrix_to_mle_col_major_u32_padded(b_matrix);
-            crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
-                &b_mle_u32,
-                &eval_point,
-                channel,
-            )
-        };
-        #[cfg(not(feature = "cuda-runtime"))]
-        let (commitment, opening) = {
-            let b_mle = matrix_to_mle_col_major_padded(b_matrix);
-            crate::crypto::mle_opening::prove_mle_opening_with_commitment(
-                &b_mle,
-                &eval_point,
-                channel,
-            )
-        };
-        weight_commitments.push(commitment);
-        weight_openings.push(opening);
+            weight_claims.push(super::types::WeightClaim {
+                weight_node_id,
+                eval_point: eval_point.clone(),
+                expected_value,
+            });
+            #[cfg(feature = "cuda-runtime")]
+            let (commitment, opening) = {
+                let b_mle_u32 = matrix_to_mle_col_major_u32_padded(b_matrix);
+                crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
+                    &b_mle_u32,
+                    &eval_point,
+                    channel,
+                )
+            };
+            #[cfg(not(feature = "cuda-runtime"))]
+            let (commitment, opening) = {
+                let b_mle = matrix_to_mle_col_major_padded(b_matrix);
+                crate::crypto::mle_opening::prove_mle_opening_with_commitment(
+                    &b_mle,
+                    &eval_point,
+                    channel,
+                )
+            };
+            weight_commitments.push(commitment);
+            weight_openings.push(opening);
+        }
     }
 
     // IO commitment from first block's input and combined output
@@ -1723,6 +1917,7 @@ pub fn prove_gkr_simd_gpu(
         weight_commitments,
         weight_openings,
         weight_claims,
+        weight_opening_transcript_mode,
         io_commitment,
         deferred_proofs: vec![],
     })

@@ -5,6 +5,7 @@ use stwo::core::fields::qm31::QM31;
 use crate::components::activation::ActivationType;
 use crate::components::matmul::RoundPoly;
 use crate::crypto::mle_opening::MleOpeningProof;
+use crate::crypto::poseidon_channel::{securefield_to_felt, PoseidonChannel};
 
 /// QM31 is the secure (extension) field used throughout stwo-ml.
 pub type SecureField = QM31;
@@ -203,11 +204,45 @@ pub enum LayerProof {
 /// for the weight MLE. Used to bind the sumcheck to the registered weight matrix.
 #[derive(Debug, Clone)]
 pub struct WeightClaim {
+    /// MatMul weight node id in the compiled circuit graph.
+    pub weight_node_id: usize,
     /// Evaluation point in the weight MLE: [r_j || sumcheck_challenges]
     /// where r_j = output column challenges, sumcheck_challenges from reduction.
     pub eval_point: Vec<SecureField>,
     /// Expected value: final_b_eval from the MatMul sumcheck.
     pub expected_value: SecureField,
+}
+
+/// Transcript strategy for weight opening proofs.
+///
+/// - `Sequential`: legacy mode; one shared channel threaded through all openings.
+/// - `BatchedSubchannelV1`: draws one master seed from the main channel and derives
+///   independent per-opening sub-channels, enabling batched/parallel opening proving.
+/// - `BatchedRlcDirectEvalV1`: skips per-weight Merkle openings and binds all
+///   weight claims with a single random-linear-combination check against model
+///   weights (off-chain verifier path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightOpeningTranscriptMode {
+    Sequential,
+    BatchedSubchannelV1,
+    BatchedRlcDirectEvalV1,
+}
+
+/// Deterministically derive a per-opening sub-channel from a master seed.
+///
+/// Domain separation includes opening index, node id, eval point, and expected value.
+pub(crate) fn derive_weight_opening_subchannel(
+    master_seed: starknet_ff::FieldElement,
+    opening_index: usize,
+    claim: &WeightClaim,
+) -> PoseidonChannel {
+    let mut ch = PoseidonChannel::new();
+    ch.mix_felt(master_seed);
+    ch.mix_u64(opening_index as u64);
+    ch.mix_u64(claim.weight_node_id as u64);
+    ch.mix_felts(&claim.eval_point);
+    ch.mix_felt(securefield_to_felt(claim.expected_value));
+    ch
 }
 
 /// Complete GKR proof for a full model forward pass.
@@ -233,6 +268,9 @@ pub struct GKRProof {
     /// Weight claims: (eval_point, expected_value) per MatMul layer.
     /// Used by the verifier to check weight_openings[i].final_value == weight_claims[i].expected_value.
     pub weight_claims: Vec<WeightClaim>,
+
+    /// Transcript mode used for generating/verifying `weight_openings`.
+    pub weight_opening_transcript_mode: WeightOpeningTranscriptMode,
 
     /// IO commitment binding model input and output.
     pub io_commitment: starknet_ff::FieldElement,
@@ -299,16 +337,10 @@ pub enum GKRError {
     CompilationError(String),
 
     #[error("layer {layer_idx} reduction failed: {reason}")]
-    ReductionError {
-        layer_idx: usize,
-        reason: String,
-    },
+    ReductionError { layer_idx: usize, reason: String },
 
     #[error("verification failed at layer {layer_idx}: {reason}")]
-    VerificationError {
-        layer_idx: usize,
-        reason: String,
-    },
+    VerificationError { layer_idx: usize, reason: String },
 
     #[error("SIMD batch error: {0}")]
     SimdError(String),
