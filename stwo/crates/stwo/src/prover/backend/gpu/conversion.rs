@@ -296,7 +296,7 @@ pub fn aos_to_secure_column(aos: &[u32], n: usize) -> SecureColumnByCoords<SimdB
 /// Each input slice has `n` u32 values representing M31 elements.
 pub fn aos_to_secure_column_from_soa(
     c0: &[u32], c1: &[u32], c2: &[u32], c3: &[u32], n: usize,
-) -> SecureColumnByCoords<SimdBackend> {
+) -> SecureColumnByCoords<GpuBackend> {
     use crate::core::fields::m31::M31;
 
     assert_eq!(c0.len(), n);
