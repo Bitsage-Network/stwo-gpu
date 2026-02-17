@@ -181,17 +181,25 @@ fi
 # ─── Disk Space Check ───────────────────────────────────────────────
 
 if [[ -n "${MODEL_HF:-}" ]] && [[ "$SKIP_DOWNLOAD" == "false" ]]; then
-    _REQUIRED_GB="${MODEL_SIZE_GB:-10}"
-    if [[ "$_REQUIRED_GB" != "?" ]]; then
-        _REQUIRED=$(( _REQUIRED_GB * 3 / 2 ))  # 1.5x for download + extraction
-        # Use parent dir or $HOME if MODEL_DIR doesn't exist yet
-        _DF_TARGET="${MODEL_DIR:-$HOME}"
-        [[ -d "$_DF_TARGET" ]] || _DF_TARGET="$HOME"
-        _AVAILABLE_GB=$(df -BG "$_DF_TARGET" 2>/dev/null | awk 'NR==2{print $4}' | tr -d 'G' || echo "")
-        if [[ -n "$_AVAILABLE_GB" ]] && (( _AVAILABLE_GB < _REQUIRED )); then
-            err "Insufficient disk space: need ~${_REQUIRED}GB, only ${_AVAILABLE_GB}GB available."
-            err "Free up space or use a larger disk."
-            exit 1
+    # Skip disk check if model is already downloaded
+    _ALREADY_DOWNLOADED=false
+    if [[ -f "${MODEL_DIR:-}/config.json" ]] && ls "${MODEL_DIR}"/*.safetensors &>/dev/null 2>&1; then
+        _ALREADY_DOWNLOADED=true
+    fi
+
+    if [[ "$_ALREADY_DOWNLOADED" == "false" ]]; then
+        _REQUIRED_GB="${MODEL_SIZE_GB:-10}"
+        if [[ "$_REQUIRED_GB" != "?" ]]; then
+            # safetensors are not compressed, so 1.1x margin is sufficient
+            _REQUIRED=$(( _REQUIRED_GB + _REQUIRED_GB / 10 ))
+            _DF_TARGET="${MODEL_DIR:-$HOME}"
+            [[ -d "$_DF_TARGET" ]] || _DF_TARGET="$HOME"
+            _AVAILABLE_GB=$(df -BG "$_DF_TARGET" 2>/dev/null | awk 'NR==2{print $4}' | tr -d 'G' || echo "")
+            if [[ -n "$_AVAILABLE_GB" ]] && (( _AVAILABLE_GB < _REQUIRED )); then
+                err "Insufficient disk space: need ~${_REQUIRED}GB, only ${_AVAILABLE_GB}GB available."
+                err "Free up space or use a larger disk."
+                exit 1
+            fi
         fi
     fi
 fi

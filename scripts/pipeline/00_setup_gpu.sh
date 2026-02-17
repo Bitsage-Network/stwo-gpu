@@ -114,9 +114,9 @@ if [[ "$SKIP_DEPS" == "false" ]]; then
         warn "  build-essential cmake pkg-config libssl-dev git git-lfs python3 jq bc"
     fi
 
-    # HuggingFace CLI
-    pip3 install --quiet --upgrade huggingface_hub 2>/dev/null || \
-        pip3 install --quiet --upgrade --user huggingface_hub 2>/dev/null || true
+    # HuggingFace CLI + filelock (system filelock is often too old)
+    pip3 install --quiet --upgrade huggingface_hub filelock 2>/dev/null || \
+        pip3 install --quiet --upgrade --user huggingface_hub filelock 2>/dev/null || true
     ok "huggingface_hub available"
 else
     log "Skipping (--skip-deps)"
