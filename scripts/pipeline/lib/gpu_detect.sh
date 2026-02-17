@@ -109,18 +109,19 @@ install_nvidia_driver() {
         ubuntu|debian)
             run_cmd sudo apt-get update -qq
             # Install the latest recommended driver (550+ supports 4090 through B300)
-            if run_cmd sudo apt-get install -y -qq nvidia-driver-550 2>&1 | tail -3; then
+            log "Installing NVIDIA driver package (this can take several minutes)..."
+            if run_cmd sudo apt-get install -y nvidia-driver-550; then
                 ok "NVIDIA driver 550 installed via apt"
             else
                 warn "nvidia-driver-550 not available, trying nvidia-driver..."
-                run_cmd sudo apt-get install -y -qq nvidia-driver 2>&1 | tail -3 || true
+                run_cmd sudo apt-get install -y nvidia-driver || true
             fi
             ;;
         rhel|centos|rocky|almalinux|fedora)
             if command -v dnf &>/dev/null; then
-                run_cmd sudo dnf install -y nvidia-driver 2>&1 | tail -3 || true
+                run_cmd sudo dnf install -y nvidia-driver || true
             elif command -v yum &>/dev/null; then
-                run_cmd sudo yum install -y nvidia-driver 2>&1 | tail -3 || true
+                run_cmd sudo yum install -y nvidia-driver || true
             fi
             ;;
         *)
@@ -168,17 +169,18 @@ install_cuda_toolkit() {
     local distro
     distro=$(_detect_distro)
     log "Installing CUDA 12.8 toolkit for ${distro}..."
+    log "This may take 10-20 minutes on a fresh machine."
 
     case "$distro" in
         ubuntu|debian)
             _ensure_cuda_apt_repo || true
 
             # Install cuda-toolkit via nvidia repo
-            if run_cmd sudo apt-get install -y -qq cuda-toolkit-12-8 2>&1 | tail -3; then
+            if run_cmd sudo apt-get install -y cuda-toolkit-12-8; then
                 ok "CUDA 12.8 toolkit installed via apt"
             else
                 log "cuda-toolkit-12-8 not in repo, trying generic cuda-toolkit..."
-                run_cmd sudo apt-get install -y -qq cuda-toolkit 2>&1 | tail -3 || {
+                run_cmd sudo apt-get install -y cuda-toolkit || {
                     warn "CUDA toolkit install failed via apt."
                     warn "Install manually: https://developer.nvidia.com/cuda-downloads"
                     return 1
@@ -187,11 +189,11 @@ install_cuda_toolkit() {
             ;;
         rhel|centos|rocky|almalinux|fedora)
             if command -v dnf &>/dev/null; then
-                run_cmd sudo dnf install -y cuda-toolkit-12-8 2>&1 | tail -3 || \
-                    run_cmd sudo dnf install -y cuda-toolkit 2>&1 | tail -3 || true
+                run_cmd sudo dnf install -y cuda-toolkit-12-8 || \
+                    run_cmd sudo dnf install -y cuda-toolkit || true
             elif command -v yum &>/dev/null; then
-                run_cmd sudo yum install -y cuda-toolkit-12-8 2>&1 | tail -3 || \
-                    run_cmd sudo yum install -y cuda-toolkit 2>&1 | tail -3 || true
+                run_cmd sudo yum install -y cuda-toolkit-12-8 || \
+                    run_cmd sudo yum install -y cuda-toolkit || true
             fi
             ;;
         *)
