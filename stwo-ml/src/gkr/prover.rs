@@ -558,10 +558,19 @@ pub fn prove_gkr_gpu(
         }
     }
 
+    eprintln!(
+        "  [GKR] layer reductions complete in {:.1}s; entering opening phase (deferred={}, weight_openings={})",
+        t_gkr_walk.elapsed().as_secs_f64(),
+        deferred_info.len(),
+        weight_data.len(),
+    );
+
     // Generate deferred proofs for skip branches of DAG Add layers BEFORE weight
     // openings. Fiat-Shamir order: walk → deferred proofs → weight openings.
     let mut deferred_proofs = Vec::with_capacity(deferred_info.len());
-    for (deferred_claim, rhs_layer_idx) in &deferred_info {
+    let t_deferred = std::time::Instant::now();
+    let deferred_total = deferred_info.len();
+    for (i, (deferred_claim, rhs_layer_idx)) in deferred_info.iter().enumerate() {
         let rhs_layer = &circuit.layers[*rhs_layer_idx];
         match &rhs_layer.layer_type {
             LayerType::MatMul { m, k, n, weight_node_id } => {
@@ -612,13 +621,32 @@ pub fn prove_gkr_gpu(
             }
             _ => {} // Only MatMul deferred proofs supported
         }
+
+        if deferred_total > 0 && ((i + 1) % 4 == 0 || i + 1 == deferred_total) {
+            let elapsed = t_deferred.elapsed().as_secs_f64();
+            let eta = if i + 1 > 0 {
+                let per = elapsed / (i + 1) as f64;
+                per * (deferred_total.saturating_sub(i + 1)) as f64
+            } else {
+                0.0
+            };
+            eprintln!(
+                "  [GKR] deferred proofs: {}/{} elapsed {:.1}s, eta ~{:.0}s",
+                i + 1,
+                deferred_total,
+                elapsed,
+                eta,
+            );
+        }
     }
 
     // Generate MLE opening proofs for weight matrices (post-deferred channel state)
     let mut weight_openings = Vec::with_capacity(weight_data.len());
     let mut weight_claims = Vec::with_capacity(weight_data.len());
+    let total_openings = weight_data.len();
+    let t_openings = std::time::Instant::now();
 
-    for (weight_node_id, eval_point, expected_value) in weight_data {
+    for (i, (weight_node_id, eval_point, expected_value)) in weight_data.into_iter().enumerate() {
         let b_matrix = weights
             .get_weight(weight_node_id)
             .ok_or(GKRError::MissingWeight { node_id: weight_node_id })?;
@@ -634,6 +662,23 @@ pub fn prove_gkr_gpu(
         );
         weight_commitments.push(commitment);
         weight_openings.push(opening);
+
+        if total_openings > 0 && ((i + 1) % 4 == 0 || i + 1 == total_openings) {
+            let elapsed = t_openings.elapsed().as_secs_f64();
+            let eta = if i + 1 > 0 {
+                let per = elapsed / (i + 1) as f64;
+                per * (total_openings.saturating_sub(i + 1)) as f64
+            } else {
+                0.0
+            };
+            eprintln!(
+                "  [GKR] weight openings: {}/{} elapsed {:.1}s, eta ~{:.0}s",
+                i + 1,
+                total_openings,
+                elapsed,
+                eta,
+            );
+        }
     }
 
     let model_input = execution.intermediates
