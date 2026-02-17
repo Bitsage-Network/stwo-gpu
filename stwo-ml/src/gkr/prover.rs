@@ -17,12 +17,14 @@ use crate::components::attention::{
 #[cfg(feature = "cuda-runtime")]
 use crate::components::matmul::matmul_m31;
 #[cfg(feature = "cuda-runtime")]
-use crate::components::matmul::matrix_to_mle_col_major_u32_pub as matrix_to_mle_col_major_u32;
+use crate::components::matmul::matrix_to_mle_col_major_u32_padded_pub as matrix_to_mle_col_major_u32_padded;
 use crate::components::matmul::{
     evaluate_mle_pub as evaluate_mle, matrix_to_mle_col_major_pub as matrix_to_mle_col_major,
     matrix_to_mle_pub as matrix_to_mle, pad_matrix_pow2, restrict_mle_pub as restrict_mle,
     M31Matrix,
 };
+#[cfg(not(feature = "cuda-runtime"))]
+use crate::components::matmul::matrix_to_mle_col_major_padded_pub as matrix_to_mle_col_major_padded;
 use crate::crypto::poseidon_channel::PoseidonChannel;
 
 use super::circuit::{LayerType, LayeredCircuit};
@@ -31,8 +33,7 @@ use super::types::{GKRClaim, GKRError, GKRProof, LayerProof, SecureField};
 #[cfg(feature = "cuda-runtime")]
 #[inline]
 fn prepare_weight_opening_mle_u32(weight: &M31Matrix) -> Vec<u32> {
-    let padded = pad_matrix_pow2(weight);
-    matrix_to_mle_col_major_u32(&padded)
+    matrix_to_mle_col_major_u32_padded(weight)
 }
 
 /// Prove a full model forward pass using the GKR protocol.
@@ -286,8 +287,7 @@ pub fn prove_gkr(
                 };
                 #[cfg(feature = "cuda-runtime")]
                 let (deferred_weight_commitment, deferred_weight_opening) = {
-                    let b_padded = pad_matrix_pow2(b_matrix);
-                    let b_mle_u32 = matrix_to_mle_col_major_u32(&b_padded);
+                    let b_mle_u32 = matrix_to_mle_col_major_u32_padded(b_matrix);
                     crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
                         &b_mle_u32,
                         &weight_eval_point,
@@ -296,8 +296,7 @@ pub fn prove_gkr(
                 };
                 #[cfg(not(feature = "cuda-runtime"))]
                 let (deferred_weight_commitment, deferred_weight_opening) = {
-                    let b_padded = pad_matrix_pow2(b_matrix);
-                    let b_mle = matrix_to_mle_col_major(&b_padded);
+                    let b_mle = matrix_to_mle_col_major_padded(b_matrix);
                     crate::crypto::mle_opening::prove_mle_opening_with_commitment(
                         &b_mle,
                         &weight_eval_point,
@@ -349,8 +348,7 @@ pub fn prove_gkr(
         });
         #[cfg(feature = "cuda-runtime")]
         let (commitment, opening) = {
-            let b_padded = pad_matrix_pow2(b_matrix);
-            let b_mle_u32 = matrix_to_mle_col_major_u32(&b_padded);
+            let b_mle_u32 = matrix_to_mle_col_major_u32_padded(b_matrix);
             crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
                 &b_mle_u32,
                 &eval_point,
@@ -359,8 +357,7 @@ pub fn prove_gkr(
         };
         #[cfg(not(feature = "cuda-runtime"))]
         let (commitment, opening) = {
-            let b_padded = pad_matrix_pow2(b_matrix);
-            let b_mle = matrix_to_mle_col_major(&b_padded);
+            let b_mle = matrix_to_mle_col_major_padded(b_matrix);
             crate::crypto::mle_opening::prove_mle_opening_with_commitment(
                 &b_mle,
                 &eval_point,
@@ -692,8 +689,7 @@ pub fn prove_gkr_gpu(
                 };
                 #[cfg(feature = "cuda-runtime")]
                 let (deferred_weight_commitment, deferred_opening) = {
-                    let b_padded = pad_matrix_pow2(b_matrix);
-                    let b_mle_u32 = matrix_to_mle_col_major_u32(&b_padded);
+                    let b_mle_u32 = matrix_to_mle_col_major_u32_padded(b_matrix);
                     crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
                         &b_mle_u32,
                         &weight_eval_point,
@@ -702,8 +698,7 @@ pub fn prove_gkr_gpu(
                 };
                 #[cfg(not(feature = "cuda-runtime"))]
                 let (deferred_weight_commitment, deferred_opening) = {
-                    let b_padded = pad_matrix_pow2(b_matrix);
-                    let b_mle = matrix_to_mle_col_major(&b_padded);
+                    let b_mle = matrix_to_mle_col_major_padded(b_matrix);
                     crate::crypto::mle_opening::prove_mle_opening_with_commitment(
                         &b_mle,
                         &weight_eval_point,
@@ -909,8 +904,7 @@ pub fn prove_gkr_gpu(
             eval_point: eval_point.clone(),
             expected_value,
         });
-        let b_padded = pad_matrix_pow2(b_matrix);
-        let b_mle = matrix_to_mle_col_major(&b_padded);
+        let b_mle = matrix_to_mle_col_major_padded(b_matrix);
         let (commitment, opening) = crate::crypto::mle_opening::prove_mle_opening_with_commitment(
             &b_mle,
             &eval_point,
@@ -1685,8 +1679,7 @@ pub fn prove_gkr_simd_gpu(
         });
         #[cfg(feature = "cuda-runtime")]
         let (commitment, opening) = {
-            let b_padded = pad_matrix_pow2(b_matrix);
-            let b_mle_u32 = matrix_to_mle_col_major_u32(&b_padded);
+            let b_mle_u32 = matrix_to_mle_col_major_u32_padded(b_matrix);
             crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
                 &b_mle_u32,
                 &eval_point,
@@ -1695,8 +1688,7 @@ pub fn prove_gkr_simd_gpu(
         };
         #[cfg(not(feature = "cuda-runtime"))]
         let (commitment, opening) = {
-            let b_padded = pad_matrix_pow2(b_matrix);
-            let b_mle = matrix_to_mle_col_major(&b_padded);
+            let b_mle = matrix_to_mle_col_major_padded(b_matrix);
             crate::crypto::mle_opening::prove_mle_opening_with_commitment(
                 &b_mle,
                 &eval_point,

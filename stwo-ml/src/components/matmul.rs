@@ -36,17 +36,17 @@
 
 use num_traits::{One, Zero};
 use starknet_ff::FieldElement;
+use stwo::core::channel::{Blake2sChannel, Channel};
 use stwo::core::fields::m31::M31;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::fields::FieldExpOps;
-use stwo::core::channel::{Blake2sChannel, Channel};
-use stwo::prover::lookups::sumcheck::{
-    self, MultivariatePolyOracle, SumcheckProof,
-};
+use stwo::prover::lookups::sumcheck::{self, MultivariatePolyOracle, SumcheckProof};
 use stwo::prover::lookups::utils::UnivariatePoly;
 
-use crate::crypto::poseidon_channel::{PoseidonChannel, securefield_to_felt};
-use crate::crypto::mle_opening::{MleOpeningProof, commit_mle_root_only, prove_mle_opening, verify_mle_opening};
+use crate::crypto::mle_opening::{
+    commit_mle_root_only, prove_mle_opening, verify_mle_opening, MleOpeningProof,
+};
+use crate::crypto::poseidon_channel::{securefield_to_felt, PoseidonChannel};
 
 /// Matrix dimensions for a matmul operation.
 #[derive(Debug, Clone, Copy)]
@@ -116,7 +116,11 @@ impl M31Matrix {
 ///
 /// Uses in-place folding to minimize memory allocation.
 fn evaluate_mle(evals: &[SecureField], point: &[SecureField]) -> SecureField {
-    assert_eq!(evals.len(), 1 << point.len(), "evals length must be 2^n_vars");
+    assert_eq!(
+        evals.len(),
+        1 << point.len(),
+        "evals length must be 2^n_vars"
+    );
     let mut current: Vec<SecureField> = evals.to_vec();
     let mut size = current.len();
     for &r in point.iter() {
@@ -172,7 +176,11 @@ fn matrix_to_mle(matrix: &M31Matrix) -> Vec<SecureField> {
     let n = matrix.rows * matrix.cols;
     assert!(n.is_power_of_two(), "matrix size must be power of 2");
     if n >= 65536 {
-        matrix.data.par_iter().map(|&v| SecureField::from(v)).collect()
+        matrix
+            .data
+            .par_iter()
+            .map(|&v| SecureField::from(v))
+            .collect()
     } else {
         matrix.data.iter().map(|&v| SecureField::from(v)).collect()
     }
@@ -191,11 +199,14 @@ fn matrix_to_mle_col_major(matrix: &M31Matrix) -> Vec<SecureField> {
         // Parallel: build per-column chunks
         use rayon::prelude::*;
         let mut evals = vec![SecureField::zero(); n];
-        evals.par_chunks_mut(matrix.rows).enumerate().for_each(|(j, col_chunk)| {
-            for i in 0..matrix.rows {
-                col_chunk[i] = SecureField::from(matrix.data[i * matrix.cols + j]);
-            }
-        });
+        evals
+            .par_chunks_mut(matrix.rows)
+            .enumerate()
+            .for_each(|(j, col_chunk)| {
+                for i in 0..matrix.rows {
+                    col_chunk[i] = SecureField::from(matrix.data[i * matrix.cols + j]);
+                }
+            });
         evals
     } else {
         let mut evals = vec![SecureField::zero(); n];
@@ -206,6 +217,119 @@ fn matrix_to_mle_col_major(matrix: &M31Matrix) -> Vec<SecureField> {
         }
         evals
     }
+}
+
+/// Convert an M31Matrix into a column-major MLE with implicit power-of-two padding.
+///
+/// Equivalent to:
+/// `matrix_to_mle_col_major(&pad_matrix_pow2(matrix))`
+/// but avoids allocating/copying an intermediate padded matrix.
+fn matrix_to_mle_col_major_padded(matrix: &M31Matrix) -> Vec<SecureField> {
+    let padded_rows = matrix.rows.next_power_of_two();
+    let padded_cols = matrix.cols.next_power_of_two();
+    let n = padded_rows * padded_cols;
+    assert!(n.is_power_of_two(), "matrix size must be power of 2");
+
+    let mut evals = vec![SecureField::zero(); n];
+
+    if n >= 65536 {
+        use rayon::prelude::*;
+        let rows = padded_rows;
+        let src_rows = matrix.rows;
+        let src_cols = matrix.cols;
+        evals
+            .par_chunks_mut(rows)
+            .enumerate()
+            .for_each(|(j, col_chunk)| {
+                if j < src_cols {
+                    for i in 0..src_rows {
+                        col_chunk[i] = SecureField::from(matrix.data[i * src_cols + j]);
+                    }
+                }
+            });
+    } else {
+        for i in 0..matrix.rows {
+            for j in 0..matrix.cols {
+                evals[j * padded_rows + i] = SecureField::from(matrix.get(i, j));
+            }
+        }
+    }
+
+    evals
+}
+
+/// Convert an M31Matrix into an MLE encoded in column-major QM31 AoS u32 words.
+///
+/// Layout per point: `[a,b,c,d]` where `SecureField::from(M31(x)) == (x,0,0,0)`.
+/// So only the first limb is populated from matrix data, others are zero.
+///
+/// Output length is `rows * cols * 4` u32 words.
+#[cfg(feature = "cuda-runtime")]
+fn matrix_to_mle_col_major_u32(matrix: &M31Matrix) -> Vec<u32> {
+    let n = matrix.rows * matrix.cols;
+    assert!(n.is_power_of_two(), "matrix size must be power of 2");
+
+    let mut evals = vec![0u32; n * 4];
+    if n >= 65536 {
+        use rayon::prelude::*;
+        let rows = matrix.rows;
+        let cols = matrix.cols;
+        evals
+            .par_chunks_mut(rows * 4)
+            .enumerate()
+            .for_each(|(j, col_chunk)| {
+                for i in 0..rows {
+                    col_chunk[i * 4] = matrix.data[i * cols + j].0;
+                }
+            });
+    } else {
+        for i in 0..matrix.rows {
+            for j in 0..matrix.cols {
+                let dst = (j * matrix.rows + i) * 4;
+                evals[dst] = matrix.get(i, j).0;
+            }
+        }
+    }
+    evals
+}
+
+/// Convert an M31Matrix into a column-major QM31 AoS u32 MLE with implicit power-of-two padding.
+///
+/// Equivalent to:
+/// `matrix_to_mle_col_major_u32(&pad_matrix_pow2(matrix))`
+/// but avoids allocating/copying an intermediate padded matrix.
+#[cfg(feature = "cuda-runtime")]
+fn matrix_to_mle_col_major_u32_padded(matrix: &M31Matrix) -> Vec<u32> {
+    let padded_rows = matrix.rows.next_power_of_two();
+    let padded_cols = matrix.cols.next_power_of_two();
+    let n = padded_rows * padded_cols;
+    assert!(n.is_power_of_two(), "matrix size must be power of 2");
+
+    let mut evals = vec![0u32; n * 4];
+    if n >= 65536 {
+        use rayon::prelude::*;
+        let rows = padded_rows;
+        let src_rows = matrix.rows;
+        let src_cols = matrix.cols;
+        evals
+            .par_chunks_mut(rows * 4)
+            .enumerate()
+            .for_each(|(j, col_chunk)| {
+                if j < src_cols {
+                    for i in 0..src_rows {
+                        col_chunk[i * 4] = matrix.data[i * src_cols + j].0;
+                    }
+                }
+            });
+    } else {
+        for i in 0..matrix.rows {
+            for j in 0..matrix.cols {
+                let dst = (j * padded_rows + i) * 4;
+                evals[dst] = matrix.get(i, j).0;
+            }
+        }
+    }
+    evals
 }
 
 /// Compute all Lagrange basis evaluations L_j(challenges) for j=0..2^v - 1.
@@ -240,15 +364,17 @@ fn compute_lagrange_basis(challenges: &[SecureField]) -> Vec<SecureField> {
 ///
 /// The matrix-vector multiply is parallelized across rows with rayon.
 pub fn restrict_cols_fused(matrix: &M31Matrix, challenges: &[SecureField]) -> Vec<SecureField> {
-    use rayon::prelude::*;
     use num_traits::Zero;
+    use rayon::prelude::*;
 
     let k = matrix.rows;
     let n = matrix.cols;
 
     if challenges.is_empty() {
         // n=1: no column restriction, just convert each row's single element
-        return (0..k).map(|i| SecureField::from(matrix.data[i * n])).collect();
+        return (0..k)
+            .map(|i| SecureField::from(matrix.data[i * n]))
+            .collect();
     }
 
     let lagrange = compute_lagrange_basis(challenges);
@@ -258,23 +384,28 @@ pub fn restrict_cols_fused(matrix: &M31Matrix, challenges: &[SecureField]) -> Ve
     // Each row is independent → parallelize across rows.
     // Inner loop reads B row sequentially (cache-friendly) and reuses lagrange (fits L2).
     if k >= 64 {
-        (0..k).into_par_iter().map(|i| {
-            let row_start = i * n;
-            let mut sum = SecureField::zero();
-            for j in 0..n {
-                sum += SecureField::from(matrix.data[row_start + j]) * lagrange[j];
-            }
-            sum
-        }).collect()
+        (0..k)
+            .into_par_iter()
+            .map(|i| {
+                let row_start = i * n;
+                let mut sum = SecureField::zero();
+                for j in 0..n {
+                    sum += SecureField::from(matrix.data[row_start + j]) * lagrange[j];
+                }
+                sum
+            })
+            .collect()
     } else {
-        (0..k).map(|i| {
-            let row_start = i * n;
-            let mut sum = SecureField::zero();
-            for j in 0..n {
-                sum += SecureField::from(matrix.data[row_start + j]) * lagrange[j];
-            }
-            sum
-        }).collect()
+        (0..k)
+            .map(|i| {
+                let row_start = i * n;
+                let mut sum = SecureField::zero();
+                for j in 0..n {
+                    sum += SecureField::from(matrix.data[row_start + j]) * lagrange[j];
+                }
+                sum
+            })
+            .collect()
     }
 }
 
@@ -285,15 +416,18 @@ pub fn restrict_cols_fused(matrix: &M31Matrix, challenges: &[SecureField]) -> Ve
 ///
 /// Memory: O(rows + cols) instead of O(rows × cols).
 pub fn restrict_rows_fused(matrix: &M31Matrix, challenges: &[SecureField]) -> Vec<SecureField> {
-    use rayon::prelude::*;
     use num_traits::Zero;
+    use rayon::prelude::*;
 
     let m = matrix.rows;
     let k = matrix.cols;
 
     if challenges.is_empty() {
         // m=1: no row restriction, just convert the single row
-        return matrix.data[..k].iter().map(|&v| SecureField::from(v)).collect();
+        return matrix.data[..k]
+            .iter()
+            .map(|&v| SecureField::from(v))
+            .collect();
     }
 
     let lagrange = compute_lagrange_basis(challenges);
@@ -301,21 +435,26 @@ pub fn restrict_rows_fused(matrix: &M31Matrix, challenges: &[SecureField]) -> Ve
 
     // f_a[j] = Σ_i matrix.data[i*k + j] × lagrange[i]
     if k >= 64 {
-        (0..k).into_par_iter().map(|j| {
-            let mut sum = SecureField::zero();
-            for i in 0..m {
-                sum += SecureField::from(matrix.data[i * k + j]) * lagrange[i];
-            }
-            sum
-        }).collect()
+        (0..k)
+            .into_par_iter()
+            .map(|j| {
+                let mut sum = SecureField::zero();
+                for i in 0..m {
+                    sum += SecureField::from(matrix.data[i * k + j]) * lagrange[i];
+                }
+                sum
+            })
+            .collect()
     } else {
-        (0..k).map(|j| {
-            let mut sum = SecureField::zero();
-            for i in 0..m {
-                sum += SecureField::from(matrix.data[i * k + j]) * lagrange[i];
-            }
-            sum
-        }).collect()
+        (0..k)
+            .map(|j| {
+                let mut sum = SecureField::zero();
+                for i in 0..m {
+                    sum += SecureField::from(matrix.data[i * k + j]) * lagrange[i];
+                }
+                sum
+            })
+            .collect()
     }
 }
 
@@ -333,8 +472,8 @@ pub fn restrict_cols_unpadded(
     challenges: &[SecureField],
     padded_rows: usize,
 ) -> Vec<SecureField> {
-    use rayon::prelude::*;
     use num_traits::Zero;
+    use rayon::prelude::*;
 
     let k_orig = matrix.rows;
     let n_orig = matrix.cols;
@@ -345,23 +484,28 @@ pub fn restrict_cols_unpadded(
     // f_b[i] = Σ_{j=0}^{n_orig-1} matrix[i][j] × lagrange[j]
     // Only sum over actual columns; lagrange[j>=n_orig] multiply zeros.
     let mut result = if k_orig >= 64 {
-        (0..k_orig).into_par_iter().map(|i| {
-            let row_start = i * n_orig;
-            let mut sum = SecureField::zero();
-            for j in 0..n_orig {
-                sum += SecureField::from(matrix.data[row_start + j]) * lagrange[j];
-            }
-            sum
-        }).collect::<Vec<_>>()
+        (0..k_orig)
+            .into_par_iter()
+            .map(|i| {
+                let row_start = i * n_orig;
+                let mut sum = SecureField::zero();
+                for j in 0..n_orig {
+                    sum += SecureField::from(matrix.data[row_start + j]) * lagrange[j];
+                }
+                sum
+            })
+            .collect::<Vec<_>>()
     } else {
-        (0..k_orig).map(|i| {
-            let row_start = i * n_orig;
-            let mut sum = SecureField::zero();
-            for j in 0..n_orig {
-                sum += SecureField::from(matrix.data[row_start + j]) * lagrange[j];
-            }
-            sum
-        }).collect()
+        (0..k_orig)
+            .map(|i| {
+                let row_start = i * n_orig;
+                let mut sum = SecureField::zero();
+                for j in 0..n_orig {
+                    sum += SecureField::from(matrix.data[row_start + j]) * lagrange[j];
+                }
+                sum
+            })
+            .collect()
     };
 
     // Zero-pad rows to padded_rows (padded rows contribute zero)
@@ -381,8 +525,8 @@ pub fn restrict_rows_unpadded(
     challenges: &[SecureField],
     padded_cols: usize,
 ) -> Vec<SecureField> {
-    use rayon::prelude::*;
     use num_traits::Zero;
+    use rayon::prelude::*;
 
     let m_orig = matrix.rows;
     let k_orig = matrix.cols;
@@ -393,21 +537,26 @@ pub fn restrict_rows_unpadded(
     // f_a[j] = Σ_{i=0}^{m_orig-1} matrix[i][j] × lagrange[i]
     // Only sum over actual rows; lagrange[i>=m_orig] multiply zeros.
     let mut result = if k_orig >= 64 {
-        (0..k_orig).into_par_iter().map(|j| {
-            let mut sum = SecureField::zero();
-            for i in 0..m_orig {
-                sum += SecureField::from(matrix.data[i * k_orig + j]) * lagrange[i];
-            }
-            sum
-        }).collect::<Vec<_>>()
+        (0..k_orig)
+            .into_par_iter()
+            .map(|j| {
+                let mut sum = SecureField::zero();
+                for i in 0..m_orig {
+                    sum += SecureField::from(matrix.data[i * k_orig + j]) * lagrange[i];
+                }
+                sum
+            })
+            .collect::<Vec<_>>()
     } else {
-        (0..k_orig).map(|j| {
-            let mut sum = SecureField::zero();
-            for i in 0..m_orig {
-                sum += SecureField::from(matrix.data[i * k_orig + j]) * lagrange[i];
-            }
-            sum
-        }).collect()
+        (0..k_orig)
+            .map(|j| {
+                let mut sum = SecureField::zero();
+                for i in 0..m_orig {
+                    sum += SecureField::from(matrix.data[i * k_orig + j]) * lagrange[i];
+                }
+                sum
+            })
+            .collect()
     };
 
     // Zero-pad columns to padded_cols (padded columns contribute zero)
@@ -464,7 +613,11 @@ pub fn matmul_m31(a: &M31Matrix, b: &M31Matrix) -> M31Matrix {
         }
     });
 
-    M31Matrix { rows: m, cols: n, data: c_data }
+    M31Matrix {
+        rows: m,
+        cols: n,
+        data: c_data,
+    }
 }
 
 /// Pad a matrix to the next power-of-2 dimensions (zero-padding).
@@ -582,7 +735,10 @@ impl MultivariatePolyOracle for MatMulOracle {
             new_b.push(self.f_b[i] + challenge * (self.f_b[mid + i] - self.f_b[i]));
         }
 
-        MatMulOracle { f_a: new_a, f_b: new_b }
+        MatMulOracle {
+            f_a: new_a,
+            f_b: new_b,
+        }
     }
 }
 
@@ -617,9 +773,15 @@ pub enum MatMulError {
     #[error("Sumcheck verification failed: {0}")]
     SumcheckFailed(String),
     #[error("Evaluation mismatch at final check: expected {expected}, got {actual}")]
-    EvaluationMismatch { expected: SecureField, actual: SecureField },
+    EvaluationMismatch {
+        expected: SecureField,
+        actual: SecureField,
+    },
     #[error("Claimed sum mismatch: expected {expected}, got {actual}")]
-    ClaimedSumMismatch { expected: SecureField, actual: SecureField },
+    ClaimedSumMismatch {
+        expected: SecureField,
+        actual: SecureField,
+    },
 }
 
 /// Prove that C = A × B using the sumcheck protocol over multilinear extensions.
@@ -637,14 +799,16 @@ pub fn prove_matmul_sumcheck(
 ) -> Result<MatMulSumcheckProof, MatMulError> {
     // Validate dimensions
     if a.cols != b.rows {
-        return Err(MatMulError::DimensionMismatch(
-            format!("A.cols={} != B.rows={}", a.cols, b.rows),
-        ));
+        return Err(MatMulError::DimensionMismatch(format!(
+            "A.cols={} != B.rows={}",
+            a.cols, b.rows
+        )));
     }
     if c.rows != a.rows || c.cols != b.cols {
-        return Err(MatMulError::DimensionMismatch(
-            format!("C({},{}) != expected ({},{})", c.rows, c.cols, a.rows, b.cols),
-        ));
+        return Err(MatMulError::DimensionMismatch(format!(
+            "C({},{}) != expected ({},{})",
+            c.rows, c.cols, a.rows, b.cols
+        )));
     }
 
     // Auto-pad to power-of-2 dimensions if needed (sumcheck requires boolean hypercube)
@@ -666,9 +830,9 @@ pub fn prove_matmul_sumcheck(
     let log_n = n.ilog2() as usize;
 
     // Build MLEs
-    let mle_a = matrix_to_mle(a);           // row-major: (row_bits, col_bits)
+    let mle_a = matrix_to_mle(a); // row-major: (row_bits, col_bits)
     let mle_b_t = matrix_to_mle_col_major(b); // col-major: (col_bits, row_bits)
-    let mle_c = matrix_to_mle(c);           // row-major: (row_bits, col_bits)
+    let mle_c = matrix_to_mle(c); // row-major: (row_bits, col_bits)
 
     // Fiat-Shamir: seed channel with dimensions
     let mut channel = Blake2sChannel::default();
@@ -852,14 +1016,16 @@ pub fn prove_matmul_sumcheck_onchain(
 ) -> Result<MatMulSumcheckProofOnChain, MatMulError> {
     // Validate dimensions
     if a.cols != b.rows {
-        return Err(MatMulError::DimensionMismatch(
-            format!("A.cols={} != B.rows={}", a.cols, b.rows),
-        ));
+        return Err(MatMulError::DimensionMismatch(format!(
+            "A.cols={} != B.rows={}",
+            a.cols, b.rows
+        )));
     }
     if c.rows != a.rows || c.cols != b.cols {
-        return Err(MatMulError::DimensionMismatch(
-            format!("C({},{}) != expected ({},{})", c.rows, c.cols, a.rows, b.cols),
-        ));
+        return Err(MatMulError::DimensionMismatch(format!(
+            "C({},{}) != expected ({},{})",
+            c.rows, c.cols, a.rows, b.cols
+        )));
     }
 
     // Auto-pad to power-of-2 dimensions if needed (sumcheck requires boolean hypercube)
@@ -1021,14 +1187,16 @@ pub fn prove_matmul_sumcheck_onchain_with_cached_weight(
     cached_b_commitment: starknet_ff::FieldElement,
 ) -> Result<MatMulSumcheckProofOnChain, MatMulError> {
     if a.cols != b.rows {
-        return Err(MatMulError::DimensionMismatch(
-            format!("A.cols={} != B.rows={}", a.cols, b.rows),
-        ));
+        return Err(MatMulError::DimensionMismatch(format!(
+            "A.cols={} != B.rows={}",
+            a.cols, b.rows
+        )));
     }
     if c.rows != a.rows || c.cols != b.cols {
-        return Err(MatMulError::DimensionMismatch(
-            format!("C({},{}) != expected ({},{})", c.rows, c.cols, a.rows, b.cols),
-        ));
+        return Err(MatMulError::DimensionMismatch(format!(
+            "C({},{}) != expected ({},{})",
+            c.rows, c.cols, a.rows, b.cols
+        )));
     }
 
     let a = &pad_matrix_pow2(a);
@@ -1156,9 +1324,10 @@ pub fn verify_matmul_sumcheck_onchain(
     let log_n = n.ilog2() as usize;
 
     if proof.num_rounds as usize != log_k {
-        return Err(MatMulError::SumcheckFailed(
-            format!("num_rounds {} != log_k {}", proof.num_rounds, log_k),
-        ));
+        return Err(MatMulError::SumcheckFailed(format!(
+            "num_rounds {} != log_k {}",
+            proof.num_rounds, log_k
+        )));
     }
     if proof.round_polys.len() != log_k {
         return Err(MatMulError::SumcheckFailed(
@@ -1193,9 +1362,9 @@ pub fn verify_matmul_sumcheck_onchain(
         let round_sum = p_at_0 + p_at_1;
 
         if round_sum != current_sum {
-            return Err(MatMulError::SumcheckFailed(
-                format!("round sum {round_sum:?} != expected {current_sum:?}"),
-            ));
+            return Err(MatMulError::SumcheckFailed(format!(
+                "round sum {round_sum:?} != expected {current_sum:?}"
+            )));
         }
 
         // Mix polynomial into channel
@@ -1220,25 +1389,26 @@ pub fn verify_matmul_sumcheck_onchain(
 
     // Verify MLE opening proofs match the claimed final evaluations
     if proof.a_opening.final_value != proof.final_a_eval {
-        return Err(MatMulError::SumcheckFailed(
-            format!(
-                "a_opening.final_value {:?} != final_a_eval {:?}",
-                proof.a_opening.final_value, proof.final_a_eval
-            ),
-        ));
+        return Err(MatMulError::SumcheckFailed(format!(
+            "a_opening.final_value {:?} != final_a_eval {:?}",
+            proof.a_opening.final_value, proof.final_a_eval
+        )));
     }
     if proof.b_opening.final_value != proof.final_b_eval {
-        return Err(MatMulError::SumcheckFailed(
-            format!(
-                "b_opening.final_value {:?} != final_b_eval {:?}",
-                proof.b_opening.final_value, proof.final_b_eval
-            ),
-        ));
+        return Err(MatMulError::SumcheckFailed(format!(
+            "b_opening.final_value {:?} != final_b_eval {:?}",
+            proof.b_opening.final_value, proof.final_b_eval
+        )));
     }
 
     // Verify MLE opening proof for A against its commitment.
     // Channel state must match prover's state after sumcheck rounds.
-    if !verify_mle_opening(proof.a_commitment, &proof.a_opening, &assignment, &mut channel) {
+    if !verify_mle_opening(
+        proof.a_commitment,
+        &proof.a_opening,
+        &assignment,
+        &mut channel,
+    ) {
         return Err(MatMulError::SumcheckFailed(
             "MLE opening verification failed for matrix A".into(),
         ));
@@ -1246,7 +1416,12 @@ pub fn verify_matmul_sumcheck_onchain(
 
     // Verify MLE opening proof for B against its commitment.
     // Channel continues sequentially from A's verification.
-    if !verify_mle_opening(proof.b_commitment, &proof.b_opening, &assignment, &mut channel) {
+    if !verify_mle_opening(
+        proof.b_commitment,
+        &proof.b_opening,
+        &assignment,
+        &mut channel,
+    ) {
         return Err(MatMulError::SumcheckFailed(
             "MLE opening verification failed for matrix B".into(),
         ));
@@ -1272,6 +1447,23 @@ pub fn matrix_to_mle_pub(matrix: &M31Matrix) -> Vec<SecureField> {
 /// Public wrapper for `matrix_to_mle_col_major` (column-major MLE construction).
 pub fn matrix_to_mle_col_major_pub(matrix: &M31Matrix) -> Vec<SecureField> {
     matrix_to_mle_col_major(matrix)
+}
+
+/// Public wrapper for `matrix_to_mle_col_major_padded` (implicit pow2-padded column-major MLE).
+pub fn matrix_to_mle_col_major_padded_pub(matrix: &M31Matrix) -> Vec<SecureField> {
+    matrix_to_mle_col_major_padded(matrix)
+}
+
+/// Public wrapper for `matrix_to_mle_col_major_u32` (QM31 AoS u32 encoding).
+#[cfg(feature = "cuda-runtime")]
+pub fn matrix_to_mle_col_major_u32_pub(matrix: &M31Matrix) -> Vec<u32> {
+    matrix_to_mle_col_major_u32(matrix)
+}
+
+/// Public wrapper for `matrix_to_mle_col_major_u32_padded` (implicit pow2-padded QM31 AoS u32).
+#[cfg(feature = "cuda-runtime")]
+pub fn matrix_to_mle_col_major_u32_padded_pub(matrix: &M31Matrix) -> Vec<u32> {
+    matrix_to_mle_col_major_u32_padded(matrix)
 }
 
 /// Public wrapper for `compute_lagrange_basis`.
@@ -1356,12 +1548,16 @@ mod tests {
         // A = [[1, 2], [3, 4]], B = [[5, 6], [7, 8]]
         // C = [[1*5+2*7, 1*6+2*8], [3*5+4*7, 3*6+4*8]] = [[19, 22], [43, 50]]
         let mut a = M31Matrix::new(2, 2);
-        a.set(0, 0, M31::from(1)); a.set(0, 1, M31::from(2));
-        a.set(1, 0, M31::from(3)); a.set(1, 1, M31::from(4));
+        a.set(0, 0, M31::from(1));
+        a.set(0, 1, M31::from(2));
+        a.set(1, 0, M31::from(3));
+        a.set(1, 1, M31::from(4));
 
         let mut b = M31Matrix::new(2, 2);
-        b.set(0, 0, M31::from(5)); b.set(0, 1, M31::from(6));
-        b.set(1, 0, M31::from(7)); b.set(1, 1, M31::from(8));
+        b.set(0, 0, M31::from(5));
+        b.set(0, 1, M31::from(6));
+        b.set(1, 0, M31::from(7));
+        b.set(1, 1, M31::from(8));
 
         let c = matmul_m31(&a, &b);
         assert_eq!(c.get(0, 0), M31::from(19));
@@ -1373,24 +1569,37 @@ mod tests {
     #[test]
     fn test_mle_evaluate() {
         // MLE of f(0)=1, f(1)=3 → f(x) = 1 + 2x
-        let evals = vec![SecureField::from(M31::from(1)), SecureField::from(M31::from(3))];
+        let evals = vec![
+            SecureField::from(M31::from(1)),
+            SecureField::from(M31::from(3)),
+        ];
         let point = vec![SecureField::zero()];
-        assert_eq!(evaluate_mle(&evals, &point), SecureField::from(M31::from(1)));
+        assert_eq!(
+            evaluate_mle(&evals, &point),
+            SecureField::from(M31::from(1))
+        );
 
         let point = vec![SecureField::one()];
-        assert_eq!(evaluate_mle(&evals, &point), SecureField::from(M31::from(3)));
+        assert_eq!(
+            evaluate_mle(&evals, &point),
+            SecureField::from(M31::from(3))
+        );
     }
 
     #[test]
     fn test_sumcheck_matmul_2x2() {
         // Smallest meaningful test: 2×2 × 2×2
         let mut a = M31Matrix::new(2, 2);
-        a.set(0, 0, M31::from(1)); a.set(0, 1, M31::from(2));
-        a.set(1, 0, M31::from(3)); a.set(1, 1, M31::from(4));
+        a.set(0, 0, M31::from(1));
+        a.set(0, 1, M31::from(2));
+        a.set(1, 0, M31::from(3));
+        a.set(1, 1, M31::from(4));
 
         let mut b = M31Matrix::new(2, 2);
-        b.set(0, 0, M31::from(5)); b.set(0, 1, M31::from(6));
-        b.set(1, 0, M31::from(7)); b.set(1, 1, M31::from(8));
+        b.set(0, 0, M31::from(5));
+        b.set(0, 1, M31::from(6));
+        b.set(1, 0, M31::from(7));
+        b.set(1, 1, M31::from(8));
 
         let c = matmul_m31(&a, &b);
 
@@ -1425,12 +1634,16 @@ mod tests {
     fn test_sumcheck_matmul_tampered_c_fails_verification() {
         // Prove with correct matrices
         let mut a = M31Matrix::new(2, 2);
-        a.set(0, 0, M31::from(1)); a.set(0, 1, M31::from(2));
-        a.set(1, 0, M31::from(3)); a.set(1, 1, M31::from(4));
+        a.set(0, 0, M31::from(1));
+        a.set(0, 1, M31::from(2));
+        a.set(1, 0, M31::from(3));
+        a.set(1, 1, M31::from(4));
 
         let mut b = M31Matrix::new(2, 2);
-        b.set(0, 0, M31::from(5)); b.set(0, 1, M31::from(6));
-        b.set(1, 0, M31::from(7)); b.set(1, 1, M31::from(8));
+        b.set(0, 0, M31::from(5));
+        b.set(0, 1, M31::from(6));
+        b.set(1, 0, M31::from(7));
+        b.set(1, 1, M31::from(8));
 
         let c = matmul_m31(&a, &b);
         let proof = prove_matmul_sumcheck(&a, &b, &c).expect("proving should succeed");
@@ -1462,7 +1675,8 @@ mod tests {
         let c = matmul_m31(&a, &b);
 
         let proof = prove_matmul_sumcheck(&a, &b, &c).expect("rectangular proving should succeed");
-        verify_matmul_sumcheck(&proof, &a, &b, &c).expect("rectangular verification should succeed");
+        verify_matmul_sumcheck(&proof, &a, &b, &c)
+            .expect("rectangular verification should succeed");
     }
 
     // === On-Chain MatMul Tests ===
@@ -1470,17 +1684,21 @@ mod tests {
     #[test]
     fn test_matmul_onchain_2x2() {
         let mut a = M31Matrix::new(2, 2);
-        a.set(0, 0, M31::from(1)); a.set(0, 1, M31::from(2));
-        a.set(1, 0, M31::from(3)); a.set(1, 1, M31::from(4));
+        a.set(0, 0, M31::from(1));
+        a.set(0, 1, M31::from(2));
+        a.set(1, 0, M31::from(3));
+        a.set(1, 1, M31::from(4));
 
         let mut b = M31Matrix::new(2, 2);
-        b.set(0, 0, M31::from(5)); b.set(0, 1, M31::from(6));
-        b.set(1, 0, M31::from(7)); b.set(1, 1, M31::from(8));
+        b.set(0, 0, M31::from(5));
+        b.set(0, 1, M31::from(6));
+        b.set(1, 0, M31::from(7));
+        b.set(1, 1, M31::from(8));
 
         let c = matmul_m31(&a, &b);
 
-        let proof = prove_matmul_sumcheck_onchain(&a, &b, &c)
-            .expect("on-chain 2x2 proving should succeed");
+        let proof =
+            prove_matmul_sumcheck_onchain(&a, &b, &c).expect("on-chain 2x2 proving should succeed");
         assert_eq!(proof.m, 2);
         assert_eq!(proof.k, 2);
         assert_eq!(proof.n, 2);
@@ -1489,8 +1707,7 @@ mod tests {
         assert_ne!(proof.a_commitment, FieldElement::ZERO);
         assert_ne!(proof.b_commitment, FieldElement::ZERO);
 
-        verify_matmul_sumcheck_onchain(&proof)
-            .expect("on-chain 2x2 verification should succeed");
+        verify_matmul_sumcheck_onchain(&proof).expect("on-chain 2x2 verification should succeed");
     }
 
     #[test]
@@ -1506,29 +1723,31 @@ mod tests {
 
         let c = matmul_m31(&a, &b);
 
-        let proof = prove_matmul_sumcheck_onchain(&a, &b, &c)
-            .expect("on-chain 4x4 proving should succeed");
+        let proof =
+            prove_matmul_sumcheck_onchain(&a, &b, &c).expect("on-chain 4x4 proving should succeed");
         assert_eq!(proof.num_rounds, 2);
         assert_eq!(proof.round_polys.len(), 2);
 
-        verify_matmul_sumcheck_onchain(&proof)
-            .expect("on-chain 4x4 verification should succeed");
+        verify_matmul_sumcheck_onchain(&proof).expect("on-chain 4x4 verification should succeed");
     }
 
     #[test]
     fn test_matmul_onchain_tampered_fails() {
         let mut a = M31Matrix::new(2, 2);
-        a.set(0, 0, M31::from(1)); a.set(0, 1, M31::from(2));
-        a.set(1, 0, M31::from(3)); a.set(1, 1, M31::from(4));
+        a.set(0, 0, M31::from(1));
+        a.set(0, 1, M31::from(2));
+        a.set(1, 0, M31::from(3));
+        a.set(1, 1, M31::from(4));
 
         let mut b = M31Matrix::new(2, 2);
-        b.set(0, 0, M31::from(5)); b.set(0, 1, M31::from(6));
-        b.set(1, 0, M31::from(7)); b.set(1, 1, M31::from(8));
+        b.set(0, 0, M31::from(5));
+        b.set(0, 1, M31::from(6));
+        b.set(1, 0, M31::from(7));
+        b.set(1, 1, M31::from(8));
 
         let c = matmul_m31(&a, &b);
 
-        let mut proof = prove_matmul_sumcheck_onchain(&a, &b, &c)
-            .expect("proving should succeed");
+        let mut proof = prove_matmul_sumcheck_onchain(&a, &b, &c).expect("proving should succeed");
 
         // Tamper with claimed sum
         proof.claimed_sum = SecureField::from(M31::from(999));
@@ -1576,8 +1795,7 @@ mod tests {
 
         let c = matmul_m31(&a, &b);
 
-        let proof = prove_matmul_sumcheck_onchain(&a, &b, &c)
-            .expect("proving should succeed");
+        let proof = prove_matmul_sumcheck_onchain(&a, &b, &c).expect("proving should succeed");
 
         // Verify — now includes MLE opening proof checks
         verify_matmul_sumcheck_onchain(&proof)
@@ -1587,61 +1805,76 @@ mod tests {
     #[test]
     fn test_matmul_onchain_tampered_a_opening_fails() {
         let mut a = M31Matrix::new(2, 2);
-        a.set(0, 0, M31::from(1)); a.set(0, 1, M31::from(2));
-        a.set(1, 0, M31::from(3)); a.set(1, 1, M31::from(4));
+        a.set(0, 0, M31::from(1));
+        a.set(0, 1, M31::from(2));
+        a.set(1, 0, M31::from(3));
+        a.set(1, 1, M31::from(4));
 
         let mut b = M31Matrix::new(2, 2);
-        b.set(0, 0, M31::from(5)); b.set(0, 1, M31::from(6));
-        b.set(1, 0, M31::from(7)); b.set(1, 1, M31::from(8));
+        b.set(0, 0, M31::from(5));
+        b.set(0, 1, M31::from(6));
+        b.set(1, 0, M31::from(7));
+        b.set(1, 1, M31::from(8));
 
         let c = matmul_m31(&a, &b);
 
-        let mut proof = prove_matmul_sumcheck_onchain(&a, &b, &c)
-            .expect("proving should succeed");
+        let mut proof = prove_matmul_sumcheck_onchain(&a, &b, &c).expect("proving should succeed");
 
         // Tamper with a_opening final_value (will mismatch final_a_eval)
         proof.a_opening.final_value = SecureField::from(M31::from(12345));
 
         let result = verify_matmul_sumcheck_onchain(&proof);
-        assert!(result.is_err(), "tampered a_opening should fail verification");
+        assert!(
+            result.is_err(),
+            "tampered a_opening should fail verification"
+        );
     }
 
     #[test]
     fn test_matmul_onchain_tampered_b_commitment_fails() {
         let mut a = M31Matrix::new(2, 2);
-        a.set(0, 0, M31::from(1)); a.set(0, 1, M31::from(2));
-        a.set(1, 0, M31::from(3)); a.set(1, 1, M31::from(4));
+        a.set(0, 0, M31::from(1));
+        a.set(0, 1, M31::from(2));
+        a.set(1, 0, M31::from(3));
+        a.set(1, 1, M31::from(4));
 
         let mut b = M31Matrix::new(2, 2);
-        b.set(0, 0, M31::from(5)); b.set(0, 1, M31::from(6));
-        b.set(1, 0, M31::from(7)); b.set(1, 1, M31::from(8));
+        b.set(0, 0, M31::from(5));
+        b.set(0, 1, M31::from(6));
+        b.set(1, 0, M31::from(7));
+        b.set(1, 1, M31::from(8));
 
         let c = matmul_m31(&a, &b);
 
-        let mut proof = prove_matmul_sumcheck_onchain(&a, &b, &c)
-            .expect("proving should succeed");
+        let mut proof = prove_matmul_sumcheck_onchain(&a, &b, &c).expect("proving should succeed");
 
         // Tamper with b_commitment — MLE opening Merkle check should fail
         proof.b_commitment = FieldElement::from(99999u64);
 
         let result = verify_matmul_sumcheck_onchain(&proof);
-        assert!(result.is_err(), "tampered b_commitment should fail verification");
+        assert!(
+            result.is_err(),
+            "tampered b_commitment should fail verification"
+        );
     }
 
     #[test]
     fn test_matmul_onchain_final_eval_mismatch() {
         let mut a = M31Matrix::new(2, 2);
-        a.set(0, 0, M31::from(1)); a.set(0, 1, M31::from(2));
-        a.set(1, 0, M31::from(3)); a.set(1, 1, M31::from(4));
+        a.set(0, 0, M31::from(1));
+        a.set(0, 1, M31::from(2));
+        a.set(1, 0, M31::from(3));
+        a.set(1, 1, M31::from(4));
 
         let mut b = M31Matrix::new(2, 2);
-        b.set(0, 0, M31::from(5)); b.set(0, 1, M31::from(6));
-        b.set(1, 0, M31::from(7)); b.set(1, 1, M31::from(8));
+        b.set(0, 0, M31::from(5));
+        b.set(0, 1, M31::from(6));
+        b.set(1, 0, M31::from(7));
+        b.set(1, 1, M31::from(8));
 
         let c = matmul_m31(&a, &b);
 
-        let mut proof = prove_matmul_sumcheck_onchain(&a, &b, &c)
-            .expect("proving should succeed");
+        let mut proof = prove_matmul_sumcheck_onchain(&a, &b, &c).expect("proving should succeed");
 
         // Tamper with final_a_eval but keep a_opening.final_value consistent
         // This will fail at the product check (current_sum != a*b)
@@ -1649,7 +1882,10 @@ mod tests {
         proof.final_a_eval = orig + SecureField::from(M31::from(1));
 
         let result = verify_matmul_sumcheck_onchain(&proof);
-        assert!(result.is_err(), "mismatched final_eval should fail verification");
+        assert!(
+            result.is_err(),
+            "mismatched final_eval should fail verification"
+        );
     }
 
     #[test]
@@ -1679,11 +1915,19 @@ mod tests {
             // Fused approach: O(k + n) memory
             let actual = restrict_cols_fused(&b, &challenges);
 
-            assert_eq!(expected.len(), actual.len(),
-                "length mismatch for {}x{}", k, n);
+            assert_eq!(
+                expected.len(),
+                actual.len(),
+                "length mismatch for {}x{}",
+                k,
+                n
+            );
             for i in 0..expected.len() {
-                assert_eq!(expected[i], actual[i],
-                    "mismatch at index {} for {}x{}", i, k, n);
+                assert_eq!(
+                    expected[i], actual[i],
+                    "mismatch at index {} for {}x{}",
+                    i, k, n
+                );
             }
         }
     }
@@ -1714,11 +1958,19 @@ mod tests {
             // Fused
             let actual = restrict_rows_fused(&a, &challenges);
 
-            assert_eq!(expected.len(), actual.len(),
-                "length mismatch for {}x{}", m, k);
+            assert_eq!(
+                expected.len(),
+                actual.len(),
+                "length mismatch for {}x{}",
+                m,
+                k
+            );
             for i in 0..expected.len() {
-                assert_eq!(expected[i], actual[i],
-                    "mismatch at index {} for {}x{}", i, m, k);
+                assert_eq!(
+                    expected[i], actual[i],
+                    "mismatch at index {} for {}x{}",
+                    i, m, k
+                );
             }
         }
     }
@@ -1772,7 +2024,10 @@ mod tests {
 
         assert_eq!(padded_result.len(), unpadded_result.len());
         for i in 0..padded_result.len() {
-            assert_eq!(padded_result[i], unpadded_result[i], "mismatch at index {i}");
+            assert_eq!(
+                padded_result[i], unpadded_result[i],
+                "mismatch at index {i}"
+            );
         }
     }
 
@@ -1801,7 +2056,10 @@ mod tests {
 
         assert_eq!(padded_result.len(), unpadded_result.len());
         for i in 0..padded_result.len() {
-            assert_eq!(padded_result[i], unpadded_result[i], "mismatch at index {i}");
+            assert_eq!(
+                padded_result[i], unpadded_result[i],
+                "mismatch at index {i}"
+            );
         }
     }
 

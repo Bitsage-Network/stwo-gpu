@@ -229,8 +229,19 @@ The proof is saved to `~/.obelysk/proofs/`.
 - Phase 2 has two subphases:
   - GKR layer reductions (usually fast, tens of seconds)
   - Weight opening proofs (can dominate runtime)
+- Opening prep now avoids an extra full padded-matrix copy, reducing CPU RAM pressure during large openings.
 
 The pipeline now prints dense progress + heartbeat messages during long openings so it does not appear frozen.
+
+If logs show:
+```text
+[GKR] MLE Merkle backend: CPU fallback (...)
+```
+then opening commitments are no longer fully GPU-resident and runtime will increase sharply.
+Use GPU-only fail-fast mode to catch this immediately:
+```bash
+./03_prove.sh --model-name qwen3-14b --gpu --gpu-only
+```
 
 **Default fast-safe tuning (no soundness downgrade):**
 - `STWO_GPU_COMMIT_STRICT` and `STWO_GPU_COMMIT_HARDEN` stay off unless you explicitly set them.

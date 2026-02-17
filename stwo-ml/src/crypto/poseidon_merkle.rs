@@ -27,6 +27,8 @@ const PARALLEL_THRESHOLD: usize = 256;
 const GPU_MERKLE_THRESHOLD_PAIRS: usize = 1 << 14; // 16K pairs
 #[cfg(feature = "cuda-runtime")]
 static GPU_MLE_MERKLE_BACKEND_LOGGED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "cuda-runtime")]
+static GPU_MLE_MERKLE_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// A binary Merkle tree with Poseidon hash.
 ///
@@ -148,6 +150,14 @@ impl PoseidonMerkleTree {
                             is_cuda_available()
                         );
                     }
+                    if !GPU_MLE_MERKLE_FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
+                        eprintln!(
+                            "[GKR] MLE Merkle backend: CPU fallback (GPU unavailable; pairs={}, threshold={}, cuda_available={})",
+                            padded.len() / 2,
+                            GPU_MERKLE_THRESHOLD_PAIRS,
+                            is_cuda_available()
+                        );
+                    }
                 }
                 Err(err) => {
                     if strict_gpu {
@@ -156,7 +166,7 @@ impl PoseidonMerkleTree {
                             err
                         );
                     }
-                    if !GPU_MLE_MERKLE_BACKEND_LOGGED.swap(true, Ordering::Relaxed) {
+                    if !GPU_MLE_MERKLE_FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
                         eprintln!("[GKR] MLE Merkle backend: CPU fallback ({err})");
                     }
                 }
@@ -289,6 +299,14 @@ impl PoseidonMerkleTree {
                             is_cuda_available()
                         );
                     }
+                    if !GPU_MLE_MERKLE_FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
+                        eprintln!(
+                            "[GKR] MLE Merkle backend: CPU fallback (direct-secure unavailable; pairs={}, threshold={}, cuda_available={})",
+                            evals.len() / 2,
+                            GPU_MERKLE_THRESHOLD_PAIRS,
+                            is_cuda_available()
+                        );
+                    }
                 }
                 Err(err) => {
                     if strict_gpu {
@@ -297,7 +315,7 @@ impl PoseidonMerkleTree {
                             err
                         );
                     }
-                    if !GPU_MLE_MERKLE_BACKEND_LOGGED.swap(true, Ordering::Relaxed) {
+                    if !GPU_MLE_MERKLE_FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
                         eprintln!("[GKR] MLE Merkle backend: CPU fallback ({err})");
                     }
                 }
@@ -352,6 +370,14 @@ impl PoseidonMerkleTree {
                             is_cuda_available()
                         );
                     }
+                    if !GPU_MLE_MERKLE_FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
+                        eprintln!(
+                            "[GKR] MLE Merkle backend: CPU fallback (direct-u32 unavailable; pairs={}, threshold={}, cuda_available={})",
+                            n_points / 2,
+                            GPU_MERKLE_THRESHOLD_PAIRS,
+                            is_cuda_available()
+                        );
+                    }
                 }
                 Err(err) => {
                     if strict_gpu {
@@ -360,7 +386,7 @@ impl PoseidonMerkleTree {
                             err
                         );
                     }
-                    if !GPU_MLE_MERKLE_BACKEND_LOGGED.swap(true, Ordering::Relaxed) {
+                    if !GPU_MLE_MERKLE_FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
                         eprintln!("[GKR] MLE Merkle backend: CPU fallback ({err})");
                     }
                 }
