@@ -3482,10 +3482,16 @@ fn check_commitment_cache(model_dir: Option<&std::path::Path>) -> Option<FieldEl
     FieldElement::from_hex_be(hex.trim().trim_start_matches("0x")).ok()
 }
 
+const WEIGHT_COMMITMENT_SCHEME_VERSION: &str = "v3_gpu_m31_segments";
+
 /// Compute a fingerprint from safetensors file metadata (sizes + mtimes).
 fn compute_fingerprint(model_dir: &std::path::Path) -> Option<String> {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    WEIGHT_COMMITMENT_SCHEME_VERSION.hash(&mut hasher);
+    std::env::var("STWO_WEIGHT_COMMIT_SEGMENTS")
+        .unwrap_or_else(|_| "".to_string())
+        .hash(&mut hasher);
     let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(model_dir).ok()?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().map_or(false, |ext| ext == "safetensors"))
@@ -3733,8 +3739,16 @@ fn compute_weight_commitment(
         }
     });
 
-    let n_segments = 64usize;
+    let target_segments = std::env::var("STWO_WEIGHT_COMMIT_SEGMENTS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(4096);
     let chunk_size = 4096usize;
+    eprintln!(
+        "[BG]   Segment parallelism target: {} segments per matrix",
+        target_segments
+    );
 
     let hash_packed_segment_cpu = |packed: &[FieldElement]| -> FieldElement {
         if packed.is_empty() {
@@ -3786,7 +3800,8 @@ fn compute_weight_commitment(
             w.cols,
             w.data.len(),
         );
-        let seg_size = (w.data.len() + n_segments - 1) / n_segments;
+        let segment_count = target_segments.min(w.data.len().max(1));
+        let seg_size = (w.data.len() + segment_count - 1) / segment_count;
         let raw_segments: Vec<&[M31]> = w.data
             .chunks(seg_size.max(1))
             .collect();
@@ -3849,7 +3864,7 @@ fn compute_weight_commitment(
         let mut final_inputs: Vec<FieldElement> = Vec::with_capacity(segment_hashes.len() + 3);
         final_inputs.push(FieldElement::from(*layer_id as u64));
         final_inputs.push(FieldElement::from((w.rows as u64) << 32 | w.cols as u64));
-        final_inputs.push(FieldElement::from(n_segments as u64));
+        final_inputs.push(FieldElement::from(raw_segments.len() as u64));
         final_inputs.extend_from_slice(&segment_hashes);
         let matrix_hash = {
             #[cfg(feature = "cuda-runtime")]
