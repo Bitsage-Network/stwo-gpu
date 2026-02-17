@@ -123,6 +123,35 @@ fi
 
 check_dir "$MODEL_DIR" "Model directory not found" || exit 1
 
+# ─── Performance Defaults (Safe / Soundness-Preserving) ─────────────
+
+# Keep GPU commitment hardening/strict checks OFF by default for faster proving.
+# Users can opt back in manually per run.
+if [[ -n "${STWO_GPU_COMMIT_HARDEN:-}" ]]; then
+    warn "Overriding STWO_GPU_COMMIT_HARDEN=${STWO_GPU_COMMIT_HARDEN} -> off (default fast mode)"
+fi
+if [[ -n "${STWO_GPU_COMMIT_STRICT:-}" ]]; then
+    warn "Overriding STWO_GPU_COMMIT_STRICT=${STWO_GPU_COMMIT_STRICT} -> off (default fast mode)"
+fi
+unset STWO_GPU_COMMIT_HARDEN
+unset STWO_GPU_COMMIT_STRICT
+
+# Single-GPU default: keep commitment/proving serialized to avoid GPU contention.
+if [[ "$USE_GPU" == "true" ]] && [[ "$MULTI_GPU" != "true" ]]; then
+    if [[ "${STWO_PARALLEL_GPU_COMMIT:-}" == "1" ]]; then
+        warn "Overriding STWO_PARALLEL_GPU_COMMIT=1 -> serialized (single-GPU default)"
+    fi
+    unset STWO_PARALLEL_GPU_COMMIT
+fi
+
+# Thread defaults for CPU fallback sections.
+if [[ -z "${RAYON_NUM_THREADS:-}" ]]; then
+    export RAYON_NUM_THREADS="$(nproc 2>/dev/null || echo 4)"
+fi
+if [[ -z "${OMP_NUM_THREADS:-}" ]]; then
+    export OMP_NUM_THREADS="${RAYON_NUM_THREADS}"
+fi
+
 # ─── Output Directory ───────────────────────────────────────────────
 
 if [[ -z "$OUTPUT_DIR" ]]; then
@@ -164,6 +193,10 @@ fi
 banner
 echo -e "${BOLD}  Proof Generation${NC}"
 echo ""
+GPU_COMMIT_PARALLEL="off"
+if [[ -n "${STWO_PARALLEL_GPU_COMMIT:-}" ]]; then
+    GPU_COMMIT_PARALLEL="on"
+fi
 log "Mode:           ${MODE}"
 log "Model:          ${MODEL_NAME:-$(basename "$MODEL_DIR")}"
 log "Model dir:      ${MODEL_DIR}"
@@ -171,6 +204,8 @@ log "Layers:         ${MODEL_LAYERS:-all}"
 log "GPU:            ${USE_GPU} (multi: ${MULTI_GPU})"
 log "Output:         ${OUTPUT_DIR}"
 log "prove-model:    ${PROVE_BIN}"
+log "Threads:        RAYON=${RAYON_NUM_THREADS} OMP=${OMP_NUM_THREADS}"
+log "GPU commit:     strict=off harden=off parallel=${GPU_COMMIT_PARALLEL}"
 echo ""
 
 timer_start "prove_total"
