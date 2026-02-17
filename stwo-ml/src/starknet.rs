@@ -1136,16 +1136,6 @@ pub fn build_verify_model_direct_calldata(
     }
 }
 
-/// Convert a QM31 (SecureField) to 4 u64 values matching Cairo's QM31 Serde layout.
-fn qm31_to_u64s(v: stwo::core::fields::qm31::SecureField) -> (u64, u64, u64, u64) {
-    (
-        v.0 .0 .0 as u64,
-        v.0 .1 .0 as u64,
-        v.1 .0 .0 as u64,
-        v.1 .1 .0 as u64,
-    )
-}
-
 /// Estimate gas cost for verifying the proof on-chain.
 ///
 /// Based on empirical Cairo verifier costs:

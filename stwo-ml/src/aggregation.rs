@@ -2635,7 +2635,7 @@ where
 
                 // GPU batch prove
                 eprintln!("    {} Batch sumcheck ({} entries, k={})...", tag, entries.len(), k_dim);
-                let t_prove = std::time::Instant::now();
+                let _t_prove = std::time::Instant::now();
 
                 let batch_result = crate::gpu_sumcheck::prove_matmul_batch_onchain_gpu(&entries)
                     .map_err(|e| AggregationError::ProvingError(

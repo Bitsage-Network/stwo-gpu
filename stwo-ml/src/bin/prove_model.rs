@@ -1777,6 +1777,7 @@ fn run_withdraw_command(cmd: &WithdrawCmd) {
 
     let note = note_entry.note.to_note();
     let commitment = note.commitment();
+    #[cfg(feature = "audit-http")]
     let leaf_index = note_entry.merkle_index;
     let note_amount = (note.amount_lo.0 as u64) | ((note.amount_hi.0 as u64) << 31);
     if note_amount != cmd.amount {
@@ -1966,7 +1967,9 @@ fn run_transfer_command(cmd: &TransferCmd) {
 
     let note1 = selected[0].note.to_note();
     let note2 = selected[1].note.to_note();
+    #[cfg(feature = "audit-http")]
     let idx1 = selected[0].merkle_index;
+    #[cfg(feature = "audit-http")]
     let idx2 = selected[1].merkle_index;
 
     // Sync Merkle tree from on-chain pool
@@ -2288,6 +2291,7 @@ fn run_pool_status_command(cmd: &PoolStatusCmd) {
 }
 
 /// Parse a hex string into [M31; 8] digest for pool-status nullifier/root checks.
+#[cfg(feature = "audit-http")]
 fn parse_m31_digest_hex(hex: &str) -> Result<[M31; 8], String> {
     let hex = hex.strip_prefix("0x").unwrap_or(hex);
     if hex.len() != 64 {
@@ -2314,7 +2318,12 @@ fn run_scan_command(cmd: &ScanCmd) {
     });
 
     let notes_path = NoteStore::default_path();
+    #[cfg(feature = "audit-http")]
     let mut note_store = NoteStore::load(&notes_path).unwrap_or_else(|_| {
+        NoteStore { notes: Vec::new(), path: notes_path.clone() }
+    });
+    #[cfg(not(feature = "audit-http"))]
+    let note_store = NoteStore::load(&notes_path).unwrap_or_else(|_| {
         NoteStore { notes: Vec::new(), path: notes_path.clone() }
     });
 
@@ -2971,113 +2980,132 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
 // ─── Retrieve Subcommand ─────────────────────────────────────────────────
 
 fn run_retrieve_command(cmd: &RetrieveCmd) {
-    use stwo_ml::audit::encryption::fetch_and_decrypt;
+    #[cfg(not(feature = "audit-http"))]
+    let _ = cmd;
 
-    eprintln!();
-    eprintln!("  prove-model retrieve");
-    eprintln!("  ─────────────────────");
-    eprintln!("  TX ID:      {}", cmd.tx_id);
-    eprintln!("  Encryption: {}", cmd.encryption);
-    eprintln!("  Gateway:    {}", cmd.arweave_gateway);
-    eprintln!("  Output:     {}", cmd.output.display());
-
-    // Parse private key
-    let privkey_hex = cmd.privkey.trim_start_matches("0x");
-    let privkey: Vec<u8> = (0..privkey_hex.len())
-        .step_by(2)
-        .filter_map(|i| u8::from_str_radix(&privkey_hex[i..i + 2], 16).ok())
-        .collect();
-
-    if privkey.is_empty() {
-        eprintln!("Error: invalid --privkey hex");
+    #[cfg(not(feature = "audit-http"))]
+    {
+        eprintln!();
+        eprintln!("  prove-model retrieve");
+        eprintln!("  ─────────────────────");
+        eprintln!("Error: audit-http feature not enabled.");
+        eprintln!("Build with: cargo build --release --bin prove-model --features cli,audit,audit-http");
         process::exit(1);
     }
 
-    // Parse recipient address (defaults to first 20 bytes of pubkey derivation)
-    let address = cmd.address.as_deref()
-        .map(|hex| {
-            let hex = hex.trim_start_matches("0x");
-            (0..hex.len())
-                .step_by(2)
-                .filter_map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
-                .collect::<Vec<u8>>()
-        })
-        .unwrap_or_else(|| privkey.clone()); // Fallback: use privkey as address
+    #[cfg(feature = "audit-http")]
+    {
+        use stwo_ml::audit::encryption::fetch_and_decrypt;
 
-    // Build encryption backend
-    let encryption: Box<dyn stwo_ml::audit::types::AuditEncryption> = match cmd.encryption.as_str() {
-        "poseidon2" | "poseidon2_m31" => {
-            Box::new(stwo_ml::audit::encryption::Poseidon2M31Encryption)
+        eprintln!();
+        eprintln!("  prove-model retrieve");
+        eprintln!("  ─────────────────────");
+        eprintln!("  TX ID:      {}", cmd.tx_id);
+        eprintln!("  Encryption: {}", cmd.encryption);
+        eprintln!("  Gateway:    {}", cmd.arweave_gateway);
+        eprintln!("  Output:     {}", cmd.output.display());
+
+        // Parse private key
+        let privkey_hex = cmd.privkey.trim_start_matches("0x");
+        let privkey: Vec<u8> = (0..privkey_hex.len())
+            .step_by(2)
+            .filter_map(|i| u8::from_str_radix(&privkey_hex[i..i + 2], 16).ok())
+            .collect();
+
+        if privkey.is_empty() {
+            eprintln!("Error: invalid --privkey hex");
+            process::exit(1);
         }
-        "aes" => {
-            #[cfg(feature = "aes-fallback")]
-            {
-                Box::new(stwo_ml::audit::encryption::Aes256GcmEncryption)
+
+        // Parse recipient address (defaults to first 20 bytes of pubkey derivation)
+        let address = cmd
+            .address
+            .as_deref()
+            .map(|hex| {
+                let hex = hex.trim_start_matches("0x");
+                (0..hex.len())
+                    .step_by(2)
+                    .filter_map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+                    .collect::<Vec<u8>>()
+            })
+            .unwrap_or_else(|| privkey.clone()); // Fallback: use privkey as address
+
+        // Build encryption backend
+        let encryption: Box<dyn stwo_ml::audit::types::AuditEncryption> = match cmd.encryption.as_str()
+        {
+            "poseidon2" | "poseidon2_m31" => {
+                Box::new(stwo_ml::audit::encryption::Poseidon2M31Encryption)
             }
-            #[cfg(not(feature = "aes-fallback"))]
-            {
-                eprintln!("Error: --encryption aes requires the 'aes-fallback' feature");
+            "aes" => {
+                #[cfg(feature = "aes-fallback")]
+                {
+                    Box::new(stwo_ml::audit::encryption::Aes256GcmEncryption)
+                }
+                #[cfg(not(feature = "aes-fallback"))]
+                {
+                    eprintln!("Error: --encryption aes requires the 'aes-fallback' feature");
+                    process::exit(1);
+                }
+            }
+            "noop" => {
+                eprintln!("Warning: --encryption noop is for testing only, NOT production-safe");
+                Box::new(stwo_ml::audit::encryption::NoopEncryption)
+            }
+            other => {
+                eprintln!(
+                    "Error: unknown encryption mode '{}' (expected 'poseidon2', 'aes', or 'noop')",
+                    other
+                );
                 process::exit(1);
             }
-        }
-        "noop" => {
-            eprintln!("Warning: --encryption noop is for testing only, NOT production-safe");
-            Box::new(stwo_ml::audit::encryption::NoopEncryption)
-        }
-        other => {
-            eprintln!("Error: unknown encryption mode '{}' (expected 'poseidon2', 'aes', or 'noop')", other);
+        };
+
+        // Build storage client (read-only, bundler not used for downloads)
+        let transport: Box<dyn stwo_ml::audit::storage::HttpTransport> =
+            Box::new(stwo_ml::audit::storage::UreqTransport);
+        let storage = stwo_ml::audit::storage::ArweaveClient::new(
+            &cmd.arweave_gateway,
+            "https://node1.irys.xyz",
+            transport,
+        );
+
+        eprintln!("Fetching and decrypting...");
+
+        let report = fetch_and_decrypt(
+            &cmd.tx_id,
+            &address,
+            &privkey,
+            encryption.as_ref(),
+            &storage,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("Error: failed to retrieve audit report: {e}");
             process::exit(1);
-        }
-    };
+        });
 
-    // Build storage client (read-only, bundler not used for downloads)
-    let transport: Box<dyn stwo_ml::audit::storage::HttpTransport> = {
-        #[cfg(feature = "audit-http")]
-        {
-            Box::new(stwo_ml::audit::storage::UreqTransport)
+        // Write decrypted report
+        let report_json = serde_json::to_string_pretty(&report).unwrap();
+        if let Some(parent) = cmd.output.parent() {
+            let _ = std::fs::create_dir_all(parent);
         }
-        #[cfg(not(feature = "audit-http"))]
-        {
-            eprintln!("Error: audit-http feature not enabled. Build with --features audit-http for real Arweave transport.");
+        std::fs::write(&cmd.output, &report_json).unwrap_or_else(|e| {
+            eprintln!("Error writing report to '{}': {e}", cmd.output.display());
             process::exit(1);
-        }
-    };
-    let storage = stwo_ml::audit::storage::ArweaveClient::new(
-        &cmd.arweave_gateway,
-        "https://node1.irys.xyz",
-        transport,
-    );
+        });
 
-    eprintln!("Fetching and decrypting...");
-
-    let report = fetch_and_decrypt(
-        &cmd.tx_id,
-        &address,
-        &privkey,
-        encryption.as_ref(),
-        &storage,
-    )
-    .unwrap_or_else(|e| {
-        eprintln!("Error: failed to retrieve audit report: {e}");
-        process::exit(1);
-    });
-
-    // Write decrypted report
-    let report_json = serde_json::to_string_pretty(&report).unwrap();
-    if let Some(parent) = cmd.output.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        eprintln!();
+        eprintln!("Audit report decrypted and written to: {}", cmd.output.display());
+        eprintln!("  Audit ID:     {}", report.audit_id);
+        eprintln!("  Model:        {}", report.model.name);
+        eprintln!(
+            "  Inferences:   {}",
+            report.inference_summary.total_inferences
+        );
+        eprintln!(
+            "  Time window:  {} → {}",
+            report.time_window.start_epoch_ns, report.time_window.end_epoch_ns
+        );
     }
-    std::fs::write(&cmd.output, &report_json).unwrap_or_else(|e| {
-        eprintln!("Error writing report to '{}': {e}", cmd.output.display());
-        process::exit(1);
-    });
-
-    eprintln!();
-    eprintln!("Audit report decrypted and written to: {}", cmd.output.display());
-    eprintln!("  Audit ID:     {}", report.audit_id);
-    eprintln!("  Model:        {}", report.model.name);
-    eprintln!("  Inferences:   {}", report.inference_summary.total_inferences);
-    eprintln!("  Time window:  {} → {}", report.time_window.start_epoch_ns, report.time_window.end_epoch_ns);
 }
 
 // ─── Report Formatting Helpers ───────────────────────────────────────────

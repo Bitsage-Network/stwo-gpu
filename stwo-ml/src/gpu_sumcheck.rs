@@ -44,9 +44,10 @@ use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, CudaViewMut, LaunchCon
 #[cfg(feature = "cuda-runtime")]
 use crate::components::matmul::{
     M31Matrix, MatMulSumcheckProof, MatMulError,
-    evaluate_mle_pub, restrict_mle_pub,
-    matrix_to_mle_pub, matrix_to_mle_col_major_pub,
+    evaluate_mle_pub, matrix_to_mle_pub,
 };
+#[cfg(all(feature = "cuda-runtime", test))]
+use crate::components::matmul::restrict_mle_pub;
 
 // =============================================================================
 // CUDA Kernel Source

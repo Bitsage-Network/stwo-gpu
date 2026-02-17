@@ -37,7 +37,7 @@ use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 
 use crate::backend::convert_evaluations;
 use crate::circuits::withdraw::{
-    WithdrawPublicInputs, WithdrawWitness, execute_withdraw, MERKLE_DEPTH,
+    WithdrawPublicInputs, WithdrawWitness, execute_withdraw,
 };
 use crate::components::poseidon2_air::{
     constrain_poseidon2_permutation, compute_merkle_chain_padding, compute_permutation_trace,
@@ -525,7 +525,7 @@ mod tests {
         let note = Note::new(pk, asset_id, amount_lo, amount_hi, blinding);
 
         let commitment = note.commitment();
-        let mut tree = PoseidonMerkleTreeM31::new(MERKLE_DEPTH);
+        let mut tree = PoseidonMerkleTreeM31::new(crate::circuits::withdraw::MERKLE_DEPTH);
         tree.append(commitment);
         let merkle_path = tree.prove(0);
         let merkle_root = tree.root();

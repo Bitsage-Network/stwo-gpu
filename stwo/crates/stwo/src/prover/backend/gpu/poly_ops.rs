@@ -369,6 +369,7 @@ fn evaluate_polynomials_simd_fallback(
         .collect()
 }
 
+#[cfg(not(feature = "cuda-runtime"))]
 fn interpolate_simd_fallback(
     eval: CircleEvaluation<GpuBackend, BaseField, BitReversedOrder>,
     twiddles: &TwiddleTree<GpuBackend>,

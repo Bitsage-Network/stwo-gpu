@@ -5,7 +5,6 @@
 //! This is a 1D lookup (single element per relation entry), simpler than
 //! the 2D activation lookup.
 
-use num_traits::One;
 use stwo::core::fields::m31::{BaseField, M31};
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::pcs::PcsConfig;

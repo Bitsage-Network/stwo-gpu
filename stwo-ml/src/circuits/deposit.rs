@@ -16,7 +16,7 @@ use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
 use stwo::core::channel::MerkleChannel;
 
 use crate::crypto::commitment::{Note, NoteCommitment};
-use crate::crypto::poseidon2_m31::{poseidon2_permutation, STATE_WIDTH, RATE};
+use crate::crypto::poseidon2_m31::{STATE_WIDTH, RATE};
 use crate::crypto::poseidon_channel::PoseidonChannel;
 use crate::circuits::poseidon_circuit::{prove_poseidon2_batch, verify_poseidon2_batch, Poseidon2BatchProof};
 use crate::circuits::helpers::{record_hash_permutations, verify_sponge_chain};
@@ -343,7 +343,7 @@ mod tests {
         // This makes perm1.input[10] differ from perm0.output[10]
         exec.all_permutation_inputs[1][10] = M31::from_u32_unchecked(999999);
         let mut state = exec.all_permutation_inputs[1];
-        poseidon2_permutation(&mut state);
+        crate::crypto::poseidon2_m31::poseidon2_permutation(&mut state);
         exec.all_permutation_outputs[1] = state;
 
         // Re-prove batch with tampered perms

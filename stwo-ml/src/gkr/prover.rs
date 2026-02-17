@@ -360,7 +360,6 @@ pub fn prove_gkr_gpu(
     weights: &GraphWeights,
     channel: &mut PoseidonChannel,
 ) -> Result<GKRProof, GKRError> {
-    use std::sync::Arc;
     use crate::gpu_sumcheck::GpuSumcheckExecutor;
 
     let gpu = GpuSumcheckExecutor::cached()
@@ -1013,7 +1012,6 @@ pub fn prove_gkr_simd_gpu(
     weights: &GraphWeights,
     channel: &mut PoseidonChannel,
 ) -> Result<GKRProof, GKRError> {
-    use std::sync::Arc;
     use crate::gpu_sumcheck::GpuSumcheckExecutor;
     use crate::components::matmul::compute_lagrange_basis_pub;
 
@@ -1701,7 +1699,6 @@ fn combine_block_intermediates_output(
 ) -> Result<M31Matrix, GKRError> {
     // For now, the combined output is an M31Matrix for compatibility with
     // pad_matrix_pow2. We compute it on CPU since the output is typically small.
-    let n_blocks = block_executions.len();
     let rows = block_executions[0].output.rows;
     let cols = block_executions[0].output.cols;
 
@@ -1714,13 +1711,13 @@ fn combine_block_intermediates_output(
         .collect();
 
     // Combine on GPU
-    let combined_mle = gpu.combine_blocks(&block_mles, block_weights)
+    let _combined_mle = gpu.combine_blocks(&block_mles, block_weights)
         .map_err(|e| GKRError::SimdError(format!("combine block outputs: {e}")))?;
 
     // Convert back to M31Matrix (truncated to real output dims)
     // The MLE is in QM31, but for the initial claim we just need the MLE vector
     // Return a placeholder matrix — the actual evaluation uses the MLE directly
-    let mut result = M31Matrix::new(rows, cols);
+    let result = M31Matrix::new(rows, cols);
     // Store zeros — the actual combined MLE is returned via pad_matrix_pow2_sf
     Ok(result)
 }
@@ -1773,7 +1770,6 @@ fn get_combined_binary_op_intermediates(
     gpu: &std::sync::Arc<crate::gpu_sumcheck::GpuSumcheckExecutor>,
 ) -> Result<(Vec<SecureField>, Vec<SecureField>), GKRError> {
     let n_blocks = block_executions.len();
-    let offset = layer_idx - template_start;
     let layer = &circuit.layers[layer_idx];
 
     if layer.input_layers.len() < 2 {
