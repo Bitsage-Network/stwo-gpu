@@ -366,7 +366,7 @@ run_cmd() {
 find_binary() {
     local name="$1"
     local search_dir="${2:-.}"
-    find "$search_dir" -name "$name" -path "*/release/*" -type f 2>/dev/null | head -1
+    find "$search_dir" -name "$name" -path "*/release/*" -type f 2>/dev/null | head -1 || true
 }
 
 # Require minimum bash version (for associative arrays)

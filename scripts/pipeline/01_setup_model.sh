@@ -227,7 +227,7 @@ if [[ -n "${MODEL_HF:-}" ]] && [[ "$SKIP_DOWNLOAD" == "false" ]]; then
         if command -v huggingface-cli &>/dev/null; then
             run_cmd huggingface-cli download "${MODEL_HF}" \
                 --local-dir "${MODEL_DIR}" \
-                --include "*.safetensors" "config.json" "tokenizer.json" "tokenizer_config.json" \
+                --include "*.safetensors" "*.safetensors.index.json" "config.json" "tokenizer.json" "tokenizer_config.json" "generation_config.json" \
                 --quiet
         # Method 2: Python API
         elif python3 -c "from huggingface_hub import snapshot_download" 2>/dev/null; then
@@ -236,7 +236,7 @@ from huggingface_hub import snapshot_download
 snapshot_download(
     '${MODEL_HF}',
     local_dir='${MODEL_DIR}',
-    allow_patterns=['*.safetensors', 'config.json', 'tokenizer.json', 'tokenizer_config.json'],
+    allow_patterns=['*.safetensors', '*.safetensors.index.json', 'config.json', 'tokenizer.json', 'tokenizer_config.json', 'generation_config.json'],
 )
 print('Download complete')
 "
