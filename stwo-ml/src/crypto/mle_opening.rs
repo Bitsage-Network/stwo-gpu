@@ -49,18 +49,6 @@ impl MleLayerValues {
             Self::Qm31U32Aos(v) => v.len() / 4,
         }
     }
-
-    #[inline]
-    fn point_at(&self, idx: usize) -> SecureField {
-        match self {
-            Self::Secure(v) => v[idx],
-            #[cfg(feature = "cuda-runtime")]
-            Self::Qm31U32Aos(v) => {
-                let s = idx * 4;
-                u32s_to_secure_field(&[v[s], v[s + 1], v[s + 2], v[s + 3]])
-            }
-        }
-    }
 }
 
 #[cfg(feature = "cuda-runtime")]
@@ -188,25 +176,37 @@ fn commit_mle_from_qm31_u32_aos(evals_u32: &[u32]) -> (FieldElement, PoseidonMer
 }
 
 #[cfg(feature = "cuda-runtime")]
-fn fold_layer_cpu(layer: &MleLayerValues, r: SecureField) -> Vec<SecureField> {
-    let mid = layer.len_points() / 2;
+fn fold_layer_cpu_qm31_words(words: &[u32], r: SecureField) -> Vec<SecureField> {
+    debug_assert!(words.len() % 4 == 0);
+    let n_points = words.len() / 4;
+    let mid = n_points / 2;
     if mid >= 1 << 16 {
         (0..mid)
             .into_par_iter()
             .map(|j| {
-                let left = layer.point_at(j);
-                let right = layer.point_at(mid + j);
+                let l = j * 4;
+                let rr = (mid + j) * 4;
+                let left = u32s_to_secure_field(&[words[l], words[l + 1], words[l + 2], words[l + 3]]);
+                let right = u32s_to_secure_field(&[
+                    words[rr],
+                    words[rr + 1],
+                    words[rr + 2],
+                    words[rr + 3],
+                ]);
                 left + r * (right - left)
             })
             .collect()
     } else {
-        let mut v = Vec::with_capacity(mid);
+        let mut out = Vec::with_capacity(mid);
         for j in 0..mid {
-            let left = layer.point_at(j);
-            let right = layer.point_at(mid + j);
-            v.push(left + r * (right - left));
+            let l = j * 4;
+            let rr = (mid + j) * 4;
+            let left = u32s_to_secure_field(&[words[l], words[l + 1], words[l + 2], words[l + 3]]);
+            let right =
+                u32s_to_secure_field(&[words[rr], words[rr + 1], words[rr + 2], words[rr + 3]]);
+            out.push(left + r * (right - left));
         }
-        v
+        out
     }
 }
 
@@ -270,7 +270,10 @@ pub fn prove_mle_opening_with_commitment_qm31_u32(
     let (initial_root, initial_tree) = commit_mle_from_qm31_u32_aos(evals_u32);
     channel.mix_felt(initial_root);
 
-    let mut current_layer = MleLayerValues::Qm31U32Aos(evals_u32.to_vec());
+    // Keep the initial layer borrowed to avoid a full-size clone of `evals_u32`.
+    // On large matrices this saves a multi-GB copy before opening generation starts.
+    let mut current_u32_layer: Option<Vec<u32>> = None;
+    let mut current_secure_layer: Option<Vec<SecureField>> = None;
     let mut layer_trees: Vec<PoseidonMerkleTree> = vec![initial_tree];
     let mut intermediate_roots: Vec<FieldElement> = Vec::new();
 
@@ -345,11 +348,50 @@ pub fn prove_mle_opening_with_commitment_qm31_u32(
                     }
                     eprintln!("[GKR] MLE fold backend: GPU step failed, switching to CPU ({e})");
                     gpu_fold_session = None;
-                    MleLayerValues::Secure(fold_layer_cpu(&current_layer, r))
+                    let folded = if let Some(cur_secure) = current_secure_layer.as_ref() {
+                        // Already in secure-field mode.
+                        let mid = cur_secure.len() / 2;
+                        if mid >= 1 << 16 {
+                            (0..mid)
+                                .into_par_iter()
+                                .map(|j| cur_secure[j] + r * (cur_secure[mid + j] - cur_secure[j]))
+                                .collect()
+                        } else {
+                            let mut v = Vec::with_capacity(mid);
+                            for j in 0..mid {
+                                v.push(cur_secure[j] + r * (cur_secure[mid + j] - cur_secure[j]));
+                            }
+                            v
+                        }
+                    } else if let Some(cur_u32) = current_u32_layer.as_ref() {
+                        fold_layer_cpu_qm31_words(cur_u32, r)
+                    } else {
+                        fold_layer_cpu_qm31_words(evals_u32, r)
+                    };
+                    MleLayerValues::Secure(folded)
                 }
             }
         } else {
-            MleLayerValues::Secure(fold_layer_cpu(&current_layer, r))
+            let folded = if let Some(cur_secure) = current_secure_layer.as_ref() {
+                let mid = cur_secure.len() / 2;
+                if mid >= 1 << 16 {
+                    (0..mid)
+                        .into_par_iter()
+                        .map(|j| cur_secure[j] + r * (cur_secure[mid + j] - cur_secure[j]))
+                        .collect()
+                } else {
+                    let mut v = Vec::with_capacity(mid);
+                    for j in 0..mid {
+                        v.push(cur_secure[j] + r * (cur_secure[mid + j] - cur_secure[j]));
+                    }
+                    v
+                }
+            } else if let Some(cur_u32) = current_u32_layer.as_ref() {
+                fold_layer_cpu_qm31_words(cur_u32, r)
+            } else {
+                fold_layer_cpu_qm31_words(evals_u32, r)
+            };
+            MleLayerValues::Secure(folded)
         };
 
         if next_layer.len_points() > 1 {
@@ -361,9 +403,25 @@ pub fn prove_mle_opening_with_commitment_qm31_u32(
             intermediate_roots.push(root);
             layer_trees.push(tree);
         }
-        current_layer = next_layer;
+        match next_layer {
+            MleLayerValues::Secure(vals) => {
+                current_secure_layer = Some(vals);
+                current_u32_layer = None;
+            }
+            MleLayerValues::Qm31U32Aos(words) => {
+                current_u32_layer = Some(words);
+                current_secure_layer = None;
+            }
+        }
     }
-    let final_value = current_layer.point_at(0);
+    let final_value = if let Some(cur_secure) = current_secure_layer.as_ref() {
+        cur_secure[0]
+    } else if let Some(cur_u32) = current_u32_layer.as_ref() {
+        u32s_to_secure_field(&[cur_u32[0], cur_u32[1], cur_u32[2], cur_u32[3]])
+    } else {
+        // No fold rounds (single-point MLE)
+        u32s_to_secure_field(&[evals_u32[0], evals_u32[1], evals_u32[2], evals_u32[3]])
+    };
 
     // Draw query indices (each query selects an index in [0, n/2))
     let half_n = n_points / 2;
