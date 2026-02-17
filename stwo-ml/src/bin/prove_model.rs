@@ -3623,7 +3623,8 @@ fn compute_weight_commitment(
     model_dir: Option<&std::path::Path>,
 ) -> FieldElement {
     use rayon::prelude::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     let n_weights = weights.weights.len();
     eprintln!("[BG] Computing weight commitment ({} matrices, packed 7:1, parallel)...", n_weights);
@@ -3636,9 +3637,31 @@ fn compute_weight_commitment(
         .unwrap_or(1);
 
     let weight_list: Vec<_> = weights.weights.iter().collect();
-    let done_count = AtomicUsize::new(0);
+    let done_count = Arc::new(AtomicUsize::new(0));
     let total = weight_list.len();
     eprintln!("[BG]   Progress update cadence: every {} matrix/matrices", progress_every);
+    let ticker_stop = Arc::new(AtomicBool::new(false));
+    let ticker_done_count = Arc::clone(&done_count);
+    let ticker_stop_flag = Arc::clone(&ticker_stop);
+    let ticker = std::thread::spawn(move || {
+        while !ticker_stop_flag.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_secs(15));
+            if ticker_stop_flag.load(Ordering::Relaxed) {
+                break;
+            }
+            let finished = ticker_done_count.load(Ordering::Relaxed);
+            let elapsed = t_commit.elapsed().as_secs_f64();
+            let pct = if total > 0 {
+                100.0 * finished as f64 / total as f64
+            } else {
+                100.0
+            };
+            eprintln!(
+                "[BG]   Working... {}/{} ({:.1}%, {:.1}s elapsed)",
+                finished, total, pct, elapsed,
+            );
+        }
+    });
 
     // Pack 7 M31 values (7×31=217 bits) into one FieldElement via Horner's method.
     let pack_m31 = |values: &[M31]| -> FieldElement {
@@ -3693,7 +3716,16 @@ fn compute_weight_commitment(
         }
     };
 
-    let per_matrix_hashes: Vec<FieldElement> = weight_list.iter().map(|(layer_id, w)| {
+    let per_matrix_hashes: Vec<FieldElement> = weight_list.iter().enumerate().map(|(idx, (layer_id, w))| {
+        eprintln!(
+            "[BG]   Matrix {}/{} start: layer={}, shape={}x{} ({} elements)",
+            idx + 1,
+            total,
+            layer_id,
+            w.rows,
+            w.cols,
+            w.data.len(),
+        );
         let seg_size = (w.data.len() + n_segments - 1) / n_segments;
         let packed_segments: Vec<Vec<FieldElement>> = w.data
             .par_chunks(seg_size.max(1))
@@ -3813,6 +3845,8 @@ fn compute_weight_commitment(
         }
         matrix_hash
     }).collect();
+    ticker_stop.store(true, Ordering::Relaxed);
+    let _ = ticker.join();
 
     let commitment = if per_matrix_hashes.is_empty() {
         FieldElement::ZERO
