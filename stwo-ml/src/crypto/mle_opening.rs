@@ -30,8 +30,9 @@ fn gpu_mle_fold_enabled() -> bool {
             let v = v.trim().to_ascii_lowercase();
             !v.is_empty() && v != "0" && v != "false" && v != "off"
         }
-        // Default ON in cuda-runtime builds.
-        Err(_) => true,
+        // Default OFF: GPU fold currently requires per-round D2H for Merkle/query
+        // construction, which can negate speedups. Keep as explicit opt-in.
+        Err(_) => false,
     }
 }
 
