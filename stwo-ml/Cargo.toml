@@ -57,7 +57,7 @@ libc = "0.2"
 cudarc = { version = "0.11", features = ["driver", "nvrtc", "cuda-12050"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-cudarc = { version = "0.11", features = ["driver", "nvrtc"], optional = true }
+cudarc = { version = "0.11", features = ["driver", "nvrtc", "cuda-12050"], optional = true }
 
 [dev-dependencies]
 rand = "0.8"

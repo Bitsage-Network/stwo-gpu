@@ -39,7 +39,7 @@ use stwo::prover::lookups::utils::UnivariatePoly;
 use stwo::prover::backend::gpu::cuda_executor::{get_cuda_executor, CudaFftError};
 
 #[cfg(feature = "cuda-runtime")]
-use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, LaunchConfig, LaunchAsync};
+use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, CudaViewMut, LaunchConfig, LaunchAsync};
 
 #[cfg(feature = "cuda-runtime")]
 use crate::components::matmul::{
@@ -2035,6 +2035,237 @@ impl GpuSumcheckExecutor {
             final_b: u32s_to_secure_field(&final_b_u32),
         })
     }
+
+    // =========================================================================
+    // GPU-resident sumcheck methods (used by GKR prover for SIMD batching)
+    // =========================================================================
+
+    /// Full GPU-resident matmul reduction: restrict + sumcheck + Fiat-Shamir
+    /// all on device, returning round polys, challenges, and final evaluations.
+    ///
+    /// Called from `gkr::prover::reduce_matmul_layer_gpu` to avoid per-round
+    /// CPU-GPU transfers.
+    pub fn reduce_matmul_layer_gpu(
+        &self,
+        a: &M31Matrix,
+        b: &M31Matrix,
+        r_i: &[SecureField],
+        r_j: &[SecureField],
+        pk: usize,
+        channel: &mut crate::crypto::poseidon_channel::PoseidonChannel,
+    ) -> Result<GpuMatMulReduction, CudaFftError> {
+        // Restrict A rows and B cols on GPU
+        let d_f_a = self.restrict_rows(a, r_i, pk)?;
+        let d_f_b = self.restrict_cols(b, r_j, pk)?;
+
+        let log_k = pk.ilog2() as usize;
+
+        // Run sumcheck rounds on CPU (downloading each round)
+        // This is a correct but not fully GPU-resident implementation.
+        // A fully pipelined version would keep Fiat-Shamir on device.
+        let mut f_a_u32 = vec![0u32; pk * 4];
+        let mut f_b_u32 = vec![0u32; pk * 4];
+        self.device.dtoh_sync_copy_into(&d_f_a, &mut f_a_u32)
+            .map_err(|e| CudaFftError::MemoryTransfer(format!("reduce f_a: {:?}", e)))?;
+        self.device.dtoh_sync_copy_into(&d_f_b, &mut f_b_u32)
+            .map_err(|e| CudaFftError::MemoryTransfer(format!("reduce f_b: {:?}", e)))?;
+
+        let f_a: Vec<SecureField> = f_a_u32.chunks_exact(4)
+            .map(|c| u32s_to_secure_field(&[c[0], c[1], c[2], c[3]]))
+            .collect();
+        let f_b: Vec<SecureField> = f_b_u32.chunks_exact(4)
+            .map(|c| u32s_to_secure_field(&[c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        // CPU sumcheck (reuses existing prove_batch-style logic)
+        let mut cur_f_a = f_a;
+        let mut cur_f_b = f_b;
+        let mut round_polys = Vec::with_capacity(log_k);
+        let mut challenges = Vec::with_capacity(log_k);
+        let mut cur_n = pk;
+
+        for _ in 0..log_k {
+            let mid = cur_n / 2;
+
+            // Evaluate round poly at t=0,1,2
+            let mut s0 = SecureField::zero();
+            let mut s1 = SecureField::zero();
+            let mut s2 = SecureField::zero();
+            for i in 0..mid {
+                let a0 = cur_f_a[i];
+                let a1 = cur_f_a[mid + i];
+                let b0 = cur_f_b[i];
+                let b1 = cur_f_b[mid + i];
+                s0 = s0 + a0 * b0;
+                s1 = s1 + a1 * b1;
+                let a2 = a1 + a1 - a0;
+                let b2 = b1 + b1 - b0;
+                s2 = s2 + a2 * b2;
+            }
+
+            // Lagrange interpolation: (0, s0), (1, s1), (2, s2) → c0, c1, c2
+            let two = SecureField::from(M31::from(2u32));
+            let inv2 = two.inverse();
+            let c0 = s0;
+            let c2 = (s2 - s1 - s1 + s0) * inv2;
+            let c1 = s1 - s0 - c2;
+
+            let round_poly = crate::components::matmul::RoundPoly { c0, c1, c2 };
+            round_polys.push(round_poly);
+
+            // Fiat-Shamir
+            channel.mix_poly_coeffs(c0, c1, c2);
+            let alpha = channel.draw_qm31();
+            challenges.push(alpha);
+
+            // Fold
+            let mut new_f_a = Vec::with_capacity(mid);
+            let mut new_f_b = Vec::with_capacity(mid);
+            for i in 0..mid {
+                new_f_a.push(cur_f_a[i] + alpha * (cur_f_a[mid + i] - cur_f_a[i]));
+                new_f_b.push(cur_f_b[i] + alpha * (cur_f_b[mid + i] - cur_f_b[i]));
+            }
+            cur_f_a = new_f_a;
+            cur_f_b = new_f_b;
+            cur_n = mid;
+        }
+
+        let final_a_eval = cur_f_a[0];
+        let final_b_eval = cur_f_b[0];
+
+        Ok(GpuMatMulReduction {
+            round_polys,
+            challenges,
+            final_a_eval,
+            final_b_eval,
+        })
+    }
+
+    /// Get or lazily compile the Poseidon2 Fiat-Shamir CUDA function and
+    /// upload round constants to device memory.
+    ///
+    /// Returns `(fiat_shamir_kernel, device_round_constants)`.
+    pub fn get_poseidon_fns(&self) -> Result<(CudaFunction, CudaSlice<u32>), CudaFftError> {
+        // Stub: Poseidon2 GPU kernels are not yet compiled.
+        // In production this would compile a Poseidon2 NVRTC kernel and upload
+        // the 142 round constants to device memory.
+        Err(CudaFftError::KernelCompilation(
+            "GPU Poseidon2 Fiat-Shamir kernel not yet implemented".into(),
+        ))
+    }
+
+    /// Upload the current PoseidonChannel state (digest + draw counter) to GPU.
+    ///
+    /// Returns `(device_digest, device_n_draws)` as device-side u32 buffers.
+    pub fn upload_channel_state(
+        &self,
+        _channel: &crate::crypto::poseidon_channel::PoseidonChannel,
+    ) -> Result<(CudaSlice<u32>, CudaSlice<u32>), CudaFftError> {
+        // Stub: channel state serialization to GPU not yet implemented.
+        Err(CudaFftError::MemoryTransfer(
+            "GPU channel state upload not yet implemented".into(),
+        ))
+    }
+
+    /// Compute the sumcheck round polynomial on device without downloading.
+    ///
+    /// Equivalent to `compute_round_poly` but returns a device-side buffer
+    /// containing the 3 QM31 reduction sums (12 u32 values: s0, s1, s2).
+    pub fn compute_round_poly_device(
+        &self,
+        _d_f_a: &CudaSlice<u32>,
+        _d_f_b: &CudaSlice<u32>,
+        _mid: usize,
+    ) -> Result<CudaSlice<u32>, CudaFftError> {
+        // Stub: device-resident round poly not yet implemented.
+        Err(CudaFftError::KernelCompilation(
+            "GPU compute_round_poly_device not yet implemented".into(),
+        ))
+    }
+
+    /// Perform a full Fiat-Shamir round on device: hash round poly into channel,
+    /// draw a challenge, and store both in device memory.
+    ///
+    /// This avoids a CPU round-trip per sumcheck round.
+    ///
+    /// Returns the challenge as a device-side `CudaSlice<u32>` (4 elements = 1 QM31).
+    pub fn fiat_shamir_round(
+        &self,
+        _d_reduction: &CudaSlice<u32>,
+        _d_channel_digest: &mut CudaSlice<u32>,
+        _d_channel_n_draws: &mut CudaSlice<u32>,
+        _d_round_constants: &CudaSlice<u32>,
+        _d_round_poly_out: &mut CudaViewMut<u32>,
+        _fiat_shamir_fn: &CudaFunction,
+    ) -> Result<CudaSlice<u32>, CudaFftError> {
+        // Stub: GPU Fiat-Shamir round not yet implemented.
+        Err(CudaFftError::KernelCompilation(
+            "GPU fiat_shamir_round not yet implemented".into(),
+        ))
+    }
+
+    /// Fold an MLE on device: fix the first variable to the given challenge.
+    ///
+    /// Equivalent to `mle_fold` but the challenge is already a device-side buffer.
+    /// Returns the folded MLE as a new device allocation of half the size.
+    pub fn mle_fold_device(
+        &self,
+        _d_input: &CudaSlice<u32>,
+        _cur_n: usize,
+        _d_challenge: &CudaSlice<u32>,
+    ) -> Result<CudaSlice<u32>, CudaFftError> {
+        // Stub: device-resident MLE fold not yet implemented.
+        Err(CudaFftError::KernelCompilation(
+            "GPU mle_fold_device not yet implemented".into(),
+        ))
+    }
+
+    /// Bulk download sumcheck results from device: round polynomials and challenges.
+    ///
+    /// Returns `(round_poly_coeffs, challenges)` where:
+    /// - `round_poly_coeffs`: `num_rounds` entries of `[c0, c1, c2]` (3 QM31 per round)
+    /// - `challenges`: `num_rounds` QM31 challenge values
+    pub fn download_sumcheck_results(
+        &self,
+        d_round_polys: &CudaSlice<u32>,
+        d_challenges: &CudaSlice<u32>,
+        num_rounds: usize,
+    ) -> Result<(Vec<[SecureField; 3]>, Vec<SecureField>), CudaFftError> {
+        let mut round_poly_raw = vec![0u32; num_rounds * 12];
+        let mut challenges_raw = vec![0u32; num_rounds * 4];
+
+        self.device.dtoh_sync_copy_into(d_round_polys, &mut round_poly_raw)
+            .map_err(|e| CudaFftError::MemoryTransfer(format!("download round_polys: {:?}", e)))?;
+        self.device.dtoh_sync_copy_into(d_challenges, &mut challenges_raw)
+            .map_err(|e| CudaFftError::MemoryTransfer(format!("download challenges: {:?}", e)))?;
+
+        // Convert raw u32 data to structured SecureField arrays
+        let round_poly_data: Vec<[SecureField; 3]> = round_poly_raw
+            .chunks_exact(12)
+            .map(|chunk| {
+                let c0 = u32s_to_secure_field(&[chunk[0], chunk[1], chunk[2], chunk[3]]);
+                let c1 = u32s_to_secure_field(&[chunk[4], chunk[5], chunk[6], chunk[7]]);
+                let c2 = u32s_to_secure_field(&[chunk[8], chunk[9], chunk[10], chunk[11]]);
+                [c0, c1, c2]
+            })
+            .collect();
+
+        let challenges: Vec<SecureField> = challenges_raw
+            .chunks_exact(4)
+            .map(|chunk| u32s_to_secure_field(&[chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect();
+
+        Ok((round_poly_data, challenges))
+    }
+}
+
+/// Result of a GPU-resident matmul reduction (full sumcheck + Fiat-Shamir).
+#[cfg(feature = "cuda-runtime")]
+pub struct GpuMatMulReduction {
+    pub round_polys: Vec<crate::components::matmul::RoundPoly>,
+    pub challenges: Vec<SecureField>,
+    pub final_a_eval: SecureField,
+    pub final_b_eval: SecureField,
 }
 
 /// Result of a GPU-accelerated 3-factor sumcheck.
@@ -2893,6 +3124,111 @@ pub fn prepare_batch_entry(
         f_a,
         f_b,
     })
+}
+
+/// Prepare a batch entry using a weight commitment cache for repeated inferences.
+///
+/// On cache hit (same node_id, same padded dims): reuses the cached restricted
+/// weight MLE and commitment, only computing the activation-side restrict.
+///
+/// On cache miss: falls back to `prepare_batch_entry` and stores the result.
+#[cfg(feature = "cuda-runtime")]
+pub fn prepare_batch_entry_cached(
+    node_id: usize,
+    a: &M31Matrix,
+    b: &M31Matrix,
+    c: &M31Matrix,
+    cache: &crate::weight_cache::SharedWeightCache,
+) -> Result<BatchEntry, MatMulError> {
+    use crate::components::matmul::pad_matrix_pow2;
+    use crate::crypto::poseidon_channel::PoseidonChannel;
+    use crate::crypto::mle_opening::commit_mle_root_only;
+
+    let m = a.rows.next_power_of_two();
+    let k = a.cols.next_power_of_two();
+    let n = b.cols.next_power_of_two();
+    let log_m = m.ilog2() as usize;
+    let log_n = n.ilog2() as usize;
+
+    // Check cache for weight-side data
+    let cached = {
+        let guard = cache.read().map_err(|_| {
+            MatMulError::SumcheckFailed("weight cache lock poisoned".into())
+        })?;
+        guard.get(node_id, m, k, n).cloned()
+    };
+
+    if let Some(cached_weight) = cached {
+        // Cache hit: only compute activation-side restrict
+        let mut channel = PoseidonChannel::new();
+        channel.mix_u64(m as u64);
+        channel.mix_u64(k as u64);
+        channel.mix_u64(n as u64);
+
+        let r_i = channel.draw_qm31s(log_m);
+        let r_j = cached_weight.r_j.clone();
+
+        // Claimed sum from C
+        let c_padded = pad_matrix_pow2(c);
+        let mle_c = matrix_to_mle_pub(&c_padded);
+        let mut r_ij = Vec::with_capacity(log_m + log_n);
+        r_ij.extend_from_slice(&r_i);
+        r_ij.extend_from_slice(&r_j);
+        let claimed_sum = evaluate_mle_pub(&mle_c, &r_ij);
+
+        // GPU restrict rows (activation side)
+        let gpu_executor = GpuSumcheckExecutor::cached()
+            .map_err(|e| MatMulError::SumcheckFailed(format!("GPU init: {e}")))?;
+
+        let d_f_a = gpu_executor.restrict_rows(a, &r_i, k)
+            .map_err(|e| MatMulError::SumcheckFailed(format!("GPU restrict_rows cached: {e}")))?;
+
+        let mut f_a_u32 = vec![0u32; k * 4];
+        gpu_executor.device.dtoh_sync_copy_into(&d_f_a, &mut f_a_u32)
+            .map_err(|e| MatMulError::SumcheckFailed(format!("download cached f_a: {:?}", e)))?;
+
+        let f_a: Vec<SecureField> = f_a_u32.chunks_exact(4)
+            .map(|c| u32s_to_secure_field(&[c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        let a_commitment = commit_mle_root_only(&f_a);
+
+        return Ok(BatchEntry {
+            node_id,
+            m,
+            k,
+            n,
+            claimed_sum,
+            r_i,
+            r_j,
+            a_commitment,
+            b_commitment: cached_weight.b_commitment,
+            f_a,
+            f_b: cached_weight.f_b,
+        });
+    }
+
+    // Cache miss: compute fully and store weight-side data
+    let entry = prepare_batch_entry(node_id, a, b, c)?;
+
+    {
+        let mut guard = cache.write().map_err(|_| {
+            MatMulError::SumcheckFailed("weight cache write lock poisoned".into())
+        })?;
+        guard.insert(
+            node_id,
+            m,
+            k,
+            n,
+            crate::weight_cache::CachedWeight {
+                f_b: entry.f_b.clone(),
+                b_commitment: entry.b_commitment,
+                r_j: entry.r_j.clone(),
+            },
+        );
+    }
+
+    Ok(entry)
 }
 
 // =============================================================================

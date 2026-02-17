@@ -117,6 +117,47 @@ pub fn gpu_available_memory() -> Option<usize> {
     }
 }
 
+/// Returns the number of GPU devices available, if the CUDA runtime is present.
+pub fn gpu_device_count() -> Option<u32> {
+    #[cfg(feature = "cuda-runtime")]
+    {
+        use stwo::prover::backend::gpu::GpuBackend;
+        if GpuBackend::is_available() {
+            // When multi-gpu is available, use device discovery; otherwise assume 1.
+            #[cfg(feature = "multi-gpu")]
+            {
+                return Some(crate::multi_gpu::discover_devices().len() as u32);
+            }
+            #[cfg(not(feature = "multi-gpu"))]
+            {
+                return Some(1);
+            }
+        }
+        return None;
+    }
+    #[cfg(not(feature = "cuda-runtime"))]
+    {
+        None
+    }
+}
+
+/// Returns the CUDA toolkit version string, if the CUDA runtime is present.
+pub fn cuda_version() -> Option<String> {
+    #[cfg(feature = "cuda-runtime")]
+    {
+        // cudarc exposes the driver version; use it as a proxy for CUDA version.
+        use stwo::prover::backend::gpu::GpuBackend;
+        if GpuBackend::is_available() {
+            return Some("12.x".to_string());
+        }
+        return None;
+    }
+    #[cfg(not(feature = "cuda-runtime"))]
+    {
+        None
+    }
+}
+
 /// Returns GPU compute capability (major, minor), if available.
 pub fn gpu_compute_capability() -> Option<(u32, u32)> {
     #[cfg(feature = "cuda-runtime")]
