@@ -1179,6 +1179,65 @@ pub fn serialize_gkr_model_proof(
                     }
                 }
             }
+            LayerProof::Quantize {
+                logup_proof,
+                input_eval,
+                output_eval,
+                table_inputs,
+                table_outputs,
+            } => {
+                serialize_u32(9, output); // tag: Quantize
+                serialize_qm31(*input_eval, output);
+                serialize_qm31(*output_eval, output);
+                match logup_proof {
+                    Some(lup) => {
+                        serialize_u32(1, output);
+                        serialize_logup_proof(lup, output);
+                    }
+                    None => serialize_u32(0, output),
+                }
+                serialize_u32(table_inputs.len() as u32, output);
+                for (&inp, &out) in table_inputs.iter().zip(table_outputs.iter()) {
+                    serialize_m31(inp, output);
+                    serialize_m31(out, output);
+                }
+            }
+            LayerProof::Embedding {
+                logup_proof,
+                input_eval,
+                output_eval,
+                input_num_vars,
+            } => {
+                serialize_u32(10, output); // tag: Embedding
+                serialize_qm31(*input_eval, output);
+                serialize_qm31(*output_eval, output);
+                serialize_u32(*input_num_vars as u32, output);
+                match logup_proof {
+                    Some(lup) => {
+                        serialize_u32(1, output);
+                        serialize_u32(lup.eq_round_polys.len() as u32, output);
+                        for rp in &lup.eq_round_polys {
+                            serialize_qm31(rp.c0, output);
+                            serialize_qm31(rp.c1, output);
+                            serialize_qm31(rp.c2, output);
+                            serialize_qm31(rp.c3, output);
+                        }
+                        serialize_qm31(lup.claimed_sum, output);
+                        let (w, tok, col, val) = lup.final_evals;
+                        serialize_qm31(w, output);
+                        serialize_qm31(tok, output);
+                        serialize_qm31(col, output);
+                        serialize_qm31(val, output);
+                        serialize_u32(lup.table_tokens.len() as u32, output);
+                        for i in 0..lup.table_tokens.len() {
+                            serialize_u32(lup.table_tokens[i], output);
+                            serialize_u32(lup.table_cols[i], output);
+                            serialize_u32(lup.multiplicities[i], output);
+                        }
+                    }
+                    None => serialize_u32(0, output),
+                }
+            }
             LayerProof::MatMulDualSimd {
                 round_polys, final_a_eval, final_b_eval, n_block_vars,
             } => {
@@ -1387,6 +1446,65 @@ pub fn serialize_gkr_proof_data_only(
                     Some(lup) => {
                         serialize_u32(1, output);
                         serialize_logup_proof_inner(lup, output, false);
+                    }
+                    None => serialize_u32(0, output),
+                }
+            }
+            LayerProof::Quantize {
+                logup_proof,
+                input_eval,
+                output_eval,
+                table_inputs,
+                table_outputs,
+            } => {
+                serialize_u32(9, output);
+                serialize_qm31(*input_eval, output);
+                serialize_qm31(*output_eval, output);
+                match logup_proof {
+                    Some(lup) => {
+                        serialize_u32(1, output);
+                        serialize_logup_proof_inner(lup, output, true);
+                    }
+                    None => serialize_u32(0, output),
+                }
+                serialize_u32(table_inputs.len() as u32, output);
+                for (&inp, &out) in table_inputs.iter().zip(table_outputs.iter()) {
+                    serialize_m31(inp, output);
+                    serialize_m31(out, output);
+                }
+            }
+            LayerProof::Embedding {
+                logup_proof,
+                input_eval,
+                output_eval,
+                input_num_vars,
+            } => {
+                serialize_u32(10, output);
+                serialize_qm31(*input_eval, output);
+                serialize_qm31(*output_eval, output);
+                serialize_u32(*input_num_vars as u32, output);
+                match logup_proof {
+                    Some(lup) => {
+                        serialize_u32(1, output);
+                        serialize_u32(lup.eq_round_polys.len() as u32, output);
+                        for rp in &lup.eq_round_polys {
+                            serialize_qm31(rp.c0, output);
+                            serialize_qm31(rp.c1, output);
+                            serialize_qm31(rp.c2, output);
+                            serialize_qm31(rp.c3, output);
+                        }
+                        serialize_qm31(lup.claimed_sum, output);
+                        let (w, tok, col, val) = lup.final_evals;
+                        serialize_qm31(w, output);
+                        serialize_qm31(tok, output);
+                        serialize_qm31(col, output);
+                        serialize_qm31(val, output);
+                        serialize_u32(lup.table_tokens.len() as u32, output);
+                        for i in 0..lup.table_tokens.len() {
+                            serialize_u32(lup.table_tokens[i], output);
+                            serialize_u32(lup.table_cols[i], output);
+                            serialize_u32(lup.multiplicities[i], output);
+                        }
                     }
                     None => serialize_u32(0, output),
                 }

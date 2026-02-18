@@ -1,5 +1,6 @@
 //! GKR protocol proof types and error types.
 
+use stwo::core::fields::m31::M31;
 use stwo::core::fields::qm31::QM31;
 
 use crate::components::activation::ActivationType;
@@ -64,6 +65,24 @@ pub struct LogUpProof {
 
     /// Multiplicities for each table entry (prover sends these; verifier uses
     /// them to independently compute the table-side sum).
+    pub multiplicities: Vec<u32>,
+}
+
+/// LogUp proof for embedding lookups: (token_id, column, value) relation.
+///
+/// Unlike activation/dequantize, the embedding table is model-dependent, so the
+/// proof carries sparse table multiplicities keyed by `(token_id, column)`.
+#[derive(Debug, Clone)]
+pub struct EmbeddingLogUpProof {
+    /// Degree-3 eq-sumcheck round polynomials proving w(x) * d(x) = 1 over the trace domain.
+    pub eq_round_polys: Vec<RoundPolyDeg3>,
+    /// Final evaluations at the sumcheck challenge point s: (w(s), tok(s), col(s), val(s)).
+    pub final_evals: (SecureField, SecureField, SecureField, SecureField),
+    /// Claimed trace-side LogUp sum Σ_i 1 / (γ - encode_i).
+    pub claimed_sum: SecureField,
+    /// Sparse table multiplicity keys and counts (same length; one entry per non-zero cell).
+    pub table_tokens: Vec<u32>,
+    pub table_cols: Vec<u32>,
     pub multiplicities: Vec<u32>,
 }
 
@@ -165,6 +184,30 @@ pub enum LayerProof {
         input_eval: SecureField,
         output_eval: SecureField,
         table_commitment: starknet_ff::FieldElement,
+    },
+
+    /// LogUp proof for quantization (input → quantized output lookup).
+    ///
+    /// The table is layer-instance dependent (built from observed input values),
+    /// so the proof carries explicit table columns.
+    Quantize {
+        logup_proof: Option<LogUpProof>,
+        input_eval: SecureField,
+        output_eval: SecureField,
+        table_inputs: Vec<M31>,
+        table_outputs: Vec<M31>,
+    },
+
+    /// LogUp proof for embedding lookup (token_id, col_idx, value).
+    ///
+    /// Verifier reconstructs table values from model weights and checks sparse
+    /// multiplicity balance.
+    Embedding {
+        logup_proof: Option<EmbeddingLogUpProof>,
+        input_eval: SecureField,
+        output_eval: SecureField,
+        /// Number of variables in the projected embedding-input claim.
+        input_num_vars: usize,
     },
 
     /// Block-extended 3-factor sumcheck for SIMD matmul where both operands vary.

@@ -988,6 +988,8 @@ pub fn build_circuit_descriptor(circuit: &crate::gkr::LayeredCircuit) -> Vec<u32
             crate::gkr::circuit::LayerType::Attention { .. } => 5,
             crate::gkr::circuit::LayerType::Dequantize { .. } => 6,
             crate::gkr::circuit::LayerType::RMSNorm { .. } => 8,
+            crate::gkr::circuit::LayerType::Quantize { .. } => 9,
+            crate::gkr::circuit::LayerType::Embedding { .. } => 10,
             crate::gkr::circuit::LayerType::Input => continue,
             crate::gkr::circuit::LayerType::Identity => continue,
         };

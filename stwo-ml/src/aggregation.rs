@@ -4391,7 +4391,8 @@ where
         || !quantize_layers.is_empty() || !dequantize_layers.is_empty();
 
     let skip_unified_stark = flag_enabled("STWO_PURE_GKR_SKIP_UNIFIED_STARK");
-    let gkr_covers_all_non_matmul = embedding_layers.is_empty() && quantize_layers.is_empty();
+    // Pure-GKR now has native reductions for activation/add/mul/layernorm/rmsnorm/embedding/quantize/dequantize.
+    let gkr_covers_all_non_matmul = true;
 
     if !has_components {
         return Ok(AggregatedModelProofOnChain {
@@ -4424,7 +4425,7 @@ where
                 "Phase 3/3: Unified STARK skipped (STWO_PURE_GKR_SKIP_UNIFIED_STARK=1, GKR-only path)."
             );
             eprintln!(
-                "  [Unified STARK] skipped: GKR covers matmul/add/mul/activation/layernorm/rmsnorm/dequantize."
+                "  [Unified STARK] skipped: GKR covers matmul/add/mul/activation/layernorm/rmsnorm/embedding/quantize/dequantize."
             );
 
             let activation_claims = activation_layers.iter().map(|layer| LayerClaim {
@@ -4452,11 +4453,22 @@ where
                 claimed_sum: SecureField::default(),
                 trace_rows: 1 << layer.log_size,
             }).collect();
+            let embedding_claims = embedding_layers.iter().map(|layer| LayerClaim {
+                layer_index: layer.node_id,
+                claimed_sum: SecureField::default(),
+                trace_rows: 1 << layer.log_size,
+            }).collect();
+            let quantize_claims = quantize_layers.iter().map(|layer| LayerClaim {
+                layer_index: layer.node_id,
+                claimed_sum: SecureField::default(),
+                trace_rows: 1 << layer.log_size,
+            }).collect();
             let dequantize_claims = dequantize_layers.iter().map(|layer| LayerClaim {
                 layer_index: layer.node_id,
                 claimed_sum: SecureField::default(),
                 trace_rows: 1 << layer.log_size,
             }).collect();
+            let quantize_params_commitment = compute_quantize_params_commitment(&quantize_layers);
 
             return Ok(AggregatedModelProofOnChain {
                 unified_stark: None,
@@ -4469,21 +4481,17 @@ where
                 execution,
                 activation_claims,
                 attention_proofs,
-                embedding_claims: Vec::new(),
-                quantize_claims: Vec::new(),
+                embedding_claims,
+                quantize_claims,
                 dequantize_claims,
                 layer_chain_commitment,
                 io_commitment,
                 layernorm_mean_var_commitments,
-                quantize_params_commitment: FieldElement::ZERO,
+                quantize_params_commitment,
                 tiled_matmul_proofs: Vec::new(),
                 gkr_proof: Some(gkr_proof),
                 gkr_batch_data: None,
             });
-        } else {
-            eprintln!(
-                "Phase 3/3: STWO_PURE_GKR_SKIP_UNIFIED_STARK=1 ignored (embedding/quantize still require unified STARK)."
-            );
         }
     }
 
@@ -6498,7 +6506,7 @@ pub fn verify_aggregated_model_proof_onchain(
             ))?;
 
         let mut gkr_channel = crate::crypto::poseidon_channel::PoseidonChannel::new();
-        crate::gkr::verify_gkr(&circuit, gkr_proof, &current, &mut gkr_channel)
+        crate::gkr::verify_gkr_with_weights(&circuit, gkr_proof, &current, weights, &mut gkr_channel)
             .map_err(|e| AggregationError::VerificationFailed(
                 format!("GKR verification: {e}")
             ))?;
@@ -7446,6 +7454,29 @@ mod tests {
     use crate::components::activation::ActivationType;
     use num_traits::Zero;
     use stwo::core::fields::FieldExpOps;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(prev) = self.prev.as_ref() {
+                std::env::set_var(self.key, prev);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     #[test]
     fn test_aggregated_matmul_only() {
@@ -8995,6 +9026,101 @@ mod tests {
 
         verify_aggregated_model_proof_onchain(proof, &graph, &input, &weights)
             .expect("pure GKR proof verification should succeed");
+    }
+
+    #[test]
+    fn test_pure_gkr_skip_unified_stark_with_quantize_claims() {
+        use crate::gadgets::quantize::{QuantParams, QuantStrategy};
+
+        // matmul -> quantize -> matmul
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(4);
+        builder.quantize(QuantParams {
+            strategy: QuantStrategy::Direct,
+            scale: 1.0,
+            zero_point: 0,
+            bits: 8,
+        });
+        builder.linear(2);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
+
+        let mut weights = GraphWeights::new();
+        let mut w0 = M31Matrix::new(4, 4);
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 3 + 1) as u32));
+            }
+        }
+        weights.add_weight(0, w0);
+
+        let mut w2 = M31Matrix::new(4, 2);
+        for i in 0..4 {
+            for j in 0..2 {
+                w2.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
+        weights.add_weight(2, w2);
+
+        let _skip_guard = EnvVarGuard::set("STWO_PURE_GKR_SKIP_UNIFIED_STARK", "1");
+        let proof = prove_model_pure_gkr(&graph, &input, &weights)
+            .expect("pure GKR + skip unified STARK with quantize should succeed");
+
+        assert!(proof.gkr_proof.is_some(), "should have GKR proof");
+        assert!(proof.unified_stark.is_none(), "Unified STARK should be skipped");
+        assert_eq!(proof.quantize_claims.len(), 1, "quantize claim should be present");
+        assert_ne!(
+            proof.quantize_params_commitment,
+            FieldElement::ZERO,
+            "quantize params commitment should be populated in skip mode",
+        );
+
+        verify_aggregated_model_proof_onchain(proof, &graph, &input, &weights)
+            .expect("pure GKR quantize skip proof verification should succeed");
+    }
+
+    #[test]
+    fn test_pure_gkr_skip_unified_stark_with_embedding_claims() {
+        // embedding -> matmul
+        let mut builder = GraphBuilder::new((1, 1));
+        builder.embedding(16, 4);
+        builder.linear(2);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 1);
+        input.set(0, 0, M31::from(3u32));
+
+        let mut weights = GraphWeights::new();
+        let mut embedding_table = M31Matrix::new(16, 4);
+        for i in 0..16 {
+            for j in 0..4 {
+                embedding_table.set(i, j, M31::from(((i + j) % 13 + 1) as u32));
+            }
+        }
+        weights.add_weight(0, embedding_table);
+
+        let mut proj = M31Matrix::new(4, 2);
+        for i in 0..4 {
+            for j in 0..2 {
+                proj.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
+        weights.add_weight(1, proj);
+
+        let _skip_guard = EnvVarGuard::set("STWO_PURE_GKR_SKIP_UNIFIED_STARK", "1");
+        let proof = prove_model_pure_gkr(&graph, &input, &weights)
+            .expect("pure GKR + skip unified STARK with embedding should succeed");
+
+        assert!(proof.gkr_proof.is_some(), "should have GKR proof");
+        assert!(proof.unified_stark.is_none(), "Unified STARK should be skipped");
+        assert_eq!(proof.embedding_claims.len(), 1, "embedding claim should be present");
+
+        verify_aggregated_model_proof_onchain(proof, &graph, &input, &weights)
+            .expect("pure GKR embedding skip proof verification should succeed");
     }
 
     // === Dequantize Integration Tests ===

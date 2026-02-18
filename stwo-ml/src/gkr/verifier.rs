@@ -22,8 +22,8 @@ use crate::gadgets::lookup_table::PrecomputedTable;
 use super::circuit::{LayerType, LayeredCircuit};
 use super::prover::compute_rsqrt_table_commitment;
 use super::types::{
-    derive_weight_opening_subchannel, GKRClaim, GKRError, GKRProof, LayerProof, LogUpProof,
-    RoundPolyDeg3, SecureField, WeightOpeningTranscriptMode,
+    derive_weight_opening_subchannel, EmbeddingLogUpProof, GKRClaim, GKRError, GKRProof,
+    LayerProof, LogUpProof, RoundPolyDeg3, SecureField, WeightOpeningTranscriptMode,
 };
 
 /// Verify a GKR proof against the model circuit and execution trace.
@@ -264,7 +264,53 @@ fn verify_gkr_inner(
                 *output_eval,
                 *table_commitment,
                 layer_idx,
+                    channel,
+                )?,
+
+            (
+                LayerType::Quantize { params, .. },
+                LayerProof::Quantize {
+                    logup_proof,
+                    input_eval,
+                    output_eval,
+                    table_inputs,
+                    table_outputs,
+                },
+            ) => verify_quantize_reduction(
+                &current_claim,
+                params,
+                logup_proof.as_ref(),
+                *input_eval,
+                *output_eval,
+                table_inputs,
+                table_outputs,
+                layer_idx,
                 channel,
+            )?,
+
+            (
+                LayerType::Embedding {
+                    vocab_size,
+                    embed_dim,
+                },
+                LayerProof::Embedding {
+                    logup_proof,
+                    input_eval,
+                    output_eval,
+                    input_num_vars,
+                },
+            ) => verify_embedding_reduction(
+                &current_claim,
+                *vocab_size,
+                *embed_dim,
+                logup_proof.as_ref(),
+                *input_eval,
+                *output_eval,
+                *input_num_vars,
+                layer.node_id,
+                layer_idx,
+                channel,
+                weights,
             )?,
 
             (
@@ -934,7 +980,53 @@ pub fn verify_gkr_simd(
                 *output_eval,
                 *table_commitment,
                 layer_idx,
+                    channel,
+                )?,
+
+            (
+                LayerType::Quantize { params, .. },
+                LayerProof::Quantize {
+                    logup_proof,
+                    input_eval,
+                    output_eval,
+                    table_inputs,
+                    table_outputs,
+                },
+            ) => verify_quantize_reduction(
+                &current_claim,
+                params,
+                logup_proof.as_ref(),
+                *input_eval,
+                *output_eval,
+                table_inputs,
+                table_outputs,
+                layer_idx,
                 channel,
+            )?,
+
+            (
+                LayerType::Embedding {
+                    vocab_size,
+                    embed_dim,
+                },
+                LayerProof::Embedding {
+                    logup_proof,
+                    input_eval,
+                    output_eval,
+                    input_num_vars,
+                },
+            ) => verify_embedding_reduction(
+                &current_claim,
+                *vocab_size,
+                *embed_dim,
+                logup_proof.as_ref(),
+                *input_eval,
+                *output_eval,
+                *input_num_vars,
+                layer.node_id,
+                layer_idx,
+                channel,
+                None,
             )?,
 
             (
@@ -1684,6 +1776,325 @@ fn verify_dequantize_reduction(
 
     Ok(GKRClaim {
         point: output_claim.point.clone(),
+        value: input_eval,
+    })
+}
+
+fn quantize_strategy_tag(strategy: crate::gadgets::quantize::QuantStrategy) -> u64 {
+    use crate::gadgets::quantize::QuantStrategy;
+    match strategy {
+        QuantStrategy::Direct => 0,
+        QuantStrategy::Symmetric8 => 1,
+        QuantStrategy::Asymmetric8 => 2,
+        QuantStrategy::Symmetric4 => 3,
+        QuantStrategy::Asymmetric4 => 4,
+    }
+}
+
+fn project_claim_point(point: &[SecureField], n_vars: usize) -> Vec<SecureField> {
+    let mut out = point.to_vec();
+    if out.len() > n_vars {
+        out.truncate(n_vars);
+    } else if out.len() < n_vars {
+        out.resize(n_vars, SecureField::zero());
+    }
+    out
+}
+
+/// Verify a Quantize reduction via LogUp eq-sumcheck.
+fn verify_quantize_reduction(
+    output_claim: &GKRClaim,
+    params: &crate::gadgets::quantize::QuantParams,
+    logup_proof: Option<&LogUpProof>,
+    input_eval: SecureField,
+    output_eval: SecureField,
+    table_inputs: &[M31],
+    table_outputs: &[M31],
+    layer_idx: usize,
+    channel: &mut PoseidonChannel,
+) -> Result<GKRClaim, GKRError> {
+    use crate::gadgets::quantize::{dequantize_value, quantize_value, QuantParams, QuantStrategy};
+
+    let logup = logup_proof.ok_or_else(|| GKRError::VerificationError {
+        layer_idx,
+        reason: "quantize proof missing LogUp proof".to_string(),
+    })?;
+
+    let num_vars = logup.eq_round_polys.len();
+    if num_vars == 0 {
+        return Err(GKRError::VerificationError {
+            layer_idx,
+            reason: "quantize eq-sumcheck has 0 rounds".to_string(),
+        });
+    }
+
+    if table_inputs.len() != table_outputs.len() {
+        return Err(GKRError::VerificationError {
+            layer_idx,
+            reason: format!(
+                "quantize table input/output length mismatch: {} vs {}",
+                table_inputs.len(),
+                table_outputs.len()
+            ),
+        });
+    }
+
+    if logup.multiplicities.len() != table_inputs.len() {
+        return Err(GKRError::VerificationError {
+            layer_idx,
+            reason: format!(
+                "quantize multiplicities length {} != table size {}",
+                logup.multiplicities.len(),
+                table_inputs.len()
+            ),
+        });
+    }
+
+    channel.mix_u64(0x514C4F47_u64); // "QLOG"
+    channel.mix_u64(params.bits as u64);
+    channel.mix_u64(params.zero_point.unsigned_abs() as u64);
+    channel.mix_u64((params.scale * (1u64 << 32) as f64) as u64);
+    channel.mix_u64(quantize_strategy_tag(params.strategy));
+    let gamma = channel.draw_qm31();
+    let beta = channel.draw_qm31();
+
+    // Ensure table rows are consistent with quantization function.
+    let direct_params = QuantParams {
+        strategy: QuantStrategy::Direct,
+        scale: 1.0,
+        zero_point: 0,
+        bits: 31,
+    };
+    for (j, (&inp, &out)) in table_inputs.iter().zip(table_outputs.iter()).enumerate() {
+        if logup.multiplicities[j] == 0 {
+            continue;
+        }
+        let f = dequantize_value(inp, &direct_params);
+        let expected = quantize_value(f, params);
+        if out != expected {
+            return Err(GKRError::VerificationError {
+                layer_idx,
+                reason: format!(
+                    "quantize table row invalid: input={} expected={} got={}",
+                    inp.0, expected.0, out.0
+                ),
+            });
+        }
+    }
+
+    let table_sum: SecureField = table_inputs
+        .iter()
+        .zip(table_outputs.iter())
+        .enumerate()
+        .filter(|(j, _)| logup.multiplicities[*j] > 0)
+        .map(|(j, (&t_in, &t_out))| {
+            let m = SecureField::from(M31::from(logup.multiplicities[j]));
+            let d = gamma - SecureField::from(t_in) - beta * SecureField::from(t_out);
+            m * d.inverse()
+        })
+        .fold(SecureField::zero(), |acc, v| acc + v);
+
+    if logup.claimed_sum != table_sum {
+        return Err(GKRError::VerificationError {
+            layer_idx,
+            reason: format!(
+                "quantize LogUp sum mismatch: claimed={}, table={}",
+                logup.claimed_sum, table_sum
+            ),
+        });
+    }
+
+    mix_secure_field(channel, logup.claimed_sum);
+
+    let mut current_sum = SecureField::one();
+    let mut sumcheck_challenges = Vec::with_capacity(num_vars);
+    for (round, rp) in logup.eq_round_polys.iter().enumerate() {
+        let p0 = rp.c0;
+        let p1 = rp.c0 + rp.c1 + rp.c2 + rp.c3;
+        if p0 + p1 != current_sum {
+            return Err(GKRError::VerificationError {
+                layer_idx,
+                reason: format!(
+                    "quantize eq-sumcheck round {}: p(0)+p(1) = {} != sum {}",
+                    round,
+                    p0 + p1,
+                    current_sum
+                ),
+            });
+        }
+        channel.mix_poly_coeffs_deg3(rp.c0, rp.c1, rp.c2, rp.c3);
+        let challenge = channel.draw_qm31();
+        sumcheck_challenges.push(challenge);
+        current_sum = rp.eval(challenge);
+    }
+
+    let (w_eval, in_eval_s, out_eval_s) = logup.final_evals;
+    let d_eval = gamma - in_eval_s - beta * out_eval_s;
+    let r = &project_claim_point(&output_claim.point, num_vars)[..num_vars];
+    let eq_val = compute_eq_eval(r, &sumcheck_challenges);
+    let expected = eq_val * w_eval * d_eval;
+    if current_sum != expected {
+        return Err(GKRError::VerificationError {
+            layer_idx,
+            reason: format!(
+                "quantize final check failed: sum={} != eq*w*d={}",
+                current_sum, expected
+            ),
+        });
+    }
+
+    mix_secure_field(channel, input_eval);
+    mix_secure_field(channel, output_eval);
+
+    Ok(GKRClaim {
+        point: output_claim.point.clone(),
+        value: input_eval,
+    })
+}
+
+/// Verify an Embedding reduction via LogUp eq-sumcheck.
+fn verify_embedding_reduction(
+    output_claim: &GKRClaim,
+    vocab_size: usize,
+    embed_dim: usize,
+    logup_proof: Option<&EmbeddingLogUpProof>,
+    input_eval: SecureField,
+    output_eval: SecureField,
+    input_num_vars: usize,
+    weight_node_id: usize,
+    layer_idx: usize,
+    channel: &mut PoseidonChannel,
+    weights: Option<&GraphWeights>,
+) -> Result<GKRClaim, GKRError> {
+    let weights = weights.ok_or_else(|| GKRError::VerificationError {
+        layer_idx,
+        reason: "embedding reduction requires verify_gkr_with_weights(...)".to_string(),
+    })?;
+    let embedding_table = weights
+        .get_weight(weight_node_id)
+        .ok_or(GKRError::MissingWeight {
+            node_id: weight_node_id,
+        })?;
+    if embedding_table.rows != vocab_size || embedding_table.cols != embed_dim {
+        return Err(GKRError::VerificationError {
+            layer_idx,
+            reason: format!(
+                "embedding table shape mismatch: expected {}x{}, got {}x{}",
+                vocab_size,
+                embed_dim,
+                embedding_table.rows,
+                embedding_table.cols
+            ),
+        });
+    }
+
+    let logup = logup_proof.ok_or_else(|| GKRError::VerificationError {
+        layer_idx,
+        reason: "embedding proof missing LogUp proof".to_string(),
+    })?;
+    let num_vars = logup.eq_round_polys.len();
+    if num_vars == 0 {
+        return Err(GKRError::VerificationError {
+            layer_idx,
+            reason: "embedding eq-sumcheck has 0 rounds".to_string(),
+        });
+    }
+    if logup.table_tokens.len() != logup.table_cols.len()
+        || logup.table_tokens.len() != logup.multiplicities.len()
+    {
+        return Err(GKRError::VerificationError {
+            layer_idx,
+            reason: "embedding sparse multiplicity vectors have inconsistent lengths".to_string(),
+        });
+    }
+
+    channel.mix_u64(0x454D424C4F47_u64); // "EMBLOG"
+    channel.mix_u64(vocab_size as u64);
+    channel.mix_u64(embed_dim as u64);
+    let gamma = channel.draw_qm31();
+    let beta_col = channel.draw_qm31();
+    let beta_val = channel.draw_qm31();
+
+    let table_sum: SecureField = logup
+        .table_tokens
+        .iter()
+        .zip(logup.table_cols.iter())
+        .zip(logup.multiplicities.iter())
+        .map(|((&tok, &col), &mult)| {
+            if (tok as usize) >= vocab_size || (col as usize) >= embed_dim {
+                return Err(GKRError::VerificationError {
+                    layer_idx,
+                    reason: format!(
+                        "embedding sparse multiplicity out of bounds: token={}, col={}",
+                        tok, col
+                    ),
+                });
+            }
+            let val = embedding_table.get(tok as usize, col as usize);
+            let d = gamma
+                - SecureField::from(M31::from(tok))
+                - beta_col * SecureField::from(M31::from(col))
+                - beta_val * SecureField::from(val);
+            Ok(SecureField::from(M31::from(mult)) * d.inverse())
+        })
+        .collect::<Result<Vec<_>, GKRError>>()?
+        .into_iter()
+        .fold(SecureField::zero(), |acc, v| acc + v);
+
+    if logup.claimed_sum != table_sum {
+        return Err(GKRError::VerificationError {
+            layer_idx,
+            reason: format!(
+                "embedding LogUp sum mismatch: claimed={}, table={}",
+                logup.claimed_sum, table_sum
+            ),
+        });
+    }
+
+    mix_secure_field(channel, logup.claimed_sum);
+
+    let mut current_sum = SecureField::one();
+    let mut sumcheck_challenges = Vec::with_capacity(num_vars);
+    for (round, rp) in logup.eq_round_polys.iter().enumerate() {
+        let p0 = rp.c0;
+        let p1 = rp.c0 + rp.c1 + rp.c2 + rp.c3;
+        if p0 + p1 != current_sum {
+            return Err(GKRError::VerificationError {
+                layer_idx,
+                reason: format!(
+                    "embedding eq-sumcheck round {}: p(0)+p(1) = {} != sum {}",
+                    round,
+                    p0 + p1,
+                    current_sum
+                ),
+            });
+        }
+        channel.mix_poly_coeffs_deg3(rp.c0, rp.c1, rp.c2, rp.c3);
+        let challenge = channel.draw_qm31();
+        sumcheck_challenges.push(challenge);
+        current_sum = rp.eval(challenge);
+    }
+
+    let (w_eval, tok_eval_s, col_eval_s, val_eval_s) = logup.final_evals;
+    let d_eval = gamma - tok_eval_s - beta_col * col_eval_s - beta_val * val_eval_s;
+    let r = &project_claim_point(&output_claim.point, num_vars)[..num_vars];
+    let eq_val = compute_eq_eval(r, &sumcheck_challenges);
+    let expected = eq_val * w_eval * d_eval;
+    if current_sum != expected {
+        return Err(GKRError::VerificationError {
+            layer_idx,
+            reason: format!(
+                "embedding final check failed: sum={} != eq*w*d={}",
+                current_sum, expected
+            ),
+        });
+    }
+
+    mix_secure_field(channel, input_eval);
+    mix_secure_field(channel, output_eval);
+
+    Ok(GKRClaim {
+        point: project_claim_point(&output_claim.point, input_num_vars),
         value: input_eval,
     })
 }
@@ -2479,12 +2890,15 @@ mod tests {
     use super::*;
     use crate::compiler::graph::{GraphBuilder, GraphExecution, GraphWeights};
     use crate::components::activation::ActivationType;
+    use crate::components::embedding::embedding_lookup;
     use crate::components::matmul::{evaluate_mle_pub, M31Matrix};
     use crate::crypto::poseidon_channel::PoseidonChannel;
+    use crate::gadgets::quantize::{dequantize_value, quantize_value, QuantParams, QuantStrategy};
     use crate::gkr::circuit::LayeredCircuit;
     use crate::gkr::prover::{
-        prove_gkr, reduce_activation_layer_for_test, reduce_layernorm_layer_for_test,
-        reduce_layernorm_simd_for_test, reduce_mul_layer_for_test,
+        prove_gkr, reduce_activation_layer_for_test, reduce_embedding_layer_for_test,
+        reduce_layernorm_layer_for_test, reduce_layernorm_simd_for_test,
+        reduce_mul_layer_for_test, reduce_quantize_layer_for_test,
     };
     use num_traits::Zero;
     use stwo::core::fields::m31::M31;
@@ -4246,6 +4660,179 @@ mod tests {
                 assert!(result.is_err(), "tampered dequantize proof should fail");
             }
             _ => panic!("expected Dequantize proof with LogUp"),
+        }
+    }
+
+    #[test]
+    fn test_quantize_logup_prove_and_verify() {
+        let input = {
+            let mut m = M31Matrix::new(2, 2);
+            m.set(0, 0, M31::from(0u32));
+            m.set(0, 1, M31::from(42u32));
+            m.set(1, 0, M31::from(100u32));
+            m.set(1, 1, M31::from(42u32));
+            m
+        };
+
+        let params = QuantParams {
+            strategy: QuantStrategy::Symmetric8,
+            scale: 1.0 / 127.0,
+            zero_point: 127,
+            bits: 8,
+        };
+        let direct_params = QuantParams {
+            strategy: QuantStrategy::Direct,
+            scale: 1.0,
+            zero_point: 0,
+            bits: 31,
+        };
+
+        let padded = pad_matrix_pow2(&input);
+        let n = padded.rows * padded.cols;
+        let output_mle: Vec<SecureField> = padded
+            .data
+            .iter()
+            .take(n)
+            .map(|&v| {
+                let f = dequantize_value(v, &direct_params);
+                SecureField::from(quantize_value(f, &params))
+            })
+            .collect();
+
+        let mut prover_channel = PoseidonChannel::new();
+        prover_channel.mix_u64(0x51414E54); // deterministic test seed
+        let r = prover_channel.draw_qm31s(2);
+        let claimed = evaluate_mle(&output_mle, &r);
+        let output_claim = GKRClaim {
+            point: r.clone(),
+            value: claimed,
+        };
+
+        let (proof, _) = reduce_quantize_layer_for_test(
+            &output_claim,
+            &input,
+            &params,
+            &mut prover_channel,
+        )
+        .unwrap();
+
+        let mut verifier_channel = PoseidonChannel::new();
+        verifier_channel.mix_u64(0x51414E54);
+        let _r_v = verifier_channel.draw_qm31s(2);
+
+        match &proof {
+            LayerProof::Quantize {
+                logup_proof,
+                input_eval,
+                output_eval,
+                table_inputs,
+                table_outputs,
+            } => {
+                let result = verify_quantize_reduction(
+                    &output_claim,
+                    &params,
+                    logup_proof.as_ref(),
+                    *input_eval,
+                    *output_eval,
+                    table_inputs,
+                    table_outputs,
+                    0,
+                    &mut verifier_channel,
+                );
+                assert!(
+                    result.is_ok(),
+                    "valid quantize proof should verify: {:?}",
+                    result.err()
+                );
+            }
+            _ => panic!("expected Quantize proof"),
+        }
+    }
+
+    #[test]
+    fn test_embedding_logup_prove_and_verify_with_weights() {
+        // Token input [1, 2]
+        let input = {
+            let mut m = M31Matrix::new(1, 2);
+            m.set(0, 0, M31::from(1u32));
+            m.set(0, 1, M31::from(2u32));
+            m
+        };
+
+        // 4x3 embedding table
+        let mut table = M31Matrix::new(4, 3);
+        for r in 0..4 {
+            for c in 0..3 {
+                table.set(r, c, M31::from((r * 10 + c + 1) as u32));
+            }
+        }
+
+        let token_u32s: Vec<u32> = input.data.iter().map(|m| m.0).collect();
+        let (output, _, _, _, _) = embedding_lookup(&token_u32s, &table);
+
+        let padded = pad_matrix_pow2(&output);
+        let n = padded.rows * padded.cols;
+        let output_mle: Vec<SecureField> = padded
+            .data
+            .iter()
+            .take(n)
+            .map(|&v| SecureField::from(v))
+            .collect();
+        let num_vars = output_mle.len().ilog2() as usize;
+
+        let mut prover_channel = PoseidonChannel::new();
+        prover_channel.mix_u64(0x454D4254); // deterministic test seed
+        let r = prover_channel.draw_qm31s(num_vars);
+        let claimed = evaluate_mle(&output_mle, &r);
+        let output_claim = GKRClaim {
+            point: r.clone(),
+            value: claimed,
+        };
+
+        let (proof, _) = reduce_embedding_layer_for_test(
+            &output_claim,
+            &input,
+            &output,
+            &table,
+            &mut prover_channel,
+        )
+        .unwrap();
+
+        let mut weights = GraphWeights::new();
+        let node_id = 7usize;
+        weights.add_weight(node_id, table.clone());
+
+        let mut verifier_channel = PoseidonChannel::new();
+        verifier_channel.mix_u64(0x454D4254);
+        let _r_v = verifier_channel.draw_qm31s(num_vars);
+
+        match &proof {
+            LayerProof::Embedding {
+                logup_proof,
+                input_eval,
+                output_eval,
+                input_num_vars,
+            } => {
+                let result = verify_embedding_reduction(
+                    &output_claim,
+                    table.rows,
+                    table.cols,
+                    logup_proof.as_ref(),
+                    *input_eval,
+                    *output_eval,
+                    *input_num_vars,
+                    node_id,
+                    0,
+                    &mut verifier_channel,
+                    Some(&weights),
+                );
+                assert!(
+                    result.is_ok(),
+                    "valid embedding proof should verify: {:?}",
+                    result.err()
+                );
+            }
+            _ => panic!("expected Embedding proof"),
         }
     }
 

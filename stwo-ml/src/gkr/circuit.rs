@@ -74,6 +74,20 @@ pub enum LayerType {
         params: QuantParams,
     },
 
+    /// Quantization: maps direct-encoded values to quantized values via lookup table.
+    /// Reduction: LogUp lookup argument.
+    Quantize {
+        size: usize,
+        params: QuantParams,
+    },
+
+    /// Embedding lookup: output[row, col] = table[token[row], col].
+    /// Reduction: LogUp lookup argument on (token_id, col_idx, value).
+    Embedding {
+        vocab_size: usize,
+        embed_dim: usize,
+    },
+
     /// Identity / passthrough (zero-cost in GKR, claim propagates unchanged).
     Identity,
 }
@@ -215,14 +229,21 @@ impl LayeredCircuit {
                 config: *config,
             }),
             GraphOp::Identity { .. } => Ok(LayerType::Identity),
-            GraphOp::Embedding { .. } => Err(GKRError::CompilationError(
-                "Embedding layers must be lowered to MatMul before GKR compilation".to_string(),
-            )),
+            GraphOp::Embedding {
+                vocab_size,
+                embed_dim,
+            } => Ok(LayerType::Embedding {
+                vocab_size: *vocab_size,
+                embed_dim: *embed_dim,
+            }),
             GraphOp::Conv2D { .. } => Err(GKRError::CompilationError(
                 "Conv2D layers must be lowered to im2col + MatMul before GKR compilation"
                     .to_string(),
             )),
-            GraphOp::Quantize { .. } => Ok(LayerType::Identity),
+            GraphOp::Quantize { params, size } => Ok(LayerType::Quantize {
+                size: *size,
+                params: params.clone(),
+            }),
             GraphOp::Dequantize { params, size } => Ok(LayerType::Dequantize {
                 size: *size,
                 params: params.clone(),
@@ -300,6 +321,8 @@ impl LayeredCircuit {
                 LayerType::RMSNorm { .. } => counts.layer_norm += 1,
                 LayerType::Attention { .. } => counts.attention += 1,
                 LayerType::Dequantize { .. } => counts.dequantize += 1,
+                LayerType::Quantize { .. } => counts.quantize += 1,
+                LayerType::Embedding { .. } => counts.embedding += 1,
                 LayerType::Input => counts.input += 1,
                 LayerType::Identity => counts.identity += 1,
             }
@@ -331,6 +354,8 @@ pub struct LayerCounts {
     pub layer_norm: usize,
     pub attention: usize,
     pub dequantize: usize,
+    pub quantize: usize,
+    pub embedding: usize,
     pub input: usize,
     pub identity: usize,
 }
@@ -375,6 +400,20 @@ fn layer_type_matches(a: &LayerType, b: &LayerType) -> bool {
             LayerType::Dequantize { size: s1, .. },
             LayerType::Dequantize { size: s2, .. },
         ) => s1 == s2,
+        (
+            LayerType::Quantize { size: s1, .. },
+            LayerType::Quantize { size: s2, .. },
+        ) => s1 == s2,
+        (
+            LayerType::Embedding {
+                vocab_size: v1,
+                embed_dim: e1,
+            },
+            LayerType::Embedding {
+                vocab_size: v2,
+                embed_dim: e2,
+            },
+        ) => v1 == v2 && e1 == e2,
         (LayerType::Input, LayerType::Input) => true,
         (LayerType::Identity, LayerType::Identity) => true,
         _ => false,

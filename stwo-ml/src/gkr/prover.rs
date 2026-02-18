@@ -242,6 +242,28 @@ pub fn prove_gkr(
                 reduce_rmsnorm_layer(&current_claim, input_matrix, *dim, channel)?
             }
 
+            LayerType::Quantize { params, .. } => {
+                let input_matrix = get_intermediate(execution, layer.node_id)?;
+                reduce_quantize_layer(&current_claim, input_matrix, params, channel)?
+            }
+
+            LayerType::Embedding { .. } => {
+                let input_matrix = get_intermediate(execution, layer.node_id)?;
+                let output_matrix = get_node_output(execution, layer.node_id)?;
+                let embed_table = weights
+                    .get_weight(layer.node_id)
+                    .ok_or(GKRError::MissingWeight {
+                        node_id: layer.node_id,
+                    })?;
+                reduce_embedding_layer(
+                    &current_claim,
+                    input_matrix,
+                    output_matrix,
+                    embed_table,
+                    channel,
+                )?
+            }
+
             LayerType::Identity => {
                 // Claim propagates unchanged
                 continue;
@@ -670,6 +692,30 @@ pub fn prove_gkr_gpu(
                 // CPU fallback — RMSNorm is memory-bound, not compute-bound
                 let input_matrix = get_intermediate(execution, layer.node_id)?;
                 reduce_rmsnorm_layer(&current_claim, input_matrix, *dim, channel)?
+            }
+
+            LayerType::Quantize { params, .. } => {
+                // CPU fallback — quantize is table-lookup bound
+                let input_matrix = get_intermediate(execution, layer.node_id)?;
+                reduce_quantize_layer(&current_claim, input_matrix, params, channel)?
+            }
+
+            LayerType::Embedding { .. } => {
+                // CPU fallback — embedding lookup is memory-bound and sparse.
+                let input_matrix = get_intermediate(execution, layer.node_id)?;
+                let output_matrix = get_node_output(execution, layer.node_id)?;
+                let embed_table = weights
+                    .get_weight(layer.node_id)
+                    .ok_or(GKRError::MissingWeight {
+                        node_id: layer.node_id,
+                    })?;
+                reduce_embedding_layer(
+                    &current_claim,
+                    input_matrix,
+                    output_matrix,
+                    embed_table,
+                    channel,
+                )?
             }
 
             LayerType::Dequantize { params, .. } => {
@@ -1844,6 +1890,33 @@ pub fn prove_gkr_simd_gpu(
                 let first_exec = &block_executions[0];
                 let input_matrix = get_intermediate(first_exec, layer.node_id)?;
                 reduce_rmsnorm_layer(&current_claim, input_matrix, *dim, channel)?
+            }
+
+            LayerType::Quantize { params, .. } => {
+                // CPU fallback — quantize is lookup-heavy
+                let first_exec = &block_executions[0];
+                let input_matrix = get_intermediate(first_exec, layer.node_id)?;
+                reduce_quantize_layer(&current_claim, input_matrix, params, channel)?
+            }
+
+            LayerType::Embedding { .. } => {
+                // CPU fallback — embedding appears outside SIMD blocks in practice,
+                // but keep a correct path for completeness.
+                let first_exec = &block_executions[0];
+                let input_matrix = get_intermediate(first_exec, layer.node_id)?;
+                let output_matrix = get_node_output(first_exec, layer.node_id)?;
+                let embed_table = weights
+                    .get_weight(layer.node_id)
+                    .ok_or(GKRError::MissingWeight {
+                        node_id: layer.node_id,
+                    })?;
+                reduce_embedding_layer(
+                    &current_claim,
+                    input_matrix,
+                    output_matrix,
+                    embed_table,
+                    channel,
+                )?
             }
 
             LayerType::Dequantize { params, .. } => {
@@ -3304,6 +3377,33 @@ pub fn reduce_dequantize_layer_for_test(
     reduce_dequantize_layer(output_claim, input_matrix, params, channel)
 }
 
+/// Test-accessible wrapper for `reduce_quantize_layer`.
+pub fn reduce_quantize_layer_for_test(
+    output_claim: &GKRClaim,
+    input_matrix: &M31Matrix,
+    params: &crate::gadgets::quantize::QuantParams,
+    channel: &mut PoseidonChannel,
+) -> Result<(LayerProof, GKRClaim), GKRError> {
+    reduce_quantize_layer(output_claim, input_matrix, params, channel)
+}
+
+/// Test-accessible wrapper for `reduce_embedding_layer`.
+pub fn reduce_embedding_layer_for_test(
+    output_claim: &GKRClaim,
+    input_matrix: &M31Matrix,
+    output_matrix: &M31Matrix,
+    embedding_table: &M31Matrix,
+    channel: &mut PoseidonChannel,
+) -> Result<(LayerProof, GKRClaim), GKRError> {
+    reduce_embedding_layer(
+        output_claim,
+        input_matrix,
+        output_matrix,
+        embedding_table,
+        channel,
+    )
+}
+
 /// Compute a deterministic commitment for a dequantize table.
 /// The table is fully determined by (bits, scale, zero_point), so the
 /// commitment is a Poseidon hash of these parameters.
@@ -3317,6 +3417,438 @@ pub fn compute_dequantize_table_commitment(
         // Encode scale as integer bits (multiply by 2^32 and truncate)
         starknet_ff::FieldElement::from((params.scale * (1u64 << 32) as f64) as u64),
     ])
+}
+
+// =============================================================================
+// Quantize Reduction
+// =============================================================================
+
+fn quantize_strategy_tag(strategy: crate::gadgets::quantize::QuantStrategy) -> u64 {
+    use crate::gadgets::quantize::QuantStrategy;
+    match strategy {
+        QuantStrategy::Direct => 0,
+        QuantStrategy::Symmetric8 => 1,
+        QuantStrategy::Asymmetric8 => 2,
+        QuantStrategy::Symmetric4 => 3,
+        QuantStrategy::Asymmetric4 => 4,
+    }
+}
+
+fn project_claim_point(point: &[SecureField], n_vars: usize) -> Vec<SecureField> {
+    let mut out = point.to_vec();
+    if out.len() > n_vars {
+        out.truncate(n_vars);
+    } else if out.len() < n_vars {
+        out.resize(n_vars, SecureField::zero());
+    }
+    out
+}
+
+/// Reduce a Quantize layer via LogUp eq-sumcheck.
+///
+/// Mirrors Dequantize reduction but uses the quantize table relation
+/// `(input, quantized_output)`.
+fn reduce_quantize_layer(
+    output_claim: &GKRClaim,
+    input_matrix: &M31Matrix,
+    params: &crate::gadgets::quantize::QuantParams,
+    channel: &mut PoseidonChannel,
+) -> Result<(LayerProof, GKRClaim), GKRError> {
+    use super::types::{LogUpProof, RoundPolyDeg3};
+    use crate::components::quantize::build_quantize_table;
+    use crate::gadgets::quantize::{dequantize_value, quantize_value, QuantParams, QuantStrategy};
+    use stwo::core::fields::FieldExpOps;
+
+    // Pad input matrix and build MLEs
+    let input_padded = pad_matrix_pow2(input_matrix);
+    let n = input_padded.rows * input_padded.cols;
+    let num_vars = n.ilog2() as usize;
+    let out_point = project_claim_point(&output_claim.point, num_vars);
+    let input_mle = matrix_to_mle(&input_padded);
+
+    // Compute quantized output in M31 field representation.
+    let direct_params = QuantParams {
+        strategy: QuantStrategy::Direct,
+        scale: 1.0,
+        zero_point: 0,
+        bits: 31,
+    };
+    let output_mle: Vec<SecureField> = input_padded
+        .data
+        .iter()
+        .take(n)
+        .map(|&v| {
+            let f = dequantize_value(v, &direct_params);
+            SecureField::from(quantize_value(f, params))
+        })
+        .collect();
+
+    let input_eval = evaluate_mle(&input_mle, &out_point);
+    let output_eval = evaluate_mle(&output_mle, &out_point);
+
+    // Build quantize table from observed inputs and multiplicities over padded trace.
+    let table = build_quantize_table(params, &input_padded.data[..n]);
+    let mut multiplicities = vec![0u32; table.size()];
+    for &inp in &input_padded.data[..n] {
+        if let Some(idx) = table.lookup_index(inp) {
+            multiplicities[idx] += 1;
+        }
+    }
+
+    // Draw LogUp encoding challenges with quantize-specific domain separation.
+    channel.mix_u64(0x514C4F47_u64); // "QLOG"
+    channel.mix_u64(params.bits as u64);
+    channel.mix_u64(params.zero_point.unsigned_abs() as u64);
+    channel.mix_u64((params.scale * (1u64 << 32) as f64) as u64);
+    channel.mix_u64(quantize_strategy_tag(params.strategy));
+    let gamma = channel.draw_qm31();
+    let beta = channel.draw_qm31();
+
+    // Compute denominators and inverse witnesses.
+    let d_vals: Vec<SecureField> = input_mle
+        .iter()
+        .zip(&output_mle)
+        .map(|(&inp, &out)| gamma - inp - beta * out)
+        .collect();
+    let w_vals = SecureField::batch_inverse(&d_vals);
+
+    let trace_sum: SecureField = w_vals
+        .iter()
+        .copied()
+        .fold(SecureField::zero(), |acc, w| acc + w);
+
+    // Table-side sum.
+    let nonzero_entries: Vec<(usize, SecureField)> = table
+        .inputs
+        .iter()
+        .zip(&table.outputs)
+        .enumerate()
+        .filter(|(j, _)| multiplicities[*j] > 0)
+        .map(|(j, (&t_in, &t_out))| {
+            let d = gamma - SecureField::from(t_in) - beta * SecureField::from(t_out);
+            (j, d)
+        })
+        .collect();
+    let table_denoms: Vec<SecureField> = nonzero_entries.iter().map(|(_, d)| *d).collect();
+    let table_inv = SecureField::batch_inverse(&table_denoms);
+    let table_sum: SecureField = nonzero_entries
+        .iter()
+        .zip(&table_inv)
+        .map(|((j, _), &inv)| SecureField::from(M31::from(multiplicities[*j])) * inv)
+        .fold(SecureField::zero(), |acc, v| acc + v);
+
+    if trace_sum != table_sum {
+        return Err(GKRError::LogUpError(format!(
+            "Quantize LogUp sum mismatch: trace={}, table={}",
+            trace_sum, table_sum
+        )));
+    }
+
+    mix_secure_field(channel, trace_sum);
+
+    // Degree-3 eq-sumcheck: Σ eq(r,x) · w(x) · d(x) = 1
+    let r = &out_point[..num_vars];
+    let mut eq_evals = build_eq_evals(r);
+    let mut w_folded = w_vals;
+    let mut d_folded = d_vals;
+    let mut eq_round_polys = Vec::with_capacity(num_vars);
+    let mut sumcheck_challenges = Vec::with_capacity(num_vars);
+    let mut cur_n = n;
+
+    for _ in 0..num_vars {
+        let mid = cur_n / 2;
+        let s0 = compute_mul_eq_sum_at_t(&eq_evals, &w_folded, &d_folded, mid, SecureField::zero());
+        let s1 = compute_mul_eq_sum_at_t(&eq_evals, &w_folded, &d_folded, mid, SecureField::one());
+        let two = SecureField::from(M31::from(2u32));
+        let three = SecureField::from(M31::from(3u32));
+        let s2 = compute_mul_eq_sum_at_t(&eq_evals, &w_folded, &d_folded, mid, two);
+        let s3 = compute_mul_eq_sum_at_t(&eq_evals, &w_folded, &d_folded, mid, three);
+
+        let inv2 = two.inverse();
+        let inv6 = (SecureField::from(M31::from(6u32))).inverse();
+        let dd1 = s1 - s0;
+        let dd2 = (s2 - s1 - s1 + s0) * inv2;
+        let dd3 = (s3 - s0 - three * (s2 - s1)) * inv6;
+        let c0 = s0;
+        let c1 = dd1 - dd2 + two * dd3;
+        let c2 = dd2 - three * dd3;
+        let c3 = dd3;
+        let rp = RoundPolyDeg3 { c0, c1, c2, c3 };
+        eq_round_polys.push(rp);
+
+        channel.mix_poly_coeffs_deg3(c0, c1, c2, c3);
+        let challenge = channel.draw_qm31();
+        sumcheck_challenges.push(challenge);
+
+        eq_evals = fold_mle(&eq_evals, challenge, mid);
+        w_folded = fold_mle(&w_folded, challenge, mid);
+        d_folded = fold_mle(&d_folded, challenge, mid);
+        cur_n = mid;
+    }
+
+    let w_eval = w_folded[0];
+    let in_eval_s = evaluate_mle(&input_mle, &sumcheck_challenges);
+    let out_eval_s = evaluate_mle(&output_mle, &sumcheck_challenges);
+
+    mix_secure_field(channel, input_eval);
+    mix_secure_field(channel, output_eval);
+
+    let logup_proof = LogUpProof {
+        eq_round_polys,
+        final_evals: (w_eval, in_eval_s, out_eval_s),
+        claimed_sum: trace_sum,
+        multiplicities,
+    };
+
+    let claim = GKRClaim {
+        point: out_point,
+        value: input_eval,
+    };
+
+    Ok((
+        LayerProof::Quantize {
+            logup_proof: Some(logup_proof),
+            input_eval,
+            output_eval,
+            table_inputs: table.inputs.clone(),
+            table_outputs: table.outputs.clone(),
+        },
+        claim,
+    ))
+}
+
+// =============================================================================
+// Embedding Reduction
+// =============================================================================
+
+/// Reduce an Embedding layer with a LogUp relation on (token_id, col_idx, value).
+///
+/// Verifier side reconstructs table values from model weights using sparse
+/// multiplicities carried in the proof.
+fn reduce_embedding_layer(
+    output_claim: &GKRClaim,
+    input_matrix: &M31Matrix,
+    output_matrix: &M31Matrix,
+    embedding_table: &M31Matrix,
+    channel: &mut PoseidonChannel,
+) -> Result<(LayerProof, GKRClaim), GKRError> {
+    use std::collections::HashMap;
+
+    use super::types::{EmbeddingLogUpProof, RoundPolyDeg3};
+    use stwo::core::fields::FieldExpOps;
+
+    if embedding_table.rows == 0 || embedding_table.cols == 0 {
+        return Err(GKRError::ReductionError {
+            layer_idx: 0,
+            reason: "embedding table is empty".to_string(),
+        });
+    }
+
+    let token_ids: Vec<u32> = input_matrix
+        .data
+        .iter()
+        .map(|m| (m.0 as usize).min(embedding_table.rows - 1) as u32)
+        .collect();
+
+    if token_ids.is_empty() {
+        return Err(GKRError::ReductionError {
+            layer_idx: 0,
+            reason: "embedding input is empty".to_string(),
+        });
+    }
+
+    let out_rows = output_matrix.rows;
+    let out_cols = output_matrix.cols;
+    if out_rows == 0 || out_cols == 0 {
+        return Err(GKRError::ReductionError {
+            layer_idx: 0,
+            reason: "embedding output is empty".to_string(),
+        });
+    }
+
+    let padded_rows = out_rows.next_power_of_two();
+    let padded_cols = out_cols.next_power_of_two();
+    let n = padded_rows * padded_cols;
+    let num_vars = n.ilog2() as usize;
+    let out_point = project_claim_point(&output_claim.point, num_vars);
+
+    let default_tok = 0u32;
+    let default_col = 0u32;
+    let default_val = embedding_table.get(0, 0);
+    let mut token_trace = vec![SecureField::from(M31::from(default_tok)); n];
+    let mut col_trace = vec![SecureField::from(M31::from(default_col)); n];
+    let mut value_trace = vec![SecureField::from(default_val); n];
+
+    let mut sparse_mults: HashMap<(u32, u32), u32> = HashMap::new();
+
+    for row in 0..out_rows {
+        let tok = token_ids
+            .get(row)
+            .copied()
+            .unwrap_or(default_tok)
+            .min((embedding_table.rows - 1) as u32);
+        for col in 0..out_cols {
+            let idx = row * padded_cols + col;
+            let col_u32 = col as u32;
+            token_trace[idx] = SecureField::from(M31::from(tok));
+            col_trace[idx] = SecureField::from(M31::from(col_u32));
+            value_trace[idx] = SecureField::from(output_matrix.get(row, col));
+            *sparse_mults.entry((tok, col_u32)).or_insert(0) += 1;
+        }
+    }
+
+    // Pad with a valid table cell so table-side sums remain well-defined.
+    let mut padded_uses = 0u32;
+    for row in 0..padded_rows {
+        let row_used_cols = if row < out_rows { out_cols } else { 0 };
+        padded_uses += (padded_cols - row_used_cols) as u32;
+    }
+    if padded_uses > 0 {
+        *sparse_mults
+            .entry((default_tok, default_col))
+            .or_insert(0) += padded_uses;
+    }
+
+    let output_eval = evaluate_mle(&value_trace, &out_point);
+
+    // Input claim is projected to the input MLE variable dimension.
+    let input_padded = pad_matrix_pow2(input_matrix);
+    let input_mle = matrix_to_mle(&input_padded);
+    let input_num_vars = input_mle.len().ilog2() as usize;
+    let input_point = project_claim_point(&output_claim.point, input_num_vars);
+    let input_eval = evaluate_mle(&input_mle, &input_point);
+
+    channel.mix_u64(0x454D424C4F47_u64); // "EMBLOG"
+    channel.mix_u64(embedding_table.rows as u64);
+    channel.mix_u64(embedding_table.cols as u64);
+    let gamma = channel.draw_qm31();
+    let beta_col = channel.draw_qm31();
+    let beta_val = channel.draw_qm31();
+
+    let d_vals: Vec<SecureField> = token_trace
+        .iter()
+        .zip(&col_trace)
+        .zip(&value_trace)
+        .map(|((&tok, &col), &val)| gamma - tok - beta_col * col - beta_val * val)
+        .collect();
+    let w_vals = SecureField::batch_inverse(&d_vals);
+    let trace_sum: SecureField = w_vals
+        .iter()
+        .copied()
+        .fold(SecureField::zero(), |acc, w| acc + w);
+
+    let mut sparse_entries: Vec<(u32, u32, u32)> = sparse_mults
+        .into_iter()
+        .map(|((tok, col), mult)| (tok, col, mult))
+        .collect();
+    sparse_entries.sort_unstable_by_key(|(tok, col, _)| (*tok, *col));
+
+    let table_denoms: Vec<SecureField> = sparse_entries
+        .iter()
+        .map(|(tok, col, _)| {
+            let row = (*tok as usize).min(embedding_table.rows - 1);
+            let c = (*col as usize).min(embedding_table.cols - 1);
+            let val = SecureField::from(embedding_table.get(row, c));
+            gamma - SecureField::from(M31::from(*tok)) - beta_col * SecureField::from(M31::from(*col))
+                - beta_val * val
+        })
+        .collect();
+    let table_inv = SecureField::batch_inverse(&table_denoms);
+    let table_sum: SecureField = sparse_entries
+        .iter()
+        .zip(&table_inv)
+        .map(|((_, _, mult), inv)| SecureField::from(M31::from(*mult)) * *inv)
+        .fold(SecureField::zero(), |acc, v| acc + v);
+
+    if trace_sum != table_sum {
+        return Err(GKRError::LogUpError(format!(
+            "Embedding LogUp sum mismatch: trace={}, table={}",
+            trace_sum, table_sum
+        )));
+    }
+
+    mix_secure_field(channel, trace_sum);
+
+    // Degree-3 eq-sumcheck: Σ eq(r,x) · w(x) · d(x) = 1
+    let r = &out_point[..num_vars];
+    let mut eq_evals = build_eq_evals(r);
+    let mut w_folded = w_vals;
+    let mut d_folded = d_vals;
+    let mut eq_round_polys = Vec::with_capacity(num_vars);
+    let mut sumcheck_challenges = Vec::with_capacity(num_vars);
+    let mut cur_n = n;
+
+    for _ in 0..num_vars {
+        let mid = cur_n / 2;
+        let s0 = compute_mul_eq_sum_at_t(&eq_evals, &w_folded, &d_folded, mid, SecureField::zero());
+        let s1 = compute_mul_eq_sum_at_t(&eq_evals, &w_folded, &d_folded, mid, SecureField::one());
+        let two = SecureField::from(M31::from(2u32));
+        let three = SecureField::from(M31::from(3u32));
+        let s2 = compute_mul_eq_sum_at_t(&eq_evals, &w_folded, &d_folded, mid, two);
+        let s3 = compute_mul_eq_sum_at_t(&eq_evals, &w_folded, &d_folded, mid, three);
+
+        let inv2 = two.inverse();
+        let inv6 = (SecureField::from(M31::from(6u32))).inverse();
+        let dd1 = s1 - s0;
+        let dd2 = (s2 - s1 - s1 + s0) * inv2;
+        let dd3 = (s3 - s0 - three * (s2 - s1)) * inv6;
+        let c0 = s0;
+        let c1 = dd1 - dd2 + two * dd3;
+        let c2 = dd2 - three * dd3;
+        let c3 = dd3;
+        let rp = RoundPolyDeg3 { c0, c1, c2, c3 };
+        eq_round_polys.push(rp);
+
+        channel.mix_poly_coeffs_deg3(c0, c1, c2, c3);
+        let challenge = channel.draw_qm31();
+        sumcheck_challenges.push(challenge);
+
+        eq_evals = fold_mle(&eq_evals, challenge, mid);
+        w_folded = fold_mle(&w_folded, challenge, mid);
+        d_folded = fold_mle(&d_folded, challenge, mid);
+        cur_n = mid;
+    }
+
+    let w_eval = w_folded[0];
+    let tok_eval_s = evaluate_mle(&token_trace, &sumcheck_challenges);
+    let col_eval_s = evaluate_mle(&col_trace, &sumcheck_challenges);
+    let val_eval_s = evaluate_mle(&value_trace, &sumcheck_challenges);
+
+    mix_secure_field(channel, input_eval);
+    mix_secure_field(channel, output_eval);
+
+    let mut table_tokens = Vec::with_capacity(sparse_entries.len());
+    let mut table_cols = Vec::with_capacity(sparse_entries.len());
+    let mut multiplicities = Vec::with_capacity(sparse_entries.len());
+    for (tok, col, mult) in sparse_entries {
+        table_tokens.push(tok);
+        table_cols.push(col);
+        multiplicities.push(mult);
+    }
+
+    let logup_proof = EmbeddingLogUpProof {
+        eq_round_polys,
+        final_evals: (w_eval, tok_eval_s, col_eval_s, val_eval_s),
+        claimed_sum: trace_sum,
+        table_tokens,
+        table_cols,
+        multiplicities,
+    };
+
+    let claim = GKRClaim {
+        point: input_point,
+        value: input_eval,
+    };
+
+    Ok((
+        LayerProof::Embedding {
+            logup_proof: Some(logup_proof),
+            input_eval,
+            output_eval,
+            input_num_vars,
+        },
+        claim,
+    ))
 }
 
 // =============================================================================
@@ -4382,6 +4914,17 @@ fn get_intermediate<'a>(
         }
     }
     Err(GKRError::MissingIntermediate { node_id })
+}
+
+/// Look up a node output matrix from execution trace.
+fn get_node_output<'a>(
+    execution: &'a GraphExecution,
+    node_id: usize,
+) -> Result<&'a M31Matrix, GKRError> {
+    execution
+        .node_outputs
+        .get(&node_id)
+        .ok_or(GKRError::MissingIntermediate { node_id })
 }
 
 /// Get the two input MLEs for a binary op (Add/Mul) by looking up
