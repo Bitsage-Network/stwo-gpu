@@ -38,6 +38,7 @@ MAX_FEE="0.05"
 MODEL_ID="0x1"
 FORCE_PAYMASTER=false
 FORCE_NO_PAYMASTER=false
+GKR_V2=false
 
 # Passthrough arrays for sub-scripts
 SETUP_ARGS=()
@@ -69,6 +70,7 @@ while [[ $# -gt 0 ]]; do
         --hf-token)        HF_TOKEN_ARG="$2"; shift 2 ;;
         --max-fee)         MAX_FEE="$2"; shift 2 ;;
         --model-id)        MODEL_ID="$2"; shift 2 ;;
+        --gkr-v2)          GKR_V2=true; shift ;;
         --install-drivers) SETUP_ARGS+=("--install-drivers"); shift ;;
         --skip-drivers)    SETUP_ARGS+=("--skip-drivers"); shift ;;
         --branch)          SETUP_ARGS+=("--branch" "$2"); shift 2 ;;
@@ -100,6 +102,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --multi-gpu          Use all GPUs"
             echo "  --gpu-only           Fail if any critical proving path falls back to CPU"
             echo "                       (submit path auto-forces --starknet-ready in step 6)"
+            echo "  --gkr-v2             Use verify_model_gkr_v2 calldata (Phase 1 compat mode=0)"
             echo "  --hf-token TOKEN     HuggingFace API token"
             echo "  --max-fee ETH        Max TX fee (default: 0.05)"
             echo "  --model-id ID        On-chain model ID (default: 0x1)"
@@ -163,6 +166,7 @@ log "Model:       ${PRESET:-${HF_MODEL}}"
 log "Mode:        ${MODE}"
 log "GPU:         ${DO_GPU} (multi: ${DO_MULTI_GPU})"
 log "GPU only:    ${DO_GPU_ONLY}"
+log "GKR v2:      ${GKR_V2}"
 log "Layers:      ${LAYERS:-all}"
 log "Action:      $(if [[ "$DO_SUBMIT" == "true" ]]; then echo "SUBMIT"; else echo "DRY RUN"; fi)"
 log "Run dir:     ${RUN_DIR}"
@@ -308,6 +312,7 @@ if (( START_IDX <= 5 )); then
     [[ "$DO_MULTI_GPU" == "true" ]] && _PROVE_ARGS+=("--multi-gpu")
     [[ "$DO_GPU_ONLY" == "true" ]] && _PROVE_ARGS+=("--gpu-only")
     [[ "$DO_SUBMIT" == "true" ]] && _PROVE_ARGS+=("--starknet-ready")
+    [[ "$GKR_V2" == "true" ]] && _PROVE_ARGS+=("--gkr-v2")
 
     run_step "Proof Generation" "$CURRENT" "$TOTAL_STEPS" \
         bash "${SCRIPT_DIR}/03_prove.sh" "${_PROVE_ARGS[@]}" || exit 1

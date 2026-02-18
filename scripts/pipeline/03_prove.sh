@@ -35,6 +35,7 @@ GKR_FLAG=false
 SALT=""
 SERVER_URL=""
 STARKNET_READY=false
+GKR_V2=false
 
 # ─── Parse Arguments ─────────────────────────────────────────────────
 
@@ -57,6 +58,7 @@ while [[ $# -gt 0 ]]; do
         --skip-commitment)  SKIP_COMMITMENT=true; shift ;;
         --gkr)              GKR_FLAG=true; shift ;;
         --starknet-ready)   STARKNET_READY=true; shift ;;
+        --gkr-v2)           GKR_V2=true; shift ;;
         --salt)             SALT="$2"; shift 2 ;;
         --server)           SERVER_URL="$2"; shift 2 ;;
         -h|--help)
@@ -70,7 +72,7 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Proof mode:"
             echo "  --mode MODE        gkr (default: gkr)"
-            echo "    gkr:        prove-model → GKR calldata for verify_model_gkr()"
+            echo "    gkr:        prove-model → GKR calldata for verify_model_gkr()/verify_model_gkr_v2()"
             echo ""
             echo "Options:"
             echo "  --layers N           Number of transformer layers (default: from config)"
@@ -87,6 +89,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --skip-commitment    Skip weight commitment (faster, can't submit on-chain)"
             echo "  --gkr                Enable GKR for LogUp verification"
             echo "  --starknet-ready     Force sequential weight openings for submit-ready Starknet calldata"
+            echo "  --gkr-v2             Emit verify_model_gkr_v2 calldata (Phase 1 compat mode)"
             echo "  --salt N             Fiat-Shamir channel salt"
             echo "  --server URL         Submit to remote prove-server instead of local binary"
             echo "  -h, --help           Show this help"
@@ -101,6 +104,12 @@ if [[ "$MODE" != "gkr" ]]; then
     err "Only --mode gkr is supported in the hardened pipeline (got: ${MODE})"
     err "Use GKR mode for full on-chain cryptographic verification."
     exit 1
+fi
+
+# Phase 1 safety: v2 calldata currently supports sequential weight binding only.
+if [[ "$GKR_V2" == "true" ]] && [[ "$STARKNET_READY" != "true" ]]; then
+    warn "--gkr-v2 requested; enabling --starknet-ready (Phase 1 requires sequential openings)"
+    STARKNET_READY=true
 fi
 
 # ─── Resolve Model ──────────────────────────────────────────────────
@@ -172,6 +181,10 @@ if [[ "$STARKNET_READY" == "true" ]] && [[ "${GKR_AGG_WEIGHT_BINDING}" == "on" ]
     GKR_AGG_WEIGHT_BINDING="off"
 fi
 export STWO_GKR_AGGREGATE_WEIGHT_BINDING="${GKR_AGG_WEIGHT_BINDING}"
+
+if [[ "$GKR_V2" == "true" ]]; then
+    export STWO_STARKNET_GKR_V2=1
+fi
 
 # Favor GPU fold for heavy weight-opening phases unless caller overrides.
 if [[ "$USE_GPU" == "true" ]] && [[ -z "${STWO_GPU_MLE_FOLD:-}" ]]; then
@@ -299,6 +312,7 @@ log "Output:         ${OUTPUT_DIR}"
 log "prove-model:    ${PROVE_BIN}"
 log "Threads:        RAYON=${RAYON_NUM_THREADS} OMP=${OMP_NUM_THREADS}"
 log "Starknet ready: ${STARKNET_READY}"
+log "GKR entrypoint: $(if [[ "$GKR_V2" == "true" ]]; then echo verify_model_gkr_v2; else echo verify_model_gkr; fi)"
 log "GPU only mode:  ${GPU_ONLY}"
 log "GPU commit:     strict=${GPU_COMMIT_STRICT} harden=${GPU_COMMIT_HARDEN} parallel=${GPU_COMMIT_PARALLEL}"
 log "GPU poly path:  strict=${GPU_POLY_STRICT} harden=${GPU_POLY_HARDEN}"
@@ -596,17 +610,55 @@ assert isinstance(entrypoint, str) and len(entrypoint) > 0, 'verify_calldata.ent
 calldata = vc.get('calldata')
 chunks = vc.get('upload_chunks', [])
 assert isinstance(chunks, list), 'verify_calldata.upload_chunks must be an array'
-if entrypoint == 'verify_model_gkr':
+ready = bool(proof.get('submission_ready', False))
+
+def parse_nat(tok, label):
+    s = str(tok)
+    try:
+        v = int(s, 0)
+    except Exception as e:
+        raise AssertionError(f'invalid {label}: {s} ({e})')
+    if v < 0:
+        raise AssertionError(f'{label} must be >= 0 (got {v})')
+    return v
+
+if entrypoint in ('verify_model_gkr', 'verify_model_gkr_v2'):
+    assert ready is True, f'{entrypoint} requires submission_ready=true'
     assert isinstance(calldata, list) and len(calldata) > 0, 'verify_calldata.calldata must be non-empty array'
-    assert len(chunks) == 0, 'verify_model_gkr should not include upload chunks'
-    assert all(str(v) != '__SESSION_ID__' for v in calldata), 'verify_model_gkr calldata must not include __SESSION_ID__ placeholder'
+    assert len(chunks) == 0, 'verify_model_gkr(*) should not include upload chunks'
+    assert all(str(v) != '__SESSION_ID__' for v in calldata), 'verify_model_gkr(*) calldata must not include __SESSION_ID__ placeholder'
+    mode = proof.get('weight_opening_mode')
+    if mode is not None:
+        assert str(mode) == 'Sequential', f'{entrypoint} requires weight_opening_mode=Sequential (got {mode})'
+    if entrypoint == 'verify_model_gkr_v2':
+        # v2 calldata inserts weight_binding_mode after weight_commitments array.
+        idx = 0
+        idx += 1  # model_id
+        assert idx < len(calldata), 'calldata truncated before raw_io length'
+        raw_io_len = parse_nat(calldata[idx], 'raw_io_data length')
+        idx += 1 + raw_io_len
+        idx += 2  # circuit_depth, num_layers
+        assert idx < len(calldata), 'calldata truncated before matmul_dims length'
+        matmul_len = parse_nat(calldata[idx], 'matmul_dims length')
+        idx += 1 + matmul_len
+        assert idx < len(calldata), 'calldata truncated before dequantize_bits length'
+        deq_len = parse_nat(calldata[idx], 'dequantize_bits length')
+        idx += 1 + deq_len
+        assert idx < len(calldata), 'calldata truncated before proof_data length'
+        proof_data_len = parse_nat(calldata[idx], 'proof_data length')
+        idx += 1 + proof_data_len
+        assert idx < len(calldata), 'calldata truncated before weight_commitments length'
+        wc_len = parse_nat(calldata[idx], 'weight_commitments length')
+        idx += 1 + wc_len
+        assert idx < len(calldata), 'calldata truncated before weight_binding_mode'
+        wb_mode = parse_nat(calldata[idx], 'weight_binding_mode')
+        assert wb_mode == 0, f'Phase 1 verify_model_gkr_v2 requires weight_binding_mode=0 (got {wb_mode})'
     print(f'  verify_calldata: {len(calldata)} felts', file=sys.stderr)
 else:
     # Off-chain / experimental transcript modes are serializable but not submit-ready.
     assert entrypoint == 'unsupported', f'unsupported verify_calldata.entrypoint: {entrypoint}'
     assert isinstance(calldata, list), 'verify_calldata.calldata must be an array'
     mode = proof.get('weight_opening_mode', 'unknown')
-    ready = bool(proof.get('submission_ready', False))
     reason = vc.get('reason') or proof.get('soundness_gate_error') or 'unspecified'
     assert ready is False, 'unsupported verify_calldata must correspond to submission_ready=false'
     claims = proof.get('weight_claim_calldata', [])
@@ -640,6 +692,7 @@ cat > "${OUTPUT_DIR}/metadata.json" << METAEOF
     "model_id": "${MODEL_ID}",
     "gpu": ${USE_GPU},
     "multi_gpu": ${MULTI_GPU},
+    "gkr_v2": ${GKR_V2},
     "security": "${SECURITY}",
     "phase1_seconds": ${PHASE1_SEC},
     "phase2_seconds": ${PHASE2_SEC},

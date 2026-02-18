@@ -95,6 +95,9 @@ cd scripts/pipeline
 # Full pipeline: setup -> download -> validate -> capture -> prove -> verify -> audit
 ./run_e2e.sh --preset qwen3-14b --gpu --submit
 
+# Same flow, using verify_model_gkr_v2 calldata (Phase 1 compat)
+./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v2
+
 # Dry run (no on-chain submission)
 ./run_e2e.sh --preset phi3-mini --gpu --dry-run
 
@@ -154,7 +157,8 @@ STARKNET_PRIVATE_KEY=0x... ./run_e2e.sh --preset qwen3-14b --gpu --submit
 | `STWO_GPU_MLE_FOLD_REQUIRE` | No | Off | Fail if MLE fold falls back to CPU |
 | `STWO_GPU_MLE_OPENING_TREE_REQUIRE` | No | Off | Fail if GPU-resident opening-tree path fails |
 | `STWO_GPU_MLE_OPENING_TIMING` | No | Off | Print per-opening tree/query timing breakdown |
-| `STWO_GKR_AGGREGATE_WEIGHT_BINDING` | No | `on` in `03_prove.sh` fast mode, auto-`off` for `run_e2e.sh --submit` | Batched RLC weight-binding mode (serializable artifact, not submit-ready for Starknet `verify_model_gkr`) |
+| `STWO_STARKNET_GKR_V2` | No | Off | Emit `verify_model_gkr_v2` calldata in `ml_gkr` artifacts |
+| `STWO_GKR_AGGREGATE_WEIGHT_BINDING` | No | `on` in `03_prove.sh` fast mode, auto-`off` for `run_e2e.sh --submit` | Batched RLC weight-binding mode (serializable artifact, not submit-ready for Starknet `verify_model_gkr`/`verify_model_gkr_v2`) |
 
 Notes:
 - The opening path now packs QM31 leaves to felt252 on GPU (no per-round CPU repack/upload), which reduces weight-opening overhead on large models.
@@ -197,7 +201,7 @@ GPU presets in `configs/4090.env`, `configs/b200.env`, `configs/b300.env`.
 
 | Mode | Pipeline | On-Chain Function | Notes |
 |------|----------|-------------------|-------|
-| `gkr` | prove-model (GKR sumcheck) | `verify_model_gkr()` | Hardened production mode. Full on-chain GKR assurance. |
+| `gkr` | prove-model (GKR sumcheck) | `verify_model_gkr()` / `verify_model_gkr_v2()` | Hardened production mode. Full on-chain GKR assurance. |
 
 ## Per-Script Usage
 
@@ -247,6 +251,7 @@ GPU presets in `configs/4090.env`, `configs/b200.env`, `configs/b300.env`.
 ./03_prove.sh --model-name qwen3-14b --mode gkr --multi-gpu
 ./03_prove.sh --model-name qwen3-14b --mode gkr --gpu --gpu-only
 ./03_prove.sh --model-name qwen3-14b --server http://prover:8080
+./03_prove.sh --model-name qwen3-14b --mode gkr --starknet-ready --gkr-v2
 ```
 
 ### 04_verify_onchain.sh
@@ -259,6 +264,13 @@ STARKNET_PRIVATE_KEY=0x... ./04_verify_onchain.sh --submit
 ```
 
 Notes:
+- The submit pipeline accepts `verify_calldata.entrypoint` as
+  `verify_model_gkr` (v1) or `verify_model_gkr_v2` (v2).
+- `--gkr-v2` (or `STWO_STARKNET_GKR_V2=1`) is Phase 1 compatibility mode:
+  only sequential weight binding is accepted (`weight_binding_mode=0`).
+- In `03_prove.sh`, `--gkr-v2` automatically enables `--starknet-ready`.
+- Ensure your deployed verifier includes `verify_model_gkr_v2` before
+  submitting v2 artifacts.
 - If `verify_calldata.entrypoint` is `unsupported` (e.g. aggregated RLC
   weight-binding mode), the script prints `weight_opening_mode` + gate reason.
 - In `--dry-run`, unsupported artifacts are reported and skipped cleanly.
@@ -278,6 +290,7 @@ Notes:
 
 ```bash
 ./run_e2e.sh --preset qwen3-14b --gpu --submit
+./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v2
 ./run_e2e.sh --preset phi3-mini --gpu --dry-run
 ./run_e2e.sh --preset qwen3-14b --gpu --gpu-only --dry-run
 ./run_e2e.sh --preset qwen3-14b --resume-from prove --submit

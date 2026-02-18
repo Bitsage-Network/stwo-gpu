@@ -223,8 +223,11 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
   if (typeof entrypoint !== "string" || entrypoint.length === 0) {
     die("verify_calldata.entrypoint must be a non-empty string");
   }
-  if (entrypoint !== "verify_model_gkr") {
-    die(`Only verify_model_gkr is supported in the hardened pipeline (got: ${entrypoint})`);
+  const allowedEntrypoints = new Set(["verify_model_gkr", "verify_model_gkr_v2"]);
+  if (!allowedEntrypoints.has(entrypoint)) {
+    die(
+      `Only verify_model_gkr / verify_model_gkr_v2 are supported in the hardened pipeline (got: ${entrypoint})`
+    );
   }
 
   const rawCalldata = verifyCalldata.calldata;
@@ -232,20 +235,81 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
     die("verify_calldata.calldata must be a non-empty array");
   }
 
+  if (proofData.submission_ready === false) {
+    const mode = proofData.weight_opening_mode ?? "unknown";
+    const reason =
+      verifyCalldata.reason ?? proofData.soundness_gate_error ?? "unspecified";
+    die(
+      `proof is marked submission_ready=false (entrypoint=${entrypoint}, weight_opening_mode=${mode}, reason=${reason})`
+    );
+  }
+  if (
+    proofData.weight_opening_mode !== undefined &&
+    String(proofData.weight_opening_mode) !== "Sequential"
+  ) {
+    die(
+      `${entrypoint} requires weight_opening_mode=Sequential (got: ${proofData.weight_opening_mode})`
+    );
+  }
+
   const rawChunks = verifyCalldata.upload_chunks ?? [];
   if (!Array.isArray(rawChunks)) {
     die("verify_calldata.upload_chunks must be an array");
   }
   if (rawChunks.length > 0) {
-    die("verify_model_gkr payload must not include upload_chunks");
+    die("verify_model_gkr(*) payload must not include upload_chunks");
   }
 
   const hasSessionPlaceholder = rawCalldata.some((v) => String(v) === "__SESSION_ID__");
   if (hasSessionPlaceholder) {
-    die("verify_model_gkr calldata must not include __SESSION_ID__ placeholder");
+    die("verify_model_gkr(*) calldata must not include __SESSION_ID__ placeholder");
   }
 
   const calldata = rawCalldata.map((v) => String(v));
+  const parseNat = (token, label) => {
+    const s = String(token);
+    let n;
+    try {
+      n = s.startsWith("0x") || s.startsWith("0X") ? Number(BigInt(s)) : Number(s);
+    } catch (e) {
+      die(`invalid ${label}: ${s} (${e.message || e})`);
+    }
+    if (!Number.isSafeInteger(n) || n < 0) {
+      die(`invalid ${label}: ${s}`);
+    }
+    return n;
+  };
+
+  if (entrypoint === "verify_model_gkr_v2") {
+    // model_id, raw_io_data, circuit_depth, num_layers, matmul_dims,
+    // dequantize_bits, proof_data, weight_commitments, weight_binding_mode, weight_openings...
+    let idx = 0;
+    idx += 1;
+    if (idx >= calldata.length) die("v2 calldata truncated before raw_io length");
+    const rawIoLen = parseNat(calldata[idx], "raw_io_data length");
+    idx += 1 + rawIoLen;
+    idx += 2;
+    if (idx >= calldata.length) die("v2 calldata truncated before matmul_dims length");
+    const matmulLen = parseNat(calldata[idx], "matmul_dims length");
+    idx += 1 + matmulLen;
+    if (idx >= calldata.length) die("v2 calldata truncated before dequantize_bits length");
+    const deqLen = parseNat(calldata[idx], "dequantize_bits length");
+    idx += 1 + deqLen;
+    if (idx >= calldata.length) die("v2 calldata truncated before proof_data length");
+    const proofDataLen = parseNat(calldata[idx], "proof_data length");
+    idx += 1 + proofDataLen;
+    if (idx >= calldata.length) die("v2 calldata truncated before weight_commitments length");
+    const weightCommitmentsLen = parseNat(calldata[idx], "weight_commitments length");
+    idx += 1 + weightCommitmentsLen;
+    if (idx >= calldata.length) die("v2 calldata truncated before weight_binding_mode");
+    const weightBindingMode = parseNat(calldata[idx], "weight_binding_mode");
+    if (weightBindingMode !== 0) {
+      die(
+        `Phase 1 verify_model_gkr_v2 requires weight_binding_mode=0 (got ${weightBindingMode})`
+      );
+    }
+  }
+
   const uploadChunks = [];
   const sessionId = null;
 
@@ -384,8 +448,10 @@ async function cmdVerify(args) {
   const verifyPayload = parseVerifyCalldata(proofData, modelIdArg);
   const modelId = verifyPayload.modelId || modelIdArg;
 
-  if (verifyPayload.entrypoint !== "verify_model_gkr") {
-    die(`Only verify_model_gkr is supported in the hardened pipeline (got: ${verifyPayload.entrypoint})`);
+  if (!new Set(["verify_model_gkr", "verify_model_gkr_v2"]).has(verifyPayload.entrypoint)) {
+    die(
+      `Only verify_model_gkr / verify_model_gkr_v2 are supported in the hardened pipeline (got: ${verifyPayload.entrypoint})`
+    );
   }
 
   if (

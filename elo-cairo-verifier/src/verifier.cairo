@@ -178,6 +178,25 @@ pub trait ISumcheckVerifier<TContractState> {
         weight_opening_proofs: Array<MleOpeningProof>,
     ) -> bool;
 
+    /// Versioned full on-chain ZKML verification path.
+    ///
+    /// Phase 1 compatibility mode:
+    ///   - `weight_binding_mode = 0` maps to the existing sequential opening flow.
+    ///   - Any other mode is rejected.
+    fn verify_model_gkr_v2(
+        ref self: TContractState,
+        model_id: felt252,
+        raw_io_data: Array<felt252>,
+        circuit_depth: u32,
+        num_layers: u32,
+        matmul_dims: Array<u32>,
+        dequantize_bits: Array<u64>,
+        proof_data: Array<felt252>,
+        weight_commitments: Array<felt252>,
+        weight_binding_mode: u32,
+        weight_opening_proofs: Array<MleOpeningProof>,
+    ) -> bool;
+
     /// Get the circuit descriptor hash for a GKR-registered model.
     fn get_model_circuit_hash(self: @TContractState, model_id: felt252) -> felt252;
 
@@ -1454,6 +1473,34 @@ mod SumcheckVerifierContract {
             });
 
             true
+        }
+
+        fn verify_model_gkr_v2(
+            ref self: ContractState,
+            model_id: felt252,
+            raw_io_data: Array<felt252>,
+            circuit_depth: u32,
+            num_layers: u32,
+            matmul_dims: Array<u32>,
+            dequantize_bits: Array<u64>,
+            proof_data: Array<felt252>,
+            weight_commitments: Array<felt252>,
+            weight_binding_mode: u32,
+            weight_opening_proofs: Array<MleOpeningProof>,
+        ) -> bool {
+            assert!(weight_binding_mode == 0, "UNSUPPORTED_WEIGHT_BINDING_MODE");
+            Self::verify_model_gkr(
+                ref self,
+                model_id,
+                raw_io_data,
+                circuit_depth,
+                num_layers,
+                matmul_dims,
+                dequantize_bits,
+                proof_data,
+                weight_commitments,
+                weight_opening_proofs,
+            )
         }
 
         fn get_model_circuit_hash(self: @ContractState, model_id: felt252) -> felt252 {
