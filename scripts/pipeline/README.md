@@ -176,6 +176,7 @@ Notes:
 - `03_prove.sh` defaults `STWO_PURE_GKR_SKIP_UNIFIED_STARK=1` for `ml_gkr`, which bypasses Phase 3 when GKR already covers activation/add/mul/layernorm/rmsnorm/dequantize.
 - In aggregated weight-binding mode, `ml_gkr` output still serializes full proof artifacts with `submission_ready=false`, `weight_opening_mode`, `weight_claim_calldata`, and versioned `weight_binding_*` metadata.
 - v3 mode 2 (`STWO_GKR_TRUSTLESS_MODE2=1`) is submit-ready and keeps full opening proofs while adding explicit `weight_binding_data` payload checks; mode-2 openings now use the same sub-channel transcript strategy as batched mode.
+- v4 aggregated-opening redesign spec (eliminate per-weight openings): `stwo-ml/docs/fast-gkr-onchain-v4-aggregated-openings.md`.
 
 ## Model Presets
 

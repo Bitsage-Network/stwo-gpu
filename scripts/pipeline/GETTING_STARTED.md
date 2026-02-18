@@ -290,6 +290,8 @@ export STWO_PURE_GKR_SKIP_UNIFIED_STARK=0
   for versioned mode-2 migration plumbing.
 - For submit-ready v3 mode-2 payload checks (opening proofs retained), use
   `--gkr-v3-mode2` or `STWO_GKR_TRUSTLESS_MODE2=1`.
+- The protocol-level v4 design to eliminate per-weight openings is tracked in
+  `stwo-ml/docs/fast-gkr-onchain-v4-aggregated-openings.md`.
 
 To generate submit-ready Starknet calldata with the default fast trustless profile (v3 mode2), run:
 ```bash

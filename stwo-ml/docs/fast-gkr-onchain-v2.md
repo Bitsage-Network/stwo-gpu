@@ -2,6 +2,9 @@
 
 ## Problem
 
+For the next major redesign that removes per-weight openings entirely, see:
+`stwo-ml/docs/fast-gkr-onchain-v4-aggregated-openings.md`.
+
 Current `ml_gkr` has two practical modes:
 
 1. `Sequential` weight openings (`--starknet-ready`)
