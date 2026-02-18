@@ -38,6 +38,7 @@ STARKNET_READY=false
 GKR_V2=false
 GKR_V3=false
 GKR_V3_MODE2=false
+LEGACY_GKR_V1=false
 
 # ─── Parse Arguments ─────────────────────────────────────────────────
 
@@ -63,6 +64,7 @@ while [[ $# -gt 0 ]]; do
         --gkr-v2)           GKR_V2=true; shift ;;
         --gkr-v3)           GKR_V3=true; shift ;;
         --gkr-v3-mode2)     GKR_V3_MODE2=true; GKR_V3=true; shift ;;
+        --legacy-gkr-v1)    LEGACY_GKR_V1=true; shift ;;
         --salt)             SALT="$2"; shift 2 ;;
         --server)           SERVER_URL="$2"; shift 2 ;;
         -h|--help)
@@ -92,10 +94,11 @@ while [[ $# -gt 0 ]]; do
             echo "  --skip-build         Skip building binaries"
             echo "  --skip-commitment    Skip weight commitment (faster, can't submit on-chain)"
             echo "  --gkr                Enable GKR for LogUp verification"
-            echo "  --starknet-ready     Force sequential weight openings for submit-ready Starknet calldata"
+            echo "  --starknet-ready     Enable submit-ready artifact gates (defaults to fast v3 mode2 unless legacy)"
             echo "  --gkr-v2             Emit verify_model_gkr_v2 calldata (mode-aware v2 path)"
             echo "  --gkr-v3             Emit verify_model_gkr_v3 calldata (v3 envelope, mode-aware)"
             echo "  --gkr-v3-mode2       Enable verify_model_gkr_v3 mode=2 (trustless payload + opening checks)"
+            echo "  --legacy-gkr-v1      Keep legacy verify_model_gkr v1 sequential-opening submit path"
             echo "  --salt N             Fiat-Shamir channel salt"
             echo "  --server URL         Submit to remote prove-server instead of local binary"
             echo "  -h, --help           Show this help"
@@ -128,6 +131,22 @@ fi
 if [[ "$GKR_V2" == "true" && "$GKR_V3" == "true" ]]; then
     warn "Both --gkr-v2 and --gkr-v3 were set; preferring v3 entrypoint."
     GKR_V2=false
+fi
+
+if [[ "$LEGACY_GKR_V1" == "true" ]] && [[ "$GKR_V2" == "true" || "$GKR_V3" == "true" || "$GKR_V3_MODE2" == "true" ]]; then
+    warn "--legacy-gkr-v1 ignored because a v2/v3 entrypoint was explicitly selected."
+    LEGACY_GKR_V1=false
+fi
+
+if [[ "$STARKNET_READY" == "true" ]] && [[ "$GKR_V2" != "true" ]] && [[ "$GKR_V3" != "true" ]]; then
+    if [[ "${LEGACY_GKR_V1}" == "true" ]]; then
+        warn "--starknet-ready + --legacy-gkr-v1: using verify_model_gkr (v1 sequential openings)."
+    else
+        warn "--starknet-ready requested without v2/v3 selector; defaulting to verify_model_gkr_v3 mode2 (fast trustless submit path)."
+        warn "Use --legacy-gkr-v1 to force verify_model_gkr (v1 sequential openings)."
+        GKR_V3=true
+        GKR_V3_MODE2=true
+    fi
 fi
 
 # ─── Resolve Model ──────────────────────────────────────────────────
@@ -368,6 +387,7 @@ else
     _GKR_ENTRYPOINT="verify_model_gkr"
 fi
 log "GKR entrypoint: ${_GKR_ENTRYPOINT}"
+log "Legacy v1 path: ${LEGACY_GKR_V1}"
 log "GPU only mode:  ${GPU_ONLY}"
 log "GPU commit:     strict=${GPU_COMMIT_STRICT} harden=${GPU_COMMIT_HARDEN} parallel=${GPU_COMMIT_PARALLEL}"
 log "GPU poly path:  strict=${GPU_POLY_STRICT} harden=${GPU_POLY_HARDEN}"
@@ -794,6 +814,7 @@ cat > "${OUTPUT_DIR}/metadata.json" << METAEOF
     "gkr_v2": ${GKR_V2},
     "gkr_v3": ${GKR_V3},
     "gkr_v3_mode2": ${GKR_V3_MODE2},
+    "legacy_gkr_v1": ${LEGACY_GKR_V1},
     "security": "${SECURITY}",
     "phase1_seconds": ${PHASE1_SEC},
     "phase2_seconds": ${PHASE2_SEC},

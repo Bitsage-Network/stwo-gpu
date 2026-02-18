@@ -41,6 +41,7 @@ FORCE_NO_PAYMASTER=false
 GKR_V2=false
 GKR_V3=false
 GKR_V2_MODE="auto"  # auto|sequential|batched|mode2 (mode2 requires --gkr-v3)
+LEGACY_GKR_V1=false
 
 # Passthrough arrays for sub-scripts
 SETUP_ARGS=()
@@ -75,6 +76,7 @@ while [[ $# -gt 0 ]]; do
         --gkr-v2)          GKR_V2=true; shift ;;
         --gkr-v3)          GKR_V3=true; shift ;;
         --gkr-v2-mode)     GKR_V2_MODE="$2"; shift 2 ;;
+        --legacy-gkr-v1)   LEGACY_GKR_V1=true; shift ;;
         --install-drivers) SETUP_ARGS+=("--install-drivers"); shift ;;
         --skip-drivers)    SETUP_ARGS+=("--skip-drivers"); shift ;;
         --branch)          SETUP_ARGS+=("--branch" "$2"); shift 2 ;;
@@ -109,7 +111,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --gkr-v2             Use verify_model_gkr_v2 calldata"
             echo "  --gkr-v3             Use verify_model_gkr_v3 calldata (v3 envelope)"
             echo "  --gkr-v2-mode MODE   v2/v3 weight-opening mode: auto|sequential|batched|mode2"
-            echo "                       auto(default): prefer batched on GPU submit path"
+            echo "                       auto(default): submit path prefers mode2 on v3"
+            echo "  --legacy-gkr-v1      Keep legacy verify_model_gkr (v1 sequential openings)"
             echo "  --hf-token TOKEN     HuggingFace API token"
             echo "  --max-fee ETH        Max TX fee (default: 0.05)"
             echo "  --model-id ID        On-chain model ID (default: 0x1)"
@@ -170,9 +173,31 @@ if [[ "${GKR_V2_MODE,,}" == "mode2" ]] && [[ "$GKR_V3" != "true" ]]; then
     exit 1
 fi
 
+if [[ "$LEGACY_GKR_V1" == "true" ]] && [[ "$GKR_V2" == "true" || "$GKR_V3" == "true" ]]; then
+    warn "--legacy-gkr-v1 ignored because a v2/v3 entrypoint was explicitly selected."
+    LEGACY_GKR_V1=false
+fi
+
 if [[ "$DO_SUBMIT" == "false" ]] && [[ "$DO_DRY_RUN" == "false" ]]; then
     warn "Neither --submit nor --dry-run specified. Defaulting to --dry-run."
     DO_DRY_RUN=true
+fi
+
+if [[ "$DO_SUBMIT" == "true" ]] && [[ "$MODE" == "gkr" ]] && [[ "$GKR_V2" != "true" ]] && [[ "$GKR_V3" != "true" ]]; then
+    if [[ "$LEGACY_GKR_V1" == "true" ]]; then
+        warn "--submit + --legacy-gkr-v1: keeping verify_model_gkr (v1 sequential openings)."
+    else
+        warn "--submit requested without --gkr-v2/--gkr-v3; defaulting to verify_model_gkr_v3 mode2 (fast trustless submit path)."
+        GKR_V3=true
+        if [[ "${GKR_V2_MODE,,}" == "auto" ]]; then
+            GKR_V2_MODE="mode2"
+        fi
+    fi
+fi
+
+if [[ "$DO_SUBMIT" == "true" ]] && [[ "$GKR_V3" == "true" ]] && [[ "${GKR_V2_MODE,,}" == "auto" ]] && [[ "$LEGACY_GKR_V1" != "true" ]]; then
+    warn "--submit + --gkr-v3 with auto mode: defaulting to mode2 trustless binding."
+    GKR_V2_MODE="mode2"
 fi
 
 # ─── Start ───────────────────────────────────────────────────────────
@@ -197,6 +222,7 @@ log "GPU only:    ${DO_GPU_ONLY}"
 log "GKR v2:      ${GKR_V2}"
 log "GKR v3:      ${GKR_V3}"
 log "GKR v2 mode: ${GKR_V2_MODE}"
+log "Legacy v1:   ${LEGACY_GKR_V1}"
 log "Layers:      ${LAYERS:-all}"
 log "Action:      $(if [[ "$DO_SUBMIT" == "true" ]]; then echo "SUBMIT"; else echo "DRY RUN"; fi)"
 log "Run dir:     ${RUN_DIR}"
@@ -344,6 +370,7 @@ if (( START_IDX <= 5 )); then
     [[ "$DO_SUBMIT" == "true" ]] && _PROVE_ARGS+=("--starknet-ready")
     [[ "$GKR_V2" == "true" ]] && _PROVE_ARGS+=("--gkr-v2")
     [[ "$GKR_V3" == "true" ]] && _PROVE_ARGS+=("--gkr-v3")
+    [[ "$LEGACY_GKR_V1" == "true" ]] && _PROVE_ARGS+=("--legacy-gkr-v1")
 
     _PROVE_ENV=()
     if [[ "$GKR_V2" == "true" || "$GKR_V3" == "true" ]]; then

@@ -291,9 +291,14 @@ export STWO_PURE_GKR_SKIP_UNIFIED_STARK=0
 - For submit-ready v3 mode-2 payload checks (opening proofs retained), use
   `--gkr-v3-mode2` or `STWO_GKR_TRUSTLESS_MODE2=1`.
 
-To force submit-ready Starknet calldata (v1 sequential openings), run:
+To generate submit-ready Starknet calldata with the default fast trustless profile (v3 mode2), run:
 ```bash
 ./03_prove.sh --model-name qwen3-14b --gpu --starknet-ready
+```
+
+To force legacy submit-ready v1 sequential openings, run:
+```bash
+./03_prove.sh --model-name qwen3-14b --gpu --starknet-ready --legacy-gkr-v1
 ```
 
 To emit v2 calldata (`verify_model_gkr_v2`) with the same sequential
@@ -367,7 +372,7 @@ For v3, it enforces:
 - non-empty `weight_binding_data` in mode `2`
 If the target contract does not expose your requested entrypoint
 (`verify_model_gkr_v2` or `verify_model_gkr_v3`), submit with v1
-(`--starknet-ready` without `--gkr-v2/--gkr-v3`) or deploy the upgraded verifier first.
+(`--starknet-ready --legacy-gkr-v1`) or deploy the upgraded verifier first.
 The paymaster submit path now preflights contract ABI support and fails fast
 before transaction submission when the requested entrypoint is missing.
 
@@ -395,8 +400,11 @@ The script will:
 # Same flow, but emit/submit verify_model_gkr_v2 calldata
 ./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v2
 
-# Same flow, but emit/submit verify_model_gkr_v3 calldata
+# Same flow, but emit/submit verify_model_gkr_v3 calldata (auto mode2 on submit path)
 ./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v3
+
+# Keep legacy v1 sequential openings on submit path
+./run_e2e.sh --preset qwen3-14b --gpu --submit --legacy-gkr-v1
 
 # Force v2 sequential mode (weight_binding_mode=0)
 ./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v2 --gkr-v2-mode sequential

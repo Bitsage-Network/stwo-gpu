@@ -98,7 +98,7 @@ cd scripts/pipeline
 # Same flow, using verify_model_gkr_v2 calldata
 ./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v2
 
-# Same flow, using verify_model_gkr_v3 calldata (v3 envelope; mode 0/1)
+# Same flow, using verify_model_gkr_v3 calldata (defaults to mode2 on submit path)
 ./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v3
 
 # Dry run (no on-chain submission)
@@ -170,7 +170,8 @@ Notes:
 - The opening path now packs QM31 leaves to felt252 on GPU (no per-round CPU repack/upload), which reduces weight-opening overhead on large models.
 - Query extraction now replays folds on GPU and downloads only queried leaf pairs (instead of full folded layers), reducing opening-phase host transfer pressure.
 - `03_prove.sh` defaults to aggregated RLC weight binding for faster off-chain proving.
-- `run_e2e.sh --submit` auto-adds `--starknet-ready`; with `--gkr-v2/--gkr-v3 --gpu`, batched sub-channel openings are enabled by default.
+- `run_e2e.sh --submit` auto-adds `--starknet-ready` and defaults to `verify_model_gkr_v3` mode2 unless `--legacy-gkr-v1` is set.
+- `run_e2e.sh --submit --gkr-v3` with `--gkr-v2-mode auto` now defaults to `mode2`.
 - Unified STARK now retries once on SIMD if GPU path hits `ConstraintsNotSatisfied` (soundness-preserving fallback). Set `--gpu-only` or `STWO_UNIFIED_STARK_NO_FALLBACK=1` to fail closed instead.
 - `03_prove.sh` defaults `STWO_PURE_GKR_SKIP_UNIFIED_STARK=1` for `ml_gkr`, which bypasses Phase 3 when GKR already covers activation/add/mul/layernorm/rmsnorm/dequantize.
 - In aggregated weight-binding mode, `ml_gkr` output still serializes full proof artifacts with `submission_ready=false`, `weight_opening_mode`, `weight_claim_calldata`, and versioned `weight_binding_*` metadata.
@@ -258,9 +259,11 @@ GPU presets in `configs/4090.env`, `configs/b200.env`, `configs/b300.env`.
 ./03_prove.sh --model-name qwen3-14b --mode gkr --multi-gpu
 ./03_prove.sh --model-name qwen3-14b --mode gkr --gpu --gpu-only
 ./03_prove.sh --model-name qwen3-14b --server http://prover:8080
+./03_prove.sh --model-name qwen3-14b --mode gkr --starknet-ready                # defaults to v3 mode2
 ./03_prove.sh --model-name qwen3-14b --mode gkr --starknet-ready --gkr-v2
 ./03_prove.sh --model-name qwen3-14b --mode gkr --starknet-ready --gkr-v3
 ./03_prove.sh --model-name qwen3-14b --mode gkr --starknet-ready --gkr-v3-mode2
+./03_prove.sh --model-name qwen3-14b --mode gkr --starknet-ready --legacy-gkr-v1
 ```
 
 ### 04_verify_onchain.sh
@@ -283,10 +286,12 @@ Notes:
   - `weight_binding_mode=0` (Sequential, `weight_binding_data=[]`)
   - `weight_binding_mode=1` (BatchedSubchannelV1, `weight_binding_data=[]`)
   - `weight_binding_mode=2` (AggregatedTrustlessV2, non-empty `weight_binding_data`)
+- In `03_prove.sh`, `--starknet-ready` with no explicit v2/v3 selector defaults to `verify_model_gkr_v3` mode2.
+- Use `--legacy-gkr-v1` to force `verify_model_gkr` (v1 sequential openings).
 - In `03_prove.sh`, `--gkr-v2` automatically enables `--starknet-ready`.
 - In `03_prove.sh`, `--gkr-v3` automatically enables `--starknet-ready`.
 - In `run_e2e.sh`, use `--gkr-v2-mode auto|sequential|batched|mode2` to control v2/v3 opening mode.
-- `--gkr-v2-mode auto` (default) prefers batched on GPU submit path.
+- `--gkr-v2-mode auto` defaults to `mode2` on submit + v3, otherwise follows `03_prove.sh` defaults.
 - Ensure your deployed verifier includes the requested entrypoint
   (`verify_model_gkr_v2` or `verify_model_gkr_v3`) before submitting artifacts.
 - Paymaster path now preflights ABI support and fails fast if the target
@@ -315,6 +320,7 @@ Notes:
 ./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v2 --gkr-v2-mode batched
 ./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v2 --gkr-v2-mode sequential
 ./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v3 --gkr-v2-mode mode2
+./run_e2e.sh --preset qwen3-14b --gpu --submit --legacy-gkr-v1
 ./run_e2e.sh --preset phi3-mini --gpu --dry-run
 ./run_e2e.sh --preset qwen3-14b --gpu --gpu-only --dry-run
 ./run_e2e.sh --preset qwen3-14b --resume-from prove --submit
