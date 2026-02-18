@@ -121,9 +121,13 @@ find_llama_bin() {
     for candidate in \
         "${ll_dir}/build/bin/llama-cli" \
         "${ll_dir}/build/bin/llama-run" \
+        "${ll_dir}/build/bin/llama-completion" \
+        "${ll_dir}/build/bin/llama-mtmd-cli" \
         "${ll_dir}/build/bin/main" \
         "$(command -v llama-cli 2>/dev/null || echo "")" \
-        "$(command -v llama-run 2>/dev/null || echo "")"; do
+        "$(command -v llama-run 2>/dev/null || echo "")" \
+        "$(command -v llama-completion 2>/dev/null || echo "")" \
+        "$(command -v llama-mtmd-cli 2>/dev/null || echo "")"; do
         if [[ -n "$candidate" ]] && [[ -f "$candidate" ]]; then
             echo "$candidate"
             return 0
@@ -132,6 +136,8 @@ find_llama_bin() {
     for candidate in \
         "$(find "${ll_dir}/build" -name "llama-cli" -type f 2>/dev/null | head -1)" \
         "$(find "${ll_dir}/build" -name "llama-run" -type f 2>/dev/null | head -1)" \
+        "$(find "${ll_dir}/build" -name "llama-completion" -type f 2>/dev/null | head -1)" \
+        "$(find "${ll_dir}/build" -name "llama-mtmd-cli" -type f 2>/dev/null | head -1)" \
         "$(find "${ll_dir}/build" -name "main" -type f 2>/dev/null | head -1)"; do
         if [[ -n "$candidate" ]] && [[ -f "$candidate" ]]; then
             echo "$candidate"
@@ -193,7 +199,7 @@ else
 
     LLAMA_CLI="$(find_llama_bin "$LLAMA_DIR" || true)"
     if [[ -z "$LLAMA_CLI" ]]; then
-        err "llama.cpp build failed — no runnable CLI binary found (llama-cli/llama-run/main)"
+        err "llama.cpp build failed — no runnable CLI binary found (llama-cli/llama-run/llama-completion/llama-mtmd-cli/main)"
         exit 1
     fi
     ok "llama.cpp built: ${LLAMA_CLI}"

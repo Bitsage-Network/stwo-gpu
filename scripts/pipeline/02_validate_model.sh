@@ -203,7 +203,9 @@ if [[ "$FULL" == "true" ]]; then
     header "Test Proof (1 layer)"
 
     TEST_OUTPUT="/tmp/obelysk_test_proof_$(date +%s).json"
-    TEST_ARGS=("--model-dir" "$MODEL_DIR" "--layers" "1" "--output" "$TEST_OUTPUT" "--format" "json")
+    # Use the hardened GKR proof format for smoke testing to match production
+    # proving flow and avoid Unified STARK path noise in validation.
+    TEST_ARGS=("--model-dir" "$MODEL_DIR" "--layers" "1" "--output" "$TEST_OUTPUT" "--format" "ml_gkr")
 
     # Enable GPU if available
     if [[ "$(get_state "gpu_config.env" "GPU_AVAILABLE" 2>/dev/null)" == "true" ]]; then
@@ -214,7 +216,7 @@ if [[ "$FULL" == "true" ]]; then
     log "Command: ${PROVE_BIN} ${TEST_ARGS[*]}"
     echo ""
 
-    if run_cmd "${PROVE_BIN}" "${TEST_ARGS[@]}" 2>&1; then
+    if env STWO_PURE_GKR_SKIP_UNIFIED_STARK=1 run_cmd "${PROVE_BIN}" "${TEST_ARGS[@]}" 2>&1; then
         if [[ -f "$TEST_OUTPUT" ]]; then
             TEST_SIZE=$(du -h "$TEST_OUTPUT" | cut -f1)
             ok "Test proof generated: ${TEST_OUTPUT} (${TEST_SIZE})"
