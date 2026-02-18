@@ -33,6 +33,7 @@ INPUT_FILE=""
 SKIP_COMMITMENT=false
 SKIP_BUILD=false
 LOG_DIR_OVERRIDE=""
+CAPTURE_TIMEOUT_SEC="${CAPTURE_TIMEOUT_SEC:-3600}"
 
 # ─── Parse Arguments ─────────────────────────────────────────────────
 
@@ -176,25 +177,64 @@ if [[ "$SKIP_COMMITMENT" == "true" ]]; then
 fi
 
 log "Command: ${CAPTURE_CMD[*]}"
+log "Capture timeout: ${CAPTURE_TIMEOUT_SEC}s"
 echo ""
 
 # ─── Run Capture ─────────────────────────────────────────────────────
 
 step "2b.1" "Running inference capture..."
+CAPTURE_RUN_LOG="/tmp/obelysk_capture_$(date +%s).log"
+: > "$CAPTURE_RUN_LOG"
 
-CAPTURE_OUTPUT=$("${CAPTURE_CMD[@]}" 2>&1) || {
-    err "Inference capture failed"
-    echo "$CAPTURE_OUTPUT"
-    exit 1
+"${CAPTURE_CMD[@]}" >"$CAPTURE_RUN_LOG" 2>&1 &
+CAPTURE_PID=$!
+tail -n +1 -f "$CAPTURE_RUN_LOG" &
+TAIL_PID=$!
+CAPTURE_STARTED_AT=$(date +%s)
+
+_stop_capture_process() {
+    local pid="$1"
+    [[ -z "$pid" ]] && return 0
+    pkill -TERM -P "$pid" 2>/dev/null || true
+    kill -TERM "$pid" 2>/dev/null || true
+    sleep 1
+    pkill -KILL -P "$pid" 2>/dev/null || true
+    kill -KILL "$pid" 2>/dev/null || true
 }
 
-# Show prover stderr output (progress messages)
-echo "$CAPTURE_OUTPUT" | grep -v '^CAPTURE_' || true
+trap '_stop_capture_process "$CAPTURE_PID"; kill "$TAIL_PID" 2>/dev/null || true; trap - INT TERM; exit 130' INT TERM
+
+while kill -0 "$CAPTURE_PID" 2>/dev/null; do
+    sleep 15
+    if ! kill -0 "$CAPTURE_PID" 2>/dev/null; then
+        break
+    fi
+    ELAPSED_CAPTURE=$(( $(date +%s) - CAPTURE_STARTED_AT ))
+    log "Capture still running... ${ELAPSED_CAPTURE}s elapsed"
+    if (( ELAPSED_CAPTURE >= CAPTURE_TIMEOUT_SEC )); then
+        warn "Capture timeout (${CAPTURE_TIMEOUT_SEC}s) reached, terminating..."
+        _stop_capture_process "$CAPTURE_PID"
+        break
+    fi
+done
+
+wait "$CAPTURE_PID" 2>/dev/null
+CAPTURE_RC=$?
+kill "$TAIL_PID" 2>/dev/null || true
+wait "$TAIL_PID" 2>/dev/null || true
+trap - INT TERM
+
+if (( CAPTURE_RC != 0 )); then
+    err "Inference capture failed"
+    tail -n 200 "$CAPTURE_RUN_LOG" 2>/dev/null || true
+    exit 1
+fi
 
 # Parse machine-readable lines
-CAPTURED_LOG_DIR=$(echo "$CAPTURE_OUTPUT" | grep '^CAPTURE_LOG_DIR=' | head -1 | cut -d= -f2-)
-CAPTURED_COUNT=$(echo "$CAPTURE_OUTPUT" | grep '^CAPTURE_COUNT=' | head -1 | cut -d= -f2-)
-CAPTURED_MODEL=$(echo "$CAPTURE_OUTPUT" | grep '^CAPTURE_MODEL=' | head -1 | cut -d= -f2-)
+CAPTURED_LOG_DIR=$(grep '^CAPTURE_LOG_DIR=' "$CAPTURE_RUN_LOG" | head -1 | cut -d= -f2-)
+CAPTURED_COUNT=$(grep '^CAPTURE_COUNT=' "$CAPTURE_RUN_LOG" | head -1 | cut -d= -f2-)
+CAPTURED_MODEL=$(grep '^CAPTURE_MODEL=' "$CAPTURE_RUN_LOG" | head -1 | cut -d= -f2-)
+rm -f "$CAPTURE_RUN_LOG" 2>/dev/null || true
 
 # ─── Verify Output ───────────────────────────────────────────────────
 

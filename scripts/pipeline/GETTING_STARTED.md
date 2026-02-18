@@ -198,6 +198,9 @@ The log is saved to `~/.obelysk/logs/<model_name>/` and contains:
 - `log.jsonl` — chain-linked inference entries (each entry hashes the previous)
 - `matrices.bin` — M31 matrix data for input/output replay
 
+`02b_capture_inference.sh` now streams capture output live with a 15s heartbeat.
+Use `CAPTURE_TIMEOUT_SEC` (default `3600`) to bound capture runtime.
+
 ---
 
 ### Step 3 — Generate the Proof
