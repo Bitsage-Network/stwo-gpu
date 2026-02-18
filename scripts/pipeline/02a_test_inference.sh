@@ -22,7 +22,7 @@ source "${SCRIPT_DIR}/lib/common.sh"
 
 MODEL_NAME=""
 MODEL_DIR=""
-PROMPT="Explain why 2+2=4 in two short sentences, then give one practical example."
+PROMPT="In exactly 4 concise bullet points, explain the attention mechanism in transformers. Do not include <think> tags."
 DO_CHAT=false
 DO_BENCHMARK=false
 GPU_LAYERS=99
@@ -384,6 +384,7 @@ elif [[ "$DO_BENCHMARK" == "true" ]]; then
         "$LLAMA_CLI" \
         -m "$GGUF_PATH" \
         -ngl "$GPU_LAYERS" \
+        -no-cnv \
         -p "Write a detailed essay about the history of mathematics." \
         -n 512 \
         --no-display-prompt || true
@@ -413,13 +414,16 @@ else
     log "GPU layers: ${GPU_LAYERS}"
     echo ""
 
+    TEST_PROMPT="${PROMPT}"$'\n'"Respond with final answer only. Do not include internal reasoning."
+
     log "Streaming model output (timeout: ${INFERENCE_TIMEOUT_SEC}s)..."
     TEST_LOG="/tmp/obelysk_infer_test_$(date +%s).log"
     run_llama_with_live_output "$TEST_LOG" \
         "$LLAMA_CLI" \
         -m "$GGUF_PATH" \
         -ngl "$GPU_LAYERS" \
-        -p "$PROMPT" \
+        -no-cnv \
+        -p "$TEST_PROMPT" \
         -n 128 \
         --no-display-prompt || true
 
