@@ -159,26 +159,33 @@ Ensure v2 covers all needed layer tags in Cairo walk for target production model
    - Submission now checks target contract ABI for requested entrypoint before TX build.
    - Missing `verify_model_gkr_v2` fails fast with actionable guidance.
 
-## Phase 3 step-2 (interface skeleton + hardened integration)
+## Phase 3 step-2 (implemented): v3 mode-2 trustless payload checks
 
 1. Contract:
    - Added `verify_model_gkr_v3(...)` entrypoint.
    - Added explicit `weight_binding_data: Array<felt252>`.
    - Modes `0/1` delegate to existing trustless opening verification.
-   - Mode `2` is fail-closed (`MODE2_NOT_IMPLEMENTED`) until aggregated trustless binding is fully implemented/audited.
+   - Mode `2` is now submit-ready with strict payload checks:
+     - `weight_binding_data == [binding_digest, claim_count]`
+     - digest is recomputed on-chain from resolved commitments + weight claims.
+   - Full MLE opening proofs are still required in mode `2` (no soundness downgrade).
 2. Rust serializers:
    - Added `build_verify_model_gkr_v3_calldata(...)`.
    - v3 layout = v2 + `weight_binding_data` array.
-   - For submit-ready modes (`0/1`), `weight_binding_data` is currently empty.
+   - For submit-ready modes:
+     - mode `0/1`: `weight_binding_data=[]`
+     - mode `2`: non-empty payload `[binding_digest, claim_count]`
    - Artifact now carries versioned binding metadata:
      - `weight_binding_schema_version`
      - `weight_binding_mode_id`
      - `weight_binding_data_calldata`
 3. Pipeline hardening:
-   - Added `--gkr-v3` in proving/e2e scripts.
+   - Added `--gkr-v3` and `--gkr-v3-mode2` in proving/e2e scripts.
    - Submit parsers/paymaster now accept `verify_model_gkr_v3` and enforce:
      - `weight_binding_mode` consistency with artifact mode.
      - `weight_binding_data=[]` for modes `0/1`.
+     - non-empty `weight_binding_data` for mode `2`.
 4. Scope:
-   - This is protocol plumbing and fail-closed safety.
-   - The mode `2` aggregated trustless binding proof system is still pending.
+   - This is a trustless v3 mode-2 baseline with full opening checks retained.
+   - The major speed-win redesign (eliminate per-weight openings with an equivalent
+     on-chain binding argument) is still pending.

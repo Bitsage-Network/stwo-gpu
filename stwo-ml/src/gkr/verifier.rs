@@ -708,12 +708,58 @@ fn verify_gkr_inner(
             }
         }
         WeightOpeningTranscriptMode::AggregatedTrustlessV2 => {
-            return Err(GKRError::VerificationError {
-                layer_idx: 0,
-                reason:
-                    "AggregatedTrustlessV2 verifier path is not implemented yet (Phase 3 reserved mode)"
-                        .to_string(),
-            });
+            if proof.weight_openings.len() != proof.weight_commitments.len() {
+                return Err(GKRError::VerificationError {
+                    layer_idx: 0,
+                    reason: format!(
+                        "weight_openings count ({}) != weight_commitments count ({})",
+                        proof.weight_openings.len(),
+                        proof.weight_commitments.len(),
+                    ),
+                });
+            }
+            if proof.weight_claims.len() != proof.weight_commitments.len() {
+                return Err(GKRError::VerificationError {
+                    layer_idx: 0,
+                    reason: format!(
+                        "weight_claims count ({}) != weight_commitments count ({})",
+                        proof.weight_claims.len(),
+                        proof.weight_commitments.len(),
+                    ),
+                });
+            }
+            for (i, ((opening, commitment), claim)) in proof
+                .weight_openings
+                .iter()
+                .zip(proof.weight_commitments.iter())
+                .zip(proof.weight_claims.iter())
+                .enumerate()
+            {
+                if opening.final_value != claim.expected_value {
+                    return Err(GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: format!(
+                            "weight opening {} final_value mismatch: opening={:?}, claim={:?}",
+                            i, opening.final_value, claim.expected_value,
+                        ),
+                    });
+                }
+
+                if !crate::crypto::mle_opening::verify_mle_opening(
+                    *commitment,
+                    opening,
+                    &claim.eval_point,
+                    channel,
+                ) {
+                    return Err(GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: format!(
+                            "aggregated trustless mode weight opening {} failed verification",
+                            i
+                        ),
+                    });
+                }
+            }
         }
     }
 

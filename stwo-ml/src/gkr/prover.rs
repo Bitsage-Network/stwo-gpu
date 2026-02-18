@@ -71,6 +71,16 @@ fn gkr_aggregate_weight_binding_enabled() -> bool {
     }
 }
 
+fn gkr_trustless_mode2_enabled() -> bool {
+    match std::env::var("STWO_GKR_TRUSTLESS_MODE2") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false" && v != "off"
+        }
+        Err(_) => false,
+    }
+}
+
 /// Prove a full model forward pass using the GKR protocol.
 ///
 /// Walks the circuit from output layer to input layer, running the
@@ -298,7 +308,14 @@ pub fn prove_gkr(
         current_claim = next_claim;
     }
 
-    let aggregate_weight_binding = gkr_aggregate_weight_binding_enabled();
+    let aggregate_weight_binding_env = gkr_aggregate_weight_binding_enabled();
+    let trustless_mode2 = gkr_trustless_mode2_enabled();
+    if trustless_mode2 && aggregate_weight_binding_env {
+        eprintln!(
+            "  [GKR] STWO_GKR_TRUSTLESS_MODE2=1 overrides STWO_GKR_AGGREGATE_WEIGHT_BINDING=on (keeping opening proofs)"
+        );
+    }
+    let aggregate_weight_binding = aggregate_weight_binding_env && !trustless_mode2;
     // In aggregated mode, include deferred MatMul weight claims in the same
     // transcript RLC binding and skip per-deferred Merkle openings.
     let mut deferred_weight_claims_data: Vec<(usize, Vec<SecureField>, SecureField)> =
@@ -476,6 +493,13 @@ pub fn prove_gkr(
             weight_commitments.push(commitment);
             weight_openings.push(opening);
         }
+    }
+
+    if trustless_mode2 && !aggregate_weight_binding {
+        weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedTrustlessV2;
+        eprintln!(
+            "  [GKR] aggregated trustless mode v2 enabled: opening proofs retained with mode-2 binding metadata"
+        );
     }
 
     // Compute IO commitment from model input and output
@@ -782,7 +806,14 @@ pub fn prove_gkr_gpu(
         weight_data.len(),
     );
 
-    let aggregate_weight_binding = gkr_aggregate_weight_binding_enabled();
+    let aggregate_weight_binding_env = gkr_aggregate_weight_binding_enabled();
+    let trustless_mode2 = gkr_trustless_mode2_enabled();
+    if trustless_mode2 && aggregate_weight_binding_env {
+        eprintln!(
+            "  [GKR] STWO_GKR_TRUSTLESS_MODE2=1 overrides STWO_GKR_AGGREGATE_WEIGHT_BINDING=on (keeping opening proofs)"
+        );
+    }
+    let aggregate_weight_binding = aggregate_weight_binding_env && !trustless_mode2;
     // In aggregated mode, include deferred MatMul weight claims in the same
     // transcript RLC binding and skip per-deferred Merkle openings.
     let mut deferred_weight_claims_data: Vec<(usize, Vec<SecureField>, SecureField)> =
@@ -945,8 +976,9 @@ pub fn prove_gkr_gpu(
         #[cfg(feature = "cuda-runtime")]
         {
             let weight_data = weight_data;
-            let batched = gkr_batch_weight_openings_enabled() && total_openings > 0;
-            if batched {
+                let batched =
+                    gkr_batch_weight_openings_enabled() && total_openings > 0 && !trustless_mode2;
+                if batched {
                 use std::sync::atomic::{AtomicUsize, Ordering};
                 use std::sync::Arc;
 
@@ -1199,6 +1231,13 @@ pub fn prove_gkr_gpu(
                 );
             }
         }
+    }
+
+    if trustless_mode2 && !aggregate_weight_binding {
+        weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedTrustlessV2;
+        eprintln!(
+            "  [GKR] aggregated trustless mode v2 enabled: opening proofs retained with mode-2 binding metadata"
+        );
     }
 
     let model_input = execution
@@ -1963,7 +2002,15 @@ pub fn prove_gkr_simd_gpu(
     let mut weight_openings = Vec::with_capacity(weight_data.len());
     let mut weight_claims = Vec::with_capacity(weight_data.len());
     let mut weight_opening_transcript_mode = WeightOpeningTranscriptMode::Sequential;
-    let aggregate_weight_binding = gkr_aggregate_weight_binding_enabled() && !weight_data.is_empty();
+    let aggregate_weight_binding_env = gkr_aggregate_weight_binding_enabled();
+    let trustless_mode2 = gkr_trustless_mode2_enabled();
+    if trustless_mode2 && aggregate_weight_binding_env {
+        eprintln!(
+            "  [GKR] STWO_GKR_TRUSTLESS_MODE2=1 overrides STWO_GKR_AGGREGATE_WEIGHT_BINDING=on (keeping opening proofs)"
+        );
+    }
+    let aggregate_weight_binding =
+        aggregate_weight_binding_env && !trustless_mode2 && !weight_data.is_empty();
 
     if aggregate_weight_binding {
         weight_opening_transcript_mode = WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1;
@@ -2019,6 +2066,13 @@ pub fn prove_gkr_simd_gpu(
             weight_commitments.push(commitment);
             weight_openings.push(opening);
         }
+    }
+
+    if trustless_mode2 && !aggregate_weight_binding {
+        weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedTrustlessV2;
+        eprintln!(
+            "  [GKR] aggregated trustless mode v2 enabled: opening proofs retained with mode-2 binding metadata"
+        );
     }
 
     // IO commitment from first block's input and combined output

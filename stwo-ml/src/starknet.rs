@@ -685,13 +685,13 @@ pub struct GkrStarknetProof {
     ///
     /// - `Some(0)` -> Sequential
     /// - `Some(1)` -> BatchedSubchannelV1
-    /// - `Some(2)` -> AggregatedTrustlessV2 (reserved)
+    /// - `Some(2)` -> AggregatedTrustlessV2 (v3 submit-ready)
     /// - `None`    -> off-chain-only mode (no Starknet mode id)
     pub weight_binding_mode_id: Option<u32>,
     /// Extra mode-specific binding payload encoded as `Array<felt252>`.
     ///
-    /// For modes `0/1`, this is currently empty. Mode `2` is reserved and will
-    /// carry aggregated trustless binding data in a future patch.
+    /// For modes `0/1`, this is empty.
+    /// For mode `2`, this carries `[binding_digest, claim_count]`.
     pub weight_binding_data_calldata: Vec<FieldElement>,
     /// Transcript mode used for weight binding/openings.
     pub weight_opening_mode: crate::gkr::types::WeightOpeningTranscriptMode,
@@ -713,6 +713,8 @@ pub struct GkrStarknetProof {
 }
 
 const WEIGHT_BINDING_SCHEMA_VERSION_V1: u32 = 1;
+const WEIGHT_BINDING_MODE2_DOMAIN_TAG: u64 = 0x5742_4d32; // "WBM2"
+const WEIGHT_BINDING_MODE2_SCHEMA_VERSION: u64 = 1;
 
 /// Strict soundness gates for GKR serialization/submission.
 ///
@@ -735,12 +737,14 @@ fn enforce_gkr_soundness_gates(proof: &crate::gkr::GKRProof) -> Result<(), Stark
     }
 
     match proof.weight_opening_transcript_mode {
-        WeightOpeningTranscriptMode::Sequential | WeightOpeningTranscriptMode::BatchedSubchannelV1 => {}
-        other => {
-            return Err(StarknetModelError::SoundnessGate(format!(
-                "unsupported weight opening transcript mode for Starknet serialization: {:?}",
-                other
-            )));
+        WeightOpeningTranscriptMode::Sequential
+        | WeightOpeningTranscriptMode::BatchedSubchannelV1
+        | WeightOpeningTranscriptMode::AggregatedTrustlessV2 => {}
+        WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1 => {
+            return Err(StarknetModelError::SoundnessGate(
+                "BatchedRlcDirectEvalV1 is off-chain only and cannot be serialized for Starknet"
+                    .to_string(),
+            ));
         }
     }
 
@@ -804,6 +808,47 @@ fn serialize_weight_claims_for_artifact(proof: &crate::gkr::GKRProof) -> Vec<Fie
     out
 }
 
+fn mode2_weight_binding_data(proof: &crate::gkr::GKRProof) -> Vec<FieldElement> {
+    let total_claims = proof.weight_claims.len() + proof.deferred_proofs.len();
+    let mut commitments = proof.weight_commitments.clone();
+    for deferred in &proof.deferred_proofs {
+        commitments.push(deferred.weight_commitment);
+    }
+
+    let mut digest_inputs = Vec::new();
+    digest_inputs.push(FieldElement::from(WEIGHT_BINDING_MODE2_DOMAIN_TAG));
+    digest_inputs.push(FieldElement::from(WEIGHT_BINDING_MODE2_SCHEMA_VERSION));
+    digest_inputs.push(FieldElement::from(total_claims as u64));
+    digest_inputs.push(FieldElement::from(commitments.len() as u64));
+
+    for (idx, claim) in proof.weight_claims.iter().enumerate() {
+        digest_inputs.push(commitments[idx]);
+        digest_inputs.push(FieldElement::from(claim.eval_point.len() as u64));
+        for &p in &claim.eval_point {
+            digest_inputs.push(crate::crypto::poseidon_channel::securefield_to_felt(p));
+        }
+        digest_inputs.push(crate::crypto::poseidon_channel::securefield_to_felt(
+            claim.expected_value,
+        ));
+    }
+
+    for (deferred_idx, deferred) in proof.deferred_proofs.iter().enumerate() {
+        let idx = proof.weight_claims.len() + deferred_idx;
+        let claim = &deferred.weight_claim;
+        digest_inputs.push(commitments[idx]);
+        digest_inputs.push(FieldElement::from(claim.eval_point.len() as u64));
+        for &p in &claim.eval_point {
+            digest_inputs.push(crate::crypto::poseidon_channel::securefield_to_felt(p));
+        }
+        digest_inputs.push(crate::crypto::poseidon_channel::securefield_to_felt(
+            claim.expected_value,
+        ));
+    }
+
+    let digest = starknet_crypto::poseidon_hash_many(&digest_inputs);
+    vec![digest, FieldElement::from(total_claims as u64)]
+}
+
 fn starknet_weight_binding_mode_for_artifact(
     mode: crate::gkr::types::WeightOpeningTranscriptMode,
 ) -> Option<u32> {
@@ -817,18 +862,15 @@ fn starknet_weight_binding_mode_for_artifact(
     }
 }
 
-fn weight_binding_data_for_artifact(
-    mode: crate::gkr::types::WeightOpeningTranscriptMode,
-) -> Vec<FieldElement> {
+fn weight_binding_data_for_artifact(proof: &crate::gkr::GKRProof) -> Vec<FieldElement> {
     use crate::gkr::types::WeightOpeningTranscriptMode;
-    match mode {
+    match proof.weight_opening_transcript_mode {
         // No extra payload needed for mode 0/1 today.
         WeightOpeningTranscriptMode::Sequential
         | WeightOpeningTranscriptMode::BatchedSubchannelV1 => Vec::new(),
-        // Reserved mode and off-chain-only mode are intentionally empty until
-        // their proof systems define a concrete on-chain payload.
-        WeightOpeningTranscriptMode::AggregatedTrustlessV2
-        | WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1 => Vec::new(),
+        WeightOpeningTranscriptMode::AggregatedTrustlessV2 => mode2_weight_binding_data(proof),
+        // Off-chain-only mode has no Starknet payload.
+        WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1 => Vec::new(),
     }
 }
 
@@ -888,8 +930,7 @@ fn build_gkr_serialized_proof_inner(
     let weight_claim_calldata = serialize_weight_claims_for_artifact(gkr_proof);
     let weight_binding_mode_id =
         starknet_weight_binding_mode_for_artifact(gkr_proof.weight_opening_transcript_mode);
-    let weight_binding_data_calldata =
-        weight_binding_data_for_artifact(gkr_proof.weight_opening_transcript_mode);
+    let weight_binding_data_calldata = weight_binding_data_for_artifact(gkr_proof);
 
     let total_calldata_size = 1
         + gkr_calldata.len()
@@ -1100,10 +1141,8 @@ fn starknet_weight_binding_mode(
         WeightOpeningTranscriptMode::Sequential => Ok(0),
         // v2 mode 1: batched sub-channel transcript (same opening statement).
         WeightOpeningTranscriptMode::BatchedSubchannelV1 => Ok(1),
-        WeightOpeningTranscriptMode::AggregatedTrustlessV2 => Err(StarknetModelError::SoundnessGate(
-            "weight binding mode 2 (AggregatedTrustlessV2) is reserved and not implemented"
-                .to_string(),
-        )),
+        // v3 mode 2: aggregated trustless binding (with explicit binding payload).
+        WeightOpeningTranscriptMode::AggregatedTrustlessV2 => Ok(2),
         WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1 => Err(StarknetModelError::SoundnessGate(
             "BatchedRlcDirectEvalV1 is off-chain only and cannot be serialized for Starknet"
                 .to_string(),
@@ -1112,20 +1151,23 @@ fn starknet_weight_binding_mode(
 }
 
 fn starknet_weight_binding_data(
-    mode: crate::gkr::types::WeightOpeningTranscriptMode,
+    proof: &crate::gkr::GKRProof,
 ) -> Result<Vec<String>, StarknetModelError> {
     use crate::gkr::types::WeightOpeningTranscriptMode;
 
-    match mode {
-        // Phase 3 currently supports v3 envelope plumbing only.
-        // For submit-ready modes (0/1) weight_binding_data stays empty.
+    match proof.weight_opening_transcript_mode {
+        // Modes 0/1 do not require extra payload.
         WeightOpeningTranscriptMode::Sequential | WeightOpeningTranscriptMode::BatchedSubchannelV1 => {
             Ok(Vec::new())
         }
-        other => Err(StarknetModelError::SoundnessGate(format!(
-            "unsupported weight binding data mode for Starknet v3 calldata: {:?}",
-            other
-        ))),
+        WeightOpeningTranscriptMode::AggregatedTrustlessV2 => Ok(mode2_weight_binding_data(proof)
+            .into_iter()
+            .map(|f| format!("0x{:x}", f))
+            .collect()),
+        WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1 => Err(StarknetModelError::SoundnessGate(
+            "BatchedRlcDirectEvalV1 is off-chain only and cannot be serialized for Starknet"
+                .to_string(),
+        )),
     }
 }
 
@@ -1200,9 +1242,7 @@ pub fn build_verify_model_gkr_v2_calldata(
 /// v3 layout extends v2 with `weight_binding_data: Array<felt252>`:
 /// - mode `0`: sequential openings
 /// - mode `1`: batched sub-channel openings
-///
-/// Mode `2` (aggregated trustless binding) is reserved and not emitted by
-/// this builder yet.
+/// - mode `2`: aggregated trustless binding payload + opening proofs (phase-3 path)
 pub fn build_verify_model_gkr_v3_calldata(
     proof: &crate::gkr::GKRProof,
     circuit: &crate::gkr::LayeredCircuit,
@@ -1301,12 +1341,18 @@ fn build_verify_model_gkr_calldata_inner(
     // 8 (v2/v3). weight_binding_mode: u32
     if layout == GkrCalldataLayout::V2 || layout == GkrCalldataLayout::V3 {
         let binding_mode = starknet_weight_binding_mode(proof.weight_opening_transcript_mode)?;
+        if layout == GkrCalldataLayout::V2 && binding_mode == 2 {
+            return Err(StarknetModelError::SoundnessGate(
+                "verify_model_gkr_v2 supports weight_binding_mode in {0,1}; mode 2 requires verify_model_gkr_v3"
+                    .to_string(),
+            ));
+        }
         parts.push(format!("{}", binding_mode));
     }
 
     // 9 (v3). weight_binding_data: Array<felt252>
     if layout == GkrCalldataLayout::V3 {
-        let weight_binding_data = starknet_weight_binding_data(proof.weight_opening_transcript_mode)?;
+        let weight_binding_data = starknet_weight_binding_data(proof)?;
         parts.push(format!("{}", weight_binding_data.len()));
         for felt in weight_binding_data {
             parts.push(felt);
@@ -2748,6 +2794,158 @@ mod tests {
             v3.calldata_parts[idx + 2],
             v2.calldata_parts[idx + 1],
             "opening payload must follow v3 binding_data field"
+        );
+    }
+
+    #[test]
+    fn test_build_verify_model_gkr_v2_rejects_mode2_binding() {
+        use crate::aggregation::prove_model_pure_gkr;
+        use crate::gkr::types::WeightOpeningTranscriptMode;
+
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(2);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
+
+        let mut weights = GraphWeights::new();
+        let mut w = M31Matrix::new(4, 2);
+        for i in 0..4 {
+            for j in 0..2 {
+                w.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
+        weights.add_weight(0, w);
+
+        let mut agg_proof =
+            prove_model_pure_gkr(&graph, &input, &weights).expect("GKR proving should succeed");
+        let gkr = agg_proof.gkr_proof.as_mut().expect("GKR proof expected");
+        gkr.weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedTrustlessV2;
+
+        let circuit = crate::gkr::LayeredCircuit::from_graph(&graph).expect("circuit compile");
+        let raw_io = crate::cairo_serde::serialize_raw_io(&input, &agg_proof.execution.output);
+        let model_id = FieldElement::from(0xBEEFu64);
+
+        let err = build_verify_model_gkr_v2_calldata(gkr, &circuit, model_id, &raw_io)
+            .expect_err("v2 calldata should reject mode2 binding");
+        match err {
+            StarknetModelError::SoundnessGate(_) => {}
+            other => panic!("expected SoundnessGate error, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_build_verify_model_gkr_v3_calldata_encodes_mode2_binding_data() {
+        use crate::aggregation::prove_model_pure_gkr;
+        use crate::gkr::types::WeightOpeningTranscriptMode;
+
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(2);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
+
+        let mut weights = GraphWeights::new();
+        let mut w = M31Matrix::new(4, 2);
+        for i in 0..4 {
+            for j in 0..2 {
+                w.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
+        weights.add_weight(0, w);
+
+        let mut agg_proof =
+            prove_model_pure_gkr(&graph, &input, &weights).expect("GKR proving should succeed");
+        let gkr = agg_proof.gkr_proof.as_mut().expect("GKR proof expected");
+        gkr.weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedTrustlessV2;
+
+        let circuit = crate::gkr::LayeredCircuit::from_graph(&graph).expect("circuit compile");
+        let raw_io = crate::cairo_serde::serialize_raw_io(&input, &agg_proof.execution.output);
+        let model_id = FieldElement::from(0xBEEFu64);
+
+        let v3 = build_verify_model_gkr_v3_calldata(gkr, &circuit, model_id, &raw_io)
+            .expect("v3 calldata should build for mode2");
+
+        // Find insertion index for weight_binding_mode (same prefix as v2).
+        let mut idx = 0usize;
+        idx += 1; // model_id
+        let raw_io_len = v3.calldata_parts[idx]
+            .parse::<usize>()
+            .expect("raw_io_data len parse");
+        idx += 1 + raw_io_len;
+        idx += 2; // circuit_depth, num_layers
+        let matmul_len = v3.calldata_parts[idx]
+            .parse::<usize>()
+            .expect("matmul_dims len parse");
+        idx += 1 + matmul_len;
+        let dequant_len = v3.calldata_parts[idx]
+            .parse::<usize>()
+            .expect("dequantize_bits len parse");
+        idx += 1 + dequant_len;
+        let proof_data_len = v3.calldata_parts[idx]
+            .parse::<usize>()
+            .expect("proof_data len parse");
+        idx += 1 + proof_data_len;
+        let weight_commitments_len = v3.calldata_parts[idx]
+            .parse::<usize>()
+            .expect("weight_commitments len parse");
+        idx += 1 + weight_commitments_len;
+
+        assert_eq!(v3.calldata_parts[idx], "2", "v3 mode should be aggregated trustless (2)");
+        let binding_data_len = v3.calldata_parts[idx + 1]
+            .parse::<usize>()
+            .expect("weight_binding_data len parse");
+        assert_eq!(
+            binding_data_len, 2,
+            "mode2 v3 payload should currently be [digest, claim_count]"
+        );
+    }
+
+    #[test]
+    fn test_mode2_serialized_proof_is_submit_ready_with_binding_payload() {
+        use crate::aggregation::prove_model_pure_gkr;
+        use crate::gkr::types::WeightOpeningTranscriptMode;
+
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(2);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
+
+        let mut weights = GraphWeights::new();
+        let mut w = M31Matrix::new(4, 2);
+        for i in 0..4 {
+            for j in 0..2 {
+                w.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
+        weights.add_weight(0, w);
+
+        let mut agg_proof =
+            prove_model_pure_gkr(&graph, &input, &weights).expect("GKR proving should succeed");
+        let gkr = agg_proof.gkr_proof.as_mut().expect("GKR proof expected");
+        gkr.weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedTrustlessV2;
+
+        let serialized = build_gkr_starknet_proof(&agg_proof, FieldElement::from(12u64), &input)
+            .expect("mode2 should satisfy strict Starknet soundness gates");
+        assert!(
+            serialized.submission_ready,
+            "mode2 should be marked submit-ready in strict builder"
+        );
+        assert_eq!(serialized.weight_binding_mode_id, Some(2));
+        assert_eq!(
+            serialized.weight_binding_data_calldata.len(),
+            2,
+            "mode2 payload should include digest + claim_count"
         );
     }
 

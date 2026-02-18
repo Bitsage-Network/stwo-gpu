@@ -264,8 +264,9 @@ pub struct WeightClaim {
 /// - `BatchedRlcDirectEvalV1`: skips per-weight Merkle openings and binds all
 ///   weight claims with a single random-linear-combination check against model
 ///   weights (off-chain verifier path).
-/// - `AggregatedTrustlessV2`: reserved for Phase-3 trustless aggregated
-///   on-chain weight binding (not implemented yet).
+/// - `AggregatedTrustlessV2`: Phase-3 trustless on-chain binding mode.
+///   Current implementation keeps full opening proofs while adding
+///   mode-2 binding payload checks in the Starknet v3 verifier path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeightOpeningTranscriptMode {
     Sequential,

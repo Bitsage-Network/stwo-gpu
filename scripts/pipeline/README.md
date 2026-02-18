@@ -162,6 +162,7 @@ STARKNET_PRIVATE_KEY=0x... ./run_e2e.sh --preset qwen3-14b --gpu --submit
 | `STWO_GPU_MLE_OPENING_TIMING` | No | Off | Print per-opening tree/query timing breakdown |
 | `STWO_STARKNET_GKR_V2` | No | Off | Emit `verify_model_gkr_v2` calldata in `ml_gkr` artifacts |
 | `STWO_STARKNET_GKR_V3` | No | Off | Emit `verify_model_gkr_v3` calldata in `ml_gkr` artifacts |
+| `STWO_GKR_TRUSTLESS_MODE2` | No | Off | Enable v3 `weight_binding_mode=2` (trustless mode-2 payload + opening checks) |
 | `STWO_GKR_BATCH_WEIGHT_OPENINGS` | No | `on` for `--starknet-ready --gkr-v2/--gkr-v3 --gpu`, else off | Use batched sub-channel weight-opening transcript (mode 1) |
 | `STWO_GKR_AGGREGATE_WEIGHT_BINDING` | No | `on` in `03_prove.sh` fast mode, auto-`off` for `run_e2e.sh --submit` | Batched RLC weight-binding mode (serializable artifact, not submit-ready for Starknet `verify_model_gkr`/`verify_model_gkr_v2`/`verify_model_gkr_v3`) |
 
@@ -173,6 +174,7 @@ Notes:
 - Unified STARK now retries once on SIMD if GPU path hits `ConstraintsNotSatisfied` (soundness-preserving fallback). Set `--gpu-only` or `STWO_UNIFIED_STARK_NO_FALLBACK=1` to fail closed instead.
 - `03_prove.sh` defaults `STWO_PURE_GKR_SKIP_UNIFIED_STARK=1` for `ml_gkr`, which bypasses Phase 3 when GKR already covers activation/add/mul/layernorm/rmsnorm/dequantize.
 - In aggregated weight-binding mode, `ml_gkr` output still serializes full proof artifacts with `submission_ready=false`, `weight_opening_mode`, `weight_claim_calldata`, and versioned `weight_binding_*` metadata.
+- v3 mode 2 (`STWO_GKR_TRUSTLESS_MODE2=1`) is submit-ready and keeps full opening proofs while adding explicit `weight_binding_data` payload checks.
 
 ## Model Presets
 
@@ -258,6 +260,7 @@ GPU presets in `configs/4090.env`, `configs/b200.env`, `configs/b300.env`.
 ./03_prove.sh --model-name qwen3-14b --server http://prover:8080
 ./03_prove.sh --model-name qwen3-14b --mode gkr --starknet-ready --gkr-v2
 ./03_prove.sh --model-name qwen3-14b --mode gkr --starknet-ready --gkr-v3
+./03_prove.sh --model-name qwen3-14b --mode gkr --starknet-ready --gkr-v3-mode2
 ```
 
 ### 04_verify_onchain.sh
@@ -274,15 +277,15 @@ Notes:
   `verify_model_gkr` (v1), `verify_model_gkr_v2` (v2), or `verify_model_gkr_v3` (v3 envelope).
 - `verify_model_gkr` (v1) requires sequential openings (`weight_binding_mode=0`).
 - `verify_model_gkr_v2` accepts:
-- `verify_model_gkr_v3` currently accepts the same submit-ready modes as v2:
-  - `weight_binding_mode=0` (Sequential, `weight_binding_data=[]`)
-  - `weight_binding_mode=1` (BatchedSubchannelV1, `weight_binding_data=[]`)
-- `verify_model_gkr_v2` accepts:
   - `weight_binding_mode=0` (Sequential)
   - `weight_binding_mode=1` (BatchedSubchannelV1)
+- `verify_model_gkr_v3` accepts:
+  - `weight_binding_mode=0` (Sequential, `weight_binding_data=[]`)
+  - `weight_binding_mode=1` (BatchedSubchannelV1, `weight_binding_data=[]`)
+  - `weight_binding_mode=2` (AggregatedTrustlessV2, non-empty `weight_binding_data`)
 - In `03_prove.sh`, `--gkr-v2` automatically enables `--starknet-ready`.
 - In `03_prove.sh`, `--gkr-v3` automatically enables `--starknet-ready`.
-- In `run_e2e.sh`, use `--gkr-v2-mode auto|sequential|batched` to control v2 opening mode.
+- In `run_e2e.sh`, use `--gkr-v2-mode auto|sequential|batched|mode2` to control v2/v3 opening mode.
 - `--gkr-v2-mode auto` (default) prefers batched on GPU submit path.
 - Ensure your deployed verifier includes the requested entrypoint
   (`verify_model_gkr_v2` or `verify_model_gkr_v3`) before submitting artifacts.
@@ -311,6 +314,7 @@ Notes:
 ./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v3
 ./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v2 --gkr-v2-mode batched
 ./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v2 --gkr-v2-mode sequential
+./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v3 --gkr-v2-mode mode2
 ./run_e2e.sh --preset phi3-mini --gpu --dry-run
 ./run_e2e.sh --preset qwen3-14b --gpu --gpu-only --dry-run
 ./run_e2e.sh --preset qwen3-14b --resume-from prove --submit

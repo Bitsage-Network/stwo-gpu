@@ -376,20 +376,27 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
     idx += 1 + weightCommitmentsLen;
     if (idx >= calldata.length) die("v2 calldata truncated before weight_binding_mode");
     const weightBindingMode = parseNat(calldata[idx], "weight_binding_mode");
+    if (entrypoint === "verify_model_gkr_v2" && !new Set([0, 1]).has(weightBindingMode)) {
+      die(`${entrypoint} requires weight_binding_mode in {0,1} (got ${weightBindingMode})`);
+    }
     let expectedMode = null;
     if (weightOpeningMode === "Sequential") {
       expectedMode = 0;
     } else if (weightOpeningMode === "BatchedSubchannelV1") {
       expectedMode = 1;
+    } else if (weightOpeningMode === "AggregatedTrustlessV2") {
+      expectedMode = 2;
     }
     if (expectedMode !== null && weightBindingMode !== expectedMode) {
       die(
         `${entrypoint} expected weight_binding_mode=${expectedMode} for weight_opening_mode=${weightOpeningMode} (got ${weightBindingMode})`
       );
     }
-    if (expectedMode === null && !new Set([0, 1]).has(weightBindingMode)) {
+    const allowedModes =
+      entrypoint === "verify_model_gkr_v3" ? new Set([0, 1, 2]) : new Set([0, 1]);
+    if (expectedMode === null && !allowedModes.has(weightBindingMode)) {
       die(
-        `${entrypoint} requires weight_binding_mode in {0,1} (got ${weightBindingMode})`
+        `${entrypoint} requires weight_binding_mode in {${[...allowedModes].join(",")}} (got ${weightBindingMode})`
       );
     }
     if (proofData.weight_binding_mode_id !== undefined && proofData.weight_binding_mode_id !== null) {
@@ -409,6 +416,9 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
         die(
           `${entrypoint} mode ${weightBindingMode} requires empty weight_binding_data (got len=${weightBindingDataLen})`
         );
+      }
+      if (weightBindingMode === 2 && weightBindingDataLen === 0) {
+        die(`${entrypoint} mode 2 requires non-empty weight_binding_data`);
       }
       if (
         Array.isArray(proofData.weight_binding_data_calldata) &&

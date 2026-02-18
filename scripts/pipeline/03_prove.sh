@@ -37,6 +37,7 @@ SERVER_URL=""
 STARKNET_READY=false
 GKR_V2=false
 GKR_V3=false
+GKR_V3_MODE2=false
 
 # ─── Parse Arguments ─────────────────────────────────────────────────
 
@@ -61,6 +62,7 @@ while [[ $# -gt 0 ]]; do
         --starknet-ready)   STARKNET_READY=true; shift ;;
         --gkr-v2)           GKR_V2=true; shift ;;
         --gkr-v3)           GKR_V3=true; shift ;;
+        --gkr-v3-mode2)     GKR_V3_MODE2=true; GKR_V3=true; shift ;;
         --salt)             SALT="$2"; shift 2 ;;
         --server)           SERVER_URL="$2"; shift 2 ;;
         -h|--help)
@@ -93,6 +95,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --starknet-ready     Force sequential weight openings for submit-ready Starknet calldata"
             echo "  --gkr-v2             Emit verify_model_gkr_v2 calldata (mode-aware v2 path)"
             echo "  --gkr-v3             Emit verify_model_gkr_v3 calldata (v3 envelope, mode-aware)"
+            echo "  --gkr-v3-mode2       Enable verify_model_gkr_v3 mode=2 (trustless payload + opening checks)"
             echo "  --salt N             Fiat-Shamir channel salt"
             echo "  --server URL         Submit to remote prove-server instead of local binary"
             echo "  -h, --help           Show this help"
@@ -116,6 +119,10 @@ if [[ "$GKR_V2" == "true" ]] && [[ "$STARKNET_READY" != "true" ]]; then
 fi
 if [[ "$GKR_V3" == "true" ]] && [[ "$STARKNET_READY" != "true" ]]; then
     warn "--gkr-v3 requested; enabling --starknet-ready for submit-ready artifact checks"
+    STARKNET_READY=true
+fi
+if [[ "$GKR_V3_MODE2" == "true" ]] && [[ "$STARKNET_READY" != "true" ]]; then
+    warn "--gkr-v3-mode2 requested; enabling --starknet-ready for submit-ready artifact checks"
     STARKNET_READY=true
 fi
 if [[ "$GKR_V2" == "true" && "$GKR_V3" == "true" ]]; then
@@ -199,6 +206,9 @@ fi
 if [[ "$GKR_V3" == "true" ]]; then
     export STWO_STARKNET_GKR_V3=1
 fi
+if [[ "$GKR_V3_MODE2" == "true" ]]; then
+    export STWO_GKR_TRUSTLESS_MODE2=1
+fi
 
 # Batched sub-channel weight openings:
 # - Safe and submit-ready with verify_model_gkr_v2/v3 (weight_binding_mode=1)
@@ -219,6 +229,10 @@ if [[ "$STARKNET_READY" == "true" ]] && [[ "$GKR_V2" != "true" ]] && [[ "${GKR_B
 fi
 if [[ "${GKR_AGG_WEIGHT_BINDING}" == "on" ]] && [[ "${GKR_BATCH_WEIGHT_OPENINGS}" == "on" ]]; then
     warn "Disabling STWO_GKR_BATCH_WEIGHT_OPENINGS because aggregated RLC mode eliminates opening proofs."
+    GKR_BATCH_WEIGHT_OPENINGS="off"
+fi
+if [[ "$GKR_V3_MODE2" == "true" ]] && [[ "${GKR_BATCH_WEIGHT_OPENINGS}" == "on" ]]; then
+    warn "Disabling STWO_GKR_BATCH_WEIGHT_OPENINGS for --gkr-v3-mode2 (mode2 currently uses sequential openings)."
     GKR_BATCH_WEIGHT_OPENINGS="off"
 fi
 export STWO_GKR_BATCH_WEIGHT_OPENINGS="${GKR_BATCH_WEIGHT_OPENINGS}"
@@ -366,6 +380,7 @@ log "GPU MLE path:   fold=${GPU_MLE_FOLD} fold_min_points=${GPU_MLE_FOLD_MIN_POI
 log "GPU opening:    qm31_pack=device (enabled by default)"
 log "GPU opening dbg: timing=${GPU_MLE_OPENING_TIMING}"
 log "Weight binding: aggregate_rlc=${GKR_AGG_WEIGHT_BINDING}"
+log "Weight binding: trustless_mode2=${STWO_GKR_TRUSTLESS_MODE2:-off}"
 log "Weight openings: batch_subchannel=${GKR_BATCH_WEIGHT_OPENINGS} jobs=${STWO_GKR_BATCH_WEIGHT_OPENING_JOBS:-auto}"
 log "Progress:       weight_every=${STWO_WEIGHT_PROGRESS_EVERY} opening_every=${STWO_GKR_OPENINGS_PROGRESS_EVERY} opening_heartbeat=${STWO_GKR_OPENING_HEARTBEAT_SEC}s"
 echo ""
@@ -703,16 +718,23 @@ if entrypoint in ('verify_model_gkr', 'verify_model_gkr_v2', 'verify_model_gkr_v
         idx += 1 + wc_len
         assert idx < len(calldata), 'calldata truncated before weight_binding_mode'
         wb_mode = parse_nat(calldata[idx], 'weight_binding_mode')
+        if entrypoint == 'verify_model_gkr_v2':
+            assert wb_mode in (0, 1), \
+                f'{entrypoint} requires weight_binding_mode in (0,1) (got {wb_mode})'
         expected_mode = None
         if mode_s == 'Sequential':
             expected_mode = 0
         elif mode_s == 'BatchedSubchannelV1':
             expected_mode = 1
+        elif mode_s == 'AggregatedTrustlessV2':
+            expected_mode = 2
         if expected_mode is not None:
             assert wb_mode == expected_mode, \
                 f'{entrypoint} expected weight_binding_mode={expected_mode} for weight_opening_mode={mode_s} (got {wb_mode})'
         else:
-            assert wb_mode in (0, 1), f'{entrypoint} requires weight_binding_mode in (0,1) (got {wb_mode})'
+            allowed_modes = (0, 1, 2) if entrypoint == 'verify_model_gkr_v3' else (0, 1)
+            assert wb_mode in allowed_modes, \
+                f'{entrypoint} requires weight_binding_mode in {allowed_modes} (got {wb_mode})'
         artifact_mode_id = proof.get('weight_binding_mode_id')
         if artifact_mode_id is not None:
             artifact_mode_id = int(str(artifact_mode_id), 0)
@@ -726,6 +748,9 @@ if entrypoint in ('verify_model_gkr', 'verify_model_gkr_v2', 'verify_model_gkr_v
             if wb_mode in (0, 1):
                 assert binding_data_len == 0, \
                     f'{entrypoint} mode {wb_mode} requires empty weight_binding_data (got len={binding_data_len})'
+            elif wb_mode == 2:
+                assert binding_data_len > 0, \
+                    f'{entrypoint} mode 2 requires non-empty weight_binding_data'
             artifact_binding_data = proof.get('weight_binding_data_calldata')
             if isinstance(artifact_binding_data, list):
                 assert len(artifact_binding_data) == binding_data_len, \
@@ -771,6 +796,7 @@ cat > "${OUTPUT_DIR}/metadata.json" << METAEOF
     "multi_gpu": ${MULTI_GPU},
     "gkr_v2": ${GKR_V2},
     "gkr_v3": ${GKR_V3},
+    "gkr_v3_mode2": ${GKR_V3_MODE2},
     "security": "${SECURITY}",
     "phase1_seconds": ${PHASE1_SEC},
     "phase2_seconds": ${PHASE2_SEC},

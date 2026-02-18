@@ -288,6 +288,8 @@ export STWO_PURE_GKR_SKIP_UNIFIED_STARK=0
 - `weight_claim_calldata` for off-chain verification/auditing.
 - `weight_binding_schema_version`, `weight_binding_mode_id`, `weight_binding_data_calldata`
   for versioned mode-2 migration plumbing.
+- For submit-ready v3 mode-2 payload checks (opening proofs retained), use
+  `--gkr-v3-mode2` or `STWO_GKR_TRUSTLESS_MODE2=1`.
 
 To force submit-ready Starknet calldata (v1 sequential openings), run:
 ```bash
@@ -307,6 +309,12 @@ statement (`weight_binding_mode=0`, `weight_binding_data=[]`):
 ./03_prove.sh --model-name qwen3-14b --gpu --starknet-ready --gkr-v3
 ```
 (`--gkr-v3` auto-enables `--starknet-ready` if omitted.)
+
+To emit v3 calldata with trustless mode-2 binding metadata
+(`weight_binding_mode=2`, non-empty `weight_binding_data`):
+```bash
+./03_prove.sh --model-name qwen3-14b --gpu --starknet-ready --gkr-v3-mode2
+```
 
 To use the faster submit-ready v2 batched-subchannel opening transcript
 (`weight_binding_mode=1`):
@@ -351,8 +359,11 @@ For `verify_model_gkr_v2` and `verify_model_gkr_v3` artifacts, the submit pipeli
 that `weight_binding_mode` matches the artifact mode:
 - `Sequential` -> `0`
 - `BatchedSubchannelV1` -> `1`
+- `AggregatedTrustlessV2` -> `2` (v3 only)
 before sending TX.
-For v3, it also enforces `weight_binding_data=[]` in modes `0/1`.
+For v3, it enforces:
+- `weight_binding_data=[]` in modes `0/1`
+- non-empty `weight_binding_data` in mode `2`
 If the target contract does not expose your requested entrypoint
 (`verify_model_gkr_v2` or `verify_model_gkr_v3`), submit with v1
 (`--starknet-ready` without `--gkr-v2/--gkr-v3`) or deploy the upgraded verifier first.
@@ -391,6 +402,9 @@ The script will:
 
 # Force v2 batched-subchannel mode (weight_binding_mode=1)
 ./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v2 --gkr-v2-mode batched
+
+# Enable v3 mode-2 trustless binding payload checks (weight_binding_mode=2)
+./run_e2e.sh --preset qwen3-14b --gpu --submit --gkr-v3 --gkr-v2-mode mode2
 
 # With your own account (legacy sncast, you pay gas)
 STARKNET_PRIVATE_KEY=0x... ./run_e2e.sh --preset qwen3-14b --gpu --submit --no-paymaster

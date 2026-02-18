@@ -454,19 +454,24 @@ if entrypoint in ('verify_model_gkr_v2', 'verify_model_gkr_v3'):
     if idx >= len(resolved):
         fail('v2 calldata truncated before weight_binding_mode')
     weight_binding_mode = parse_nat(resolved[idx], 'weight_binding_mode')
+    if entrypoint == 'verify_model_gkr_v2' and weight_binding_mode not in (0, 1):
+        fail(f'{entrypoint} requires weight_binding_mode in (0,1) (got {weight_binding_mode})')
     expected_mode = None
     if str(weight_opening_mode) == 'Sequential':
         expected_mode = 0
     elif str(weight_opening_mode) == 'BatchedSubchannelV1':
         expected_mode = 1
+    elif str(weight_opening_mode) == 'AggregatedTrustlessV2':
+        expected_mode = 2
     if expected_mode is not None and weight_binding_mode != expected_mode:
         fail(
             f'{entrypoint} expected weight_binding_mode={expected_mode} '
             f'for weight_opening_mode={weight_opening_mode} (got {weight_binding_mode})'
         )
-    if expected_mode is None and weight_binding_mode not in (0, 1):
+    allowed_modes = (0, 1, 2) if entrypoint == 'verify_model_gkr_v3' else (0, 1)
+    if expected_mode is None and weight_binding_mode not in allowed_modes:
         fail(
-            f'{entrypoint} requires weight_binding_mode in {{0,1}} '
+            f'{entrypoint} requires weight_binding_mode in {allowed_modes} '
             f'(got {weight_binding_mode})'
         )
     artifact_mode_id = proof.get('weight_binding_mode_id')
@@ -491,6 +496,8 @@ if entrypoint in ('verify_model_gkr_v2', 'verify_model_gkr_v3'):
                 f'{entrypoint} mode {weight_binding_mode} requires empty weight_binding_data '
                 f'(got len={weight_binding_data_len})'
             )
+        if weight_binding_mode == 2 and weight_binding_data_len == 0:
+            fail(f'{entrypoint} mode 2 requires non-empty weight_binding_data')
         artifact_binding_data = proof.get('weight_binding_data_calldata')
         if isinstance(artifact_binding_data, list) and len(artifact_binding_data) != weight_binding_data_len:
             fail(
