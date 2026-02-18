@@ -95,6 +95,28 @@ function getProvider(network) {
   return new RpcProvider({ nodeUrl: rpcUrl, batch: 0 });
 }
 
+function normalizePrivateKey(rawKey) {
+  // starknet.js versions may return randomPrivateKey() as:
+  // - hex string
+  // - bigint/number
+  // - byte array (Uint8Array / number[])
+  if (typeof rawKey === "string") {
+    return num.toHex(rawKey);
+  }
+  if (typeof rawKey === "bigint" || typeof rawKey === "number") {
+    return num.toHex(rawKey);
+  }
+  if (rawKey && typeof rawKey === "object") {
+    const isTypedArray =
+      ArrayBuffer.isView(rawKey) || Array.isArray(rawKey);
+    if (isTypedArray) {
+      const hex = Buffer.from(rawKey).toString("hex");
+      return num.toHex(`0x${hex}`);
+    }
+  }
+  throw new Error("Unsupported private key format returned by starknet.js");
+}
+
 function loadAccountConfig() {
   if (!existsSync(ACCOUNT_CONFIG_FILE)) return null;
   return JSON.parse(readFileSync(ACCOUNT_CONFIG_FILE, "utf-8"));
@@ -141,7 +163,7 @@ function generateEphemeralAccount(network) {
   const net = NETWORKS[network];
   if (!net?.accountClassHash) die(`No account class hash for ${network}`);
 
-  const privateKey = num.toHex(ec.starkCurve.utils.randomPrivateKey());
+  const privateKey = normalizePrivateKey(ec.starkCurve.utils.randomPrivateKey());
   const publicKey = ec.starkCurve.getStarkKey(privateKey);
   const salt = publicKey;
 
@@ -568,7 +590,7 @@ async function cmdSetup(args) {
 
   // Generate new keypair for the pipeline account
   info("Generating new Stark keypair...");
-  const privateKey = num.toHex(ec.starkCurve.utils.randomPrivateKey());
+  const privateKey = normalizePrivateKey(ec.starkCurve.utils.randomPrivateKey());
   const publicKey = ec.starkCurve.getStarkKey(privateKey);
   info(`Public key: ${publicKey}`);
 
