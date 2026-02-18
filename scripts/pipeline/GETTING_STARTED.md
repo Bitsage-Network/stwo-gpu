@@ -232,6 +232,7 @@ The proof is saved to `~/.obelysk/proofs/`.
 - Opening prep now avoids an extra full padded-matrix copy, reducing CPU RAM pressure during large openings.
 - GPU opening trees now use device-side QM31 packing, removing per-round CPU repack/upload overhead in large weight openings.
 - Opening query extraction now replays folds on GPU and downloads only queried leaf pairs, avoiding full-layer per-round downloads.
+- Unified STARK retries once on SIMD if GPU proving returns `ConstraintsNotSatisfied` (soundness-preserving fallback). In `--gpu-only` mode this fallback is disabled and the run fails closed.
 
 The pipeline now prints dense progress + heartbeat messages during long openings so it does not appear frozen.
 
@@ -269,6 +270,8 @@ export STWO_GPU_COMMIT_STRICT=1
 export STWO_GPU_COMMIT_HARDEN=1
 export STWO_GPU_POLY_STRICT=1
 export STWO_GPU_POLY_HARDEN=1
+# Force fail-closed instead of Unified STARK GPU->SIMD fallback
+export STWO_UNIFIED_STARK_NO_FALLBACK=1
 ./03_prove.sh --model-name qwen3-14b --gpu
 ```
 

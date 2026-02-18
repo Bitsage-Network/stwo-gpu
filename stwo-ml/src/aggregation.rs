@@ -162,6 +162,18 @@ where
         .map_err(|e| AggregationError::ProvingError(format!("{e:?}")))
 }
 
+fn flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            let s = v.trim();
+            s == "1"
+                || s.eq_ignore_ascii_case("true")
+                || s.eq_ignore_ascii_case("yes")
+                || s.eq_ignore_ascii_case("on")
+        })
+        .unwrap_or(false)
+}
+
 /// Compute a layer chain commitment: a running Poseidon hash over ALL intermediate
 /// values at each layer boundary.
 ///
@@ -3941,6 +3953,14 @@ where
     FrameworkComponent<EmbeddingEval>: ComponentProver<B>,
     FrameworkComponent<QuantizeEval>: ComponentProver<B>,
     FrameworkComponent<DequantizeEval>: ComponentProver<B>,
+    FrameworkComponent<ActivationEval>: ComponentProver<SimdBackend>,
+    FrameworkComponent<ElementwiseAddEval>: ComponentProver<SimdBackend>,
+    FrameworkComponent<ElementwiseMulEval>: ComponentProver<SimdBackend>,
+    FrameworkComponent<LayerNormEval>: ComponentProver<SimdBackend>,
+    FrameworkComponent<RMSNormEval>: ComponentProver<SimdBackend>,
+    FrameworkComponent<EmbeddingEval>: ComponentProver<SimdBackend>,
+    FrameworkComponent<QuantizeEval>: ComponentProver<SimdBackend>,
+    FrameworkComponent<DequantizeEval>: ComponentProver<SimdBackend>,
 {
     let gpu_active = crate::backend::gpu_is_available();
     let _ = gpu_active; // used only with cuda-runtime
@@ -4398,11 +4418,35 @@ where
     eprintln!("Phase 3/3: Building unified STARK (non-matmul components)...");
     let t_stark = std::time::Instant::now();
 
-    let result = build_unified_stark::<B>(
+    let result = match build_unified_stark::<B>(
         &activation_layers, &add_layers, &mul_layers,
         &layernorm_layers, &embedding_layers, &quantize_layers,
         &dequantize_layers,
-    )?;
+    ) {
+        Ok(v) => v,
+        Err(err) => {
+            let is_gpu_backend = std::any::type_name::<B>().contains("GpuBackend");
+            let gpu_only = flag_enabled("STWO_GPU_ONLY");
+            let no_fallback = flag_enabled("STWO_UNIFIED_STARK_NO_FALLBACK");
+            let is_constraint_sanity = format!("{err}").contains("ConstraintsNotSatisfied");
+
+            if is_gpu_backend && is_constraint_sanity && !gpu_only && !no_fallback {
+                eprintln!(
+                    "  [Unified STARK] GPU path hit ConstraintsNotSatisfied; retrying SIMD fallback for correctness."
+                );
+                eprintln!(
+                    "  [Unified STARK] Set STWO_GPU_ONLY=1 or STWO_UNIFIED_STARK_NO_FALLBACK=1 to fail closed instead."
+                );
+                build_unified_stark::<SimdBackend>(
+                    &activation_layers, &add_layers, &mul_layers,
+                    &layernorm_layers, &embedding_layers, &quantize_layers,
+                    &dequantize_layers,
+                )?
+            } else {
+                return Err(err);
+            }
+        }
+    };
 
     eprintln!(
         "  Unified STARK in {:.2}s (total: {:.1}s)",

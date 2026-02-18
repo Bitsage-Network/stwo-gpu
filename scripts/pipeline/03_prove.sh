@@ -141,6 +141,7 @@ GPU_MLE_FOLD_REQUIRE="${STWO_GPU_MLE_FOLD_REQUIRE:-off}"
 GPU_MLE_OPENING_TREE="${STWO_GPU_MLE_OPENING_TREE:-on}"
 GPU_MLE_OPENING_TREE_REQUIRE="${STWO_GPU_MLE_OPENING_TREE_REQUIRE:-off}"
 GPU_MLE_OPENING_TIMING="${STWO_GPU_MLE_OPENING_TIMING:-off}"
+UNIFIED_STARK_NO_FALLBACK="${STWO_UNIFIED_STARK_NO_FALLBACK:-off}"
 
 # Default to fast aggregated weight binding for off-chain proving.
 # For submit-ready Starknet calldata, caller can pass --starknet-ready.
@@ -177,12 +178,14 @@ GPU_MLE_OPENING_TREE="${STWO_GPU_MLE_OPENING_TREE:-auto}"
 
 if [[ "$GPU_ONLY" == "true" ]]; then
     export STWO_GPU_ONLY=1
+    export STWO_UNIFIED_STARK_NO_FALLBACK=1
     export STWO_GPU_MLE_MERKLE_REQUIRE=1
     export STWO_GPU_MLE_FOLD_REQUIRE=1
     export STWO_GPU_MLE_OPENING_TREE=1
     export STWO_GPU_MLE_OPENING_TREE_REQUIRE=1
     export STWO_GPU_MLE_FOLD=1
     export STWO_GPU_POLY_STRICT=1
+    UNIFIED_STARK_NO_FALLBACK="on"
     GPU_MLE_MERKLE_REQUIRE="on"
     GPU_MLE_FOLD_REQUIRE="on"
     GPU_MLE_OPENING_TREE_REQUIRE="on"
@@ -272,6 +275,10 @@ GPU_COMMIT_PARALLEL="off"
 if [[ -n "${STWO_PARALLEL_GPU_COMMIT:-}" ]]; then
     GPU_COMMIT_PARALLEL="on"
 fi
+UNIFIED_STARK_FALLBACK="on"
+if [[ "${UNIFIED_STARK_NO_FALLBACK,,}" =~ ^(1|true|on|yes)$ ]]; then
+    UNIFIED_STARK_FALLBACK="off"
+fi
 log "Mode:           ${MODE}"
 log "Model:          ${MODEL_NAME:-$(basename "$MODEL_DIR")}"
 log "Model dir:      ${MODEL_DIR}"
@@ -284,6 +291,7 @@ log "Starknet ready: ${STARKNET_READY}"
 log "GPU only mode:  ${GPU_ONLY}"
 log "GPU commit:     strict=${GPU_COMMIT_STRICT} harden=${GPU_COMMIT_HARDEN} parallel=${GPU_COMMIT_PARALLEL}"
 log "GPU poly path:  strict=${GPU_POLY_STRICT} harden=${GPU_POLY_HARDEN}"
+log "Unified STARK:  gpu_constraints_fallback=${UNIFIED_STARK_FALLBACK}"
 log "GPU MLE path:   fold=${GPU_MLE_FOLD} fold_min_points=${GPU_MLE_FOLD_MIN_POINTS} opening_tree=${GPU_MLE_OPENING_TREE} merkle_require=${GPU_MLE_MERKLE_REQUIRE} fold_require=${GPU_MLE_FOLD_REQUIRE} opening_tree_require=${GPU_MLE_OPENING_TREE_REQUIRE}"
 log "GPU opening:    qm31_pack=device (enabled by default)"
 log "GPU opening dbg: timing=${GPU_MLE_OPENING_TIMING}"

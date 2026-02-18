@@ -142,6 +142,7 @@ STARKNET_PRIVATE_KEY=0x... ./run_e2e.sh --preset qwen3-14b --gpu --submit
 | `STWO_GPU_COMMIT_HARDEN` | No | Off | `03_prove.sh`, `prove-model` |
 | `STWO_GPU_POLY_STRICT` | No | Off | STWO GPU poly backend |
 | `STWO_GPU_POLY_HARDEN` | No | Off | STWO GPU poly backend |
+| `STWO_UNIFIED_STARK_NO_FALLBACK` | No | Off | `prove-model` unified STARK (disable GPU→SIMD retry on `ConstraintsNotSatisfied`) |
 | `STWO_PARALLEL_GPU_COMMIT` | No | Off (single GPU default) | `03_prove.sh`, `prove-model` |
 | `STWO_WEIGHT_PROGRESS_EVERY` | No | `1` | Weight commitment progress cadence |
 | `STWO_GKR_OPENINGS_PROGRESS_EVERY` | No | `1` | Weight-opening progress cadence |
@@ -159,6 +160,7 @@ Notes:
 - Query extraction now replays folds on GPU and downloads only queried leaf pairs (instead of full folded layers), reducing opening-phase host transfer pressure.
 - `03_prove.sh` defaults to aggregated RLC weight binding for faster off-chain proving.
 - `run_e2e.sh --submit` auto-adds `--starknet-ready`, which forces sequential openings.
+- Unified STARK now retries once on SIMD if GPU path hits `ConstraintsNotSatisfied` (soundness-preserving fallback). Set `--gpu-only` or `STWO_UNIFIED_STARK_NO_FALLBACK=1` to fail closed instead.
 - In aggregated weight-binding mode, `ml_gkr` output still serializes full proof artifacts with `submission_ready=false`, `weight_opening_mode`, and `weight_claim_calldata`.
 
 ## Model Presets
