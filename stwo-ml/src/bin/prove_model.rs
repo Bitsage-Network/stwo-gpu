@@ -160,7 +160,7 @@ struct Cli {
     /// Contract address for --submit-gkr (hex).
     #[arg(
         long,
-        default_value = "0x00c7845a80d01927826b17032a432ad9cd36ea61be17fe8cc089d9b68c57e710"
+        default_value = "0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005"
     )]
     contract: String,
 
