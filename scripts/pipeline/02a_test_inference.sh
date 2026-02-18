@@ -289,12 +289,49 @@ run_llama_with_live_output() {
         echo -e "${DIM}[DRY RUN] $*${NC}" >&2
         return 0
     fi
-    if command -v timeout >/dev/null 2>&1; then
-        timeout "${INFERENCE_TIMEOUT_SEC}s" "$@" 2>&1 | tee "$out_file"
+
+    # Prefer PTY execution so llama output flushes live (avoids "stuck" feeling).
+    if command -v script >/dev/null 2>&1; then
+        local cmd_quoted=""
+        printf -v cmd_quoted '%q ' "$@"
+        if command -v timeout >/dev/null 2>&1; then
+            script -q -e -c "timeout ${INFERENCE_TIMEOUT_SEC}s ${cmd_quoted}" /dev/null 2>&1 | tee "$out_file"
+        else
+            script -q -e -c "${cmd_quoted}" /dev/null 2>&1 | tee "$out_file"
+        fi
         return ${PIPESTATUS[0]}
     fi
-    "$@" 2>&1 | tee "$out_file"
-    return ${PIPESTATUS[0]}
+
+    # Fallback path when `script` is unavailable: stream + heartbeat + timeout.
+    : > "$out_file"
+    "$@" >"$out_file" 2>&1 &
+    local cmd_pid=$!
+    tail -n +1 -f "$out_file" &
+    local tail_pid=$!
+    local started_at
+    started_at=$(date +%s)
+
+    while kill -0 "$cmd_pid" 2>/dev/null; do
+        sleep 15
+        if ! kill -0 "$cmd_pid" 2>/dev/null; then
+            break
+        fi
+        local elapsed=$(( $(date +%s) - started_at ))
+        log "Inference still running... ${elapsed}s elapsed"
+        if (( elapsed >= INFERENCE_TIMEOUT_SEC )); then
+            warn "Inference timeout (${INFERENCE_TIMEOUT_SEC}s) reached, terminating llama process..."
+            kill -TERM "$cmd_pid" 2>/dev/null || true
+            sleep 2
+            kill -KILL "$cmd_pid" 2>/dev/null || true
+            break
+        fi
+    done
+
+    wait "$cmd_pid"
+    local rc=$?
+    kill "$tail_pid" 2>/dev/null || true
+    wait "$tail_pid" 2>/dev/null || true
+    return "$rc"
 }
 
 if [[ "$DO_CHAT" == "true" ]]; then
