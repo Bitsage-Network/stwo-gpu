@@ -31,7 +31,9 @@ use crate::crypto::poseidon_channel::PoseidonChannel;
 
 use super::circuit::{LayerType, LayeredCircuit};
 use super::types::WeightOpeningTranscriptMode;
-use super::types::{derive_weight_opening_subchannel, GKRClaim, GKRError, GKRProof, LayerProof, SecureField};
+use super::types::{
+    derive_weight_opening_subchannel, GKRClaim, GKRError, GKRProof, LayerProof, SecureField,
+};
 
 #[cfg(feature = "cuda-runtime")]
 #[inline]
@@ -71,6 +73,16 @@ fn gkr_aggregate_weight_binding_enabled() -> bool {
 
 fn gkr_trustless_mode2_enabled() -> bool {
     match std::env::var("STWO_GKR_TRUSTLESS_MODE2") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false" && v != "off"
+        }
+        Err(_) => false,
+    }
+}
+
+fn gkr_trustless_mode3_enabled() -> bool {
+    match std::env::var("STWO_GKR_TRUSTLESS_MODE3") {
         Ok(v) => {
             let v = v.trim().to_ascii_lowercase();
             !v.is_empty() && v != "0" && v != "false" && v != "off"
@@ -308,13 +320,19 @@ pub fn prove_gkr(
     }
 
     let aggregate_weight_binding_env = gkr_aggregate_weight_binding_enabled();
-    let trustless_mode2 = gkr_trustless_mode2_enabled();
-    if trustless_mode2 && aggregate_weight_binding_env {
+    let trustless_mode3 = gkr_trustless_mode3_enabled();
+    let trustless_mode2 = gkr_trustless_mode2_enabled() && !trustless_mode3;
+    if trustless_mode3 && gkr_trustless_mode2_enabled() {
+        eprintln!("  [GKR] STWO_GKR_TRUSTLESS_MODE3=1 overrides STWO_GKR_TRUSTLESS_MODE2=1");
+    }
+    if (trustless_mode2 || trustless_mode3) && aggregate_weight_binding_env {
+        let mode = if trustless_mode3 { "MODE3" } else { "MODE2" };
         eprintln!(
-            "  [GKR] STWO_GKR_TRUSTLESS_MODE2=1 overrides STWO_GKR_AGGREGATE_WEIGHT_BINDING=on (keeping opening proofs)"
+            "  [GKR] STWO_GKR_TRUSTLESS_{mode}=1 overrides STWO_GKR_AGGREGATE_WEIGHT_BINDING=on (keeping opening proofs)"
         );
     }
-    let aggregate_weight_binding = aggregate_weight_binding_env && !trustless_mode2;
+    let aggregate_weight_binding =
+        aggregate_weight_binding_env && !(trustless_mode2 || trustless_mode3);
     // In aggregated mode, include deferred MatMul weight claims in the same
     // transcript RLC binding and skip per-deferred Merkle openings.
     let mut deferred_weight_claims_data: Vec<(usize, Vec<SecureField>, SecureField)> =
@@ -460,7 +478,7 @@ pub fn prove_gkr(
             weight_data.len() + deferred_weight_claims_data.len()
         );
     } else {
-        let opening_seed = if trustless_mode2 && !weight_data.is_empty() {
+        let opening_seed = if (trustless_mode2 || trustless_mode3) && !weight_data.is_empty() {
             Some(channel.draw_felt252())
         } else {
             None
@@ -523,11 +541,19 @@ pub fn prove_gkr(
         }
     }
 
-    if trustless_mode2 && !aggregate_weight_binding {
-        weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedTrustlessV2;
-        eprintln!(
-            "  [GKR] aggregated trustless mode v2 enabled: opening proofs retained with mode-2 binding metadata"
-        );
+    if (trustless_mode2 || trustless_mode3) && !aggregate_weight_binding {
+        if trustless_mode3 {
+            weight_opening_transcript_mode =
+                WeightOpeningTranscriptMode::AggregatedOpeningsV4Experimental;
+            eprintln!(
+                "  [GKR] aggregated trustless mode v4 (experimental) enabled: opening proofs retained with mode-3 binding metadata"
+            );
+        } else {
+            weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedTrustlessV2;
+            eprintln!(
+                "  [GKR] aggregated trustless mode v2 enabled: opening proofs retained with mode-2 binding metadata"
+            );
+        }
     }
 
     // Compute IO commitment from model input and output
@@ -836,13 +862,19 @@ pub fn prove_gkr_gpu(
     );
 
     let aggregate_weight_binding_env = gkr_aggregate_weight_binding_enabled();
-    let trustless_mode2 = gkr_trustless_mode2_enabled();
-    if trustless_mode2 && aggregate_weight_binding_env {
+    let trustless_mode3 = gkr_trustless_mode3_enabled();
+    let trustless_mode2 = gkr_trustless_mode2_enabled() && !trustless_mode3;
+    if trustless_mode3 && gkr_trustless_mode2_enabled() {
+        eprintln!("  [GKR] STWO_GKR_TRUSTLESS_MODE3=1 overrides STWO_GKR_TRUSTLESS_MODE2=1");
+    }
+    if (trustless_mode2 || trustless_mode3) && aggregate_weight_binding_env {
+        let mode = if trustless_mode3 { "MODE3" } else { "MODE2" };
         eprintln!(
-            "  [GKR] STWO_GKR_TRUSTLESS_MODE2=1 overrides STWO_GKR_AGGREGATE_WEIGHT_BINDING=on (keeping opening proofs)"
+            "  [GKR] STWO_GKR_TRUSTLESS_{mode}=1 overrides STWO_GKR_AGGREGATE_WEIGHT_BINDING=on (keeping opening proofs)"
         );
     }
-    let aggregate_weight_binding = aggregate_weight_binding_env && !trustless_mode2;
+    let aggregate_weight_binding =
+        aggregate_weight_binding_env && !(trustless_mode2 || trustless_mode3);
     // In aggregated mode, include deferred MatMul weight claims in the same
     // transcript RLC binding and skip per-deferred Merkle openings.
     let mut deferred_weight_claims_data: Vec<(usize, Vec<SecureField>, SecureField)> =
@@ -1006,7 +1038,7 @@ pub fn prove_gkr_gpu(
         {
             let weight_data = weight_data;
             let batched = gkr_batch_weight_openings_enabled() && total_openings > 0;
-            let use_subchannel_openings = trustless_mode2 || batched;
+            let use_subchannel_openings = trustless_mode2 || trustless_mode3 || batched;
             let opening_seed = if use_subchannel_openings {
                 Some(channel.draw_felt252())
             } else {
@@ -1230,7 +1262,7 @@ pub fn prove_gkr_gpu(
 
         #[cfg(not(feature = "cuda-runtime"))]
         {
-            let opening_seed = if trustless_mode2 && total_openings > 0 {
+            let opening_seed = if (trustless_mode2 || trustless_mode3) && total_openings > 0 {
                 Some(channel.draw_felt252())
             } else {
                 None
@@ -1300,11 +1332,19 @@ pub fn prove_gkr_gpu(
         }
     }
 
-    if trustless_mode2 && !aggregate_weight_binding {
-        weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedTrustlessV2;
-        eprintln!(
-            "  [GKR] aggregated trustless mode v2 enabled: opening proofs retained with mode-2 binding metadata (sub-channel transcript)"
-        );
+    if (trustless_mode2 || trustless_mode3) && !aggregate_weight_binding {
+        if trustless_mode3 {
+            weight_opening_transcript_mode =
+                WeightOpeningTranscriptMode::AggregatedOpeningsV4Experimental;
+            eprintln!(
+                "  [GKR] aggregated trustless mode v4 (experimental) enabled: opening proofs retained with mode-3 binding metadata (sub-channel transcript)"
+            );
+        } else {
+            weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedTrustlessV2;
+            eprintln!(
+                "  [GKR] aggregated trustless mode v2 enabled: opening proofs retained with mode-2 binding metadata (sub-channel transcript)"
+            );
+        }
     }
 
     let model_input = execution
@@ -2071,14 +2111,20 @@ pub fn prove_gkr_simd_gpu(
     let mut weight_claims = Vec::with_capacity(weight_data.len());
     let mut weight_opening_transcript_mode = WeightOpeningTranscriptMode::Sequential;
     let aggregate_weight_binding_env = gkr_aggregate_weight_binding_enabled();
-    let trustless_mode2 = gkr_trustless_mode2_enabled();
-    if trustless_mode2 && aggregate_weight_binding_env {
+    let trustless_mode3 = gkr_trustless_mode3_enabled();
+    let trustless_mode2 = gkr_trustless_mode2_enabled() && !trustless_mode3;
+    if trustless_mode3 && gkr_trustless_mode2_enabled() {
+        eprintln!("  [GKR] STWO_GKR_TRUSTLESS_MODE3=1 overrides STWO_GKR_TRUSTLESS_MODE2=1");
+    }
+    if (trustless_mode2 || trustless_mode3) && aggregate_weight_binding_env {
+        let mode = if trustless_mode3 { "MODE3" } else { "MODE2" };
         eprintln!(
-            "  [GKR] STWO_GKR_TRUSTLESS_MODE2=1 overrides STWO_GKR_AGGREGATE_WEIGHT_BINDING=on (keeping opening proofs)"
+            "  [GKR] STWO_GKR_TRUSTLESS_{mode}=1 overrides STWO_GKR_AGGREGATE_WEIGHT_BINDING=on (keeping opening proofs)"
         );
     }
-    let aggregate_weight_binding =
-        aggregate_weight_binding_env && !trustless_mode2 && !weight_data.is_empty();
+    let aggregate_weight_binding = aggregate_weight_binding_env
+        && !(trustless_mode2 || trustless_mode3)
+        && !weight_data.is_empty();
 
     if aggregate_weight_binding {
         weight_opening_transcript_mode = WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1;
@@ -2101,7 +2147,7 @@ pub fn prove_gkr_simd_gpu(
             weight_data.len()
         );
     } else {
-        let opening_seed = if trustless_mode2 && !weight_data.is_empty() {
+        let opening_seed = if (trustless_mode2 || trustless_mode3) && !weight_data.is_empty() {
             Some(channel.draw_felt252())
         } else {
             None
@@ -2164,11 +2210,19 @@ pub fn prove_gkr_simd_gpu(
         }
     }
 
-    if trustless_mode2 && !aggregate_weight_binding {
-        weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedTrustlessV2;
-        eprintln!(
-            "  [GKR] aggregated trustless mode v2 enabled: opening proofs retained with mode-2 binding metadata"
-        );
+    if (trustless_mode2 || trustless_mode3) && !aggregate_weight_binding {
+        if trustless_mode3 {
+            weight_opening_transcript_mode =
+                WeightOpeningTranscriptMode::AggregatedOpeningsV4Experimental;
+            eprintln!(
+                "  [GKR] aggregated trustless mode v4 (experimental) enabled: opening proofs retained with mode-3 binding metadata"
+            );
+        } else {
+            weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedTrustlessV2;
+            eprintln!(
+                "  [GKR] aggregated trustless mode v2 enabled: opening proofs retained with mode-2 binding metadata"
+            );
+        }
     }
 
     // IO commitment from first block's input and combined output

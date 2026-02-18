@@ -269,12 +269,16 @@ pub struct WeightClaim {
 ///   mode-2 binding payload checks in the Starknet v3 verifier path.
 ///   Openings use per-opening sub-channel transcripts for deterministic
 ///   parallelizable proving/verifying.
+/// - `AggregatedOpeningsV4Experimental`: experimental mode-3 envelope for
+///   Starknet v4 integration scaffolding. Current implementation still uses
+///   full opening proofs and emits mode-3 binding metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeightOpeningTranscriptMode {
     Sequential,
     BatchedSubchannelV1,
     BatchedRlcDirectEvalV1,
     AggregatedTrustlessV2,
+    AggregatedOpeningsV4Experimental,
 }
 
 /// Deterministically derive a per-opening sub-channel from a master seed.

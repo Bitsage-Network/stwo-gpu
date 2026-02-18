@@ -708,7 +708,8 @@ fn verify_gkr_inner(
                 });
             }
         }
-        WeightOpeningTranscriptMode::AggregatedTrustlessV2 => {
+        WeightOpeningTranscriptMode::AggregatedTrustlessV2
+        | WeightOpeningTranscriptMode::AggregatedOpeningsV4Experimental => {
             if proof.weight_openings.len() != proof.weight_commitments.len() {
                 return Err(GKRError::VerificationError {
                     layer_idx: 0,

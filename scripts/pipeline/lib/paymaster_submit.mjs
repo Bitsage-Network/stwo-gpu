@@ -198,7 +198,11 @@ async function preflightContractEntrypoint(provider, contractAddress, entrypoint
   }
 
   if (!abiHasEntrypoint(abi, entrypoint)) {
-    if (entrypoint === "verify_model_gkr_v2" || entrypoint === "verify_model_gkr_v3") {
+    if (
+      entrypoint === "verify_model_gkr_v2" ||
+      entrypoint === "verify_model_gkr_v3" ||
+      entrypoint === "verify_model_gkr_v4"
+    ) {
       die(
         `Contract ${contractAddress} does not expose ${entrypoint}. ` +
           "Deploy the upgraded verifier, or submit with v1 (Sequential mode)."
@@ -286,10 +290,11 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
     "verify_model_gkr",
     "verify_model_gkr_v2",
     "verify_model_gkr_v3",
+    "verify_model_gkr_v4",
   ]);
   if (!allowedEntrypoints.has(entrypoint)) {
     die(
-      `Only verify_model_gkr / verify_model_gkr_v2 / verify_model_gkr_v3 are supported in the hardened pipeline (got: ${entrypoint})`
+      `Only verify_model_gkr / verify_model_gkr_v2 / verify_model_gkr_v3 / verify_model_gkr_v4 are supported in the hardened pipeline (got: ${entrypoint})`
     );
   }
 
@@ -323,6 +328,15 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
         `${entrypoint} requires weight_opening_mode in {Sequential,BatchedSubchannelV1} (got: ${proofData.weight_opening_mode})`
       );
     }
+  } else if (entrypoint === "verify_model_gkr_v4") {
+    if (
+      weightOpeningMode !== undefined &&
+      weightOpeningMode !== "AggregatedOpeningsV4Experimental"
+    ) {
+      die(
+        `${entrypoint} requires weight_opening_mode=AggregatedOpeningsV4Experimental (got: ${proofData.weight_opening_mode})`
+      );
+    }
   }
 
   const rawChunks = verifyCalldata.upload_chunks ?? [];
@@ -353,7 +367,11 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
     return n;
   };
 
-  if (entrypoint === "verify_model_gkr_v2" || entrypoint === "verify_model_gkr_v3") {
+  if (
+    entrypoint === "verify_model_gkr_v2" ||
+    entrypoint === "verify_model_gkr_v3" ||
+    entrypoint === "verify_model_gkr_v4"
+  ) {
     // model_id, raw_io_data, circuit_depth, num_layers, matmul_dims,
     // dequantize_bits, proof_data, weight_commitments, weight_binding_mode, weight_openings...
     let idx = 0;
@@ -379,6 +397,9 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
     if (entrypoint === "verify_model_gkr_v2" && !new Set([0, 1]).has(weightBindingMode)) {
       die(`${entrypoint} requires weight_binding_mode in {0,1} (got ${weightBindingMode})`);
     }
+    if (entrypoint === "verify_model_gkr_v4" && weightBindingMode !== 3) {
+      die(`${entrypoint} requires weight_binding_mode=3 (got ${weightBindingMode})`);
+    }
     let expectedMode = null;
     if (weightOpeningMode === "Sequential") {
       expectedMode = 0;
@@ -386,6 +407,8 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
       expectedMode = 1;
     } else if (weightOpeningMode === "AggregatedTrustlessV2") {
       expectedMode = 2;
+    } else if (weightOpeningMode === "AggregatedOpeningsV4Experimental") {
+      expectedMode = 3;
     }
     if (expectedMode !== null && weightBindingMode !== expectedMode) {
       die(
@@ -393,7 +416,11 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
       );
     }
     const allowedModes =
-      entrypoint === "verify_model_gkr_v3" ? new Set([0, 1, 2]) : new Set([0, 1]);
+      entrypoint === "verify_model_gkr_v3"
+        ? new Set([0, 1, 2])
+        : entrypoint === "verify_model_gkr_v4"
+          ? new Set([3])
+          : new Set([0, 1]);
     if (expectedMode === null && !allowedModes.has(weightBindingMode)) {
       die(
         `${entrypoint} requires weight_binding_mode in {${[...allowedModes].join(",")}} (got ${weightBindingMode})`
@@ -407,9 +434,9 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
         );
       }
     }
-    if (entrypoint === "verify_model_gkr_v3") {
+    if (entrypoint === "verify_model_gkr_v3" || entrypoint === "verify_model_gkr_v4") {
       idx += 1; // consume weight_binding_mode
-      if (idx >= calldata.length) die("v3 calldata truncated before weight_binding_data length");
+      if (idx >= calldata.length) die(`${entrypoint} calldata truncated before weight_binding_data length`);
       const weightBindingDataLen = parseNat(calldata[idx], "weight_binding_data length");
       idx += 1 + weightBindingDataLen;
       if (new Set([0, 1]).has(weightBindingMode) && weightBindingDataLen !== 0) {
@@ -419,6 +446,9 @@ function parseVerifyCalldata(proofData, fallbackModelId) {
       }
       if (weightBindingMode === 2 && weightBindingDataLen === 0) {
         die(`${entrypoint} mode 2 requires non-empty weight_binding_data`);
+      }
+      if (weightBindingMode === 3 && weightBindingDataLen === 0) {
+        die(`${entrypoint} mode 3 requires non-empty weight_binding_data`);
       }
       if (
         Array.isArray(proofData.weight_binding_data_calldata) &&
@@ -570,12 +600,12 @@ async function cmdVerify(args) {
   const modelId = verifyPayload.modelId || modelIdArg;
 
   if (
-    !new Set(["verify_model_gkr", "verify_model_gkr_v2", "verify_model_gkr_v3"]).has(
+    !new Set(["verify_model_gkr", "verify_model_gkr_v2", "verify_model_gkr_v3", "verify_model_gkr_v4"]).has(
       verifyPayload.entrypoint
     )
   ) {
     die(
-      `Only verify_model_gkr / verify_model_gkr_v2 / verify_model_gkr_v3 are supported in the hardened pipeline (got: ${verifyPayload.entrypoint})`
+      `Only verify_model_gkr / verify_model_gkr_v2 / verify_model_gkr_v3 / verify_model_gkr_v4 are supported in the hardened pipeline (got: ${verifyPayload.entrypoint})`
     );
   }
 

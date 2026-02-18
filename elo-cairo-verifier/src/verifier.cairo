@@ -222,6 +222,28 @@ pub trait ISumcheckVerifier<TContractState> {
         weight_opening_proofs: Array<MleOpeningProof>,
     ) -> bool;
 
+    /// Phase-4 versioned interface for experimental aggregated openings envelope.
+    ///
+    /// Supported `weight_binding_mode` values:
+    ///   - `3`: aggregated openings experimental envelope
+    ///
+    /// `weight_binding_data`:
+    ///   - mode `3`: `[binding_digest, claim_count]`
+    fn verify_model_gkr_v4(
+        ref self: TContractState,
+        model_id: felt252,
+        raw_io_data: Array<felt252>,
+        circuit_depth: u32,
+        num_layers: u32,
+        matmul_dims: Array<u32>,
+        dequantize_bits: Array<u64>,
+        proof_data: Array<felt252>,
+        weight_commitments: Array<felt252>,
+        weight_binding_mode: u32,
+        weight_binding_data: Array<felt252>,
+        weight_opening_proofs: Array<MleOpeningProof>,
+    ) -> bool;
+
     /// Get the circuit descriptor hash for a GKR-registered model.
     fn get_model_circuit_hash(self: @TContractState, model_id: felt252) -> felt252;
 
@@ -465,8 +487,11 @@ mod SumcheckVerifierContract {
     const WEIGHT_BINDING_MODE_SEQUENTIAL: u32 = 0;
     const WEIGHT_BINDING_MODE_BATCHED_SUBCHANNEL_V1: u32 = 1;
     const WEIGHT_BINDING_MODE_AGGREGATED_TRUSTLESS_V2: u32 = 2;
+    const WEIGHT_BINDING_MODE_AGGREGATED_OPENINGS_V4_EXPERIMENTAL: u32 = 3;
     const WEIGHT_BINDING_MODE2_DOMAIN_TAG: felt252 = 0x57424d32;
     const WEIGHT_BINDING_MODE2_SCHEMA_VERSION: felt252 = 1;
+    const WEIGHT_BINDING_MODE3_DOMAIN_TAG: felt252 = 0x57424d33;
+    const WEIGHT_BINDING_MODE3_SCHEMA_VERSION: felt252 = 1;
 
     fn derive_weight_opening_subchannel(
         opening_seed: felt252,
@@ -481,13 +506,15 @@ mod SumcheckVerifierContract {
         ch
     }
 
-    fn compute_mode2_binding_digest(
+    fn compute_mode_binding_digest(
         commitments: Span<felt252>,
         claims: Span<WeightClaimData>,
+        domain_tag: felt252,
+        schema_version: felt252,
     ) -> felt252 {
         let mut hasher_inputs: Array<felt252> = array![
-            WEIGHT_BINDING_MODE2_DOMAIN_TAG,
-            WEIGHT_BINDING_MODE2_SCHEMA_VERSION,
+            domain_tag,
+            schema_version,
             claims.len().into(),
             commitments.len().into(),
         ];
@@ -517,6 +544,30 @@ mod SumcheckVerifierContract {
         core::poseidon::poseidon_hash_span(hasher_inputs.span())
     }
 
+    fn compute_mode2_binding_digest(
+        commitments: Span<felt252>,
+        claims: Span<WeightClaimData>,
+    ) -> felt252 {
+        compute_mode_binding_digest(
+            commitments,
+            claims,
+            WEIGHT_BINDING_MODE2_DOMAIN_TAG,
+            WEIGHT_BINDING_MODE2_SCHEMA_VERSION,
+        )
+    }
+
+    fn compute_mode3_binding_digest(
+        commitments: Span<felt252>,
+        claims: Span<WeightClaimData>,
+    ) -> felt252 {
+        compute_mode_binding_digest(
+            commitments,
+            claims,
+            WEIGHT_BINDING_MODE3_DOMAIN_TAG,
+            WEIGHT_BINDING_MODE3_SCHEMA_VERSION,
+        )
+    }
+
     fn verify_model_gkr_core(
         ref self: ContractState,
         model_id: felt252,
@@ -534,7 +585,8 @@ mod SumcheckVerifierContract {
         assert!(
             weight_binding_mode == WEIGHT_BINDING_MODE_SEQUENTIAL
                 || weight_binding_mode == WEIGHT_BINDING_MODE_BATCHED_SUBCHANNEL_V1
-                || weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_TRUSTLESS_V2,
+                || weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_TRUSTLESS_V2
+                || weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_OPENINGS_V4_EXPERIMENTAL,
             "UNSUPPORTED_WEIGHT_BINDING_MODE",
         );
 
@@ -732,10 +784,12 @@ mod SumcheckVerifierContract {
             weight_opening_proofs.len() == expected_weight_claims,
             "WEIGHT_OPENING_COUNT_MISMATCH",
         );
-        if weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_TRUSTLESS_V2 {
+        if weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_TRUSTLESS_V2
+            || weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_OPENINGS_V4_EXPERIMENTAL
+        {
             assert!(
                 weight_binding_data.len() == 2,
-                "MODE2_WEIGHT_BINDING_DATA_LENGTH_MISMATCH",
+                "WEIGHT_BINDING_DATA_LENGTH_MISMATCH",
             );
         } else {
             assert!(weight_binding_data.len() == 0, "UNEXPECTED_WEIGHT_BINDING_DATA_FOR_MODE");
@@ -744,6 +798,7 @@ mod SumcheckVerifierContract {
         let opening_seed = if (
             weight_binding_mode == WEIGHT_BINDING_MODE_BATCHED_SUBCHANNEL_V1
                 || weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_TRUSTLESS_V2
+                || weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_OPENINGS_V4_EXPERIMENTAL
         ) && expected_weight_claims > 0 {
             channel_draw_felt252(ref ch)
         } else {
@@ -783,20 +838,23 @@ mod SumcheckVerifierContract {
             w_i += 1;
         };
 
-        if weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_TRUSTLESS_V2 {
+        if weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_TRUSTLESS_V2
+            || weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_OPENINGS_V4_EXPERIMENTAL
+        {
             let advertised_claim_count_u256: u256 = (*weight_binding_data.at(1)).into();
             let advertised_claim_count: u32 = advertised_claim_count_u256.try_into().unwrap();
             assert!(
                 advertised_claim_count == expected_weight_claims,
-                "MODE2_WEIGHT_BINDING_CLAIM_COUNT_MISMATCH",
+                "WEIGHT_BINDING_CLAIM_COUNT_MISMATCH",
             );
-            let expected_digest = compute_mode2_binding_digest(
-                resolved_weight_commitments.span(),
-                weight_claims.span(),
-            );
+            let expected_digest = if weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_TRUSTLESS_V2 {
+                compute_mode2_binding_digest(resolved_weight_commitments.span(), weight_claims.span())
+            } else {
+                compute_mode3_binding_digest(resolved_weight_commitments.span(), weight_claims.span())
+            };
             assert!(
                 expected_digest == *weight_binding_data.at(0),
-                "MODE2_WEIGHT_BINDING_DIGEST_MISMATCH",
+                "WEIGHT_BINDING_DIGEST_MISMATCH",
             );
         }
 
@@ -816,6 +874,7 @@ mod SumcheckVerifierContract {
 
             let valid = if weight_binding_mode == WEIGHT_BINDING_MODE_BATCHED_SUBCHANNEL_V1
                 || weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_TRUSTLESS_V2
+                || weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_OPENINGS_V4_EXPERIMENTAL
             {
                 let mut sub_ch = derive_weight_opening_subchannel(opening_seed, w_i, claim);
                 verify_mle_opening(
@@ -1682,6 +1741,41 @@ mod SumcheckVerifierContract {
                 weight_binding_mode == WEIGHT_BINDING_MODE_SEQUENTIAL
                     || weight_binding_mode == WEIGHT_BINDING_MODE_BATCHED_SUBCHANNEL_V1
                     || weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_TRUSTLESS_V2,
+                "UNSUPPORTED_WEIGHT_BINDING_MODE",
+            );
+
+            verify_model_gkr_core(
+                ref self,
+                model_id,
+                raw_io_data,
+                circuit_depth,
+                num_layers,
+                matmul_dims,
+                dequantize_bits,
+                proof_data,
+                weight_commitments,
+                weight_binding_mode,
+                weight_binding_data.span(),
+                weight_opening_proofs,
+            )
+        }
+
+        fn verify_model_gkr_v4(
+            ref self: ContractState,
+            model_id: felt252,
+            raw_io_data: Array<felt252>,
+            circuit_depth: u32,
+            num_layers: u32,
+            matmul_dims: Array<u32>,
+            dequantize_bits: Array<u64>,
+            proof_data: Array<felt252>,
+            weight_commitments: Array<felt252>,
+            weight_binding_mode: u32,
+            weight_binding_data: Array<felt252>,
+            weight_opening_proofs: Array<MleOpeningProof>,
+        ) -> bool {
+            assert!(
+                weight_binding_mode == WEIGHT_BINDING_MODE_AGGREGATED_OPENINGS_V4_EXPERIMENTAL,
                 "UNSUPPORTED_WEIGHT_BINDING_MODE",
             );
 

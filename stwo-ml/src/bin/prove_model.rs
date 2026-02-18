@@ -1188,6 +1188,7 @@ fn main() {
             use stwo_ml::starknet::{
                 build_gkr_serializable_proof, build_verify_model_gkr_calldata,
                 build_verify_model_gkr_v2_calldata, build_verify_model_gkr_v3_calldata,
+                build_verify_model_gkr_v4_calldata,
             };
 
             let gkr_proof =
@@ -1218,6 +1219,13 @@ fn main() {
                 eprintln!("  Warning: Starknet soundness gate status: {reason}");
             }
 
+            let use_starknet_gkr_v4 = std::env::var("STWO_STARKNET_GKR_V4")
+                .ok()
+                .map(|v| {
+                    let v = v.trim().to_ascii_lowercase();
+                    !v.is_empty() && v != "0" && v != "false" && v != "off"
+                })
+                .unwrap_or(false);
             let use_starknet_gkr_v3 = std::env::var("STWO_STARKNET_GKR_V3")
                 .ok()
                 .map(|v| {
@@ -1225,7 +1233,8 @@ fn main() {
                     !v.is_empty() && v != "0" && v != "false" && v != "off"
                 })
                 .unwrap_or(false);
-            let use_starknet_gkr_v2 = !use_starknet_gkr_v3
+            let use_starknet_gkr_v2 = !use_starknet_gkr_v4
+                && !use_starknet_gkr_v3
                 && std::env::var("STWO_STARKNET_GKR_V2")
                     .ok()
                     .map(|v| {
@@ -1233,7 +1242,9 @@ fn main() {
                         !v.is_empty() && v != "0" && v != "false" && v != "off"
                     })
                     .unwrap_or(false);
-            let verify_entrypoint = if use_starknet_gkr_v3 {
+            let verify_entrypoint = if use_starknet_gkr_v4 {
+                "verify_model_gkr_v4"
+            } else if use_starknet_gkr_v3 {
                 "verify_model_gkr_v3"
             } else if use_starknet_gkr_v2 {
                 "verify_model_gkr_v2"
@@ -1248,7 +1259,9 @@ fn main() {
                     Ok(circuit) => {
                         let raw_io =
                             stwo_ml::cairo_serde::serialize_raw_io(&input, &proof.execution.output);
-                        let verify_result = if use_starknet_gkr_v3 {
+                        let verify_result = if use_starknet_gkr_v4 {
+                            build_verify_model_gkr_v4_calldata(gkr_p, &circuit, model_id, &raw_io)
+                        } else if use_starknet_gkr_v3 {
                             build_verify_model_gkr_v3_calldata(gkr_p, &circuit, model_id, &raw_io)
                         } else if use_starknet_gkr_v2 {
                             build_verify_model_gkr_v2_calldata(gkr_p, &circuit, model_id, &raw_io)
