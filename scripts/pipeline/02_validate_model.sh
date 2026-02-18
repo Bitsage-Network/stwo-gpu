@@ -216,7 +216,7 @@ if [[ "$FULL" == "true" ]]; then
     log "Command: ${PROVE_BIN} ${TEST_ARGS[*]}"
     echo ""
 
-    if env STWO_PURE_GKR_SKIP_UNIFIED_STARK=1 run_cmd "${PROVE_BIN}" "${TEST_ARGS[@]}" 2>&1; then
+    if STWO_PURE_GKR_SKIP_UNIFIED_STARK=1 run_cmd "${PROVE_BIN}" "${TEST_ARGS[@]}" 2>&1; then
         if [[ -f "$TEST_OUTPUT" ]]; then
             TEST_SIZE=$(du -h "$TEST_OUTPUT" | cut -f1)
             ok "Test proof generated: ${TEST_OUTPUT} (${TEST_SIZE})"
