@@ -164,18 +164,6 @@ fn felt_to_securefield_packed(fe: FieldElement) -> SecureField {
 
 #[cfg(feature = "cuda-runtime")]
 #[inline]
-fn securefield_to_u64_limbs_direct(sf: SecureField) -> [u64; 4] {
-    let QM31(CM31(a, b), CM31(c, d)) = sf;
-    let packed = (1u128 << 124)
-        | ((a.0 as u128) << 93)
-        | ((b.0 as u128) << 62)
-        | ((c.0 as u128) << 31)
-        | (d.0 as u128);
-    [packed as u64, (packed >> 64) as u64, 0, 0]
-}
-
-#[cfg(feature = "cuda-runtime")]
-#[inline]
 fn qm31_u32_to_u64_limbs_direct(words: &[u32]) -> [u64; 4] {
     debug_assert!(words.len() == 4);
     let packed = (1u128 << 124)
@@ -260,78 +248,6 @@ fn commit_mle_from_qm31_u32_aos(evals_u32: &[u32]) -> (FieldElement, PoseidonMer
 }
 
 #[cfg(feature = "cuda-runtime")]
-fn build_gpu_opening_tree_from_qm31_u32(
-    evals_u32: &[u32],
-) -> Result<(FieldElement, Poseidon252MerkleGpuTree), String> {
-    assert!(!evals_u32.is_empty());
-    assert!(evals_u32.len() % 4 == 0);
-    let n_points = evals_u32.len() / 4;
-    assert!(n_points.is_power_of_two());
-    let n_leaf_hashes = n_points / 2;
-    if n_leaf_hashes == 0 {
-        return Err("cannot build gpu opening tree for single-point input".to_string());
-    }
-
-    let executor = get_cuda_executor().map_err(|e| format!("cuda init: {e}"))?;
-    let d_rc = upload_poseidon252_round_constants(&executor.device)
-        .map_err(|e| format!("upload round constants: {e}"))?;
-
-    let mut leaf_limbs = vec![0u64; n_points * 4];
-    leaf_limbs
-        .par_chunks_mut(4)
-        .zip(evals_u32.par_chunks_exact(4))
-        .for_each(|(dst, src)| {
-            dst.copy_from_slice(&qm31_u32_to_u64_limbs_direct(src));
-        });
-
-    let d_prev_leaf = executor
-        .device
-        .htod_sync_copy(&leaf_limbs)
-        .map_err(|e| format!("H2D leaf limbs: {:?}", e))?;
-    let d_dummy_columns = executor
-        .device
-        .htod_sync_copy(&[0u32])
-        .map_err(|e| format!("H2D dummy columns: {:?}", e))?;
-
-    let tree = executor
-        .execute_poseidon252_merkle_full_tree_gpu_layers(
-            &d_dummy_columns,
-            0,
-            Some(&d_prev_leaf),
-            n_leaf_hashes,
-            &d_rc,
-        )
-        .map_err(|e| format!("execute full-tree gpu layers: {e}"))?;
-    let root_limbs = tree
-        .root_u64()
-        .map_err(|e| format!("download gpu root: {e}"))?;
-    let root = u64_limbs_to_felt252(&root_limbs)
-        .ok_or_else(|| "invalid root limbs from gpu merkle tree".to_string())?;
-    Ok((root, tree))
-}
-
-#[cfg(feature = "cuda-runtime")]
-fn build_gpu_opening_tree_from_qm31_u32_device(
-    d_qm31_aos: &CudaSlice<u32>,
-    n_points: usize,
-) -> Result<(FieldElement, Poseidon252MerkleGpuTree), String> {
-    let executor = get_cuda_executor().map_err(|e| format!("cuda init: {e}"))?;
-    let d_rc = upload_poseidon252_round_constants(&executor.device)
-        .map_err(|e| format!("upload round constants: {e}"))?;
-    let d_dummy_columns = executor
-        .device
-        .htod_sync_copy(&[0u32])
-        .map_err(|e| format!("H2D dummy columns: {:?}", e))?;
-    build_gpu_opening_tree_from_qm31_u32_device_with_ctx(
-        executor,
-        &d_rc,
-        &d_dummy_columns,
-        d_qm31_aos,
-        n_points,
-    )
-}
-
-#[cfg(feature = "cuda-runtime")]
 fn build_gpu_opening_tree_from_qm31_u32_device_with_ctx(
     executor: &CudaFftExecutor,
     d_rc: &CudaSlice<u64>,
@@ -389,98 +305,6 @@ fn build_gpu_opening_tree_from_qm31_u32_device_with_ctx(
     let root = u64_limbs_to_felt252(&root_limbs)
         .ok_or_else(|| "invalid root limbs from gpu merkle tree".to_string())?;
     Ok((root, tree))
-}
-
-#[cfg(feature = "cuda-runtime")]
-fn build_gpu_opening_tree_from_secure(
-    evals: &[SecureField],
-) -> Result<(FieldElement, Poseidon252MerkleGpuTree), String> {
-    assert!(!evals.is_empty());
-    assert!(evals.len().is_power_of_two());
-    let n_points = evals.len();
-    let n_leaf_hashes = n_points / 2;
-    if n_leaf_hashes == 0 {
-        return Err("cannot build gpu opening tree for single-point input".to_string());
-    }
-
-    let executor = get_cuda_executor().map_err(|e| format!("cuda init: {e}"))?;
-    let d_rc = upload_poseidon252_round_constants(&executor.device)
-        .map_err(|e| format!("upload round constants: {e}"))?;
-
-    let mut leaf_limbs = vec![0u64; n_points * 4];
-    leaf_limbs
-        .par_chunks_mut(4)
-        .zip(evals.par_iter())
-        .for_each(|(dst, sf)| {
-            dst.copy_from_slice(&securefield_to_u64_limbs_direct(*sf));
-        });
-
-    let d_prev_leaf = executor
-        .device
-        .htod_sync_copy(&leaf_limbs)
-        .map_err(|e| format!("H2D leaf limbs: {:?}", e))?;
-    let d_dummy_columns = executor
-        .device
-        .htod_sync_copy(&[0u32])
-        .map_err(|e| format!("H2D dummy columns: {:?}", e))?;
-
-    let tree = executor
-        .execute_poseidon252_merkle_full_tree_gpu_layers(
-            &d_dummy_columns,
-            0,
-            Some(&d_prev_leaf),
-            n_leaf_hashes,
-            &d_rc,
-        )
-        .map_err(|e| format!("execute full-tree gpu layers: {e}"))?;
-    let root_limbs = tree
-        .root_u64()
-        .map_err(|e| format!("download gpu root: {e}"))?;
-    let root = u64_limbs_to_felt252(&root_limbs)
-        .ok_or_else(|| "invalid root limbs from gpu merkle tree".to_string())?;
-    Ok((root, tree))
-}
-
-#[cfg(feature = "cuda-runtime")]
-fn leaf_value_from_layer(layer: &MleLayerValues, idx: usize) -> SecureField {
-    match layer {
-        MleLayerValues::Secure(v) => v[idx],
-        MleLayerValues::Qm31U32Aos(words) => {
-            let s = idx * 4;
-            u32s_to_secure_field(&[words[s], words[s + 1], words[s + 2], words[s + 3]])
-        }
-    }
-}
-
-#[cfg(feature = "cuda-runtime")]
-#[inline]
-fn leaf_value_from_words(words: &[u32], idx: usize) -> SecureField {
-    let s = idx * 4;
-    u32s_to_secure_field(&[words[s], words[s + 1], words[s + 2], words[s + 3]])
-}
-
-#[cfg(feature = "cuda-runtime")]
-fn build_gpu_merkle_path(
-    tree: &Poseidon252MerkleGpuTree,
-    layer_values: &MleLayerValues,
-    leaf_idx: usize,
-    n_leaves: usize,
-) -> Result<Vec<FieldElement>, String> {
-    let leaf_sibling_idx = leaf_idx ^ 1;
-    let leaf_sibling = leaf_value_from_layer(layer_values, leaf_sibling_idx);
-    build_gpu_merkle_path_with_leaf_sibling(tree, leaf_idx, n_leaves, leaf_sibling)
-}
-
-#[cfg(feature = "cuda-runtime")]
-fn build_gpu_merkle_path_from_words(
-    tree: &Poseidon252MerkleGpuTree,
-    words: &[u32],
-    leaf_idx: usize,
-    n_leaves: usize,
-) -> Result<Vec<FieldElement>, String> {
-    let leaf_sibling_idx = leaf_idx ^ 1;
-    let leaf_sibling = leaf_value_from_words(words, leaf_sibling_idx);
-    build_gpu_merkle_path_with_leaf_sibling(tree, leaf_idx, n_leaves, leaf_sibling)
 }
 
 #[cfg(feature = "cuda-runtime")]
