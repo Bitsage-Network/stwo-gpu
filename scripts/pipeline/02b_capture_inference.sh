@@ -27,7 +27,7 @@ source "${SCRIPT_DIR}/lib/common.sh"
 MODEL_NAME=""
 MODEL_DIR=""
 NUM_LAYERS=""
-CAPTURE_COUNT=10
+CAPTURE_COUNT=3
 MODEL_ID="0x1"
 INPUT_FILE=""
 SKIP_COMMITMENT=false
@@ -59,7 +59,7 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Options:"
             echo "  --layers N           Number of transformer layers (default: from config)"
-            echo "  --count N            Number of forward passes to capture (default: 10)"
+            echo "  --count N            Number of forward passes to capture (default: 3)"
             echo "  --model-id ID        Model ID for log metadata (default: 0x1)"
             echo "  --input FILE         JSON input file (default: diverse generated inputs)"
             echo "  --skip-commitment    Skip weight commitment (faster, weaker audit)"

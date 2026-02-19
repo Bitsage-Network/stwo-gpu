@@ -18,7 +18,6 @@ use crate::components::attention::{
 };
 #[cfg(feature = "cuda-runtime")]
 use crate::components::matmul::matmul_m31;
-#[cfg(not(feature = "cuda-runtime"))]
 use crate::components::matmul::matrix_to_mle_col_major_padded_pub as matrix_to_mle_col_major_padded;
 #[cfg(feature = "cuda-runtime")]
 use crate::components::matmul::matrix_to_mle_col_major_u32_padded_pub as matrix_to_mle_col_major_u32_padded;
@@ -26,7 +25,6 @@ use crate::components::matmul::{
     evaluate_mle_pub as evaluate_mle, matrix_to_mle_col_major_pub as matrix_to_mle_col_major,
     matrix_to_mle_pub as matrix_to_mle, pad_matrix_pow2, M31Matrix,
 };
-#[cfg(any(feature = "cuda-runtime", test))]
 use crate::components::matmul::restrict_mle_pub as restrict_mle;
 use crate::crypto::aggregated_opening::{
     prove_aggregated_binding, AggregatedWeightClaim,
@@ -181,7 +179,7 @@ fn apply_aggregated_oracle_sumcheck(
             .ok_or(GKRError::MissingWeight {
                 node_id: *weight_node_id,
             })?;
-        let b_mle = matrix_to_mle_col_major(b_matrix);
+        let b_mle = matrix_to_mle_col_major_padded(b_matrix);
         let n_vars = b_mle.len().trailing_zeros() as usize;
         let commitment = crate::crypto::mle_opening::commit_mle_root_only(&b_mle);
         weight_commitments.push(commitment);
@@ -205,7 +203,7 @@ fn apply_aggregated_oracle_sumcheck(
             .ok_or(GKRError::MissingWeight {
                 node_id: *weight_node_id,
             })?;
-        let b_mle = matrix_to_mle_col_major(b_matrix);
+        let b_mle = matrix_to_mle_col_major_padded(b_matrix);
         let n_vars = b_mle.len().trailing_zeros() as usize;
         let commitment = crate::crypto::mle_opening::commit_mle_root_only(&b_mle);
 
@@ -1174,7 +1172,7 @@ pub fn prove_gkr_gpu(
         aggregate_weight_binding && (total_openings > 0 || !deferred_weight_claims_data.is_empty())
         && !use_aggregated_oracle_sumcheck;
 
-    let mut weight_commitments_new;
+    let weight_commitments_new;
     if use_aggregated_oracle_sumcheck {
         weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
         let (wc, claims, proof) = apply_aggregated_oracle_sumcheck(
@@ -2161,7 +2159,7 @@ pub fn prove_gkr_simd_gpu(
         && !weight_data.is_empty()
         && !use_aggregated_oracle_sumcheck;
 
-    let mut weight_commitments_new;
+    let weight_commitments_new;
     if use_aggregated_oracle_sumcheck {
         weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
         let mut no_deferred_proofs = Vec::new();

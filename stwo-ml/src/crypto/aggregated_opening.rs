@@ -280,6 +280,7 @@ fn global_point(
 ///
 /// For a partial point with `assigned` selector bits, returns the matrix index
 /// range that could match.
+#[allow(dead_code)]
 fn active_matrix_for_selector(selector_bits: &[SecureField], n_selector: usize) -> Option<usize> {
     // Only works on boolean selector assignments
     let one = SecureField::from(M31::from(1));
@@ -528,7 +529,7 @@ fn eval_round_at_value(
     // For each claim, compute its contribution
     for (i, claim) in claims.iter().enumerate() {
         let gp = &global_points[i];
-        let n_vars = claim.local_n_vars;
+        let _n_vars = claim.local_n_vars;
 
         // eq factor for this round variable
         let eq_round = gp[round] * value + (one - gp[round]) * (one - value);

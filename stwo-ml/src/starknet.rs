@@ -3278,7 +3278,7 @@ mod tests {
             let weight = weights
                 .get_weight(claim.weight_node_id)
                 .expect("weight must exist for claim");
-            let mle = crate::components::matmul::matrix_to_mle_col_major_pub(weight);
+            let mle = crate::components::matmul::matrix_to_mle_col_major_padded_pub(weight);
             agg_claims.push(AggregatedWeightClaim {
                 matrix_index: idx,
                 local_n_vars: mle.len().trailing_zeros() as usize,
