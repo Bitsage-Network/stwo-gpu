@@ -1561,20 +1561,131 @@ fn reduce_add_layer_gpu(
     )
 }
 
-/// GPU Mul reduction: falls back to CPU eq-sumcheck.
+/// GPU-accelerated Mul reduction via 3-way eq-sumcheck.
 ///
-/// The eq-sumcheck is memory-bound (not compute-bound), so GPU acceleration
-/// has minimal benefit. We use the CPU implementation which is sound.
+/// Proves: Ṽ_c(r) = Σ_{x} eq(r,x) · Ṽ_a(x) · Ṽ_b(x)
+/// using GPU round polynomial evaluation + MLE folding.
 #[cfg(feature = "cuda-runtime")]
 fn reduce_mul_layer_gpu(
-    _gpu: &std::sync::Arc<crate::gpu_sumcheck::GpuSumcheckExecutor>,
+    gpu: &std::sync::Arc<crate::gpu_sumcheck::GpuSumcheckExecutor>,
     output_claim: &GKRClaim,
     lhs_vals: &[SecureField],
     rhs_vals: &[SecureField],
     channel: &mut PoseidonChannel,
 ) -> Result<(LayerProof, GKRClaim), GKRError> {
-    // CPU fallback — produces identical proofs to CPU prover
-    reduce_mul_layer(output_claim, lhs_vals, rhs_vals, channel)
+    use super::types::RoundPolyDeg3;
+    use crate::gpu_sumcheck::{secure_field_to_u32s, u32s_to_secure_field};
+    use stwo::core::fields::FieldExpOps;
+
+    let n = lhs_vals.len();
+    assert!(n.is_power_of_two(), "MLE size must be power of 2");
+    assert_eq!(n, rhs_vals.len(), "lhs and rhs must have same length");
+
+    let num_vars = n.ilog2() as usize;
+    let r = &output_claim.point;
+    assert!(r.len() >= num_vars, "claim point too short for MLE size");
+
+    let eq_evals = build_eq_evals(&r[..num_vars]);
+
+    // Upload eq, lhs, rhs to GPU
+    let eq_flat: Vec<u32> = eq_evals.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
+    let lhs_flat: Vec<u32> = lhs_vals.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
+    let rhs_flat: Vec<u32> = rhs_vals.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
+
+    let mut d_eq = gpu.device.htod_sync_copy(&eq_flat).map_err(|e| GKRError::ReductionError {
+        layer_idx: 0, reason: format!("GPU upload eq: {:?}", e),
+    })?;
+    let mut d_lhs = gpu.device.htod_sync_copy(&lhs_flat).map_err(|e| GKRError::ReductionError {
+        layer_idx: 0, reason: format!("GPU upload lhs: {:?}", e),
+    })?;
+    let mut d_rhs = gpu.device.htod_sync_copy(&rhs_flat).map_err(|e| GKRError::ReductionError {
+        layer_idx: 0, reason: format!("GPU upload rhs: {:?}", e),
+    })?;
+
+    channel.mix_u64(0x4D554C as u64); // "MUL" tag
+    mix_secure_field(channel, output_claim.value);
+
+    let mut eq_round_polys = Vec::with_capacity(num_vars);
+    let mut sumcheck_challenges = Vec::with_capacity(num_vars);
+    let mut cur_n = n;
+
+    for _ in 0..num_vars {
+        let mid = cur_n / 2;
+
+        let (s0_u32, s1_u32, s2_u32, s3_u32) = gpu
+            .compute_logup_round_poly_3way(&d_eq, &d_lhs, &d_rhs, mid)
+            .map_err(|e| GKRError::ReductionError {
+                layer_idx: 0, reason: format!("GPU mul round: {e}"),
+            })?;
+
+        let s0 = u32s_to_secure_field(&s0_u32);
+        let s1 = u32s_to_secure_field(&s1_u32);
+        let s2 = u32s_to_secure_field(&s2_u32);
+        let s3 = u32s_to_secure_field(&s3_u32);
+
+        let two = SecureField::from(M31::from(2u32));
+        let three = SecureField::from(M31::from(3u32));
+        let inv2 = two.inverse();
+        let inv6 = (SecureField::from(M31::from(6u32))).inverse();
+
+        let d1 = s1 - s0;
+        let d2 = (s2 - s1 - s1 + s0) * inv2;
+        let d3 = (s3 - s0 - three * (s2 - s1)) * inv6;
+
+        let c0 = s0;
+        let c1 = d1 - d2 + two * d3;
+        let c2 = d2 - three * d3;
+        let c3 = d3;
+
+        eq_round_polys.push(RoundPolyDeg3 { c0, c1, c2, c3 });
+
+        channel.mix_poly_coeffs_deg3(c0, c1, c2, c3);
+        let challenge = channel.draw_qm31();
+        sumcheck_challenges.push(challenge);
+
+        let challenge_u32 = secure_field_to_u32s(challenge);
+        let (new_eq, new_lhs, new_rhs) = gpu
+            .logup_3way_fold(&d_eq, &d_lhs, &d_rhs, cur_n, &challenge_u32)
+            .map_err(|e| GKRError::ReductionError {
+                layer_idx: 0, reason: format!("GPU mul fold: {e}"),
+            })?;
+        d_eq = new_eq;
+        d_lhs = new_lhs;
+        d_rhs = new_rhs;
+        cur_n = mid;
+    }
+
+    // Download final evaluations (1 QM31 each)
+    let mut lhs_eval_u32 = [0u32; 4];
+    let mut rhs_eval_u32 = [0u32; 4];
+    gpu.device.dtoh_sync_copy_into(&d_lhs, &mut lhs_eval_u32).map_err(|e| GKRError::ReductionError {
+        layer_idx: 0, reason: format!("GPU download lhs_eval: {:?}", e),
+    })?;
+    gpu.device.dtoh_sync_copy_into(&d_rhs, &mut rhs_eval_u32).map_err(|e| GKRError::ReductionError {
+        layer_idx: 0, reason: format!("GPU download rhs_eval: {:?}", e),
+    })?;
+    let lhs_eval = u32s_to_secure_field(&lhs_eval_u32);
+    let rhs_eval = u32s_to_secure_field(&rhs_eval_u32);
+
+    mix_secure_field(channel, lhs_eval);
+    mix_secure_field(channel, rhs_eval);
+
+    let alpha = channel.draw_qm31();
+    let combined = alpha * lhs_eval + (SecureField::one() - alpha) * rhs_eval;
+
+    let claim = GKRClaim {
+        point: output_claim.point.clone(),
+        value: combined,
+    };
+
+    Ok((
+        LayerProof::Mul {
+            eq_round_polys,
+            lhs_eval,
+            rhs_eval,
+        },
+        claim,
+    ))
 }
 
 /// GPU-accelerated activation LogUp reduction.
