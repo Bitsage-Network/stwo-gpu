@@ -346,39 +346,105 @@ pub struct GKRProof {
     pub aggregated_binding: Option<AggregatedWeightBindingProof>,
 }
 
+/// Discriminant for deferred proof kind: weight-bearing (MatMul) vs weightless
+/// (Quantize/Dequantize — LogUp layers with no weight matrix).
+#[derive(Debug, Clone)]
+pub enum DeferredProofKind {
+    /// MatMul deferred proof — carries weight data (commitment, opening, claim, dims).
+    MatMul {
+        /// MatMul dimensions (m, k, n).
+        dims: (usize, usize, usize),
+        /// Weight commitment (Poseidon Merkle root).
+        weight_commitment: starknet_ff::FieldElement,
+        /// Weight MLE opening proof.
+        weight_opening: MleOpeningProof,
+        /// Weight claim.
+        weight_claim: WeightClaim,
+    },
+    /// Weightless deferred proof (Quantize, Dequantize) — no weight matrix.
+    Weightless,
+}
+
 /// Deferred proof for the rhs branch of a DAG Add layer.
 ///
 /// In residual connections (e.g., output = FFN(x) + x), the Add layer's
 /// inputs come from different branches. The main GKR walk follows the lhs
-/// branch. The rhs branch gets a separate matmul sumcheck proof that binds
-/// `rhs_eval` to the weights and model input.
+/// branch. The rhs branch gets a separate deferred proof.
 ///
-/// Self-contained: includes its own weight commitment and opening proof,
-/// separate from the main walk's weight data. This ensures the Fiat-Shamir
-/// channel state is sequential: main walk → main weight openings → deferred
-/// proof + deferred weight opening.
+/// For MatMul branches, this is a matmul sumcheck proof binding `rhs_eval`
+/// to the weights and model input — self-contained with its own weight
+/// commitment and opening proof.
+///
+/// For Quantize/Dequantize branches, this is a LogUp proof with no weight
+/// data (weightless).
 #[derive(Debug, Clone)]
 pub struct DeferredProof {
     /// The deferred claim: "rhs branch MLE at point r equals rhs_eval"
     pub claim: GKRClaim,
 
-    /// MatMul dimensions (m, k, n) of the deferred layer.
-    pub dims: (usize, usize, usize),
-
-    /// MatMul sumcheck proof for the deferred reduction.
+    /// Layer reduction proof for the deferred branch.
     pub layer_proof: LayerProof,
 
-    /// Final input claim from the deferred matmul reduction.
+    /// Final input claim from the deferred reduction.
     pub input_claim: GKRClaim,
 
-    /// Weight commitment for the deferred matmul (Poseidon Merkle root).
-    pub weight_commitment: starknet_ff::FieldElement,
+    /// Kind of deferred proof: MatMul (with weight data) or Weightless.
+    pub kind: DeferredProofKind,
+}
 
-    /// Weight MLE opening proof for the deferred matmul.
-    pub weight_opening: MleOpeningProof,
+impl DeferredProof {
+    /// Returns the weight claim if this is a MatMul deferred proof.
+    pub fn weight_claim(&self) -> Option<&WeightClaim> {
+        match &self.kind {
+            DeferredProofKind::MatMul { weight_claim, .. } => Some(weight_claim),
+            DeferredProofKind::Weightless => None,
+        }
+    }
 
-    /// Weight claim for the deferred matmul.
-    pub weight_claim: WeightClaim,
+    /// Returns the weight commitment if this is a MatMul deferred proof.
+    pub fn weight_commitment(&self) -> Option<starknet_ff::FieldElement> {
+        match &self.kind {
+            DeferredProofKind::MatMul { weight_commitment, .. } => Some(*weight_commitment),
+            DeferredProofKind::Weightless => None,
+        }
+    }
+
+    /// Returns a mutable reference to the weight commitment if this is a MatMul deferred proof.
+    pub fn weight_commitment_mut(&mut self) -> Option<&mut starknet_ff::FieldElement> {
+        match &mut self.kind {
+            DeferredProofKind::MatMul { weight_commitment, .. } => Some(weight_commitment),
+            DeferredProofKind::Weightless => None,
+        }
+    }
+
+    /// Returns the weight opening if this is a MatMul deferred proof.
+    pub fn weight_opening(&self) -> Option<&MleOpeningProof> {
+        match &self.kind {
+            DeferredProofKind::MatMul { weight_opening, .. } => Some(weight_opening),
+            DeferredProofKind::Weightless => None,
+        }
+    }
+
+    /// Returns mutable reference to the weight opening if MatMul.
+    pub fn weight_opening_mut(&mut self) -> Option<&mut MleOpeningProof> {
+        match &mut self.kind {
+            DeferredProofKind::MatMul { weight_opening, .. } => Some(weight_opening),
+            DeferredProofKind::Weightless => None,
+        }
+    }
+
+    /// Returns the MatMul dimensions (m, k, n) if this is a MatMul deferred proof.
+    pub fn dims(&self) -> Option<(usize, usize, usize)> {
+        match &self.kind {
+            DeferredProofKind::MatMul { dims, .. } => Some(*dims),
+            DeferredProofKind::Weightless => None,
+        }
+    }
+
+    /// Returns true if this deferred proof carries weight data.
+    pub fn has_weights(&self) -> bool {
+        matches!(self.kind, DeferredProofKind::MatMul { .. })
+    }
 }
 
 /// Intermediate claim produced by a layer reduction.

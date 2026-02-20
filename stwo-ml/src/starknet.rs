@@ -788,11 +788,13 @@ fn enforce_gkr_soundness_gates(proof: &crate::gkr::GKRProof) -> Result<(), Stark
         }
     }
     for (i, deferred) in proof.deferred_proofs.iter().enumerate() {
-        if deferred.weight_opening.queries.is_empty() {
-            return Err(StarknetModelError::SoundnessGate(format!(
-                "deferred weight opening {} has no Merkle queries",
-                i
-            )));
+        if let Some(wo) = deferred.weight_opening() {
+            if wo.queries.is_empty() {
+                return Err(StarknetModelError::SoundnessGate(format!(
+                    "deferred weight opening {} has no Merkle queries",
+                    i
+                )));
+            }
         }
     }
 
@@ -811,15 +813,18 @@ fn serialize_weight_claim(claim: &crate::gkr::types::WeightClaim, output: &mut V
 fn serialize_weight_claims_for_artifact(proof: &crate::gkr::GKRProof) -> Vec<FieldElement> {
     // Order mirrors verifier-side claim walk:
     //   1) main walk MatMul claims
-    //   2) deferred MatMul claims
-    let total_claims = proof.weight_claims.len() + proof.deferred_proofs.len();
+    //   2) deferred MatMul claims (weightless proofs are skipped)
+    let deferred_matmul_count = proof.deferred_proofs.iter().filter(|d| d.has_weights()).count();
+    let total_claims = proof.weight_claims.len() + deferred_matmul_count;
     let mut out = Vec::new();
     crate::cairo_serde::serialize_u32(total_claims as u32, &mut out);
     for claim in &proof.weight_claims {
         serialize_weight_claim(claim, &mut out);
     }
     for deferred in &proof.deferred_proofs {
-        serialize_weight_claim(&deferred.weight_claim, &mut out);
+        if let Some(claim) = deferred.weight_claim() {
+            serialize_weight_claim(claim, &mut out);
+        }
     }
     out
 }
@@ -829,10 +834,13 @@ fn mode_weight_binding_data_with_domain(
     domain_tag: u64,
     schema_version: u64,
 ) -> Vec<FieldElement> {
-    let total_claims = proof.weight_claims.len() + proof.deferred_proofs.len();
+    let deferred_matmul_count = proof.deferred_proofs.iter().filter(|d| d.has_weights()).count();
+    let total_claims = proof.weight_claims.len() + deferred_matmul_count;
     let mut commitments = proof.weight_commitments.clone();
     for deferred in &proof.deferred_proofs {
-        commitments.push(deferred.weight_commitment);
+        if let Some(wc) = deferred.weight_commitment() {
+            commitments.push(wc);
+        }
     }
 
     let mut digest_inputs = Vec::new();
@@ -852,17 +860,19 @@ fn mode_weight_binding_data_with_domain(
         ));
     }
 
-    for (deferred_idx, deferred) in proof.deferred_proofs.iter().enumerate() {
-        let idx = proof.weight_claims.len() + deferred_idx;
-        let claim = &deferred.weight_claim;
-        digest_inputs.push(commitments[idx]);
-        digest_inputs.push(FieldElement::from(claim.eval_point.len() as u64));
-        for &p in &claim.eval_point {
-            digest_inputs.push(crate::crypto::poseidon_channel::securefield_to_felt(p));
+    let mut deferred_claim_idx = proof.weight_claims.len();
+    for deferred in &proof.deferred_proofs {
+        if let Some(claim) = deferred.weight_claim() {
+            digest_inputs.push(commitments[deferred_claim_idx]);
+            digest_inputs.push(FieldElement::from(claim.eval_point.len() as u64));
+            for &p in &claim.eval_point {
+                digest_inputs.push(crate::crypto::poseidon_channel::securefield_to_felt(p));
+            }
+            digest_inputs.push(crate::crypto::poseidon_channel::securefield_to_felt(
+                claim.expected_value,
+            ));
+            deferred_claim_idx += 1;
         }
-        digest_inputs.push(crate::crypto::poseidon_channel::securefield_to_felt(
-            claim.expected_value,
-        ));
     }
 
     let digest = starknet_crypto::poseidon_hash_many(&digest_inputs);
@@ -955,27 +965,32 @@ fn build_gkr_serialized_proof_inner(
     let io_calldata = crate::cairo_serde::serialize_raw_io(input, &proof.execution.output);
 
     // Weight commitments are a separate parameter to verify_model_gkr.
-    // Include both main-walk matmuls and deferred matmul branches.
+    // Include both main-walk matmuls and deferred matmul branches (weightless proofs excluded).
     let mut weight_commitments = gkr_proof.weight_commitments.clone();
     for deferred in &gkr_proof.deferred_proofs {
-        weight_commitments.push(deferred.weight_commitment);
+        if let Some(wc) = deferred.weight_commitment() {
+            weight_commitments.push(wc);
+        }
     }
 
     // Serialize weight MLE opening proofs as Array<MleOpeningProof> for Cairo Serde.
     // Order must match Cairo verifier weight_claims:
     //   1) main walk matmul claims
-    //   2) deferred matmul claims (DAG Add skip branches)
-    let total_openings = gkr_proof.weight_openings.len() + gkr_proof.deferred_proofs.len();
+    //   2) deferred matmul claims (DAG Add skip branches, weightless excluded)
+    let deferred_opening_count = gkr_proof.deferred_proofs.iter().filter(|d| d.has_weights()).count();
+    let total_openings = gkr_proof.weight_openings.len() + deferred_opening_count;
     let mut weight_opening_calldata = Vec::new();
     crate::cairo_serde::serialize_u32(total_openings as u32, &mut weight_opening_calldata);
     for opening in &gkr_proof.weight_openings {
         crate::cairo_serde::serialize_mle_opening_proof(opening, &mut weight_opening_calldata);
     }
     for deferred in &gkr_proof.deferred_proofs {
-        crate::cairo_serde::serialize_mle_opening_proof(
-            &deferred.weight_opening,
-            &mut weight_opening_calldata,
-        );
+        if let Some(wo) = deferred.weight_opening() {
+            crate::cairo_serde::serialize_mle_opening_proof(
+                wo,
+                &mut weight_opening_calldata,
+            );
+        }
     }
 
     let weight_claim_calldata = serialize_weight_claims_for_artifact(gkr_proof);
@@ -1424,10 +1439,12 @@ fn build_verify_model_gkr_calldata_inner(
         parts.push(format!("0x{:x}", f));
     }
 
-    // 7. weight_commitments: Array<felt252> (main + deferred matmul branches)
+    // 7. weight_commitments: Array<felt252> (main + deferred matmul branches, weightless excluded)
     let mut weight_commitments = proof.weight_commitments.clone();
     for deferred in &proof.deferred_proofs {
-        weight_commitments.push(deferred.weight_commitment);
+        if let Some(wc) = deferred.weight_commitment() {
+            weight_commitments.push(wc);
+        }
     }
     parts.push(format!("{}", weight_commitments.len()));
     for wc in &weight_commitments {
@@ -1493,8 +1510,9 @@ fn build_verify_model_gkr_calldata_inner(
     }
 
     // 8/9/10. weight_opening_proofs: Array<MleOpeningProof>
-    // Order matches verifier weight_claims: main walk first, then deferred.
-    let total_openings = proof.weight_openings.len() + proof.deferred_proofs.len();
+    // Order matches verifier weight_claims: main walk first, then deferred (weightless excluded).
+    let deferred_opening_count = proof.deferred_proofs.iter().filter(|d| d.has_weights()).count();
+    let total_openings = proof.weight_openings.len() + deferred_opening_count;
     parts.push(format!("{}", total_openings));
 
     let mut opening_buf = Vec::new();
@@ -1506,10 +1524,12 @@ fn build_verify_model_gkr_calldata_inner(
         }
     }
     for deferred in &proof.deferred_proofs {
-        opening_buf.clear();
-        crate::cairo_serde::serialize_mle_opening_proof(&deferred.weight_opening, &mut opening_buf);
-        for felt in &opening_buf {
-            parts.push(format!("0x{:x}", felt));
+        if let Some(wo) = deferred.weight_opening() {
+            opening_buf.clear();
+            crate::cairo_serde::serialize_mle_opening_proof(wo, &mut opening_buf);
+            for felt in &opening_buf {
+                parts.push(format!("0x{:x}", felt));
+            }
         }
     }
 
@@ -1638,6 +1658,12 @@ mod tests {
         fn set(key: &'static str, value: &str) -> Self {
             let prev = std::env::var(key).ok();
             std::env::set_var(key, value);
+            Self { key, prev }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::remove_var(key);
             Self { key, prev }
         }
     }
@@ -2514,6 +2540,7 @@ mod tests {
     #[test]
     fn test_prove_for_starknet_ml_gkr_pipeline() {
         // Full pipeline test: graph → prove → serialize → verify structure
+        let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);
         let graph = builder.build();
@@ -2635,6 +2662,7 @@ mod tests {
     #[test]
     fn test_gkr_soundness_gate_rejects_missing_weight_openings() {
         use crate::aggregation::prove_model_pure_gkr;
+        let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
 
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);
@@ -2674,6 +2702,7 @@ mod tests {
     #[test]
     fn test_build_gkr_serializable_proof_keeps_artifact_when_not_submission_ready() {
         use crate::aggregation::prove_model_pure_gkr;
+        let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
 
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);
@@ -2727,6 +2756,7 @@ mod tests {
     #[test]
     fn test_build_verify_model_gkr_v2_calldata_inserts_mode_field() {
         use crate::aggregation::prove_model_pure_gkr;
+        let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
 
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);
@@ -2806,6 +2836,7 @@ mod tests {
     fn test_build_verify_model_gkr_v2_calldata_accepts_batched_subchannel_mode() {
         use crate::aggregation::prove_model_pure_gkr;
         use crate::gkr::types::WeightOpeningTranscriptMode;
+        let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
 
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);
@@ -2878,6 +2909,7 @@ mod tests {
     #[test]
     fn test_build_verify_model_gkr_v3_calldata_inserts_mode_and_empty_binding_data() {
         use crate::aggregation::prove_model_pure_gkr;
+        let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
 
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);
@@ -3004,6 +3036,7 @@ mod tests {
     fn test_build_verify_model_gkr_v3_calldata_encodes_mode2_binding_data() {
         use crate::aggregation::prove_model_pure_gkr;
         use crate::gkr::types::WeightOpeningTranscriptMode;
+        let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
 
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);
@@ -3076,9 +3109,13 @@ mod tests {
     #[test]
     fn test_build_verify_model_gkr_v3_rejects_mode4_binding() {
         use crate::aggregation::prove_model_pure_gkr;
+        use crate::crypto::aggregated_opening::{prove_aggregated_binding, AggregatedWeightClaim};
+        use crate::crypto::poseidon_channel::PoseidonChannel;
         use crate::gkr::types::WeightOpeningTranscriptMode;
 
-        let _binding_mode = EnvVarGuard::set("STWO_WEIGHT_BINDING", "aggregated");
+        // Prove with sequential mode, then manually construct mode 4 state.
+        // This avoids env-var race conditions with parallel tests.
+        let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
 
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);
@@ -3101,14 +3138,31 @@ mod tests {
         let mut agg_proof =
             prove_model_pure_gkr(&graph, &input, &weights).expect("GKR proving should succeed");
         let gkr = agg_proof.gkr_proof.as_mut().expect("GKR proof expected");
-        assert_eq!(
-            gkr.weight_opening_transcript_mode,
-            WeightOpeningTranscriptMode::AggregatedOracleSumcheck
-        );
-        assert!(
-            gkr.aggregated_binding.is_some(),
-            "mode4 proof should include aggregated binding payload"
-        );
+
+        // Build aggregated binding from weight claims (mirrors mode 4 prover path).
+        let mut agg_claims = Vec::with_capacity(gkr.weight_claims.len());
+        let mut all_mles = Vec::with_capacity(gkr.weight_claims.len());
+        for (idx, claim) in gkr.weight_claims.iter().enumerate() {
+            let weight = weights
+                .get_weight(claim.weight_node_id)
+                .expect("weight must exist for claim");
+            let mle = crate::components::matmul::matrix_to_mle_col_major_pub(weight);
+            agg_claims.push(AggregatedWeightClaim {
+                matrix_index: idx,
+                local_n_vars: mle.len().trailing_zeros() as usize,
+                eval_point: claim.eval_point.clone(),
+                expected_value: claim.expected_value,
+                commitment: gkr.weight_commitments[idx],
+            });
+            all_mles.push(mle);
+        }
+        let mle_refs: Vec<&[crate::gkr::types::SecureField]> =
+            all_mles.iter().map(|m| m.as_slice()).collect();
+        let mut channel = PoseidonChannel::new();
+        let aggregated_binding = prove_aggregated_binding(&agg_claims, &mle_refs, &mut channel);
+
+        gkr.weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
+        gkr.aggregated_binding = Some(aggregated_binding);
 
         let circuit = crate::gkr::LayeredCircuit::from_graph(&graph).expect("circuit compile");
         let raw_io = crate::cairo_serde::serialize_raw_io(&input, &agg_proof.execution.output);
@@ -3129,6 +3183,7 @@ mod tests {
     fn test_mode2_serialized_proof_is_submit_ready_with_binding_payload() {
         use crate::aggregation::prove_model_pure_gkr;
         use crate::gkr::types::WeightOpeningTranscriptMode;
+        let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
 
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);
@@ -3171,6 +3226,7 @@ mod tests {
     fn test_build_verify_model_gkr_v4_calldata_encodes_mode3_binding_data() {
         use crate::aggregation::prove_model_pure_gkr;
         use crate::gkr::types::WeightOpeningTranscriptMode;
+        let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
 
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);
@@ -3247,6 +3303,7 @@ mod tests {
         use crate::crypto::aggregated_opening::{prove_aggregated_binding, AggregatedWeightClaim};
         use crate::crypto::poseidon_channel::PoseidonChannel;
         use crate::gkr::types::WeightOpeningTranscriptMode;
+        let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
 
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);
@@ -3278,7 +3335,7 @@ mod tests {
             let weight = weights
                 .get_weight(claim.weight_node_id)
                 .expect("weight must exist for claim");
-            let mle = crate::components::matmul::matrix_to_mle_col_major_padded_pub(weight);
+            let mle = crate::components::matmul::matrix_to_mle_col_major_pub(weight);
             agg_claims.push(AggregatedWeightClaim {
                 matrix_index: idx,
                 local_n_vars: mle.len().trailing_zeros() as usize,
@@ -3340,6 +3397,7 @@ mod tests {
     #[test]
     fn test_build_verify_model_gkr_v4_rejects_non_mode3_or_mode4_binding() {
         use crate::aggregation::prove_model_pure_gkr;
+        let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
 
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);
@@ -3378,6 +3436,7 @@ mod tests {
     fn test_build_verify_model_gkr_v4_rejects_mode4_without_aggregated_binding() {
         use crate::aggregation::prove_model_pure_gkr;
         use crate::gkr::types::WeightOpeningTranscriptMode;
+        let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
 
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);

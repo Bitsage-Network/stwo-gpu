@@ -54,7 +54,7 @@ use std::collections::HashMap;
 use crate::backend::convert_evaluations;
 use crate::compiler::graph::{ComputationGraph, GraphOp, GraphWeights};
 use crate::compiler::prove::{
-    apply_layernorm_detailed_auto, apply_rmsnorm_detailed_auto, elementwise_add, elementwise_mul,
+    apply_layernorm_detailed, apply_rmsnorm_detailed, elementwise_add, elementwise_mul,
     GraphExecution, ModelError,
 };
 use crate::components::activation::{compute_multiplicities, ActivationEval, ActivationRelation};
@@ -73,7 +73,7 @@ use crate::components::layernorm::{
     build_rsqrt_table, LayerNormConfig, LayerNormEval, LayerNormRelation,
 };
 use crate::components::matmul::{
-    estimate_sumcheck_memory, matmul_m31_auto, prove_matmul_sumcheck_auto,
+    estimate_sumcheck_memory, matmul_m31, prove_matmul_sumcheck_auto,
     prove_matmul_sumcheck_onchain_auto, M31Matrix, MatMulSumcheckProof, MatMulSumcheckProofOnChain,
 };
 use crate::components::quantize::{build_quantize_table, QuantizeEval, QuantizeRelation};
@@ -661,7 +661,12 @@ where
                     .get_weight(node.id)
                     .ok_or(ModelError::MissingWeight(node.id))?;
 
-                let output = matmul_m31_auto(&current, weight);
+                // GPU GEMM for all matrix sizes, CPU fallback
+                #[cfg(feature = "cuda-runtime")]
+                let output = crate::gpu_sumcheck::gpu_matmul_m31_full(&current, weight)
+                    .unwrap_or_else(|_| matmul_m31(&current, weight));
+                #[cfg(not(feature = "cuda-runtime"))]
+                let output = matmul_m31(&current, weight);
 
                 let proof = prove_matmul_sumcheck_auto(&current, weight, &output).map_err(|e| {
                     ModelError::ProvingError {
@@ -707,10 +712,7 @@ where
                     type_tag: activation_type.type_tag(),
                 });
 
-                // Push the original (unreduced) input for chain commitment
-                // consistency with the verifier (which records `current` before
-                // table-mask reduction).
-                intermediates.push((node.id, current.clone()));
+                intermediates.push((node.id, reduced_matrix));
                 node_outputs.insert(node.id, output.clone());
                 current = output;
             }
@@ -795,7 +797,7 @@ where
 
             GraphOp::LayerNorm { dim } => {
                 let ln_log_size = LayerNormConfig::new(*dim).rsqrt_table_log_size;
-                let ln = apply_layernorm_detailed_auto(&current, *dim);
+                let ln = apply_layernorm_detailed(&current, *dim);
                 let rsqrt_table = build_rsqrt_table(ln_log_size);
 
                 layernorm_layers.push(LayerNormLayerData {
@@ -816,7 +818,7 @@ where
 
             GraphOp::RMSNorm { dim } => {
                 let rn_log_size = RMSNormConfig::new(*dim).rsqrt_table_log_size;
-                let rn = apply_rmsnorm_detailed_auto(&current, *dim);
+                let rn = apply_rmsnorm_detailed(&current, *dim);
                 let rsqrt_table = build_rmsnorm_rsqrt_table(rn_log_size);
 
                 rmsnorm_layers.push(RMSNormLayerData {
@@ -1031,6 +1033,47 @@ where
                 })?;
         attention_proofs.push((layer.node_id, proof));
     }
+
+    // ── proof-stream: emit LayerActivation events for all intermediates ────────
+    #[cfg(feature = "proof-stream")]
+    {
+        use crate::gkr::prover::PROOF_SINK;
+        PROOF_SINK.with(|s| {
+            if let Some(sink) = s.borrow().as_ref() {
+                for (idx, (node_id, matrix)) in intermediates.iter().enumerate() {
+                    let sample: Vec<u32> = matrix.data
+                        .iter()
+                        .step_by((matrix.data.len() / 128).max(1))
+                        .take(128)
+                        .map(|v| v.0)
+                        .collect();
+                    let n = matrix.data.len() as f64;
+                    let mean = matrix.data.iter().map(|v| v.0 as f64).sum::<f64>() / n.max(1.0);
+                    let std = if n > 1.0 {
+                        (matrix.data.iter().map(|v| (v.0 as f64 - mean).powi(2)).sum::<f64>() / (n - 1.0)).sqrt()
+                    } else { 0.0 };
+                    let min = matrix.data.iter().map(|v| v.0).min().unwrap_or(0);
+                    let max = matrix.data.iter().map(|v| v.0).max().unwrap_or(0);
+                    let zeros = matrix.data.iter().filter(|v| v.0 == 0).count();
+                    sink.emit(proof_stream::ProofEvent::LayerActivation {
+                        layer_idx: idx,
+                        node_id: *node_id,
+                        kind: proof_stream::LayerKind::Add,
+                        output_shape: (matrix.rows, matrix.cols),
+                        output_sample: sample,
+                        stats: proof_stream::ActivationStats {
+                            mean: mean as f32,
+                            std_dev: std as f32,
+                            min: min as f32,
+                            max: max as f32,
+                            sparsity: zeros as f32 / n.max(1.0) as f32,
+                        },
+                    });
+                }
+            }
+        });
+    }
+    // ── end proof-stream ───────────────────────────────────────────────────────
 
     // Compute layer chain commitment before consuming `intermediates`.
     let layer_chain_commitment = compute_layer_chain_commitment(input, &intermediates, &current);
@@ -1931,12 +1974,38 @@ where
         &quantize_layers,
         &dequantize_layers,
     );
+    #[cfg(feature = "proof-stream")]
+    {
+        use crate::gkr::prover::PROOF_SINK;
+        PROOF_SINK.with(|s| {
+            if let Some(sink) = s.borrow().as_ref() {
+                sink.emit(proof_stream::ProofEvent::StarkProofStart {
+                    num_activation_layers: activation_layers.len(),
+                    num_add_layers: add_layers.len(),
+                    num_layernorm_layers: layernorm_layers.len(),
+                });
+            }
+        });
+    }
+    #[cfg(feature = "proof-stream")]
+    let _ps_stark_t = std::time::Instant::now();
     let stark_proof = prove_unified_stark_with_gpu_pipeline::<B, MC>(
         &component_refs,
         channel,
         commitment_scheme,
         max_log_size,
     )?;
+    #[cfg(feature = "proof-stream")]
+    {
+        use crate::gkr::prover::PROOF_SINK;
+        PROOF_SINK.with(|s| {
+            if let Some(sink) = s.borrow().as_ref() {
+                sink.emit(proof_stream::ProofEvent::StarkProofEnd {
+                    duration_ms: _ps_stark_t.elapsed().as_millis() as u64,
+                });
+            }
+        });
+    }
 
     let quantize_params_commitment = compute_quantize_params_commitment(&quantize_layers);
 
@@ -2268,13 +2337,23 @@ where
                         let weight = weights
                             .get_weight(node.id)
                             .ok_or(ModelError::MissingWeight(node.id))?;
-                        matmul_m31_auto(&current, weight)
+                        #[cfg(feature = "cuda-runtime")]
+                        let out = crate::gpu_sumcheck::gpu_matmul_m31_full(&current, weight)
+                            .unwrap_or_else(|_| matmul_m31(&current, weight));
+                        #[cfg(not(feature = "cuda-runtime"))]
+                        let out = matmul_m31(&current, weight);
+                        out
                     }
                 } else {
                     let weight = weights
                         .get_weight(node.id)
                         .ok_or(ModelError::MissingWeight(node.id))?;
-                    matmul_m31_auto(&current, weight)
+                    #[cfg(feature = "cuda-runtime")]
+                    let out = crate::gpu_sumcheck::gpu_matmul_m31_full(&current, weight)
+                        .unwrap_or_else(|_| matmul_m31(&current, weight));
+                    #[cfg(not(feature = "cuda-runtime"))]
+                    let out = matmul_m31(&current, weight);
+                    out
                 };
 
                 // Collect for deferred proving (Phase 2) — skipped if precomputed has proofs
@@ -2328,10 +2407,7 @@ where
                     type_tag: activation_type.type_tag(),
                 });
 
-                // Push the original (unreduced) input for chain commitment
-                // consistency with the verifier (which records `current` before
-                // table-mask reduction).
-                intermediates.push((node.id, current.clone()));
+                intermediates.push((node.id, reduced_matrix));
                 node_outputs.insert(node.id, output.clone());
                 current = output;
             }
@@ -2437,7 +2513,7 @@ where
                     dim,
                 );
                 let ln_log_size = LayerNormConfig::new(*dim).rsqrt_table_log_size;
-                let ln = apply_layernorm_detailed_auto(&current, *dim);
+                let ln = apply_layernorm_detailed(&current, *dim);
                 let rsqrt_table = build_rsqrt_table(ln_log_size);
 
                 layernorm_layers.push(LayerNormLayerData {
@@ -2465,7 +2541,7 @@ where
                     dim,
                 );
                 let rn_log_size = RMSNormConfig::new(*dim).rsqrt_table_log_size;
-                let rn = apply_rmsnorm_detailed_auto(&current, *dim);
+                let rn = apply_rmsnorm_detailed(&current, *dim);
                 let rsqrt_table = build_rmsnorm_rsqrt_table(rn_log_size);
 
                 rmsnorm_layers.push(RMSNormLayerData {
@@ -4006,7 +4082,6 @@ pub fn prove_model_aggregated_onchain_auto(
 /// - Phase 1 forward pass using precomputed C matrices (no weight loading)
 /// - Phase 2 skipped (proofs already provided)
 /// - Phase 3 STARK for non-matmul components (activations, add, mul, layernorm)
-#[allow(dead_code)] // Used by streaming pipeline when enabled
 pub(crate) fn prove_model_aggregated_onchain_with_precomputed(
     graph: &ComputationGraph,
     input: &M31Matrix,
@@ -4440,7 +4515,11 @@ where
                     .get_weight(node.id)
                     .ok_or(ModelError::MissingWeight(node.id))?;
 
-                let output = matmul_m31_auto(&current, weight);
+                #[cfg(feature = "cuda-runtime")]
+                let output = crate::gpu_sumcheck::gpu_matmul_m31_full(&current, weight)
+                    .unwrap_or_else(|_| matmul_m31(&current, weight));
+                #[cfg(not(feature = "cuda-runtime"))]
+                let output = matmul_m31(&current, weight);
 
                 eprintln!(
                     "  [{}/{}] Node {} MatMul {}x{}x{} — forward only (GKR deferred)",
@@ -4494,10 +4573,7 @@ where
                     type_tag: activation_type.type_tag(),
                 });
 
-                // Push the original (unreduced) input for chain commitment
-                // consistency with the verifier (which records `current` before
-                // table-mask reduction).
-                intermediates.push((node.id, current.clone()));
+                intermediates.push((node.id, reduced_matrix));
                 node_outputs.insert(node.id, output.clone());
                 current = output;
             }
@@ -4582,7 +4658,7 @@ where
 
             GraphOp::LayerNorm { dim } => {
                 let ln_log_size = LayerNormConfig::new(*dim).rsqrt_table_log_size;
-                let ln = apply_layernorm_detailed_auto(&current, *dim);
+                let ln = apply_layernorm_detailed(&current, *dim);
                 let rsqrt_table = build_rsqrt_table(ln_log_size);
 
                 layernorm_layers.push(LayerNormLayerData {
@@ -4603,7 +4679,7 @@ where
 
             GraphOp::RMSNorm { dim } => {
                 let rn_log_size = RMSNormConfig::new(*dim).rsqrt_table_log_size;
-                let rn = apply_rmsnorm_detailed_auto(&current, *dim);
+                let rn = apply_rmsnorm_detailed(&current, *dim);
                 let rsqrt_table = build_rmsnorm_rsqrt_table(rn_log_size);
 
                 rmsnorm_layers.push(RMSNormLayerData {
@@ -5218,7 +5294,7 @@ pub(crate) fn collect_forward_pass_layer_data(
                 let weight = weights
                     .get_weight(node.id)
                     .ok_or(ModelError::MissingWeight(node.id))?;
-                let output = matmul_m31_auto(&current, weight);
+                let output = matmul_m31(&current, weight);
                 intermediates.push((node.id, current.clone()));
                 node_outputs.insert(node.id, output.clone());
                 current = output;
@@ -5255,10 +5331,7 @@ pub(crate) fn collect_forward_pass_layer_data(
                     type_tag: activation_type.type_tag(),
                 });
 
-                // Push the original (unreduced) input for chain commitment
-                // consistency with the verifier (which records `current` before
-                // table-mask reduction).
-                intermediates.push((node.id, current.clone()));
+                intermediates.push((node.id, reduced_matrix));
                 node_outputs.insert(node.id, output.clone());
                 current = output;
             }
@@ -5323,7 +5396,7 @@ pub(crate) fn collect_forward_pass_layer_data(
 
             GraphOp::LayerNorm { dim } => {
                 let ln_log_size = LayerNormConfig::new(*dim).rsqrt_table_log_size;
-                let ln = apply_layernorm_detailed_auto(&current, *dim);
+                let ln = apply_layernorm_detailed(&current, *dim);
                 let rsqrt_table = build_rsqrt_table(ln_log_size);
 
                 layernorm_layers.push(LayerNormLayerData {
@@ -5344,7 +5417,7 @@ pub(crate) fn collect_forward_pass_layer_data(
 
             GraphOp::RMSNorm { dim } => {
                 let rn_log_size = RMSNormConfig::new(*dim).rsqrt_table_log_size;
-                let rn = apply_rmsnorm_detailed_auto(&current, *dim);
+                let rn = apply_rmsnorm_detailed(&current, *dim);
                 let rsqrt_table = build_rmsnorm_rsqrt_table(rn_log_size);
 
                 rmsnorm_layers.push(RMSNormLayerData {
@@ -6733,7 +6806,7 @@ pub fn verify_aggregated_model_proof(
                 let weight = weights
                     .get_weight(node.id)
                     .ok_or(ModelError::MissingWeight(node.id))?;
-                let output = matmul_m31_auto(&current, weight);
+                let output = matmul_m31(&current, weight);
                 matmul_matrices.insert(node.id, (current.clone(), weight.clone(), output.clone()));
                 node_outputs.insert(node.id, output.clone());
                 current = output;
@@ -6754,6 +6827,11 @@ pub fn verify_aggregated_model_proof(
                     cols: current.cols,
                     data: reduced_data,
                 };
+                // Prover stores the masked (reduced) input for the chain commitment,
+                // not the raw input. Overwrite the entry pushed before the match.
+                if let Some(last) = verifier_intermediates.last_mut() {
+                    last.1 = reduced.clone();
+                }
                 let output = crate::compiler::prove::apply_activation_pub(&reduced, &*f);
                 node_outputs.insert(node.id, output.clone());
                 current = output;
@@ -6793,13 +6871,13 @@ pub fn verify_aggregated_model_proof(
                 current = output;
             }
             GraphOp::LayerNorm { dim } => {
-                let ln = apply_layernorm_detailed_auto(&current, *dim);
+                let ln = apply_layernorm_detailed(&current, *dim);
                 ln_verify_data.push((node.id, ln.means.clone(), ln.variances.clone()));
                 node_outputs.insert(node.id, ln.output_matrix.clone());
                 current = ln.output_matrix;
             }
             GraphOp::RMSNorm { dim } => {
-                let rn = apply_rmsnorm_detailed_auto(&current, *dim);
+                let rn = apply_rmsnorm_detailed(&current, *dim);
                 node_outputs.insert(node.id, rn.output_matrix.clone());
                 current = rn.output_matrix;
             }
@@ -7048,7 +7126,7 @@ pub fn verify_aggregated_model_proof_onchain(
                 let weight = weights
                     .get_weight(node.id)
                     .ok_or(ModelError::MissingWeight(node.id))?;
-                let output = matmul_m31_auto(&current, weight);
+                let output = matmul_m31(&current, weight);
                 node_outputs.insert(node.id, output.clone());
                 current = output;
             }
@@ -7068,6 +7146,11 @@ pub fn verify_aggregated_model_proof_onchain(
                     cols: current.cols,
                     data: reduced_data,
                 };
+                // Prover stores the masked (reduced) input for the chain commitment,
+                // not the raw input. Overwrite the entry pushed before the match.
+                if let Some(last) = verifier_intermediates.last_mut() {
+                    last.1 = reduced.clone();
+                }
                 let output = crate::compiler::prove::apply_activation_pub(&reduced, &*f);
                 node_outputs.insert(node.id, output.clone());
                 current = output;
@@ -7107,13 +7190,13 @@ pub fn verify_aggregated_model_proof_onchain(
                 current = output;
             }
             GraphOp::LayerNorm { dim } => {
-                let ln = apply_layernorm_detailed_auto(&current, *dim);
+                let ln = apply_layernorm_detailed(&current, *dim);
                 ln_verify_data.push((node.id, ln.means.clone(), ln.variances.clone()));
                 node_outputs.insert(node.id, ln.output_matrix.clone());
                 current = ln.output_matrix;
             }
             GraphOp::RMSNorm { dim } => {
-                let rn = apply_rmsnorm_detailed_auto(&current, *dim);
+                let rn = apply_rmsnorm_detailed(&current, *dim);
                 node_outputs.insert(node.id, rn.output_matrix.clone());
                 current = rn.output_matrix;
             }
@@ -8039,7 +8122,7 @@ fn verify_attention_proof_blake2s(
         let k_t = transpose_m31(&kv_heads_k[kv_idx]);
         let q_h_p = pad_to_pow2(&q_heads[h]);
         let k_t_p = pad_to_pow2(&k_t);
-        let scores_p = matmul_m31_auto(&q_h_p, &k_t_p);
+        let scores_p = matmul_m31(&q_h_p, &k_t_p);
 
         verify_matmul_sumcheck(&proof.score_proofs[h], &q_h_p, &k_t_p, &scores_p).map_err(|e| {
             AggregationError::VerificationFailed(format!("Attention score head {h}: {e}"))
@@ -8048,7 +8131,7 @@ fn verify_attention_proof_blake2s(
         // Per-head: context = softmax × V_kv (padded)
         let soft_p = pad_to_pow2(&inter.softmax_outputs[h]);
         let v_h_p = pad_to_pow2(&kv_heads_v[kv_idx]);
-        let context_p = matmul_m31_auto(&soft_p, &v_h_p);
+        let context_p = matmul_m31(&soft_p, &v_h_p);
 
         verify_matmul_sumcheck(&proof.attn_v_proofs[h], &soft_p, &v_h_p, &context_p).map_err(
             |e| AggregationError::VerificationFailed(format!("Attention attn_v head {h}: {e}")),
@@ -9784,8 +9867,8 @@ mod tests {
         );
 
         // Independently recompute and verify the commitment matches
-        let matmul_output = matmul_m31_auto(&input, weights.get_weight(0).unwrap());
-        let ln = apply_layernorm_detailed_auto(&matmul_output, 4);
+        let matmul_output = matmul_m31(&input, weights.get_weight(0).unwrap());
+        let ln = apply_layernorm_detailed(&matmul_output, 4);
         let expected = compute_layernorm_mean_var_commitment(&ln.means, &ln.variances);
         assert_eq!(
             proof.layernorm_mean_var_commitments[0], expected,
