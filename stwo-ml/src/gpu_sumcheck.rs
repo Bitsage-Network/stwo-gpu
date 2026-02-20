@@ -458,6 +458,148 @@ extern "C" __global__ void m31_relu_kernel(
     unsigned int val = input[idx];
     output[idx] = (val <= (P >> 1)) ? val : 0u;
 }
+
+// --- M31 field helpers for reduction kernels ---
+__device__ __forceinline__ unsigned int m31_add(unsigned int a, unsigned int b) {
+    unsigned int s = a + b;
+    return (s >= P) ? (s - P) : s;
+}
+
+__device__ __forceinline__ unsigned int m31_sub(unsigned int a, unsigned int b) {
+    return (a >= b) ? (a - b) : (a + P - b);
+}
+
+__device__ __forceinline__ unsigned int m31_mul(unsigned int a, unsigned int b) {
+    unsigned long long prod = (unsigned long long)a * (unsigned long long)b;
+    unsigned int lo = (unsigned int)(prod & P);
+    unsigned int hi = (unsigned int)(prod >> 31);
+    unsigned int result = lo + hi;
+    return (result >= P) ? (result - P) : result;
+}
+
+// --- LayerNorm kernel ---
+// One block per row, 256 threads. Shared-memory tree reduction.
+// Computes: mean = sum(x)/n, variance = sum((x-mean)^2)/n & 0xFFFF,
+//           rsqrt = table[variance], output = (x - mean) * rsqrt
+extern "C" __global__ void m31_layernorm_kernel(
+    const unsigned int* __restrict__ input,   // rows * dim
+    unsigned int* __restrict__ output,        // rows * dim
+    unsigned int* __restrict__ out_means,     // rows
+    unsigned int* __restrict__ out_variances, // rows
+    unsigned int* __restrict__ out_rsqrt,     // rows
+    const unsigned int* __restrict__ rsqrt_table, // 2^16 entries
+    unsigned int dim,
+    unsigned int inv_n
+) {
+    __shared__ unsigned int s_data[256];
+
+    unsigned int row = blockIdx.x;
+    unsigned int tid = threadIdx.x;
+    unsigned int base = row * dim;
+
+    // --- Step 1: Compute sum for mean ---
+    unsigned int local_sum = 0;
+    for (unsigned int i = tid; i < dim; i += 256) {
+        local_sum = m31_add(local_sum, input[base + i]);
+    }
+    s_data[tid] = local_sum;
+    __syncthreads();
+
+    // Tree reduction for sum
+    for (unsigned int stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_data[tid] = m31_add(s_data[tid], s_data[tid + stride]);
+        }
+        __syncthreads();
+    }
+
+    unsigned int mean = m31_mul(s_data[0], inv_n);
+    __syncthreads();
+
+    // --- Step 2: Compute variance sum((x - mean)^2) ---
+    unsigned int local_var = 0;
+    for (unsigned int i = tid; i < dim; i += 256) {
+        unsigned int diff = m31_sub(input[base + i], mean);
+        local_var = m31_add(local_var, m31_mul(diff, diff));
+    }
+    s_data[tid] = local_var;
+    __syncthreads();
+
+    for (unsigned int stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_data[tid] = m31_add(s_data[tid], s_data[tid + stride]);
+        }
+        __syncthreads();
+    }
+
+    unsigned int variance = m31_mul(s_data[0], inv_n) & 0xFFFFu;
+    unsigned int rsqrt_val = rsqrt_table[variance];
+    __syncthreads();
+
+    // --- Step 3: Compute output = (x - mean) * rsqrt ---
+    for (unsigned int i = tid; i < dim; i += 256) {
+        unsigned int centered = m31_sub(input[base + i], mean);
+        output[base + i] = m31_mul(centered, rsqrt_val);
+    }
+
+    // Write per-row stats
+    if (tid == 0) {
+        out_means[row] = mean;
+        out_variances[row] = variance;
+        out_rsqrt[row] = rsqrt_val;
+    }
+}
+
+// --- RMSNorm kernel ---
+// One block per row, 256 threads. Shared-memory tree reduction.
+// Computes: rms_sq = sum(x^2)/n & 0xFFFF, rsqrt = table[rms_sq], output = x * rsqrt
+extern "C" __global__ void m31_rmsnorm_kernel(
+    const unsigned int* __restrict__ input,   // rows * dim
+    unsigned int* __restrict__ output,        // rows * dim
+    unsigned int* __restrict__ out_rms_sq,    // rows
+    unsigned int* __restrict__ out_rsqrt,     // rows
+    const unsigned int* __restrict__ rsqrt_table, // 2^16 entries
+    unsigned int dim,
+    unsigned int inv_n
+) {
+    __shared__ unsigned int s_data[256];
+
+    unsigned int row = blockIdx.x;
+    unsigned int tid = threadIdx.x;
+    unsigned int base = row * dim;
+
+    // --- Step 1: Compute sum(x^2) ---
+    unsigned int local_sq = 0;
+    for (unsigned int i = tid; i < dim; i += 256) {
+        unsigned int x = input[base + i];
+        local_sq = m31_add(local_sq, m31_mul(x, x));
+    }
+    s_data[tid] = local_sq;
+    __syncthreads();
+
+    // Tree reduction
+    for (unsigned int stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_data[tid] = m31_add(s_data[tid], s_data[tid + stride]);
+        }
+        __syncthreads();
+    }
+
+    unsigned int rms_sq = m31_mul(s_data[0], inv_n) & 0xFFFFu;
+    unsigned int rsqrt_val = rsqrt_table[rms_sq];
+    __syncthreads();
+
+    // --- Step 2: Compute output = x * rsqrt ---
+    for (unsigned int i = tid; i < dim; i += 256) {
+        output[base + i] = m31_mul(input[base + i], rsqrt_val);
+    }
+
+    // Write per-row stats
+    if (tid == 0) {
+        out_rms_sq[row] = rms_sq;
+        out_rsqrt[row] = rsqrt_val;
+    }
+}
 "#;
 
 // =============================================================================
@@ -1070,6 +1212,8 @@ struct ForwardKernels {
     add_fn: CudaFunction,
     mul_fn: CudaFunction,
     relu_fn: CudaFunction,
+    layernorm_fn: CudaFunction,
+    rmsnorm_fn: CudaFunction,
 }
 
 /// MLE restrict CUDA kernel handles.
@@ -1254,6 +1398,8 @@ impl GpuSumcheckExecutor {
                 add_fn: fns.add_fn.clone(),
                 mul_fn: fns.mul_fn.clone(),
                 relu_fn: fns.relu_fn.clone(),
+                layernorm_fn: fns.layernorm_fn.clone(),
+                rmsnorm_fn: fns.rmsnorm_fn.clone(),
             });
         }
 
@@ -1263,6 +1409,7 @@ impl GpuSumcheckExecutor {
         self.device.load_ptx(ptx, "forward", &[
             "m31_gemv_kernel", "m31_gemm_kernel",
             "m31_add_kernel", "m31_mul_kernel", "m31_relu_kernel",
+            "m31_layernorm_kernel", "m31_rmsnorm_kernel",
         ]).map_err(|e| CudaFftError::KernelCompilation(format!("load forward PTX: {:?}", e)))?;
 
         let fns = ForwardKernels {
@@ -1276,6 +1423,10 @@ impl GpuSumcheckExecutor {
                 .ok_or_else(|| CudaFftError::KernelCompilation("m31_mul_kernel not found".into()))?,
             relu_fn: self.device.get_func("forward", "m31_relu_kernel")
                 .ok_or_else(|| CudaFftError::KernelCompilation("m31_relu_kernel not found".into()))?,
+            layernorm_fn: self.device.get_func("forward", "m31_layernorm_kernel")
+                .ok_or_else(|| CudaFftError::KernelCompilation("m31_layernorm_kernel not found".into()))?,
+            rmsnorm_fn: self.device.get_func("forward", "m31_rmsnorm_kernel")
+                .ok_or_else(|| CudaFftError::KernelCompilation("m31_rmsnorm_kernel not found".into()))?,
         };
 
         *guard = Some(ForwardKernels {
@@ -1284,6 +1435,8 @@ impl GpuSumcheckExecutor {
             add_fn: fns.add_fn.clone(),
             mul_fn: fns.mul_fn.clone(),
             relu_fn: fns.relu_fn.clone(),
+            layernorm_fn: fns.layernorm_fn.clone(),
+            rmsnorm_fn: fns.rmsnorm_fn.clone(),
         });
         Ok(fns)
     }
@@ -2601,6 +2754,190 @@ pub fn gpu_relu(input: &[M31]) -> Result<Vec<M31>, MatMulError> {
     executor.device.dtoh_sync_copy_into(&d_out, &mut out_u32)
         .map_err(|e| MatMulError::SumcheckFailed(format!("GPU download: {:?}", e)))?;
     Ok(out_u32.iter().map(|&v| M31::from(v)).collect())
+}
+
+/// GPU-accelerated LayerNorm forward pass.
+///
+/// Computes per-row: mean, variance (masked to 16 bits), rsqrt table lookup,
+/// output = (input - mean) * rsqrt.
+///
+/// Returns (output_matrix, per_row_means, per_row_variances, per_row_rsqrt).
+#[cfg(feature = "cuda-runtime")]
+pub fn gpu_layernorm_m31(
+    input: &M31Matrix,
+    dim: usize,
+    inv_n: u32,
+    rsqrt_table: &[u32],
+) -> Result<(M31Matrix, Vec<M31>, Vec<M31>, Vec<M31>), MatMulError> {
+    let rows = input.rows;
+    let cols = input.cols;
+    let n = dim.min(cols);
+
+    if n == 0 {
+        return Err(MatMulError::SumcheckFailed("LayerNorm dim=0".into()));
+    }
+
+    let executor = GpuSumcheckExecutor::cached()
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU init: {e}")))?;
+    let fns = executor.get_forward_fns()
+        .map_err(|e| MatMulError::SumcheckFailed(format!("forward kernels: {e}")))?;
+
+    // Upload input (only the active dim portion per row if cols > dim)
+    // For simplicity, upload full matrix and let kernel work on first `dim` elements.
+    // If cols != dim, we handle the padding columns on CPU after download.
+    let input_u32: Vec<u32> = input.data.iter().map(|v| v.0).collect();
+    let d_input = executor.device.htod_sync_copy(&input_u32)
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU upload input: {:?}", e)))?;
+
+    // Upload rsqrt table
+    let d_rsqrt_table = executor.device.htod_sync_copy(rsqrt_table)
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU upload rsqrt_table: {:?}", e)))?;
+
+    // Allocate output buffers
+    let d_output: CudaSlice<u32> = executor.device.alloc_zeros(rows * cols)
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU alloc output: {:?}", e)))?;
+    let d_means: CudaSlice<u32> = executor.device.alloc_zeros(rows)
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU alloc means: {:?}", e)))?;
+    let d_variances: CudaSlice<u32> = executor.device.alloc_zeros(rows)
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU alloc variances: {:?}", e)))?;
+    let d_rsqrt: CudaSlice<u32> = executor.device.alloc_zeros(rows)
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU alloc rsqrt: {:?}", e)))?;
+
+    // Launch: one block per row, 256 threads per block
+    // Kernel uses cols as the dim parameter and processes first `n` elements per row.
+    // We pass `n` (the active dim) so the kernel only reduces over the active range.
+    unsafe {
+        fns.layernorm_fn.clone().launch(
+            LaunchConfig {
+                grid_dim: (rows as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 256 * 4,
+            },
+            (&d_input, &d_output, &d_means, &d_variances, &d_rsqrt,
+             &d_rsqrt_table, n as u32, inv_n),
+        ).map_err(|e| MatMulError::SumcheckFailed(format!("GPU LayerNorm launch: {:?}", e)))?;
+    }
+
+    // Download results
+    let mut output_u32 = vec![0u32; rows * cols];
+    let mut means_u32 = vec![0u32; rows];
+    let mut variances_u32 = vec![0u32; rows];
+    let mut rsqrt_u32 = vec![0u32; rows];
+
+    executor.device.dtoh_sync_copy_into(&d_output, &mut output_u32)
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU download output: {:?}", e)))?;
+    executor.device.dtoh_sync_copy_into(&d_means, &mut means_u32)
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU download means: {:?}", e)))?;
+    executor.device.dtoh_sync_copy_into(&d_variances, &mut variances_u32)
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU download variances: {:?}", e)))?;
+    executor.device.dtoh_sync_copy_into(&d_rsqrt, &mut rsqrt_u32)
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU download rsqrt: {:?}", e)))?;
+
+    // Convert to M31
+    let output_data: Vec<M31> = output_u32.iter().map(|&v| M31::from(v)).collect();
+    let means: Vec<M31> = means_u32.iter().map(|&v| M31::from(v)).collect();
+    let variances: Vec<M31> = variances_u32.iter().map(|&v| M31::from(v)).collect();
+    let rsqrt_vals: Vec<M31> = rsqrt_u32.iter().map(|&v| M31::from(v)).collect();
+
+    // If cols > n, the kernel only wrote the first n elements per row.
+    // Copy original input for columns [n..cols] (passthrough).
+    let mut final_data = output_data;
+    if n < cols {
+        for row in 0..rows {
+            for col in n..cols {
+                final_data[row * cols + col] = input.data[row * cols + col];
+            }
+        }
+    }
+
+    Ok((
+        M31Matrix { rows, cols, data: final_data },
+        means,
+        variances,
+        rsqrt_vals,
+    ))
+}
+
+/// GPU-accelerated RMSNorm forward pass.
+///
+/// Computes per-row: rms_sq = sum(x²)/n & 0xFFFF, rsqrt = table[rms_sq],
+/// output = input * rsqrt.
+///
+/// Returns (output_matrix, per_row_rms_sq, per_row_rsqrt).
+#[cfg(feature = "cuda-runtime")]
+pub fn gpu_rmsnorm_m31(
+    input: &M31Matrix,
+    dim: usize,
+    inv_n: u32,
+    rsqrt_table: &[u32],
+) -> Result<(M31Matrix, Vec<M31>, Vec<M31>), MatMulError> {
+    let rows = input.rows;
+    let cols = input.cols;
+    let n = dim.min(cols);
+
+    if n == 0 {
+        return Err(MatMulError::SumcheckFailed("RMSNorm dim=0".into()));
+    }
+
+    let executor = GpuSumcheckExecutor::cached()
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU init: {e}")))?;
+    let fns = executor.get_forward_fns()
+        .map_err(|e| MatMulError::SumcheckFailed(format!("forward kernels: {e}")))?;
+
+    let input_u32: Vec<u32> = input.data.iter().map(|v| v.0).collect();
+    let d_input = executor.device.htod_sync_copy(&input_u32)
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU upload input: {:?}", e)))?;
+    let d_rsqrt_table = executor.device.htod_sync_copy(rsqrt_table)
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU upload rsqrt_table: {:?}", e)))?;
+
+    let d_output: CudaSlice<u32> = executor.device.alloc_zeros(rows * cols)
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU alloc output: {:?}", e)))?;
+    let d_rms_sq: CudaSlice<u32> = executor.device.alloc_zeros(rows)
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU alloc rms_sq: {:?}", e)))?;
+    let d_rsqrt: CudaSlice<u32> = executor.device.alloc_zeros(rows)
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU alloc rsqrt: {:?}", e)))?;
+
+    unsafe {
+        fns.rmsnorm_fn.clone().launch(
+            LaunchConfig {
+                grid_dim: (rows as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 256 * 4,
+            },
+            (&d_input, &d_output, &d_rms_sq, &d_rsqrt,
+             &d_rsqrt_table, n as u32, inv_n),
+        ).map_err(|e| MatMulError::SumcheckFailed(format!("GPU RMSNorm launch: {:?}", e)))?;
+    }
+
+    let mut output_u32 = vec![0u32; rows * cols];
+    let mut rms_sq_u32 = vec![0u32; rows];
+    let mut rsqrt_u32 = vec![0u32; rows];
+
+    executor.device.dtoh_sync_copy_into(&d_output, &mut output_u32)
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU download output: {:?}", e)))?;
+    executor.device.dtoh_sync_copy_into(&d_rms_sq, &mut rms_sq_u32)
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU download rms_sq: {:?}", e)))?;
+    executor.device.dtoh_sync_copy_into(&d_rsqrt, &mut rsqrt_u32)
+        .map_err(|e| MatMulError::SumcheckFailed(format!("GPU download rsqrt: {:?}", e)))?;
+
+    let output_data: Vec<M31> = output_u32.iter().map(|&v| M31::from(v)).collect();
+    let rms_sq: Vec<M31> = rms_sq_u32.iter().map(|&v| M31::from(v)).collect();
+    let rsqrt_vals: Vec<M31> = rsqrt_u32.iter().map(|&v| M31::from(v)).collect();
+
+    let mut final_data = output_data;
+    if n < cols {
+        for row in 0..rows {
+            for col in n..cols {
+                final_data[row * cols + col] = input.data[row * cols + col];
+            }
+        }
+    }
+
+    Ok((
+        M31Matrix { rows, cols, data: final_data },
+        rms_sq,
+        rsqrt_vals,
+    ))
 }
 
 // =============================================================================

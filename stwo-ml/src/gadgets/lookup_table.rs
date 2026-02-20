@@ -136,6 +136,19 @@ impl PrecomputedTable {
         }
     }
 
+    /// Flat u32 array indexed by input value, for GPU texture lookup.
+    ///
+    /// Returns a `Vec<u32>` of size `2^log_size` where `table[inp.0 % size] = out.0`.
+    /// Used by GPU LayerNorm/RMSNorm kernels to do direct rsqrt lookups.
+    pub fn as_gpu_lookup_table(&self) -> Vec<u32> {
+        let size = 1usize << self.log_size;
+        let mut table = vec![0u32; size];
+        for (inp, out) in self.inputs.iter().zip(self.outputs.iter()) {
+            table[inp.0 as usize % size] = out.0;
+        }
+        table
+    }
+
     /// Generate preprocessed columns (input_col, output_col) as CircleEvaluations.
     ///
     /// Generic over backend `B` — works with `SimdBackend`, `CpuBackend`, or `GpuBackend`.

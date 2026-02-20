@@ -54,7 +54,7 @@ use std::collections::HashMap;
 use crate::backend::convert_evaluations;
 use crate::compiler::graph::{ComputationGraph, GraphOp, GraphWeights};
 use crate::compiler::prove::{
-    apply_layernorm_detailed, apply_rmsnorm_detailed, elementwise_add, elementwise_mul,
+    apply_layernorm_detailed_auto, apply_rmsnorm_detailed_auto, elementwise_add, elementwise_mul,
     GraphExecution, ModelError,
 };
 use crate::components::activation::{compute_multiplicities, ActivationEval, ActivationRelation};
@@ -707,7 +707,10 @@ where
                     type_tag: activation_type.type_tag(),
                 });
 
-                intermediates.push((node.id, reduced_matrix));
+                // Push the original (unreduced) input for chain commitment
+                // consistency with the verifier (which records `current` before
+                // table-mask reduction).
+                intermediates.push((node.id, current.clone()));
                 node_outputs.insert(node.id, output.clone());
                 current = output;
             }
@@ -792,7 +795,7 @@ where
 
             GraphOp::LayerNorm { dim } => {
                 let ln_log_size = LayerNormConfig::new(*dim).rsqrt_table_log_size;
-                let ln = apply_layernorm_detailed(&current, *dim);
+                let ln = apply_layernorm_detailed_auto(&current, *dim);
                 let rsqrt_table = build_rsqrt_table(ln_log_size);
 
                 layernorm_layers.push(LayerNormLayerData {
@@ -813,7 +816,7 @@ where
 
             GraphOp::RMSNorm { dim } => {
                 let rn_log_size = RMSNormConfig::new(*dim).rsqrt_table_log_size;
-                let rn = apply_rmsnorm_detailed(&current, *dim);
+                let rn = apply_rmsnorm_detailed_auto(&current, *dim);
                 let rsqrt_table = build_rmsnorm_rsqrt_table(rn_log_size);
 
                 rmsnorm_layers.push(RMSNormLayerData {
@@ -2325,7 +2328,10 @@ where
                     type_tag: activation_type.type_tag(),
                 });
 
-                intermediates.push((node.id, reduced_matrix));
+                // Push the original (unreduced) input for chain commitment
+                // consistency with the verifier (which records `current` before
+                // table-mask reduction).
+                intermediates.push((node.id, current.clone()));
                 node_outputs.insert(node.id, output.clone());
                 current = output;
             }
@@ -2431,7 +2437,7 @@ where
                     dim,
                 );
                 let ln_log_size = LayerNormConfig::new(*dim).rsqrt_table_log_size;
-                let ln = apply_layernorm_detailed(&current, *dim);
+                let ln = apply_layernorm_detailed_auto(&current, *dim);
                 let rsqrt_table = build_rsqrt_table(ln_log_size);
 
                 layernorm_layers.push(LayerNormLayerData {
@@ -2459,7 +2465,7 @@ where
                     dim,
                 );
                 let rn_log_size = RMSNormConfig::new(*dim).rsqrt_table_log_size;
-                let rn = apply_rmsnorm_detailed(&current, *dim);
+                let rn = apply_rmsnorm_detailed_auto(&current, *dim);
                 let rsqrt_table = build_rmsnorm_rsqrt_table(rn_log_size);
 
                 rmsnorm_layers.push(RMSNormLayerData {
@@ -4487,7 +4493,10 @@ where
                     type_tag: activation_type.type_tag(),
                 });
 
-                intermediates.push((node.id, reduced_matrix));
+                // Push the original (unreduced) input for chain commitment
+                // consistency with the verifier (which records `current` before
+                // table-mask reduction).
+                intermediates.push((node.id, current.clone()));
                 node_outputs.insert(node.id, output.clone());
                 current = output;
             }
@@ -4572,7 +4581,7 @@ where
 
             GraphOp::LayerNorm { dim } => {
                 let ln_log_size = LayerNormConfig::new(*dim).rsqrt_table_log_size;
-                let ln = apply_layernorm_detailed(&current, *dim);
+                let ln = apply_layernorm_detailed_auto(&current, *dim);
                 let rsqrt_table = build_rsqrt_table(ln_log_size);
 
                 layernorm_layers.push(LayerNormLayerData {
@@ -4593,7 +4602,7 @@ where
 
             GraphOp::RMSNorm { dim } => {
                 let rn_log_size = RMSNormConfig::new(*dim).rsqrt_table_log_size;
-                let rn = apply_rmsnorm_detailed(&current, *dim);
+                let rn = apply_rmsnorm_detailed_auto(&current, *dim);
                 let rsqrt_table = build_rmsnorm_rsqrt_table(rn_log_size);
 
                 rmsnorm_layers.push(RMSNormLayerData {
@@ -5245,7 +5254,10 @@ pub(crate) fn collect_forward_pass_layer_data(
                     type_tag: activation_type.type_tag(),
                 });
 
-                intermediates.push((node.id, reduced_matrix));
+                // Push the original (unreduced) input for chain commitment
+                // consistency with the verifier (which records `current` before
+                // table-mask reduction).
+                intermediates.push((node.id, current.clone()));
                 node_outputs.insert(node.id, output.clone());
                 current = output;
             }
@@ -5310,7 +5322,7 @@ pub(crate) fn collect_forward_pass_layer_data(
 
             GraphOp::LayerNorm { dim } => {
                 let ln_log_size = LayerNormConfig::new(*dim).rsqrt_table_log_size;
-                let ln = apply_layernorm_detailed(&current, *dim);
+                let ln = apply_layernorm_detailed_auto(&current, *dim);
                 let rsqrt_table = build_rsqrt_table(ln_log_size);
 
                 layernorm_layers.push(LayerNormLayerData {
@@ -5331,7 +5343,7 @@ pub(crate) fn collect_forward_pass_layer_data(
 
             GraphOp::RMSNorm { dim } => {
                 let rn_log_size = RMSNormConfig::new(*dim).rsqrt_table_log_size;
-                let rn = apply_rmsnorm_detailed(&current, *dim);
+                let rn = apply_rmsnorm_detailed_auto(&current, *dim);
                 let rsqrt_table = build_rmsnorm_rsqrt_table(rn_log_size);
 
                 rmsnorm_layers.push(RMSNormLayerData {
@@ -6780,13 +6792,13 @@ pub fn verify_aggregated_model_proof(
                 current = output;
             }
             GraphOp::LayerNorm { dim } => {
-                let ln = apply_layernorm_detailed(&current, *dim);
+                let ln = apply_layernorm_detailed_auto(&current, *dim);
                 ln_verify_data.push((node.id, ln.means.clone(), ln.variances.clone()));
                 node_outputs.insert(node.id, ln.output_matrix.clone());
                 current = ln.output_matrix;
             }
             GraphOp::RMSNorm { dim } => {
-                let rn = apply_rmsnorm_detailed(&current, *dim);
+                let rn = apply_rmsnorm_detailed_auto(&current, *dim);
                 node_outputs.insert(node.id, rn.output_matrix.clone());
                 current = rn.output_matrix;
             }
@@ -7094,13 +7106,13 @@ pub fn verify_aggregated_model_proof_onchain(
                 current = output;
             }
             GraphOp::LayerNorm { dim } => {
-                let ln = apply_layernorm_detailed(&current, *dim);
+                let ln = apply_layernorm_detailed_auto(&current, *dim);
                 ln_verify_data.push((node.id, ln.means.clone(), ln.variances.clone()));
                 node_outputs.insert(node.id, ln.output_matrix.clone());
                 current = ln.output_matrix;
             }
             GraphOp::RMSNorm { dim } => {
-                let rn = apply_rmsnorm_detailed(&current, *dim);
+                let rn = apply_rmsnorm_detailed_auto(&current, *dim);
                 node_outputs.insert(node.id, rn.output_matrix.clone());
                 current = rn.output_matrix;
             }
@@ -9772,7 +9784,7 @@ mod tests {
 
         // Independently recompute and verify the commitment matches
         let matmul_output = matmul_m31_auto(&input, weights.get_weight(0).unwrap());
-        let ln = apply_layernorm_detailed(&matmul_output, 4);
+        let ln = apply_layernorm_detailed_auto(&matmul_output, 4);
         let expected = compute_layernorm_mean_var_commitment(&ln.means, &ln.variances);
         assert_eq!(
             proof.layernorm_mean_var_commitments[0], expected,
