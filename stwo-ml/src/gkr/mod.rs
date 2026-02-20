@@ -61,4 +61,4 @@ pub use prover::prove_gkr;
 pub use prover::prove_gkr_gpu;
 #[cfg(feature = "cuda-runtime")]
 pub use prover::prove_gkr_simd_gpu;
-pub use verifier::{verify_gkr, verify_gkr_simd, verify_gkr_with_execution, verify_gkr_with_weights};
+pub use verifier::{verify_gkr, verify_gkr_simd, verify_gkr_simd_with_weights, verify_gkr_with_execution, verify_gkr_with_weights};

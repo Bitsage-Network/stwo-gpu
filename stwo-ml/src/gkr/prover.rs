@@ -16,20 +16,23 @@ use crate::compiler::graph::{GraphExecution, GraphWeights};
 use crate::components::attention::{
     attention_forward, split_heads, transpose_m31, AttentionWeights, MultiHeadAttentionConfig,
 };
-use crate::components::matmul::matmul_m31_auto;
+#[cfg(feature = "cuda-runtime")]
+use crate::components::matmul::matmul_m31;
+#[cfg(not(feature = "cuda-runtime"))]
 use crate::components::matmul::matrix_to_mle_col_major_padded_pub as matrix_to_mle_col_major_padded;
 #[cfg(feature = "cuda-runtime")]
 use crate::components::matmul::matrix_to_mle_col_major_u32_padded_pub as matrix_to_mle_col_major_u32_padded;
-#[allow(unused_imports)] // used behind cfg(test) and cfg(cuda-runtime)
 use crate::components::matmul::{
-    evaluate_mle_pub as evaluate_mle,
-    matrix_to_mle_col_major_pub as matrix_to_mle_col_major,
-    matrix_to_mle_pub as matrix_to_mle, pad_matrix_pow2,
-    restrict_mle_pub as restrict_mle, M31Matrix,
+    evaluate_mle_pub as evaluate_mle, matrix_to_mle_col_major_pub as matrix_to_mle_col_major,
+    matrix_to_mle_pub as matrix_to_mle, pad_matrix_pow2, M31Matrix,
 };
+#[cfg(any(feature = "cuda-runtime", test))]
+use crate::components::matmul::restrict_mle_pub as restrict_mle;
 use crate::crypto::aggregated_opening::{
     prove_aggregated_binding, AggregatedWeightClaim,
 };
+#[cfg(feature = "cuda-runtime")]
+use crate::crypto::aggregated_opening::prove_aggregated_binding_gpu;
 use crate::crypto::poseidon_channel::PoseidonChannel;
 
 use super::circuit::{LayerType, LayeredCircuit};
@@ -37,6 +40,91 @@ use super::types::WeightOpeningTranscriptMode;
 use super::types::{
     derive_weight_opening_subchannel, GKRClaim, GKRError, GKRProof, LayerProof, SecureField,
 };
+// ── proof-stream: thread-local sink + zero-overhead macro ─────────────────
+#[cfg(feature = "proof-stream")]
+use std::cell::RefCell;
+
+#[cfg(feature = "proof-stream")]
+thread_local! {
+    pub static PROOF_SINK: RefCell<Option<proof_stream::ProofSink>> = RefCell::new(None);
+}
+
+/// Install a [`proof_stream::ProofSink`] for this thread.  Returns a RAII guard
+/// that flushes and removes the sink on drop.
+#[cfg(feature = "proof-stream")]
+pub fn set_proof_sink(sink: proof_stream::ProofSink) -> ProofSinkGuard {
+    PROOF_SINK.with(|s| *s.borrow_mut() = Some(sink));
+    ProofSinkGuard
+}
+
+#[cfg(feature = "proof-stream")]
+pub struct ProofSinkGuard;
+#[cfg(feature = "proof-stream")]
+impl Drop for ProofSinkGuard {
+    fn drop(&mut self) {
+        PROOF_SINK.with(|s| {
+            if let Some(sink) = s.borrow().as_ref() { sink.flush(); }
+            *s.borrow_mut() = None;
+        });
+    }
+}
+
+/// Emit a proof event if a sink is installed.  The closure is never called
+/// (and never compiled) when the `proof-stream` feature is absent.
+#[cfg(feature = "proof-stream")]
+macro_rules! emit_proof_event {
+    ($e:expr) => {
+        PROOF_SINK.with(|s| {
+            if let Some(sink) = s.borrow().as_ref() { sink.emit_if($e); }
+        })
+    };
+}
+/// No-op: `$($tt:tt)*` avoids compiling the closure body (which may reference
+/// `proof_stream::*`) when the feature is disabled.
+#[cfg(not(feature = "proof-stream"))]
+macro_rules! emit_proof_event {
+    ($($tt:tt)*) => {};
+}
+
+#[cfg(feature = "proof-stream")]
+fn layer_kind_from_type(layer_type: &LayerType) -> proof_stream::LayerKind {
+    match layer_type {
+        LayerType::MatMul { .. }     => proof_stream::LayerKind::MatMul,
+        LayerType::Add { .. }        => proof_stream::LayerKind::Add,
+        LayerType::Mul { .. }        => proof_stream::LayerKind::Mul,
+        LayerType::Activation { .. } => proof_stream::LayerKind::Activation,
+        LayerType::LayerNorm { .. }  => proof_stream::LayerKind::LayerNorm,
+        LayerType::RMSNorm { .. }    => proof_stream::LayerKind::RMSNorm,
+        LayerType::Attention { .. }  => proof_stream::LayerKind::Attention,
+        LayerType::Embedding { .. }  => proof_stream::LayerKind::Embedding,
+        // Quantize/Dequantize mapped to Add (no dedicated color needed)
+        LayerType::Dequantize { .. } | LayerType::Quantize { .. } => proof_stream::LayerKind::Add,
+        LayerType::Input | LayerType::Identity => proof_stream::LayerKind::Add,
+    }
+}
+
+#[cfg(feature = "proof-stream")]
+fn estimate_trace_cost(layer_type: &LayerType) -> usize {
+    match layer_type {
+        LayerType::MatMul { m, k, n, .. } => (m * k * n).next_power_of_two(),
+        LayerType::Attention { config }   => config.seq_len * config.d_model,
+        LayerType::Add { size } | LayerType::Mul { size } => *size,
+        LayerType::Activation { size, .. }
+        | LayerType::Dequantize { size, .. }
+        | LayerType::Quantize { size, .. } => *size,
+        LayerType::LayerNorm { dim } | LayerType::RMSNorm { dim } => *dim,
+        LayerType::Embedding { vocab_size, embed_dim } => vocab_size * embed_dim,
+        LayerType::Input | LayerType::Identity => 0,
+    }
+}
+
+#[cfg(feature = "proof-stream")]
+#[inline(always)]
+fn sf_to_f32(sf: SecureField) -> f32 {
+    // QM31 → real M31 component as a float in [0, 1)
+    sf.0.0.0 as f32 / 0x7fff_ffff_u32 as f32
+}
+
 
 #[cfg(feature = "cuda-runtime")]
 #[inline]
@@ -172,6 +260,8 @@ fn apply_aggregated_oracle_sumcheck(
     // Collect aggregated claims with MLEs
     let mut agg_claims = Vec::new();
     let mut all_mles: Vec<Vec<SecureField>> = Vec::new();
+    #[cfg(feature = "cuda-runtime")]
+    let mut all_mles_u32: Vec<Vec<u32>> = Vec::new();
 
     // Main walk claims
     for (idx, (weight_node_id, eval_point, expected_value)) in weight_data.iter().enumerate() {
@@ -180,7 +270,7 @@ fn apply_aggregated_oracle_sumcheck(
             .ok_or(GKRError::MissingWeight {
                 node_id: *weight_node_id,
             })?;
-        let b_mle = matrix_to_mle_col_major_padded(b_matrix);
+        let b_mle = matrix_to_mle_col_major(b_matrix);
         let n_vars = b_mle.len().trailing_zeros() as usize;
         let commitment = crate::crypto::mle_opening::commit_mle_root_only(&b_mle);
         weight_commitments.push(commitment);
@@ -193,6 +283,17 @@ fn apply_aggregated_oracle_sumcheck(
             commitment,
         });
         all_mles.push(b_mle);
+        #[cfg(feature = "cuda-runtime")]
+        {
+            let b_mle_u32 = matrix_to_mle_col_major_u32_padded(b_matrix);
+            debug_assert_eq!(
+                n_vars,
+                (b_mle_u32.len() / 4).trailing_zeros() as usize,
+                "n_vars mismatch: SecureField MLE has {n_vars} vars, u32 MLE has {} vars (weight node {weight_node_id})",
+                (b_mle_u32.len() / 4).trailing_zeros(),
+            );
+            all_mles_u32.push(b_mle_u32);
+        }
     }
 
     // Deferred claims
@@ -204,13 +305,15 @@ fn apply_aggregated_oracle_sumcheck(
             .ok_or(GKRError::MissingWeight {
                 node_id: *weight_node_id,
             })?;
-        let b_mle = matrix_to_mle_col_major_padded(b_matrix);
+        let b_mle = matrix_to_mle_col_major(b_matrix);
         let n_vars = b_mle.len().trailing_zeros() as usize;
         let commitment = crate::crypto::mle_opening::commit_mle_root_only(&b_mle);
 
-        // Update deferred proof's weight commitment
+        // Update deferred proof's weight commitment (only for MatMul kind)
         if let Some(dp) = deferred_proofs.get_mut(deferred_idx) {
-            dp.weight_commitment = commitment;
+            if let Some(wc) = dp.weight_commitment_mut() {
+                *wc = commitment;
+            }
         }
 
         let claim_idx = weight_data.len() + deferred_idx;
@@ -222,10 +325,27 @@ fn apply_aggregated_oracle_sumcheck(
             commitment,
         });
         all_mles.push(b_mle);
+        #[cfg(feature = "cuda-runtime")]
+        {
+            let b_mle_u32 = matrix_to_mle_col_major_u32_padded(b_matrix);
+            debug_assert_eq!(
+                n_vars,
+                (b_mle_u32.len() / 4).trailing_zeros() as usize,
+                "n_vars mismatch (deferred): SecureField MLE has {n_vars} vars, u32 MLE has {} vars (weight node {weight_node_id})",
+                (b_mle_u32.len() / 4).trailing_zeros(),
+            );
+            all_mles_u32.push(b_mle_u32);
+        }
     }
 
     let binding_proof = if !agg_claims.is_empty() {
         let mle_refs: Vec<&[SecureField]> = all_mles.iter().map(|m| m.as_slice()).collect();
+        #[cfg(feature = "cuda-runtime")]
+        let proof = {
+            let mle_u32_refs: Vec<&[u32]> = all_mles_u32.iter().map(|m| m.as_slice()).collect();
+            prove_aggregated_binding_gpu(&agg_claims, &mle_refs, &mle_u32_refs, channel)
+        };
+        #[cfg(not(feature = "cuda-runtime"))]
         let proof = prove_aggregated_binding(&agg_claims, &mle_refs, channel);
         eprintln!(
             "  [{log_tag}] aggregated oracle sumcheck: {} claims, ~{} felts calldata (vs ~{} felts per-opening)",
@@ -404,6 +524,13 @@ pub fn prove_gkr(
         value: output_value,
     };
     let mut current_claim = output_claim.clone();
+    emit_proof_event!(|| proof_stream::ProofEvent::ProofStart {
+        model_name: None,
+        backend: "cpu-gkr".to_string(),
+        num_layers: d,
+        input_shape: circuit.input_shape,
+        output_shape: circuit.output_shape,
+    });
 
     // Deferred claims from DAG Add layers (rhs branches needing separate proofs).
     // Each entry: (rhs_claim, rhs_layer_idx_in_circuit)
@@ -412,6 +539,17 @@ pub fn prove_gkr(
     // Walk layers from output → input
     for layer_idx in (0..d).rev() {
         let layer = &circuit.layers[layer_idx];
+        #[cfg(feature = "proof-stream")]
+        let _ps_layer_t = std::time::Instant::now();
+        emit_proof_event!(|| proof_stream::ProofEvent::LayerStart {
+            layer_idx,
+            kind: layer_kind_from_type(&layer.layer_type),
+            input_shape: layer.input_shape,
+            output_shape: layer.output_shape,
+            trace_cost: estimate_trace_cost(&layer.layer_type),
+            claim_value_approx: sf_to_f32(current_claim.value),
+            gpu_device: None,
+        });
 
         let (proof, next_claim) = match &layer.layer_type {
             LayerType::MatMul {
@@ -430,6 +568,40 @@ pub fn prove_gkr(
 
                 let (reduction, claim) =
                     reduce_matmul_layer(&current_claim, a_matrix, b_matrix, *m, *k, *n, channel)?;
+
+                #[cfg(feature = "proof-stream")]
+                {
+                    let total_rounds = reduction.round_polys.len();
+                    for (round, rp) in reduction.round_polys.iter().enumerate() {
+                        let c0 = proof_stream::SecureFieldMirror {
+                            a: rp.c0.0.0.0,
+                            b: rp.c0.0.1.0,
+                            c: rp.c0.1.0.0,
+                            d: rp.c0.1.1.0,
+                        };
+                        let c1 = proof_stream::SecureFieldMirror {
+                            a: rp.c1.0.0.0,
+                            b: rp.c1.0.1.0,
+                            c: rp.c1.1.0.0,
+                            d: rp.c1.1.1.0,
+                        };
+                        let c2 = proof_stream::SecureFieldMirror {
+                            a: rp.c2.0.0.0,
+                            b: rp.c2.0.1.0,
+                            c: rp.c2.1.0.0,
+                            d: rp.c2.1.1.0,
+                        };
+                        let claim_approx = c0.as_f32() + c1.as_f32() + c2.as_f32();
+                        emit_proof_event!(|| proof_stream::ProofEvent::SumcheckRound {
+                            layer_idx,
+                            round,
+                            total_rounds,
+                            poly_deg2: Some(proof_stream::RoundPolyViz { c0, c1, c2 }),
+                            poly_deg3: None,
+                            claim_value_approx: claim_approx,
+                        });
+                    }
+                }
 
                 push_matmul_weight_data(
                     *weight_node_id, *m, *n,
@@ -539,6 +711,14 @@ pub fn prove_gkr(
 
         layer_proofs.push(proof);
         current_claim = next_claim;
+        #[cfg(feature = "proof-stream")]
+        emit_proof_event!(|| proof_stream::ProofEvent::LayerEnd {
+            layer_idx,
+            kind: proof_stream::LayerProofKind::Sumcheck,
+            final_claim_value_approx: sf_to_f32(current_claim.value),
+            duration_ms: _ps_layer_t.elapsed().as_millis() as u64,
+            rounds_completed: 0,
+        });
     }
 
     let flags = compute_weight_mode_flags();
@@ -625,16 +805,42 @@ pub fn prove_gkr(
 
                 deferred_proofs.push(super::types::DeferredProof {
                     claim: deferred_claim.clone(),
-                    dims: (*m, *k, *n),
                     layer_proof: LayerProof::MatMul {
                         round_polys: reduction.round_polys,
                         final_a_eval: reduction.final_a_eval,
                         final_b_eval: reduction.final_b_eval,
                     },
                     input_claim,
-                    weight_commitment: deferred_weight_commitment,
-                    weight_opening: deferred_weight_opening,
-                    weight_claim: deferred_weight_claim,
+                    kind: super::types::DeferredProofKind::MatMul {
+                        dims: (*m, *k, *n),
+                        weight_commitment: deferred_weight_commitment,
+                        weight_opening: deferred_weight_opening,
+                        weight_claim: deferred_weight_claim,
+                    },
+                });
+            }
+            LayerType::Quantize { params, .. } => {
+                let input_matrix = get_intermediate(execution, rhs_layer.node_id)?;
+                mix_secure_field(channel, deferred_claim.value);
+                let (layer_proof, input_claim) =
+                    reduce_quantize_layer(deferred_claim, input_matrix, params, channel)?;
+                deferred_proofs.push(super::types::DeferredProof {
+                    claim: deferred_claim.clone(),
+                    layer_proof,
+                    input_claim,
+                    kind: super::types::DeferredProofKind::Weightless,
+                });
+            }
+            LayerType::Dequantize { params, .. } => {
+                let input_matrix = get_intermediate(execution, rhs_layer.node_id)?;
+                mix_secure_field(channel, deferred_claim.value);
+                let (layer_proof, input_claim) =
+                    reduce_dequantize_layer(deferred_claim, input_matrix, params, channel)?;
+                deferred_proofs.push(super::types::DeferredProof {
+                    claim: deferred_claim.clone(),
+                    layer_proof,
+                    input_claim,
+                    kind: super::types::DeferredProofKind::Weightless,
                 });
             }
             other => {
@@ -749,6 +955,12 @@ pub fn prove_gkr(
         weight_opening_transcript_mode = mode;
     }
 
+    emit_proof_event!(|| proof_stream::ProofEvent::ProofComplete {
+        duration_ms: 0,
+        num_layer_proofs: layer_proofs.len(),
+        num_weight_openings: weight_openings.len(),
+        weight_binding_mode: "sequential".to_string(),
+    });
     // Compute IO commitment from model input and output
     let model_input = execution
         .intermediates
@@ -937,13 +1149,15 @@ pub fn prove_gkr_gpu(
             }
 
             LayerType::LayerNorm { dim, .. } => {
+                // CPU fallback — LayerNorm is memory-bound, not compute-bound
                 let input_matrix = get_intermediate(execution, layer.node_id)?;
-                reduce_layernorm_layer_gpu(&gpu, &current_claim, input_matrix, *dim, channel)?
+                reduce_layernorm_layer(&current_claim, input_matrix, *dim, channel)?
             }
 
             LayerType::RMSNorm { dim, .. } => {
+                // CPU fallback — RMSNorm is memory-bound, not compute-bound
                 let input_matrix = get_intermediate(execution, layer.node_id)?;
-                reduce_rmsnorm_layer_gpu(&gpu, &current_claim, input_matrix, *dim, channel)?
+                reduce_rmsnorm_layer(&current_claim, input_matrix, *dim, channel)?
             }
 
             LayerType::Quantize { params, .. } => {
@@ -1113,19 +1327,53 @@ pub fn prove_gkr_gpu(
 
                 deferred_proofs.push(super::types::DeferredProof {
                     claim: deferred_claim.clone(),
-                    dims: (*m, *k, *n),
                     layer_proof: LayerProof::MatMul {
                         round_polys: reduction.round_polys,
                         final_a_eval: reduction.final_a_eval,
                         final_b_eval: reduction.final_b_eval,
                     },
                     input_claim,
-                    weight_commitment: deferred_weight_commitment,
-                    weight_opening: deferred_opening,
-                    weight_claim: deferred_weight_claim,
+                    kind: super::types::DeferredProofKind::MatMul {
+                        dims: (*m, *k, *n),
+                        weight_commitment: deferred_weight_commitment,
+                        weight_opening: deferred_opening,
+                        weight_claim: deferred_weight_claim,
+                    },
                 });
             }
-            _ => {} // Only MatMul deferred proofs supported
+            LayerType::Quantize { params, .. } => {
+                let input_matrix = get_intermediate(execution, rhs_layer.node_id)?;
+                mix_secure_field(channel, deferred_claim.value);
+                let (layer_proof, input_claim) =
+                    reduce_quantize_layer(deferred_claim, input_matrix, params, channel)?;
+                deferred_proofs.push(super::types::DeferredProof {
+                    claim: deferred_claim.clone(),
+                    layer_proof,
+                    input_claim,
+                    kind: super::types::DeferredProofKind::Weightless,
+                });
+            }
+            LayerType::Dequantize { params, .. } => {
+                let input_matrix = get_intermediate(execution, rhs_layer.node_id)?;
+                mix_secure_field(channel, deferred_claim.value);
+                let (layer_proof, input_claim) =
+                    reduce_dequantize_layer(deferred_claim, input_matrix, params, channel)?;
+                deferred_proofs.push(super::types::DeferredProof {
+                    claim: deferred_claim.clone(),
+                    layer_proof,
+                    input_claim,
+                    kind: super::types::DeferredProofKind::Weightless,
+                });
+            }
+            other => {
+                return Err(GKRError::ReductionError {
+                    layer_idx: *rhs_layer_idx,
+                    reason: format!(
+                        "GPU deferred proof not supported for layer type {:?}",
+                        std::mem::discriminant(other),
+                    ),
+                });
+            }
         }
 
         if deferred_total > 0 && ((i + 1) % 4 == 0 || i + 1 == deferred_total) {
@@ -1171,7 +1419,7 @@ pub fn prove_gkr_gpu(
         aggregate_weight_binding && (total_openings > 0 || !deferred_weight_claims_data.is_empty())
         && !use_aggregated_oracle_sumcheck;
 
-    let weight_commitments_new;
+    let mut weight_commitments_new;
     if use_aggregated_oracle_sumcheck {
         weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
         let (wc, claims, proof) = apply_aggregated_oracle_sumcheck(
@@ -1561,131 +1809,20 @@ fn reduce_add_layer_gpu(
     )
 }
 
-/// GPU-accelerated Mul reduction via 3-way eq-sumcheck.
+/// GPU Mul reduction: falls back to CPU eq-sumcheck.
 ///
-/// Proves: Ṽ_c(r) = Σ_{x} eq(r,x) · Ṽ_a(x) · Ṽ_b(x)
-/// using GPU round polynomial evaluation + MLE folding.
+/// The eq-sumcheck is memory-bound (not compute-bound), so GPU acceleration
+/// has minimal benefit. We use the CPU implementation which is sound.
 #[cfg(feature = "cuda-runtime")]
 fn reduce_mul_layer_gpu(
-    gpu: &std::sync::Arc<crate::gpu_sumcheck::GpuSumcheckExecutor>,
+    _gpu: &std::sync::Arc<crate::gpu_sumcheck::GpuSumcheckExecutor>,
     output_claim: &GKRClaim,
     lhs_vals: &[SecureField],
     rhs_vals: &[SecureField],
     channel: &mut PoseidonChannel,
 ) -> Result<(LayerProof, GKRClaim), GKRError> {
-    use super::types::RoundPolyDeg3;
-    use crate::gpu_sumcheck::{secure_field_to_u32s, u32s_to_secure_field};
-    use stwo::core::fields::FieldExpOps;
-
-    let n = lhs_vals.len();
-    assert!(n.is_power_of_two(), "MLE size must be power of 2");
-    assert_eq!(n, rhs_vals.len(), "lhs and rhs must have same length");
-
-    let num_vars = n.ilog2() as usize;
-    let r = &output_claim.point;
-    assert!(r.len() >= num_vars, "claim point too short for MLE size");
-
-    let eq_evals = build_eq_evals(&r[..num_vars]);
-
-    // Upload eq, lhs, rhs to GPU
-    let eq_flat: Vec<u32> = eq_evals.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
-    let lhs_flat: Vec<u32> = lhs_vals.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
-    let rhs_flat: Vec<u32> = rhs_vals.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
-
-    let mut d_eq = gpu.device.htod_sync_copy(&eq_flat).map_err(|e| GKRError::ReductionError {
-        layer_idx: 0, reason: format!("GPU upload eq: {:?}", e),
-    })?;
-    let mut d_lhs = gpu.device.htod_sync_copy(&lhs_flat).map_err(|e| GKRError::ReductionError {
-        layer_idx: 0, reason: format!("GPU upload lhs: {:?}", e),
-    })?;
-    let mut d_rhs = gpu.device.htod_sync_copy(&rhs_flat).map_err(|e| GKRError::ReductionError {
-        layer_idx: 0, reason: format!("GPU upload rhs: {:?}", e),
-    })?;
-
-    channel.mix_u64(0x4D554C as u64); // "MUL" tag
-    mix_secure_field(channel, output_claim.value);
-
-    let mut eq_round_polys = Vec::with_capacity(num_vars);
-    let mut sumcheck_challenges = Vec::with_capacity(num_vars);
-    let mut cur_n = n;
-
-    for _ in 0..num_vars {
-        let mid = cur_n / 2;
-
-        let (s0_u32, s1_u32, s2_u32, s3_u32) = gpu
-            .compute_logup_round_poly_3way(&d_eq, &d_lhs, &d_rhs, mid)
-            .map_err(|e| GKRError::ReductionError {
-                layer_idx: 0, reason: format!("GPU mul round: {e}"),
-            })?;
-
-        let s0 = u32s_to_secure_field(&s0_u32);
-        let s1 = u32s_to_secure_field(&s1_u32);
-        let s2 = u32s_to_secure_field(&s2_u32);
-        let s3 = u32s_to_secure_field(&s3_u32);
-
-        let two = SecureField::from(M31::from(2u32));
-        let three = SecureField::from(M31::from(3u32));
-        let inv2 = two.inverse();
-        let inv6 = (SecureField::from(M31::from(6u32))).inverse();
-
-        let d1 = s1 - s0;
-        let d2 = (s2 - s1 - s1 + s0) * inv2;
-        let d3 = (s3 - s0 - three * (s2 - s1)) * inv6;
-
-        let c0 = s0;
-        let c1 = d1 - d2 + two * d3;
-        let c2 = d2 - three * d3;
-        let c3 = d3;
-
-        eq_round_polys.push(RoundPolyDeg3 { c0, c1, c2, c3 });
-
-        channel.mix_poly_coeffs_deg3(c0, c1, c2, c3);
-        let challenge = channel.draw_qm31();
-        sumcheck_challenges.push(challenge);
-
-        let challenge_u32 = secure_field_to_u32s(challenge);
-        let (new_eq, new_lhs, new_rhs) = gpu
-            .logup_3way_fold(&d_eq, &d_lhs, &d_rhs, cur_n, &challenge_u32)
-            .map_err(|e| GKRError::ReductionError {
-                layer_idx: 0, reason: format!("GPU mul fold: {e}"),
-            })?;
-        d_eq = new_eq;
-        d_lhs = new_lhs;
-        d_rhs = new_rhs;
-        cur_n = mid;
-    }
-
-    // Download final evaluations (1 QM31 each)
-    let mut lhs_eval_u32 = [0u32; 4];
-    let mut rhs_eval_u32 = [0u32; 4];
-    gpu.device.dtoh_sync_copy_into(&d_lhs, &mut lhs_eval_u32).map_err(|e| GKRError::ReductionError {
-        layer_idx: 0, reason: format!("GPU download lhs_eval: {:?}", e),
-    })?;
-    gpu.device.dtoh_sync_copy_into(&d_rhs, &mut rhs_eval_u32).map_err(|e| GKRError::ReductionError {
-        layer_idx: 0, reason: format!("GPU download rhs_eval: {:?}", e),
-    })?;
-    let lhs_eval = u32s_to_secure_field(&lhs_eval_u32);
-    let rhs_eval = u32s_to_secure_field(&rhs_eval_u32);
-
-    mix_secure_field(channel, lhs_eval);
-    mix_secure_field(channel, rhs_eval);
-
-    let alpha = channel.draw_qm31();
-    let combined = alpha * lhs_eval + (SecureField::one() - alpha) * rhs_eval;
-
-    let claim = GKRClaim {
-        point: output_claim.point.clone(),
-        value: combined,
-    };
-
-    Ok((
-        LayerProof::Mul {
-            eq_round_polys,
-            lhs_eval,
-            rhs_eval,
-        },
-        claim,
-    ))
+    // CPU fallback — produces identical proofs to CPU prover
+    reduce_mul_layer(output_claim, lhs_vals, rhs_vals, channel)
 }
 
 /// GPU-accelerated activation LogUp reduction.
@@ -1712,29 +1849,15 @@ fn reduce_activation_layer_gpu(
 
     let activation_fn = activation_type.as_fn();
 
-    // Pad input matrix, reduce to table range, and build MLEs
+    // Pad input matrix and build MLEs
     let input_padded = pad_matrix_pow2(input_matrix);
     let n = input_padded.rows * input_padded.cols;
     let num_vars = n.ilog2() as usize;
 
-    // Mask inputs to table range for LogUp consistency (matches aggregation path)
-    let table_log_size = activation_type.recommended_table_log_size();
-    let table_mask = (1u32 << table_log_size) - 1;
-    let reduced_data: Vec<M31> = input_padded
-        .data
-        .iter()
-        .map(|&x| M31::from(x.0 & table_mask))
-        .collect();
-    let reduced_padded = M31Matrix {
-        rows: input_padded.rows,
-        cols: input_padded.cols,
-        data: reduced_data,
-    };
+    let input_mle = matrix_to_mle(&input_padded);
 
-    let input_mle = matrix_to_mle(&reduced_padded);
-
-    // Compute output by applying activation to each reduced input element
-    let output_mle: Vec<SecureField> = reduced_padded
+    // Compute output by applying activation to each input element
+    let output_mle: Vec<SecureField> = input_padded
         .data
         .iter()
         .take(n)
@@ -1756,10 +1879,11 @@ fn reduce_activation_layer_gpu(
         })?;
 
     // Build activation table
+    let table_log_size = activation_type.recommended_table_log_size();
     let table = PrecomputedTable::build_parallel(|x| activation_fn(x), table_log_size);
 
     // Compute multiplicities (uses hash index for O(1) lookup)
-    let trace_inputs_m31: Vec<M31> = reduced_padded.data[..n].to_vec();
+    let trace_inputs_m31: Vec<M31> = input_padded.data[..n].to_vec();
     let multiplicities_m31 =
         crate::components::activation::compute_multiplicities(&trace_inputs_m31, &table);
     let multiplicities: Vec<u32> = multiplicities_m31.iter().map(|m| m.0).collect();
@@ -1967,704 +2091,6 @@ fn reduce_activation_layer_gpu(
             table_commitment,
         },
         claim,
-    ))
-}
-
-// =============================================================================
-// GPU LayerNorm / RMSNorm GKR Reductions
-// =============================================================================
-
-/// GPU-accelerated LayerNorm GKR reduction.
-///
-/// Two-phase proof:
-/// 1. Linear eq-sumcheck: output = centered × rsqrt (GPU 3-way rounds + fold)
-/// 2. LogUp eq-sumcheck: (variance, rsqrt) ∈ rsqrt_table (GPU 3-way rounds + fold)
-#[cfg(feature = "cuda-runtime")]
-fn reduce_layernorm_layer_gpu(
-    gpu: &std::sync::Arc<crate::gpu_sumcheck::GpuSumcheckExecutor>,
-    output_claim: &GKRClaim,
-    input_matrix: &M31Matrix,
-    dim: usize,
-    channel: &mut PoseidonChannel,
-) -> Result<(LayerProof, GKRClaim), GKRError> {
-    use super::types::{LogUpProof, RoundPolyDeg3};
-    use crate::components::layernorm::{build_rsqrt_table, LayerNormConfig};
-    use crate::gpu_sumcheck::{secure_field_to_u32s, u32s_to_secure_field};
-    use stwo::core::fields::FieldExpOps;
-
-    let config = LayerNormConfig::new(dim);
-    let rsqrt_table = build_rsqrt_table(config.rsqrt_table_log_size);
-
-    // Pad input matrix and build MLE
-    let input_padded = pad_matrix_pow2(input_matrix);
-    let n = input_padded.rows * input_padded.cols;
-    let num_vars = n.ilog2() as usize;
-    let cols = input_padded.cols;
-
-    let input_mle = matrix_to_mle(&input_padded);
-
-    // Compute LayerNorm forward pass on CPU (per-row stats are cheap)
-    let n_active = dim.min(input_padded.cols);
-    let inv_n = m31_mod_inverse(n_active as u32);
-
-    let mut mean_mle = vec![SecureField::zero(); n];
-    let mut rsqrt_mle = vec![SecureField::zero(); n];
-    let mut var_mle = vec![SecureField::zero(); n];
-    let mut output_mle = vec![SecureField::zero(); n];
-    let mut centered_mle = vec![SecureField::zero(); n];
-
-    for row in 0..input_padded.rows {
-        let mut sum = M31::from(0u32);
-        for col in 0..n_active {
-            sum = sum + input_padded.get(row, col);
-        }
-        let mean = sum * inv_n;
-        let mean_sf = SecureField::from(mean);
-
-        let mut var_sum = M31::from(0u32);
-        for col in 0..n_active {
-            let diff = input_padded.get(row, col) - mean;
-            var_sum = var_sum + diff * diff;
-        }
-        let variance_raw = var_sum * inv_n;
-        let variance = M31::from(variance_raw.0 & ((1u32 << config.rsqrt_table_log_size) - 1));
-        let variance_sf = SecureField::from(variance);
-
-        let rsqrt = rsqrt_table
-            .lookup(variance)
-            .expect("variance reduced to table range");
-        let rsqrt_sf = SecureField::from(rsqrt);
-
-        for col in 0..cols {
-            let idx = row * cols + col;
-            mean_mle[idx] = mean_sf;
-            var_mle[idx] = variance_sf;
-            rsqrt_mle[idx] = rsqrt_sf;
-
-            if col < n_active {
-                let x = input_padded.get(row, col);
-                let centered = x - mean;
-                let out_val = centered * rsqrt;
-                centered_mle[idx] = SecureField::from(centered);
-                output_mle[idx] = SecureField::from(out_val);
-            } else {
-                let x = input_padded.get(row, col);
-                centered_mle[idx] = SecureField::from(x);
-                output_mle[idx] = SecureField::from(x);
-            }
-        }
-    }
-
-    // GPU MLE evaluations at claim point
-    let input_eval = gpu
-        .evaluate_mle_gpu(&input_mle, &output_claim.point)
-        .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0,
-            reason: format!("GPU eval_mle LN input: {e}"),
-        })?;
-    let output_eval = gpu
-        .evaluate_mle_gpu(&output_mle, &output_claim.point)
-        .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0,
-            reason: format!("GPU eval_mle LN output: {e}"),
-        })?;
-    let mean_eval = gpu
-        .evaluate_mle_gpu(&mean_mle, &output_claim.point)
-        .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0,
-            reason: format!("GPU eval_mle LN mean: {e}"),
-        })?;
-    let rsqrt_eval = gpu
-        .evaluate_mle_gpu(&rsqrt_mle, &output_claim.point)
-        .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0,
-            reason: format!("GPU eval_mle LN rsqrt: {e}"),
-        })?;
-
-    // ===== Part 1: Linear transform eq-sumcheck (GPU) =====
-    channel.mix_u64(0x4C4E as u64); // "LN" tag
-    mix_secure_field(channel, mean_eval);
-    mix_secure_field(channel, rsqrt_eval);
-    mix_secure_field(channel, output_claim.value);
-
-    // Upload centered and rsqrt MLEs to GPU for 3-way eq-sumcheck
-    let r = &output_claim.point[..num_vars];
-    let eq_evals = build_eq_evals(r);
-
-    let eq_flat: Vec<u32> = eq_evals.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
-    let centered_flat: Vec<u32> = centered_mle.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
-    let rsqrt_flat: Vec<u32> = rsqrt_mle.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
-
-    let mut d_eq = gpu.device.htod_sync_copy(&eq_flat).map_err(|e| GKRError::ReductionError {
-        layer_idx: 0, reason: format!("GPU upload eq: {:?}", e),
-    })?;
-    let mut d_centered = gpu.device.htod_sync_copy(&centered_flat).map_err(|e| GKRError::ReductionError {
-        layer_idx: 0, reason: format!("GPU upload centered: {:?}", e),
-    })?;
-    let mut d_rsqrt = gpu.device.htod_sync_copy(&rsqrt_flat).map_err(|e| GKRError::ReductionError {
-        layer_idx: 0, reason: format!("GPU upload rsqrt: {:?}", e),
-    })?;
-
-    let mut linear_round_polys = Vec::with_capacity(num_vars);
-    let mut linear_challenges = Vec::with_capacity(num_vars);
-    let mut cur_n = n;
-
-    for _ in 0..num_vars {
-        let mid = cur_n / 2;
-
-        let (s0_u32, s1_u32, s2_u32, s3_u32) = gpu
-            .compute_logup_round_poly_3way(&d_eq, &d_centered, &d_rsqrt, mid)
-            .map_err(|e| GKRError::ReductionError {
-                layer_idx: 0, reason: format!("GPU LN linear round: {e}"),
-            })?;
-
-        let s0 = u32s_to_secure_field(&s0_u32);
-        let s1 = u32s_to_secure_field(&s1_u32);
-        let s2 = u32s_to_secure_field(&s2_u32);
-        let s3 = u32s_to_secure_field(&s3_u32);
-
-        let two = SecureField::from(M31::from(2u32));
-        let three = SecureField::from(M31::from(3u32));
-        let inv2 = two.inverse();
-        let inv6 = (SecureField::from(M31::from(6u32))).inverse();
-
-        let dd1 = s1 - s0;
-        let dd2 = (s2 - s1 - s1 + s0) * inv2;
-        let dd3 = (s3 - s0 - three * (s2 - s1)) * inv6;
-
-        let c0 = s0;
-        let c1 = dd1 - dd2 + two * dd3;
-        let c2 = dd2 - three * dd3;
-        let c3 = dd3;
-
-        linear_round_polys.push(RoundPolyDeg3 { c0, c1, c2, c3 });
-
-        channel.mix_poly_coeffs_deg3(c0, c1, c2, c3);
-        let challenge = channel.draw_qm31();
-        linear_challenges.push(challenge);
-
-        let challenge_u32 = secure_field_to_u32s(challenge);
-        let (new_eq, new_centered, new_rsqrt) = gpu
-            .logup_3way_fold(&d_eq, &d_centered, &d_rsqrt, cur_n, &challenge_u32)
-            .map_err(|e| GKRError::ReductionError {
-                layer_idx: 0, reason: format!("GPU LN linear fold: {e}"),
-            })?;
-        d_eq = new_eq;
-        d_centered = new_centered;
-        d_rsqrt = new_rsqrt;
-        cur_n = mid;
-    }
-
-    // Download final evaluations (1 QM31 each)
-    let mut centered_final_u32 = [0u32; 4];
-    let mut rsqrt_final_u32 = [0u32; 4];
-    gpu.device.dtoh_sync_copy_into(&d_centered, &mut centered_final_u32).map_err(|e| GKRError::ReductionError {
-        layer_idx: 0, reason: format!("GPU download centered_final: {:?}", e),
-    })?;
-    gpu.device.dtoh_sync_copy_into(&d_rsqrt, &mut rsqrt_final_u32).map_err(|e| GKRError::ReductionError {
-        layer_idx: 0, reason: format!("GPU download rsqrt_final: {:?}", e),
-    })?;
-    let centered_final = u32s_to_secure_field(&centered_final_u32);
-    let rsqrt_final = u32s_to_secure_field(&rsqrt_final_u32);
-    let linear_final_evals = (centered_final, rsqrt_final);
-
-    mix_secure_field(channel, centered_final);
-    mix_secure_field(channel, rsqrt_final);
-
-    // ===== Part 2: rsqrt LogUp eq-sumcheck (GPU) =====
-    let table = &rsqrt_table;
-    let var_m31: Vec<M31> = var_mle.iter().map(|v| M31::from(v.0 .0 .0)).collect();
-    let multiplicities_m31 = crate::components::activation::compute_multiplicities(&var_m31, table);
-    let multiplicities: Vec<u32> = multiplicities_m31.iter().map(|m| m.0).collect();
-
-    channel.mix_u64(0x4C4F47 as u64); // "LOG" tag
-    channel.mix_u64(0x5253 as u64); // "RS" (rsqrt)
-    let gamma = channel.draw_qm31();
-    let beta = channel.draw_qm31();
-
-    // GPU denominator computation
-    let d_vals_device = gpu
-        .compute_logup_denominators_gpu(&var_mle, &rsqrt_mle, gamma, beta)
-        .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0, reason: format!("GPU LN logup denominators: {e}"),
-        })?;
-
-    // Download for CPU batch inverse + sum check
-    let mut d_vals_flat = vec![0u32; n * 4];
-    gpu.device.dtoh_sync_copy_into(&d_vals_device, &mut d_vals_flat).map_err(|e| GKRError::ReductionError {
-        layer_idx: 0, reason: format!("GPU download LN denoms: {:?}", e),
-    })?;
-    let d_vals: Vec<SecureField> = d_vals_flat
-        .chunks_exact(4)
-        .map(|c| u32s_to_secure_field(&[c[0], c[1], c[2], c[3]]))
-        .collect();
-
-    let w_vals = SecureField::batch_inverse(&d_vals);
-    let trace_sum: SecureField = w_vals.iter().copied().fold(SecureField::zero(), |acc, w| acc + w);
-
-    // Table-side sum
-    let nonzero_entries: Vec<(usize, SecureField)> = table
-        .inputs.iter().zip(&table.outputs).enumerate()
-        .filter(|(j, _)| multiplicities[*j] > 0)
-        .map(|(j, (&t_in, &t_out))| {
-            (j, gamma - SecureField::from(t_in) - beta * SecureField::from(t_out))
-        })
-        .collect();
-    let table_denoms: Vec<SecureField> = nonzero_entries.iter().map(|(_, d)| *d).collect();
-    let table_inv = SecureField::batch_inverse(&table_denoms);
-    let table_sum: SecureField = nonzero_entries.iter().zip(&table_inv)
-        .map(|((j, _), &inv)| SecureField::from(M31::from(multiplicities[*j])) * inv)
-        .fold(SecureField::zero(), |acc, v| acc + v);
-
-    if trace_sum != table_sum {
-        return Err(GKRError::LogUpError(format!(
-            "LayerNorm LogUp sum mismatch: trace={}, table={}", trace_sum, table_sum,
-        )));
-    }
-    mix_secure_field(channel, trace_sum);
-
-    // Upload eq, w, d to GPU for LogUp eq-sumcheck
-    let r_logup = &output_claim.point[..num_vars];
-    let eq_evals_logup = build_eq_evals(r_logup);
-
-    let eq_logup_flat: Vec<u32> = eq_evals_logup.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
-    let w_flat: Vec<u32> = w_vals.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
-
-    let mut d_eq_l = gpu.device.htod_sync_copy(&eq_logup_flat).map_err(|e| GKRError::ReductionError {
-        layer_idx: 0, reason: format!("GPU upload eq_logup: {:?}", e),
-    })?;
-    let mut d_w = gpu.device.htod_sync_copy(&w_flat).map_err(|e| GKRError::ReductionError {
-        layer_idx: 0, reason: format!("GPU upload w: {:?}", e),
-    })?;
-    let mut d_d = d_vals_device;
-
-    let mut logup_round_polys = Vec::with_capacity(num_vars);
-    let mut logup_challenges = Vec::with_capacity(num_vars);
-    let mut cur_n_logup = n;
-
-    for _ in 0..num_vars {
-        let mid = cur_n_logup / 2;
-
-        let (s0_u32, s1_u32, s2_u32, s3_u32) = gpu
-            .compute_logup_round_poly_3way(&d_eq_l, &d_w, &d_d, mid)
-            .map_err(|e| GKRError::ReductionError {
-                layer_idx: 0, reason: format!("GPU LN logup round: {e}"),
-            })?;
-
-        let s0 = u32s_to_secure_field(&s0_u32);
-        let s1 = u32s_to_secure_field(&s1_u32);
-        let s2 = u32s_to_secure_field(&s2_u32);
-        let s3 = u32s_to_secure_field(&s3_u32);
-
-        let two = SecureField::from(M31::from(2u32));
-        let three = SecureField::from(M31::from(3u32));
-        let inv2 = two.inverse();
-        let inv6 = (SecureField::from(M31::from(6u32))).inverse();
-
-        let dd1 = s1 - s0;
-        let dd2 = (s2 - s1 - s1 + s0) * inv2;
-        let dd3 = (s3 - s0 - three * (s2 - s1)) * inv6;
-
-        let c0 = s0;
-        let c1 = dd1 - dd2 + two * dd3;
-        let c2 = dd2 - three * dd3;
-        let c3 = dd3;
-
-        logup_round_polys.push(RoundPolyDeg3 { c0, c1, c2, c3 });
-
-        channel.mix_poly_coeffs_deg3(c0, c1, c2, c3);
-        let challenge = channel.draw_qm31();
-        logup_challenges.push(challenge);
-
-        let challenge_u32 = secure_field_to_u32s(challenge);
-        let (new_eq, new_w, new_d) = gpu
-            .logup_3way_fold(&d_eq_l, &d_w, &d_d, cur_n_logup, &challenge_u32)
-            .map_err(|e| GKRError::ReductionError {
-                layer_idx: 0, reason: format!("GPU LN logup fold: {e}"),
-            })?;
-        d_eq_l = new_eq;
-        d_w = new_w;
-        d_d = new_d;
-        cur_n_logup = mid;
-    }
-
-    // Download final w_eval
-    let mut w_eval_u32 = [0u32; 4];
-    gpu.device.dtoh_sync_copy_into(&d_w, &mut w_eval_u32).map_err(|e| GKRError::ReductionError {
-        layer_idx: 0, reason: format!("GPU download LN w_eval: {:?}", e),
-    })?;
-    let w_eval = u32s_to_secure_field(&w_eval_u32);
-
-    // Final MLE evaluations at LogUp challenge point (GPU)
-    let var_eval_s = gpu
-        .evaluate_mle_gpu(&var_mle, &logup_challenges)
-        .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0, reason: format!("GPU eval_mle LN var final: {e}"),
-        })?;
-    let rsqrt_eval_s = gpu
-        .evaluate_mle_gpu(&rsqrt_mle, &logup_challenges)
-        .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0, reason: format!("GPU eval_mle LN rsqrt final: {e}"),
-        })?;
-
-    let logup_proof = LogUpProof {
-        eq_round_polys: logup_round_polys,
-        final_evals: (w_eval, var_eval_s, rsqrt_eval_s),
-        claimed_sum: trace_sum,
-        multiplicities,
-    };
-
-    let rsqrt_table_commitment = compute_rsqrt_table_commitment(config.rsqrt_table_log_size);
-
-    mix_secure_field(channel, input_eval);
-    mix_secure_field(channel, output_eval);
-
-    let claim = GKRClaim {
-        point: output_claim.point.clone(),
-        value: input_eval,
-    };
-
-    Ok((
-        LayerProof::LayerNorm {
-            logup_proof: Some(logup_proof),
-            linear_round_polys,
-            linear_final_evals,
-            input_eval,
-            output_eval,
-            mean: mean_eval,
-            rsqrt_var: rsqrt_eval,
-            rsqrt_table_commitment,
-            simd_combined: false,
-        },
-        claim,
-    ))
-}
-
-/// GPU-accelerated RMSNorm GKR reduction.
-///
-/// Two-phase proof:
-/// 1. Linear eq-sumcheck: output = input × rsqrt (GPU 3-way rounds + fold)
-/// 2. LogUp eq-sumcheck: (rms², rsqrt) ∈ rsqrt_table (GPU 3-way rounds + fold)
-#[cfg(feature = "cuda-runtime")]
-fn reduce_rmsnorm_layer_gpu(
-    gpu: &std::sync::Arc<crate::gpu_sumcheck::GpuSumcheckExecutor>,
-    output_claim: &GKRClaim,
-    input_matrix: &M31Matrix,
-    dim: usize,
-    channel: &mut PoseidonChannel,
-) -> Result<(LayerProof, GKRClaim), GKRError> {
-    use super::types::{LogUpProof, RoundPolyDeg3};
-    use crate::components::rmsnorm::{build_rsqrt_table, RMSNormConfig};
-    use crate::gpu_sumcheck::{secure_field_to_u32s, u32s_to_secure_field};
-    use stwo::core::fields::FieldExpOps;
-
-    let config = RMSNormConfig::new(dim);
-    let rsqrt_table = build_rsqrt_table(config.rsqrt_table_log_size);
-
-    let input_padded = pad_matrix_pow2(input_matrix);
-    let n = input_padded.rows * input_padded.cols;
-    let num_vars = n.ilog2() as usize;
-    let cols = input_padded.cols;
-    let input_mle = matrix_to_mle(&input_padded);
-    let n_active = dim.min(input_padded.cols);
-    let inv_n = m31_mod_inverse(n_active as u32);
-
-    // Compute RMSNorm forward pass on CPU (per-row stats are cheap)
-    let mut rsqrt_mle = vec![SecureField::zero(); n];
-    let mut rms_sq_mle = vec![SecureField::zero(); n];
-    let mut output_mle = vec![SecureField::zero(); n];
-
-    for row in 0..input_padded.rows {
-        let mut sq_sum = M31::from(0u32);
-        for col in 0..n_active {
-            let x = input_padded.get(row, col);
-            sq_sum = sq_sum + x * x;
-        }
-        let rms_sq_raw = sq_sum * inv_n;
-        let rms_sq = M31::from(rms_sq_raw.0 & ((1u32 << config.rsqrt_table_log_size) - 1));
-        let rsqrt = rsqrt_table
-            .lookup(rms_sq)
-            .expect("rms_sq reduced to table range");
-
-        for col in 0..cols {
-            let idx = row * cols + col;
-            rms_sq_mle[idx] = SecureField::from(rms_sq);
-            rsqrt_mle[idx] = SecureField::from(rsqrt);
-            let x = input_padded.get(row, col);
-            output_mle[idx] = if col < n_active {
-                SecureField::from(x * rsqrt)
-            } else {
-                SecureField::from(x)
-            };
-        }
-    }
-
-    // GPU MLE evaluations at claim point
-    let input_eval = gpu
-        .evaluate_mle_gpu(&input_mle, &output_claim.point)
-        .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0, reason: format!("GPU eval_mle RN input: {e}"),
-        })?;
-    let output_eval = gpu
-        .evaluate_mle_gpu(&output_mle, &output_claim.point)
-        .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0, reason: format!("GPU eval_mle RN output: {e}"),
-        })?;
-    let rsqrt_eval = gpu
-        .evaluate_mle_gpu(&rsqrt_mle, &output_claim.point)
-        .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0, reason: format!("GPU eval_mle RN rsqrt: {e}"),
-        })?;
-    let rms_sq_eval = gpu
-        .evaluate_mle_gpu(&rms_sq_mle, &output_claim.point)
-        .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0, reason: format!("GPU eval_mle RN rms_sq: {e}"),
-        })?;
-
-    // ===== Part 1: Linear eq-sumcheck: output = input × rsqrt (GPU) =====
-    channel.mix_u64(0x524E as u64); // "RN" tag
-    mix_secure_field(channel, rms_sq_eval);
-    mix_secure_field(channel, rsqrt_eval);
-    mix_secure_field(channel, output_claim.value);
-
-    let r = &output_claim.point[..num_vars];
-    let eq_evals = build_eq_evals(r);
-
-    let eq_flat: Vec<u32> = eq_evals.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
-    let input_flat: Vec<u32> = input_mle.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
-    let rsqrt_flat: Vec<u32> = rsqrt_mle.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
-
-    let mut d_eq = gpu.device.htod_sync_copy(&eq_flat).map_err(|e| GKRError::ReductionError {
-        layer_idx: 0, reason: format!("GPU upload eq: {:?}", e),
-    })?;
-    let mut d_input = gpu.device.htod_sync_copy(&input_flat).map_err(|e| GKRError::ReductionError {
-        layer_idx: 0, reason: format!("GPU upload input: {:?}", e),
-    })?;
-    let mut d_rsqrt = gpu.device.htod_sync_copy(&rsqrt_flat).map_err(|e| GKRError::ReductionError {
-        layer_idx: 0, reason: format!("GPU upload rsqrt: {:?}", e),
-    })?;
-
-    let mut linear_round_polys = Vec::with_capacity(num_vars);
-    let mut linear_challenges = Vec::with_capacity(num_vars);
-    let mut cur_n = n;
-
-    for _ in 0..num_vars {
-        let mid = cur_n / 2;
-
-        let (s0_u32, s1_u32, s2_u32, s3_u32) = gpu
-            .compute_logup_round_poly_3way(&d_eq, &d_input, &d_rsqrt, mid)
-            .map_err(|e| GKRError::ReductionError {
-                layer_idx: 0, reason: format!("GPU RN linear round: {e}"),
-            })?;
-
-        let s0 = u32s_to_secure_field(&s0_u32);
-        let s1 = u32s_to_secure_field(&s1_u32);
-        let s2 = u32s_to_secure_field(&s2_u32);
-        let s3 = u32s_to_secure_field(&s3_u32);
-
-        let two = SecureField::from(M31::from(2u32));
-        let three = SecureField::from(M31::from(3u32));
-        let inv2 = two.inverse();
-        let inv6 = (SecureField::from(M31::from(6u32))).inverse();
-
-        let dd1 = s1 - s0;
-        let dd2 = (s2 - s1 - s1 + s0) * inv2;
-        let dd3 = (s3 - s0 - three * (s2 - s1)) * inv6;
-
-        let c0 = s0;
-        let c1 = dd1 - dd2 + two * dd3;
-        let c2 = dd2 - three * dd3;
-        let c3 = dd3;
-        linear_round_polys.push(RoundPolyDeg3 { c0, c1, c2, c3 });
-
-        channel.mix_poly_coeffs_deg3(c0, c1, c2, c3);
-        let challenge = channel.draw_qm31();
-        linear_challenges.push(challenge);
-
-        let challenge_u32 = secure_field_to_u32s(challenge);
-        let (new_eq, new_input, new_rsqrt) = gpu
-            .logup_3way_fold(&d_eq, &d_input, &d_rsqrt, cur_n, &challenge_u32)
-            .map_err(|e| GKRError::ReductionError {
-                layer_idx: 0, reason: format!("GPU RN linear fold: {e}"),
-            })?;
-        d_eq = new_eq;
-        d_input = new_input;
-        d_rsqrt = new_rsqrt;
-        cur_n = mid;
-    }
-
-    // Download final evaluations
-    let mut input_final_u32 = [0u32; 4];
-    let mut rsqrt_final_u32 = [0u32; 4];
-    gpu.device.dtoh_sync_copy_into(&d_input, &mut input_final_u32).map_err(|e| GKRError::ReductionError {
-        layer_idx: 0, reason: format!("GPU download input_final: {:?}", e),
-    })?;
-    gpu.device.dtoh_sync_copy_into(&d_rsqrt, &mut rsqrt_final_u32).map_err(|e| GKRError::ReductionError {
-        layer_idx: 0, reason: format!("GPU download rsqrt_final: {:?}", e),
-    })?;
-    let input_final = u32s_to_secure_field(&input_final_u32);
-    let rsqrt_final = u32s_to_secure_field(&rsqrt_final_u32);
-
-    mix_secure_field(channel, input_final);
-    mix_secure_field(channel, rsqrt_final);
-
-    // ===== Part 2: rsqrt LogUp eq-sumcheck (GPU) =====
-    let rms_sq_m31: Vec<M31> = rms_sq_mle.iter().map(|v| M31::from(v.0 .0 .0)).collect();
-    let mults_m31 = crate::components::activation::compute_multiplicities(&rms_sq_m31, &rsqrt_table);
-    let multiplicities: Vec<u32> = mults_m31.iter().map(|m| m.0).collect();
-
-    channel.mix_u64(0x4C4F47 as u64); // "LOG"
-    channel.mix_u64(0x524E as u64); // "RN"
-    let gamma = channel.draw_qm31();
-    let beta = channel.draw_qm31();
-
-    // GPU denominator computation
-    let d_vals_device = gpu
-        .compute_logup_denominators_gpu(&rms_sq_mle, &rsqrt_mle, gamma, beta)
-        .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0, reason: format!("GPU RN logup denominators: {e}"),
-        })?;
-
-    let mut d_vals_flat = vec![0u32; n * 4];
-    gpu.device.dtoh_sync_copy_into(&d_vals_device, &mut d_vals_flat).map_err(|e| GKRError::ReductionError {
-        layer_idx: 0, reason: format!("GPU download RN denoms: {:?}", e),
-    })?;
-    let d_vals: Vec<SecureField> = d_vals_flat
-        .chunks_exact(4)
-        .map(|c| u32s_to_secure_field(&[c[0], c[1], c[2], c[3]]))
-        .collect();
-
-    let w_vals = SecureField::batch_inverse(&d_vals);
-    let trace_sum: SecureField = w_vals.iter().copied().sum();
-
-    let nonzero: Vec<(usize, SecureField)> = rsqrt_table
-        .inputs.iter().zip(&rsqrt_table.outputs).enumerate()
-        .filter(|(j, _)| multiplicities[*j] > 0)
-        .map(|(j, (&ti, &to))| {
-            (j, gamma - SecureField::from(ti) - beta * SecureField::from(to))
-        })
-        .collect();
-    let tbl_inv = SecureField::batch_inverse(&nonzero.iter().map(|(_, d)| *d).collect::<Vec<_>>());
-    let table_sum: SecureField = nonzero.iter().zip(&tbl_inv)
-        .map(|((j, _), &inv)| SecureField::from(M31::from(multiplicities[*j])) * inv)
-        .sum();
-
-    if trace_sum != table_sum {
-        return Err(GKRError::LogUpError(format!(
-            "RMSNorm LogUp sum mismatch: trace={}, table={}", trace_sum, table_sum,
-        )));
-    }
-    mix_secure_field(channel, trace_sum);
-
-    // Upload eq, w, d to GPU for LogUp eq-sumcheck
-    let r_logup = &output_claim.point[..num_vars];
-    let eq_logup = build_eq_evals(r_logup);
-
-    let eq_logup_flat: Vec<u32> = eq_logup.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
-    let w_flat: Vec<u32> = w_vals.iter().flat_map(|sf| secure_field_to_u32s(*sf)).collect();
-
-    let mut d_eq_l = gpu.device.htod_sync_copy(&eq_logup_flat).map_err(|e| GKRError::ReductionError {
-        layer_idx: 0, reason: format!("GPU upload eq_logup: {:?}", e),
-    })?;
-    let mut d_w = gpu.device.htod_sync_copy(&w_flat).map_err(|e| GKRError::ReductionError {
-        layer_idx: 0, reason: format!("GPU upload w: {:?}", e),
-    })?;
-    let mut d_d = d_vals_device;
-
-    let mut logup_rps = Vec::with_capacity(num_vars);
-    let mut logup_chals = Vec::with_capacity(num_vars);
-    let mut cur_n2 = n;
-
-    for _ in 0..num_vars {
-        let mid = cur_n2 / 2;
-
-        let (s0_u32, s1_u32, s2_u32, s3_u32) = gpu
-            .compute_logup_round_poly_3way(&d_eq_l, &d_w, &d_d, mid)
-            .map_err(|e| GKRError::ReductionError {
-                layer_idx: 0, reason: format!("GPU RN logup round: {e}"),
-            })?;
-
-        let s0 = u32s_to_secure_field(&s0_u32);
-        let s1 = u32s_to_secure_field(&s1_u32);
-        let s2 = u32s_to_secure_field(&s2_u32);
-        let s3 = u32s_to_secure_field(&s3_u32);
-
-        let two = SecureField::from(M31::from(2u32));
-        let three = SecureField::from(M31::from(3u32));
-        let inv2 = two.inverse();
-        let inv6 = (SecureField::from(M31::from(6u32))).inverse();
-
-        let dd1 = s1 - s0;
-        let dd2 = (s2 - s1 - s1 + s0) * inv2;
-        let dd3 = (s3 - s0 - three * (s2 - s1)) * inv6;
-
-        let c0 = s0;
-        let c1 = dd1 - dd2 + two * dd3;
-        let c2 = dd2 - three * dd3;
-        let c3 = dd3;
-        logup_rps.push(RoundPolyDeg3 { c0, c1, c2, c3 });
-
-        channel.mix_poly_coeffs_deg3(c0, c1, c2, c3);
-        let ch = channel.draw_qm31();
-        logup_chals.push(ch);
-
-        let ch_u32 = secure_field_to_u32s(ch);
-        let (new_eq, new_w, new_d) = gpu
-            .logup_3way_fold(&d_eq_l, &d_w, &d_d, cur_n2, &ch_u32)
-            .map_err(|e| GKRError::ReductionError {
-                layer_idx: 0, reason: format!("GPU RN logup fold: {e}"),
-            })?;
-        d_eq_l = new_eq;
-        d_w = new_w;
-        d_d = new_d;
-        cur_n2 = mid;
-    }
-
-    let mut w_eval_u32 = [0u32; 4];
-    gpu.device.dtoh_sync_copy_into(&d_w, &mut w_eval_u32).map_err(|e| GKRError::ReductionError {
-        layer_idx: 0, reason: format!("GPU download RN w_eval: {:?}", e),
-    })?;
-    let w_eval = u32s_to_secure_field(&w_eval_u32);
-
-    let rms_eval_s = gpu
-        .evaluate_mle_gpu(&rms_sq_mle, &logup_chals)
-        .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0, reason: format!("GPU eval_mle RN rms final: {e}"),
-        })?;
-    let rsqrt_eval_s = gpu
-        .evaluate_mle_gpu(&rsqrt_mle, &logup_chals)
-        .map_err(|e| GKRError::ReductionError {
-            layer_idx: 0, reason: format!("GPU eval_mle RN rsqrt final: {e}"),
-        })?;
-
-    let logup_proof = LogUpProof {
-        eq_round_polys: logup_rps,
-        final_evals: (w_eval, rms_eval_s, rsqrt_eval_s),
-        claimed_sum: trace_sum,
-        multiplicities,
-    };
-
-    let rsqrt_table_commitment = compute_rsqrt_table_commitment(config.rsqrt_table_log_size);
-
-    mix_secure_field(channel, input_eval);
-    mix_secure_field(channel, output_eval);
-
-    Ok((
-        LayerProof::RMSNorm {
-            logup_proof: Some(logup_proof),
-            linear_round_polys,
-            linear_final_evals: (input_final, rsqrt_final),
-            input_eval,
-            output_eval,
-            rms_sq_eval,
-            rsqrt_eval,
-            rsqrt_table_commitment,
-            simd_combined: false,
-        },
-        GKRClaim {
-            point: output_claim.point.clone(),
-            value: input_eval,
-        },
     ))
 }
 
@@ -2971,21 +2397,163 @@ pub fn prove_gkr_simd_gpu(
     let mut weight_opening_transcript_mode = WeightOpeningTranscriptMode::Sequential;
     let mut aggregated_binding_proof = None;
     let flags = compute_weight_mode_flags();
-    let no_deferred: Vec<(usize, Vec<SecureField>, SecureField)> = Vec::new();
+    let aggregate_weight_binding = flags.aggregate_weight_binding;
+    // In aggregated mode, include deferred MatMul weight claims in the same
+    // transcript RLC binding and skip per-deferred Merkle openings.
+    let mut deferred_weight_claims_data: Vec<(usize, Vec<SecureField>, SecureField)> =
+        Vec::with_capacity(deferred_info.len());
+
+    // Generate deferred proofs for skip branches of DAG Add layers BEFORE
+    // weight openings. Fiat-Shamir order: walk → deferred proofs → weight openings.
+    let mut deferred_proofs = Vec::with_capacity(deferred_info.len());
+    for (deferred_claim, rhs_layer_idx) in &deferred_info {
+        let rhs_layer = &circuit.layers[*rhs_layer_idx];
+        match &rhs_layer.layer_type {
+            LayerType::MatMul {
+                m,
+                k,
+                n,
+                weight_node_id,
+            } => {
+                // Shared weight matrix
+                let b_matrix =
+                    weights
+                        .get_weight(*weight_node_id)
+                        .ok_or(GKRError::MissingWeight {
+                            node_id: *weight_node_id,
+                        })?;
+
+                // Per-block input activations for the skip layer
+                let rhs_offset = *rhs_layer_idx - template.start;
+                let block_a_matrices: Vec<&M31Matrix> = (0..n_blocks)
+                    .map(|b| {
+                        let block_layer_idx = circuit.block_ranges[b].start + rhs_offset;
+                        let block_node_id = circuit.layers[block_layer_idx].node_id;
+                        get_intermediate(&block_executions[b], block_node_id)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                mix_secure_field(channel, deferred_claim.value);
+
+                let (reduction, input_claim) = reduce_matmul_layer_simd_gpu(
+                    &gpu,
+                    deferred_claim,
+                    &block_a_matrices,
+                    b_matrix,
+                    &block_weights,
+                    *m,
+                    *k,
+                    *n,
+                    channel,
+                )?;
+
+                // Build weight eval point (same as push_matmul_weight_data)
+                let final_b_eval = match &reduction {
+                    LayerProof::MatMul { final_b_eval, .. } => *final_b_eval,
+                    _ => unreachable!("reduce_matmul_layer_simd_gpu returns MatMul"),
+                };
+                let pm = m.next_power_of_two();
+                let log_m = pm.ilog2() as usize;
+                let pn = n.next_power_of_two();
+                let log_n = pn.ilog2() as usize;
+                let r_j = deferred_claim.point[log_m..log_m + log_n].to_vec();
+                let sumcheck_challenges = &input_claim.point[log_m..];
+                let mut weight_eval_point = r_j;
+                weight_eval_point.extend_from_slice(sumcheck_challenges);
+
+                let deferred_weight_claim = super::types::WeightClaim {
+                    weight_node_id: *weight_node_id,
+                    eval_point: weight_eval_point.clone(),
+                    expected_value: final_b_eval,
+                };
+
+                // In aggregated mode, defer weight opening; otherwise prove inline
+                let (deferred_weight_commitment, deferred_weight_opening) =
+                    if aggregate_weight_binding {
+                        deferred_weight_claims_data.push((
+                            *weight_node_id,
+                            weight_eval_point,
+                            final_b_eval,
+                        ));
+                        (
+                            starknet_ff::FieldElement::ZERO,
+                            crate::crypto::mle_opening::MleOpeningProof {
+                                intermediate_roots: Vec::new(),
+                                queries: Vec::new(),
+                                final_value: SecureField::zero(),
+                            },
+                        )
+                    } else {
+                        let b_mle_u32 = matrix_to_mle_col_major_u32_padded(b_matrix);
+                        crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
+                            &b_mle_u32,
+                            &deferred_weight_claim.eval_point,
+                            channel,
+                        )
+                    };
+
+                deferred_proofs.push(super::types::DeferredProof {
+                    claim: deferred_claim.clone(),
+                    layer_proof: reduction,
+                    input_claim,
+                    kind: super::types::DeferredProofKind::MatMul {
+                        dims: (*m, *k, *n),
+                        weight_commitment: deferred_weight_commitment,
+                        weight_opening: deferred_weight_opening,
+                        weight_claim: deferred_weight_claim,
+                    },
+                });
+            }
+            LayerType::Quantize { params, .. } => {
+                // CPU fallback on block 0 (same as main walk pattern)
+                let input_matrix = get_intermediate(&block_executions[0], rhs_layer.node_id)?;
+                mix_secure_field(channel, deferred_claim.value);
+                let (layer_proof, input_claim) =
+                    reduce_quantize_layer(deferred_claim, input_matrix, params, channel)?;
+                deferred_proofs.push(super::types::DeferredProof {
+                    claim: deferred_claim.clone(),
+                    layer_proof,
+                    input_claim,
+                    kind: super::types::DeferredProofKind::Weightless,
+                });
+            }
+            LayerType::Dequantize { params, .. } => {
+                // CPU fallback on block 0 (same as main walk pattern)
+                let input_matrix = get_intermediate(&block_executions[0], rhs_layer.node_id)?;
+                mix_secure_field(channel, deferred_claim.value);
+                let (layer_proof, input_claim) =
+                    reduce_dequantize_layer(deferred_claim, input_matrix, params, channel)?;
+                deferred_proofs.push(super::types::DeferredProof {
+                    claim: deferred_claim.clone(),
+                    layer_proof,
+                    input_claim,
+                    kind: super::types::DeferredProofKind::Weightless,
+                });
+            }
+            other => {
+                return Err(GKRError::ReductionError {
+                    layer_idx: *rhs_layer_idx,
+                    reason: format!(
+                        "SIMD deferred proof not supported for layer type {:?}",
+                        std::mem::discriminant(other),
+                    ),
+                });
+            }
+        }
+    }
 
     let use_aggregated_oracle_sumcheck = gkr_aggregated_oracle_sumcheck_enabled()
-        && !weight_data.is_empty();
+        && (!weight_data.is_empty() || !deferred_weight_claims_data.is_empty());
 
-    let aggregate_weight_binding = flags.aggregate_weight_binding
-        && !weight_data.is_empty()
+    let aggregate_weight_binding = aggregate_weight_binding
+        && (!weight_data.is_empty() || !deferred_weight_claims_data.is_empty())
         && !use_aggregated_oracle_sumcheck;
 
-    let weight_commitments_new;
+    let mut weight_commitments_new;
     if use_aggregated_oracle_sumcheck {
         weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
-        let mut no_deferred_proofs = Vec::new();
         let (wc, claims, proof) = apply_aggregated_oracle_sumcheck(
-            &weight_data, &no_deferred, &mut no_deferred_proofs,
+            &weight_data, &deferred_weight_claims_data, &mut deferred_proofs,
             weights, channel, "GKR-SIMD-GPU",
         )?;
         weight_commitments_new = wc;
@@ -2994,7 +2562,7 @@ pub fn prove_gkr_simd_gpu(
     } else if aggregate_weight_binding {
         weight_opening_transcript_mode = WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1;
         weight_claims = apply_aggregated_rlc_binding(
-            &weight_data, &no_deferred, channel,
+            &weight_data, &deferred_weight_claims_data, channel,
         );
         weight_commitments_new = Vec::new();
     } else {
@@ -3077,14 +2645,6 @@ pub fn prove_gkr_simd_gpu(
     let io_commitment =
         crate::aggregation::compute_io_commitment(model_input, &block_executions[0].output);
 
-    // TODO: Generate deferred proofs for SIMD path (combine per-block skip intermediates)
-    // For now, assert no deferred claims in SIMD mode.
-    if !deferred_info.is_empty() {
-        return Err(GKRError::SimdError(
-            "DAG Add layers with deferred proofs not yet supported in SIMD GPU path".into(),
-        ));
-    }
-
     Ok(GKRProof {
         layer_proofs,
         output_claim,
@@ -3094,7 +2654,7 @@ pub fn prove_gkr_simd_gpu(
         weight_claims,
         weight_opening_transcript_mode,
         io_commitment,
-        deferred_proofs: vec![],
+        deferred_proofs,
         aggregated_binding: aggregated_binding_proof,
     })
 }
@@ -3990,29 +3550,15 @@ fn reduce_activation_layer(
 
     let activation_fn = activation_type.as_fn();
 
-    // Pad input matrix, reduce to table range, and build MLEs
+    // Pad input matrix and build MLEs
     let input_padded = pad_matrix_pow2(input_matrix);
     let n = input_padded.rows * input_padded.cols;
     let num_vars = n.ilog2() as usize;
 
-    // Mask inputs to table range for LogUp consistency (matches aggregation path)
-    let table_log_size = activation_type.recommended_table_log_size();
-    let table_mask = (1u32 << table_log_size) - 1;
-    let reduced_data: Vec<M31> = input_padded
-        .data
-        .iter()
-        .map(|&x| M31::from(x.0 & table_mask))
-        .collect();
-    let reduced_padded = M31Matrix {
-        rows: input_padded.rows,
-        cols: input_padded.cols,
-        data: reduced_data,
-    };
+    let input_mle = matrix_to_mle(&input_padded);
 
-    let input_mle = matrix_to_mle(&reduced_padded);
-
-    // Compute output by applying activation to each reduced input element
-    let output_mle: Vec<SecureField> = reduced_padded
+    // Compute output by applying activation to each input element
+    let output_mle: Vec<SecureField> = input_padded
         .data
         .iter()
         .take(n)
@@ -4024,10 +3570,11 @@ fn reduce_activation_layer(
     let output_eval = evaluate_mle(&output_mle, &output_claim.point);
 
     // Build activation table (deterministic from activation type + log size)
+    let table_log_size = activation_type.recommended_table_log_size();
     let table = PrecomputedTable::build_parallel(|x| activation_fn(x), table_log_size);
 
     // Compute multiplicities (how many trace entries use each table row)
-    let trace_inputs_m31: Vec<M31> = reduced_padded.data[..n].to_vec();
+    let trace_inputs_m31: Vec<M31> = input_padded.data[..n].to_vec();
     let multiplicities_m31 =
         crate::components::activation::compute_multiplicities(&trace_inputs_m31, &table);
     let multiplicities: Vec<u32> = multiplicities_m31.iter().map(|m| m.0).collect();
@@ -6185,7 +5732,7 @@ fn reduce_attention_layer_simd_gpu(
         let block_k_h_t_refs: Vec<&M31Matrix> = block_k_h_t.iter().collect();
 
         let block_raw_scores: Vec<M31Matrix> = (0..n_blocks)
-            .map(|b| matmul_m31_auto(block_q_h[b], &block_k_h_t[b]))
+            .map(|b| matmul_m31(block_q_h[b], &block_k_h_t[b]))
             .collect();
         let block_score_mles: Vec<Vec<SecureField>> = block_raw_scores
             .iter()
@@ -6402,7 +5949,8 @@ fn reduce_attention_layer(
                             channel: &mut PoseidonChannel|
      -> Result<(LayerProof, GKRClaim, SecureField), GKRError> {
         // Build output MLE
-        let c = matmul_m31_auto(a, b);
+        use crate::components::matmul::matmul_m31;
+        let c = matmul_m31(a, b);
         let c_padded = pad_matrix_pow2(&c);
         let c_mle = matrix_to_mle(&c_padded);
 
@@ -6507,7 +6055,7 @@ fn reduce_attention_layer(
     sub_claim_values.push(k_value);
 
     // Q projection — this one determines the final input claim
-    let q = matmul_m31_auto(input_matrix, &attn_weights.w_q);
+    let q = crate::components::matmul::matmul_m31(input_matrix, &attn_weights.w_q);
     let q_padded = pad_matrix_pow2(&q);
     let q_mle = matrix_to_mle(&q_padded);
     let log_rows = q_padded.rows.ilog2() as usize;

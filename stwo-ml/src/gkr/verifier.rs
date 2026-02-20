@@ -108,6 +108,8 @@ fn verify_gkr_inner(
     // Walk layers from output → input, verifying each proof
     let mut proof_idx = 0;
     let mut expected_weight_node_ids = Vec::new();
+    // Track skip layer indices for deferred proofs (populated on Add layers)
+    let mut deferred_skip_layer_indices: Vec<usize> = Vec::new();
 
     for layer_idx in (0..d).rev() {
         let layer = &circuit.layers[layer_idx];
@@ -161,14 +163,25 @@ fn verify_gkr_inner(
                 LayerProof::Add {
                     lhs_eval, rhs_eval, ..
                 },
-            ) => verify_add_reduction(
-                &current_claim,
-                *lhs_eval,
-                *rhs_eval,
-                &layer.input_layers,
-                layer_idx,
-                channel,
-            )?,
+            ) => {
+                // Track skip layer index for deferred proof verification
+                let skip_layer_idx = if layer.input_layers.len() >= 2 && layer.input_layers[1] > layer.input_layers[0] {
+                    layer.input_layers[0]
+                } else if layer.input_layers.len() >= 2 {
+                    layer.input_layers[1]
+                } else {
+                    0
+                };
+                deferred_skip_layer_indices.push(skip_layer_idx);
+                verify_add_reduction(
+                    &current_claim,
+                    *lhs_eval,
+                    *rhs_eval,
+                    &layer.input_layers,
+                    layer_idx,
+                    channel,
+                )?
+            }
 
             (
                 LayerType::Mul { .. },
@@ -391,20 +404,46 @@ fn verify_gkr_inner(
 
     // Verify deferred proofs for skip branches of DAG Add layers.
     // Fiat-Shamir order: walk → deferred proofs → weight openings.
-    // Each deferred proof contains a matmul sumcheck + weight opening that
+    // Each deferred proof contains a layer reduction + optional weight opening that
     // binds the skip_eval from an Add reduction to actual weights and input.
+    if proof.deferred_proofs.len() != deferred_skip_layer_indices.len() {
+        return Err(GKRError::VerificationError {
+            layer_idx: 0,
+            reason: format!(
+                "deferred_proofs count ({}) != Add layers walked ({})",
+                proof.deferred_proofs.len(),
+                deferred_skip_layer_indices.len(),
+            ),
+        });
+    }
     for (i, deferred) in proof.deferred_proofs.iter().enumerate() {
         // Mix deferred claim into channel (must match prover)
         mix_secure_field(channel, deferred.claim.value);
 
-        // Verify the deferred matmul sumcheck
-        let (m, k, n) = deferred.dims;
+        // Verify the deferred layer reduction
         match &deferred.layer_proof {
             LayerProof::MatMul {
                 round_polys,
                 final_a_eval,
                 final_b_eval,
             } => {
+                let (m, k, n) = deferred.dims().ok_or_else(|| GKRError::VerificationError {
+                    layer_idx: 0,
+                    reason: format!("deferred proof {} is MatMul layer_proof but has Weightless kind", i),
+                })?;
+                // Cross-check dims against circuit's skip layer
+                let skip_idx = deferred_skip_layer_indices[i];
+                if let LayerType::MatMul { m: cm, k: ck, n: cn, .. } = &circuit.layers[skip_idx].layer_type {
+                    if m != *cm || k != *ck || n != *cn {
+                        return Err(GKRError::VerificationError {
+                            layer_idx: skip_idx,
+                            reason: format!(
+                                "deferred proof {} dims ({},{},{}) != circuit layer dims ({},{},{})",
+                                i, m, k, n, cm, ck, cn,
+                            ),
+                        });
+                    }
+                }
                 let deferred_input_claim = verify_matmul_reduction(
                     &deferred.claim,
                     round_polys,
@@ -427,58 +466,152 @@ fn verify_gkr_inner(
                     });
                 }
             }
+            LayerProof::Dequantize {
+                logup_proof,
+                input_eval,
+                output_eval,
+                table_commitment,
+            } => {
+                // Verify Dequantize deferred proof via full LogUp verification.
+                // Look up QuantParams from the circuit's skip layer.
+                let skip_layer_idx = deferred_skip_layer_indices.get(i).copied().ok_or_else(|| {
+                    GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: format!("deferred proof {} has no matching skip layer index", i),
+                    }
+                })?;
+                let params = match &circuit.layers[skip_layer_idx].layer_type {
+                    LayerType::Dequantize { params, .. } => params,
+                    other => return Err(GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: format!(
+                            "deferred proof {} skip layer {} is {:?}, expected Dequantize",
+                            i, skip_layer_idx, std::mem::discriminant(other),
+                        ),
+                    }),
+                };
+                let deferred_input_claim = verify_dequantize_reduction(
+                    &deferred.claim,
+                    params,
+                    logup_proof.as_ref(),
+                    *input_eval,
+                    *output_eval,
+                    *table_commitment,
+                    0,
+                    channel,
+                )?;
+                if deferred_input_claim.point != deferred.input_claim.point
+                    || deferred_input_claim.value != deferred.input_claim.value
+                {
+                    return Err(GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: format!("deferred proof {} (dequantize) input claim mismatch", i),
+                    });
+                }
+            }
+            LayerProof::Quantize {
+                logup_proof,
+                input_eval,
+                output_eval,
+                table_inputs,
+                table_outputs,
+            } => {
+                // Verify Quantize deferred proof via full LogUp verification.
+                let skip_layer_idx = deferred_skip_layer_indices.get(i).copied().ok_or_else(|| {
+                    GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: format!("deferred proof {} has no matching skip layer index", i),
+                    }
+                })?;
+                let params = match &circuit.layers[skip_layer_idx].layer_type {
+                    LayerType::Quantize { params, .. } => params,
+                    other => return Err(GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: format!(
+                            "deferred proof {} skip layer {} is {:?}, expected Quantize",
+                            i, skip_layer_idx, std::mem::discriminant(other),
+                        ),
+                    }),
+                };
+                let deferred_input_claim = verify_quantize_reduction(
+                    &deferred.claim,
+                    params,
+                    logup_proof.as_ref(),
+                    *input_eval,
+                    *output_eval,
+                    table_inputs,
+                    table_outputs,
+                    0,
+                    channel,
+                )?;
+                if deferred_input_claim.point != deferred.input_claim.point
+                    || deferred_input_claim.value != deferred.input_claim.value
+                {
+                    return Err(GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: format!("deferred proof {} (quantize) input claim mismatch", i),
+                    });
+                }
+            }
             _ => {
                 return Err(GKRError::VerificationError {
                     layer_idx: 0,
-                    reason: format!("deferred proof {} has non-matmul layer proof type", i,),
+                    reason: format!("deferred proof {} has unsupported layer proof type", i,),
                 });
             }
         }
 
-        if batched_rlc_mode {
-            // In batched RLC mode, deferred weight binding is checked in the
-            // aggregated verifier pass (no per-deferred Merkle opening).
-            if deferred.weight_commitment != starknet_ff::FieldElement::ZERO {
-                return Err(GKRError::VerificationError {
-                    layer_idx: 0,
-                    reason: format!(
-                        "deferred proof {} expects zero weight_commitment in batched RLC mode",
-                        i
-                    ),
-                });
-            }
-            if !deferred.weight_opening.intermediate_roots.is_empty()
-                || !deferred.weight_opening.queries.is_empty()
-            {
-                return Err(GKRError::VerificationError {
-                    layer_idx: 0,
-                    reason: format!(
-                        "deferred proof {} expects empty weight_opening in batched RLC mode",
-                        i
-                    ),
-                });
-            }
-        } else {
-            // Verify deferred weight opening
-            if deferred.weight_opening.final_value != deferred.weight_claim.expected_value {
-                return Err(GKRError::VerificationError {
-                    layer_idx: 0,
-                    reason: format!("deferred proof {} weight opening final_value mismatch", i,),
-                });
-            }
-            if !crate::crypto::mle_opening::verify_mle_opening(
-                deferred.weight_commitment,
-                &deferred.weight_opening,
-                &deferred.weight_claim.eval_point,
-                channel,
-            ) {
-                return Err(GKRError::VerificationError {
-                    layer_idx: 0,
-                    reason: format!(
-                        "deferred proof {} weight MLE opening failed verification",
-                        i,
-                    ),
-                });
+        // Weight opening verification (MatMul kind only)
+        if deferred.has_weights() {
+            let weight_commitment = deferred.weight_commitment().unwrap();
+            let weight_opening = deferred.weight_opening().unwrap();
+            let weight_claim = deferred.weight_claim().unwrap();
+
+            if batched_rlc_mode {
+                // In batched RLC mode, deferred weight binding is checked in the
+                // aggregated verifier pass (no per-deferred Merkle opening).
+                if weight_commitment != starknet_ff::FieldElement::ZERO {
+                    return Err(GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: format!(
+                            "deferred proof {} expects zero weight_commitment in batched RLC mode",
+                            i
+                        ),
+                    });
+                }
+                if !weight_opening.intermediate_roots.is_empty()
+                    || !weight_opening.queries.is_empty()
+                {
+                    return Err(GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: format!(
+                            "deferred proof {} expects empty weight_opening in batched RLC mode",
+                            i
+                        ),
+                    });
+                }
+            } else {
+                // Verify deferred weight opening
+                if weight_opening.final_value != weight_claim.expected_value {
+                    return Err(GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: format!("deferred proof {} weight opening final_value mismatch", i,),
+                    });
+                }
+                if !crate::crypto::mle_opening::verify_mle_opening(
+                    weight_commitment,
+                    weight_opening,
+                    &weight_claim.eval_point,
+                    channel,
+                ) {
+                    return Err(GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: format!(
+                            "deferred proof {} weight MLE opening failed verification",
+                            i,
+                        ),
+                    });
+                }
             }
         }
     }
@@ -660,24 +793,25 @@ fn verify_gkr_inner(
             let mut combined_actual = SecureField::zero();
 
             for (i, deferred) in proof.deferred_proofs.iter().enumerate() {
-                let claim = &deferred.weight_claim;
-                let weight =
-                    weights
-                        .get_weight(claim.weight_node_id)
-                        .ok_or(GKRError::MissingWeight {
-                            node_id: claim.weight_node_id,
+                if let Some(claim) = deferred.weight_claim() {
+                    let weight =
+                        weights
+                            .get_weight(claim.weight_node_id)
+                            .ok_or(GKRError::MissingWeight {
+                                node_id: claim.weight_node_id,
+                            })?;
+                    let actual = evaluate_weight_claim_against_matrix(weight, &claim.eval_point)
+                        .map_err(|reason| GKRError::VerificationError {
+                            layer_idx: 0,
+                            reason: format!(
+                                "batched RLC deferred weight claim {} evaluation failed: {}",
+                                i, reason
+                            ),
                         })?;
-                let actual = evaluate_weight_claim_against_matrix(weight, &claim.eval_point)
-                    .map_err(|reason| GKRError::VerificationError {
-                        layer_idx: 0,
-                        reason: format!(
-                            "batched RLC deferred weight claim {} evaluation failed: {}",
-                            i, reason
-                        ),
-                    })?;
-                combined_expected = combined_expected + rho_pow * claim.expected_value;
-                combined_actual = combined_actual + rho_pow * actual;
-                rho_pow = rho_pow * rho;
+                    combined_expected = combined_expected + rho_pow * claim.expected_value;
+                    combined_actual = combined_actual + rho_pow * actual;
+                    rho_pow = rho_pow * rho;
+                }
             }
 
             for (i, claim) in proof.weight_claims.iter().enumerate() {
@@ -804,16 +938,19 @@ fn verify_gkr_inner(
                     commitment: *commitment,
                 });
             }
-            for (deferred_idx, deferred) in proof.deferred_proofs.iter().enumerate() {
-                let claim = &deferred.weight_claim;
-                let claim_idx = proof.weight_claims.len() + deferred_idx;
-                agg_claims.push(AggregatedWeightClaim {
-                    matrix_index: claim_idx,
-                    local_n_vars: claim.eval_point.len(),
-                    eval_point: claim.eval_point.clone(),
-                    expected_value: claim.expected_value,
-                    commitment: deferred.weight_commitment,
-                });
+            let mut matmul_deferred_idx = 0usize;
+            for deferred in proof.deferred_proofs.iter() {
+                if let Some(claim) = deferred.weight_claim() {
+                    let claim_idx = proof.weight_claims.len() + matmul_deferred_idx;
+                    agg_claims.push(AggregatedWeightClaim {
+                        matrix_index: claim_idx,
+                        local_n_vars: claim.eval_point.len(),
+                        eval_point: claim.eval_point.clone(),
+                        expected_value: claim.expected_value,
+                        commitment: deferred.weight_commitment().unwrap_or(starknet_ff::FieldElement::ZERO),
+                    });
+                    matmul_deferred_idx += 1;
+                }
             }
 
             if agg_claims.is_empty() {
@@ -907,7 +1044,31 @@ pub fn verify_gkr_simd(
     proof: &GKRProof,
     combined_output: &[SecureField],
     channel: &mut PoseidonChannel,
-) -> Result<(), GKRError> {
+) -> Result<GKRClaim, GKRError> {
+    verify_gkr_simd_inner(circuit, proof, combined_output, None, channel)
+}
+
+/// Verify a SIMD GKR proof with optional access to weight matrices.
+///
+/// The `weights` parameter is required for `BatchedRlcDirectEvalV1` mode where
+/// the verifier directly evaluates weight MLEs instead of checking Merkle openings.
+pub fn verify_gkr_simd_with_weights(
+    circuit: &LayeredCircuit,
+    proof: &GKRProof,
+    combined_output: &[SecureField],
+    weights: &GraphWeights,
+    channel: &mut PoseidonChannel,
+) -> Result<GKRClaim, GKRError> {
+    verify_gkr_simd_inner(circuit, proof, combined_output, Some(weights), channel)
+}
+
+fn verify_gkr_simd_inner(
+    circuit: &LayeredCircuit,
+    proof: &GKRProof,
+    combined_output: &[SecureField],
+    weights: Option<&GraphWeights>,
+    channel: &mut PoseidonChannel,
+) -> Result<GKRClaim, GKRError> {
     let simd_config = circuit.simd_config.as_ref().ok_or_else(|| {
         GKRError::SimdError("circuit has no SIMD config — need >= 2 identical blocks".into())
     })?;
@@ -939,6 +1100,9 @@ pub fn verify_gkr_simd(
     let template = &simd_config.template_range;
     let template_layers: Vec<usize> = (template.start..template.end).rev().collect();
     let mut proof_idx = 0;
+    let mut expected_weight_node_ids = Vec::new();
+    // Track skip layer indices for deferred proofs (populated on Add layers)
+    let mut deferred_skip_layer_indices: Vec<usize> = Vec::new();
 
     for &layer_idx in &template_layers {
         let layer = &circuit.layers[layer_idx];
@@ -961,37 +1125,58 @@ pub fn verify_gkr_simd(
 
         current_claim = match (&layer.layer_type, layer_proof) {
             (
-                LayerType::MatMul { m, k, n, .. },
+                LayerType::MatMul {
+                    m,
+                    k,
+                    n,
+                    weight_node_id,
+                },
                 LayerProof::MatMul {
                     round_polys,
                     final_a_eval,
                     final_b_eval,
                 },
-            ) => verify_matmul_reduction(
-                &current_claim,
-                round_polys,
-                *final_a_eval,
-                *final_b_eval,
-                *m,
-                *k,
-                *n,
-                layer_idx,
-                channel,
-            )?,
+            ) => {
+                expected_weight_node_ids.push(*weight_node_id);
+                verify_matmul_reduction(
+                    &current_claim,
+                    round_polys,
+                    *final_a_eval,
+                    *final_b_eval,
+                    *m,
+                    *k,
+                    *n,
+                    layer_idx,
+                    channel,
+                )?
+            }
 
             (
                 LayerType::Add { .. },
                 LayerProof::Add {
                     lhs_eval, rhs_eval, ..
                 },
-            ) => verify_add_reduction(
-                &current_claim,
-                *lhs_eval,
-                *rhs_eval,
-                &layer.input_layers,
-                layer_idx,
-                channel,
-            )?,
+            ) => {
+                // Track skip layer index for deferred proof verification
+                let skip_layer_idx = if layer.input_layers.len() >= 2
+                    && layer.input_layers[1] > layer.input_layers[0]
+                {
+                    layer.input_layers[0]
+                } else if layer.input_layers.len() >= 2 {
+                    layer.input_layers[1]
+                } else {
+                    0
+                };
+                deferred_skip_layer_indices.push(skip_layer_idx);
+                verify_add_reduction(
+                    &current_claim,
+                    *lhs_eval,
+                    *rhs_eval,
+                    &layer.input_layers,
+                    layer_idx,
+                    channel,
+                )?
+            }
 
             (
                 LayerType::Mul { .. },
@@ -1205,7 +1390,594 @@ pub fn verify_gkr_simd(
         });
     }
 
-    Ok(())
+    let batched_rlc_mode =
+        proof.weight_opening_transcript_mode == WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1;
+
+    // Verify deferred proofs for skip branches of DAG Add layers.
+    // Fiat-Shamir order: walk → deferred proofs → weight openings.
+    if proof.deferred_proofs.len() != deferred_skip_layer_indices.len() {
+        return Err(GKRError::VerificationError {
+            layer_idx: 0,
+            reason: format!(
+                "SIMD deferred_proofs count ({}) != Add layers walked ({})",
+                proof.deferred_proofs.len(),
+                deferred_skip_layer_indices.len(),
+            ),
+        });
+    }
+    for (i, deferred) in proof.deferred_proofs.iter().enumerate() {
+        // Mix deferred claim into channel (must match prover)
+        mix_secure_field(channel, deferred.claim.value);
+
+        // Verify the deferred layer reduction
+        match &deferred.layer_proof {
+            LayerProof::MatMul {
+                round_polys,
+                final_a_eval,
+                final_b_eval,
+            } => {
+                let (m, k, n) = deferred.dims().ok_or_else(|| GKRError::VerificationError {
+                    layer_idx: 0,
+                    reason: format!(
+                        "SIMD deferred proof {} is MatMul layer_proof but has Weightless kind",
+                        i
+                    ),
+                })?;
+                // Cross-check dims against circuit's skip layer
+                let skip_idx = deferred_skip_layer_indices[i];
+                if let LayerType::MatMul { m: cm, k: ck, n: cn, .. } = &circuit.layers[skip_idx].layer_type {
+                    if m != *cm || k != *ck || n != *cn {
+                        return Err(GKRError::VerificationError {
+                            layer_idx: skip_idx,
+                            reason: format!(
+                                "SIMD deferred proof {} dims ({},{},{}) != circuit layer dims ({},{},{})",
+                                i, m, k, n, cm, ck, cn,
+                            ),
+                        });
+                    }
+                }
+                let deferred_input_claim = verify_matmul_reduction(
+                    &deferred.claim,
+                    round_polys,
+                    *final_a_eval,
+                    *final_b_eval,
+                    m,
+                    k,
+                    n,
+                    0, // layer_idx (deferred)
+                    channel,
+                )?;
+
+                if deferred_input_claim.point != deferred.input_claim.point
+                    || deferred_input_claim.value != deferred.input_claim.value
+                {
+                    return Err(GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: format!("SIMD deferred proof {} input claim mismatch", i),
+                    });
+                }
+            }
+            LayerProof::Dequantize {
+                logup_proof,
+                input_eval,
+                output_eval,
+                table_commitment,
+            } => {
+                let skip_layer_idx =
+                    deferred_skip_layer_indices.get(i).copied().ok_or_else(|| {
+                        GKRError::VerificationError {
+                            layer_idx: 0,
+                            reason: format!(
+                                "SIMD deferred proof {} has no matching skip layer index",
+                                i
+                            ),
+                        }
+                    })?;
+                let params = match &circuit.layers[skip_layer_idx].layer_type {
+                    LayerType::Dequantize { params, .. } => params,
+                    other => {
+                        return Err(GKRError::VerificationError {
+                            layer_idx: 0,
+                            reason: format!(
+                                "SIMD deferred proof {} skip layer {} is {:?}, expected Dequantize",
+                                i,
+                                skip_layer_idx,
+                                std::mem::discriminant(other),
+                            ),
+                        })
+                    }
+                };
+                let deferred_input_claim = verify_dequantize_reduction(
+                    &deferred.claim,
+                    params,
+                    logup_proof.as_ref(),
+                    *input_eval,
+                    *output_eval,
+                    *table_commitment,
+                    0,
+                    channel,
+                )?;
+                if deferred_input_claim.point != deferred.input_claim.point
+                    || deferred_input_claim.value != deferred.input_claim.value
+                {
+                    return Err(GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: format!(
+                            "SIMD deferred proof {} (dequantize) input claim mismatch",
+                            i
+                        ),
+                    });
+                }
+            }
+            LayerProof::Quantize {
+                logup_proof,
+                input_eval,
+                output_eval,
+                table_inputs,
+                table_outputs,
+            } => {
+                let skip_layer_idx =
+                    deferred_skip_layer_indices.get(i).copied().ok_or_else(|| {
+                        GKRError::VerificationError {
+                            layer_idx: 0,
+                            reason: format!(
+                                "SIMD deferred proof {} has no matching skip layer index",
+                                i
+                            ),
+                        }
+                    })?;
+                let params = match &circuit.layers[skip_layer_idx].layer_type {
+                    LayerType::Quantize { params, .. } => params,
+                    other => {
+                        return Err(GKRError::VerificationError {
+                            layer_idx: 0,
+                            reason: format!(
+                                "SIMD deferred proof {} skip layer {} is {:?}, expected Quantize",
+                                i,
+                                skip_layer_idx,
+                                std::mem::discriminant(other),
+                            ),
+                        })
+                    }
+                };
+                let deferred_input_claim = verify_quantize_reduction(
+                    &deferred.claim,
+                    params,
+                    logup_proof.as_ref(),
+                    *input_eval,
+                    *output_eval,
+                    table_inputs,
+                    table_outputs,
+                    0,
+                    channel,
+                )?;
+                if deferred_input_claim.point != deferred.input_claim.point
+                    || deferred_input_claim.value != deferred.input_claim.value
+                {
+                    return Err(GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: format!(
+                            "SIMD deferred proof {} (quantize) input claim mismatch",
+                            i
+                        ),
+                    });
+                }
+            }
+            _ => {
+                return Err(GKRError::VerificationError {
+                    layer_idx: 0,
+                    reason: format!(
+                        "SIMD deferred proof {} has unsupported layer proof type",
+                        i
+                    ),
+                });
+            }
+        }
+
+        // Weight opening verification (MatMul kind only)
+        if deferred.has_weights() {
+            let weight_commitment = deferred.weight_commitment().unwrap();
+            let weight_opening = deferred.weight_opening().unwrap();
+            let weight_claim = deferred.weight_claim().unwrap();
+
+            if batched_rlc_mode {
+                if weight_commitment != starknet_ff::FieldElement::ZERO {
+                    return Err(GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: format!(
+                            "SIMD deferred proof {} expects zero weight_commitment in batched RLC mode",
+                            i
+                        ),
+                    });
+                }
+                if !weight_opening.intermediate_roots.is_empty()
+                    || !weight_opening.queries.is_empty()
+                {
+                    return Err(GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: format!(
+                            "SIMD deferred proof {} expects empty weight_opening in batched RLC mode",
+                            i
+                        ),
+                    });
+                }
+            } else {
+                if weight_opening.final_value != weight_claim.expected_value {
+                    return Err(GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: format!(
+                            "SIMD deferred proof {} weight opening final_value mismatch",
+                            i
+                        ),
+                    });
+                }
+                if !crate::crypto::mle_opening::verify_mle_opening(
+                    weight_commitment,
+                    weight_opening,
+                    &weight_claim.eval_point,
+                    channel,
+                ) {
+                    return Err(GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: format!(
+                            "SIMD deferred proof {} weight MLE opening failed verification",
+                            i,
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    // Verify weight MLE opening proofs (post-deferred channel state).
+    if proof.weight_claims.len() != expected_weight_node_ids.len() {
+        return Err(GKRError::VerificationError {
+            layer_idx: 0,
+            reason: format!(
+                "SIMD weight_claims count ({}) != matmul layers in circuit walk ({})",
+                proof.weight_claims.len(),
+                expected_weight_node_ids.len()
+            ),
+        });
+    }
+    for (i, (claim, expected_node_id)) in proof
+        .weight_claims
+        .iter()
+        .zip(expected_weight_node_ids.iter())
+        .enumerate()
+    {
+        if claim.weight_node_id != *expected_node_id {
+            return Err(GKRError::VerificationError {
+                layer_idx: 0,
+                reason: format!(
+                    "SIMD weight claim {} node mismatch: claim={}, expected={}",
+                    i, claim.weight_node_id, expected_node_id
+                ),
+            });
+        }
+    }
+
+    match proof.weight_opening_transcript_mode {
+        WeightOpeningTranscriptMode::Sequential => {
+            if proof.weight_openings.len() != proof.weight_commitments.len() {
+                return Err(GKRError::VerificationError {
+                    layer_idx: 0,
+                    reason: format!(
+                        "SIMD weight_openings count ({}) != weight_commitments count ({})",
+                        proof.weight_openings.len(),
+                        proof.weight_commitments.len(),
+                    ),
+                });
+            }
+            if proof.weight_claims.len() != proof.weight_commitments.len() {
+                return Err(GKRError::VerificationError {
+                    layer_idx: 0,
+                    reason: format!(
+                        "SIMD weight_claims count ({}) != weight_commitments count ({})",
+                        proof.weight_claims.len(),
+                        proof.weight_commitments.len(),
+                    ),
+                });
+            }
+            for (i, ((opening, commitment), claim)) in proof
+                .weight_openings
+                .iter()
+                .zip(proof.weight_commitments.iter())
+                .zip(proof.weight_claims.iter())
+                .enumerate()
+            {
+                if opening.final_value != claim.expected_value {
+                    return Err(GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: format!(
+                            "SIMD weight opening {} final_value mismatch: opening={:?}, claim={:?}",
+                            i, opening.final_value, claim.expected_value,
+                        ),
+                    });
+                }
+                if !crate::crypto::mle_opening::verify_mle_opening(
+                    *commitment,
+                    opening,
+                    &claim.eval_point,
+                    channel,
+                ) {
+                    return Err(GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: format!(
+                            "SIMD weight MLE opening proof {} failed verification",
+                            i
+                        ),
+                    });
+                }
+            }
+        }
+        WeightOpeningTranscriptMode::BatchedSubchannelV1 => {
+            if proof.weight_openings.len() != proof.weight_commitments.len() {
+                return Err(GKRError::VerificationError {
+                    layer_idx: 0,
+                    reason: format!(
+                        "SIMD weight_openings count ({}) != weight_commitments count ({})",
+                        proof.weight_openings.len(),
+                        proof.weight_commitments.len(),
+                    ),
+                });
+            }
+            if proof.weight_claims.len() != proof.weight_commitments.len() {
+                return Err(GKRError::VerificationError {
+                    layer_idx: 0,
+                    reason: format!(
+                        "SIMD weight_claims count ({}) != weight_commitments count ({})",
+                        proof.weight_claims.len(),
+                        proof.weight_commitments.len(),
+                    ),
+                });
+            }
+            let opening_seed = if proof.weight_openings.is_empty() {
+                None
+            } else {
+                Some(channel.draw_felt252())
+            };
+            for (i, ((opening, commitment), claim)) in proof
+                .weight_openings
+                .iter()
+                .zip(proof.weight_commitments.iter())
+                .zip(proof.weight_claims.iter())
+                .enumerate()
+            {
+                if opening.final_value != claim.expected_value {
+                    return Err(GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: format!(
+                            "SIMD weight opening {} final_value mismatch: opening={:?}, claim={:?}",
+                            i, opening.final_value, claim.expected_value,
+                        ),
+                    });
+                }
+                let mut sub_channel = derive_weight_opening_subchannel(
+                    opening_seed.expect("seed exists when openings are non-empty"),
+                    i,
+                    claim,
+                );
+                if !crate::crypto::mle_opening::verify_mle_opening(
+                    *commitment,
+                    opening,
+                    &claim.eval_point,
+                    &mut sub_channel,
+                ) {
+                    return Err(GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: format!(
+                            "SIMD batched weight MLE opening proof {} failed verification",
+                            i
+                        ),
+                    });
+                }
+            }
+        }
+        WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1 => {
+            if !proof.weight_openings.is_empty() {
+                return Err(GKRError::VerificationError {
+                    layer_idx: 0,
+                    reason: format!(
+                        "SIMD batched RLC mode expects no weight openings, got {}",
+                        proof.weight_openings.len()
+                    ),
+                });
+            }
+            if !proof.weight_commitments.is_empty() {
+                return Err(GKRError::VerificationError {
+                    layer_idx: 0,
+                    reason: format!(
+                        "SIMD batched RLC mode expects no weight commitments, got {}",
+                        proof.weight_commitments.len()
+                    ),
+                });
+            }
+            let weights = weights.ok_or_else(|| GKRError::VerificationError {
+                layer_idx: 0,
+                reason: "SIMD batched RLC mode requires verify_gkr_simd_with_weights(...)".to_string(),
+            })?;
+            let rho = channel.draw_qm31();
+            let mut rho_pow = SecureField::one();
+            let mut combined_expected = SecureField::zero();
+            let mut combined_actual = SecureField::zero();
+
+            for (i, deferred) in proof.deferred_proofs.iter().enumerate() {
+                if let Some(claim) = deferred.weight_claim() {
+                    let weight =
+                        weights
+                            .get_weight(claim.weight_node_id)
+                            .ok_or(GKRError::MissingWeight {
+                                node_id: claim.weight_node_id,
+                            })?;
+                    let actual = evaluate_weight_claim_against_matrix(weight, &claim.eval_point)
+                        .map_err(|reason| GKRError::VerificationError {
+                            layer_idx: 0,
+                            reason: format!(
+                                "SIMD batched RLC deferred weight claim {} evaluation failed: {}",
+                                i, reason
+                            ),
+                        })?;
+                    combined_expected = combined_expected + rho_pow * claim.expected_value;
+                    combined_actual = combined_actual + rho_pow * actual;
+                    rho_pow = rho_pow * rho;
+                }
+            }
+            for (i, claim) in proof.weight_claims.iter().enumerate() {
+                let weight =
+                    weights
+                        .get_weight(claim.weight_node_id)
+                        .ok_or(GKRError::MissingWeight {
+                            node_id: claim.weight_node_id,
+                        })?;
+                let actual = evaluate_weight_claim_against_matrix(weight, &claim.eval_point)
+                    .map_err(|reason| GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: format!(
+                            "SIMD batched RLC weight claim {} evaluation failed: {}",
+                            i, reason
+                        ),
+                    })?;
+                combined_expected = combined_expected + rho_pow * claim.expected_value;
+                combined_actual = combined_actual + rho_pow * actual;
+                rho_pow = rho_pow * rho;
+            }
+            mix_secure_field(channel, combined_expected);
+            if combined_expected != combined_actual {
+                return Err(GKRError::VerificationError {
+                    layer_idx: 0,
+                    reason: format!(
+                        "SIMD batched RLC weight-binding mismatch: expected {:?}, actual {:?}",
+                        combined_expected, combined_actual
+                    ),
+                });
+            }
+        }
+        WeightOpeningTranscriptMode::AggregatedTrustlessV2
+        | WeightOpeningTranscriptMode::AggregatedOpeningsV4Experimental => {
+            if proof.weight_openings.len() != proof.weight_commitments.len() {
+                return Err(GKRError::VerificationError {
+                    layer_idx: 0,
+                    reason: format!(
+                        "SIMD weight_openings count ({}) != weight_commitments count ({})",
+                        proof.weight_openings.len(),
+                        proof.weight_commitments.len(),
+                    ),
+                });
+            }
+            if proof.weight_claims.len() != proof.weight_commitments.len() {
+                return Err(GKRError::VerificationError {
+                    layer_idx: 0,
+                    reason: format!(
+                        "SIMD weight_claims count ({}) != weight_commitments count ({})",
+                        proof.weight_claims.len(),
+                        proof.weight_commitments.len(),
+                    ),
+                });
+            }
+            let opening_seed = if proof.weight_openings.is_empty() {
+                None
+            } else {
+                Some(channel.draw_felt252())
+            };
+            for (i, ((opening, commitment), claim)) in proof
+                .weight_openings
+                .iter()
+                .zip(proof.weight_commitments.iter())
+                .zip(proof.weight_claims.iter())
+                .enumerate()
+            {
+                if opening.final_value != claim.expected_value {
+                    return Err(GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: format!(
+                            "SIMD weight opening {} final_value mismatch: opening={:?}, claim={:?}",
+                            i, opening.final_value, claim.expected_value,
+                        ),
+                    });
+                }
+                let mut sub_channel = derive_weight_opening_subchannel(
+                    opening_seed.expect("seed exists when openings are non-empty"),
+                    i,
+                    claim,
+                );
+                if !crate::crypto::mle_opening::verify_mle_opening(
+                    *commitment,
+                    opening,
+                    &claim.eval_point,
+                    &mut sub_channel,
+                ) {
+                    return Err(GKRError::VerificationError {
+                        layer_idx: 0,
+                        reason: format!(
+                            "SIMD aggregated trustless weight opening {} failed verification",
+                            i
+                        ),
+                    });
+                }
+            }
+        }
+        WeightOpeningTranscriptMode::AggregatedOracleSumcheck => {
+            let binding_proof = proof.aggregated_binding.as_ref().ok_or_else(|| {
+                GKRError::VerificationError {
+                    layer_idx: 0,
+                    reason:
+                        "SIMD AggregatedOracleSumcheck mode requires aggregated_binding proof"
+                            .to_string(),
+                }
+            })?;
+
+            let mut agg_claims = Vec::new();
+            for (idx, (claim, commitment)) in proof
+                .weight_claims
+                .iter()
+                .zip(proof.weight_commitments.iter())
+                .enumerate()
+            {
+                agg_claims.push(AggregatedWeightClaim {
+                    matrix_index: idx,
+                    local_n_vars: claim.eval_point.len(),
+                    eval_point: claim.eval_point.clone(),
+                    expected_value: claim.expected_value,
+                    commitment: *commitment,
+                });
+            }
+            let mut matmul_deferred_idx = 0usize;
+            for deferred in proof.deferred_proofs.iter() {
+                if let Some(claim) = deferred.weight_claim() {
+                    let claim_idx = proof.weight_claims.len() + matmul_deferred_idx;
+                    agg_claims.push(AggregatedWeightClaim {
+                        matrix_index: claim_idx,
+                        local_n_vars: claim.eval_point.len(),
+                        eval_point: claim.eval_point.clone(),
+                        expected_value: claim.expected_value,
+                        commitment: deferred
+                            .weight_commitment()
+                            .unwrap_or(starknet_ff::FieldElement::ZERO),
+                    });
+                    matmul_deferred_idx += 1;
+                }
+            }
+
+            if agg_claims.is_empty() {
+                return Err(GKRError::VerificationError {
+                    layer_idx: 0,
+                    reason: "SIMD AggregatedOracleSumcheck mode with zero claims".to_string(),
+                });
+            }
+
+            if !verify_aggregated_binding(binding_proof, &agg_claims, channel) {
+                return Err(GKRError::VerificationError {
+                    layer_idx: 0,
+                    reason:
+                        "SIMD aggregated oracle sumcheck weight binding verification failed"
+                            .to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(current_claim)
 }
 
 // ===== Per-Layer Verification =====
@@ -3278,12 +4050,16 @@ mod tests {
         proof.weight_openings.clear();
         proof.weight_commitments.clear();
         for deferred in proof.deferred_proofs.iter_mut() {
-            deferred.weight_commitment = starknet_ff::FieldElement::ZERO;
-            deferred.weight_opening = crate::crypto::mle_opening::MleOpeningProof {
-                intermediate_roots: Vec::new(),
-                queries: Vec::new(),
-                final_value: SecureField::zero(),
-            };
+            if let Some(wc) = deferred.weight_commitment_mut() {
+                *wc = starknet_ff::FieldElement::ZERO;
+            }
+            if let Some(wo) = deferred.weight_opening_mut() {
+                *wo = crate::crypto::mle_opening::MleOpeningProof {
+                    intermediate_roots: Vec::new(),
+                    queries: Vec::new(),
+                    final_value: SecureField::zero(),
+                };
+            }
         }
 
         let mut verifier_channel = PoseidonChannel::new();
@@ -5880,5 +6656,298 @@ mod tests {
             err_msg.contains("final check failed"),
             "expected 'final check failed', got: {err_msg}"
         );
+    }
+
+    #[test]
+    fn test_deferred_proof_dequantize_dag() {
+        // DAG: Input(1×4) → Dequantize → fork → MatMul(4×4) → Add(deq_fork, matmul_out)
+        // The Dequantize skip branch gets a Weightless deferred proof.
+        let params = QuantParams {
+            strategy: QuantStrategy::Symmetric8,
+            scale: 0.1,
+            zero_point: 0,
+            bits: 8,
+        };
+
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.dequantize(params.clone());
+        let fork = builder.fork();
+        builder.linear(4);
+        builder.add_from(fork);
+        let graph = builder.build();
+        let circuit = LayeredCircuit::from_graph(&graph).unwrap();
+
+        // Input: quantized values (valid for 8-bit: 0..255)
+        let mut x_quant = M31Matrix::new(1, 4);
+        x_quant.data = vec![M31::from(10u32), M31::from(20u32), M31::from(30u32), M31::from(40u32)];
+
+        // Dequantize output: dequantize(10, scale=0.1, zp=0) = 1.0 → M31(1), etc.
+        let direct_params = QuantParams {
+            strategy: QuantStrategy::Direct,
+            scale: 1.0,
+            zero_point: 0,
+            bits: 31,
+        };
+        let mut x_deq = M31Matrix::new(1, 4);
+        for i in 0..4 {
+            let f = dequantize_value(x_quant.data[i], &params);
+            x_deq.data[i] = quantize_value(f, &direct_params);
+        }
+        assert_eq!(x_deq.data, vec![M31::from(1u32), M31::from(2u32), M31::from(3u32), M31::from(4u32)]);
+
+        // Weight matrix for MatMul (4×4)
+        let mut w = M31Matrix::new(4, 4);
+        for i in 0..16 {
+            w.data[i] = M31::from(((i % 5) + 1) as u32);
+        }
+
+        // Forward pass
+        let y = matmul_forward(&x_deq, &w);
+        let mut out = M31Matrix::new(1, 4);
+        for j in 0..4 {
+            out.set(0, j, x_deq.get(0, j) + y.get(0, j));
+        }
+
+        // Build weights (only MatMul node 1 has weights)
+        let mut weights = GraphWeights::new();
+        weights.add_weight(1, w);
+
+        // Build execution trace
+        let mut node_outputs = std::collections::HashMap::new();
+        node_outputs.insert(0usize, x_deq.clone());
+        node_outputs.insert(1usize, y.clone());
+        node_outputs.insert(2usize, out.clone());
+
+        let execution = GraphExecution {
+            intermediates: vec![
+                (0, x_quant.clone()),  // input to Dequantize
+                (1, x_deq.clone()),    // input to MatMul
+                (2, y.clone()),        // input to Add (trunk = MatMul output)
+            ],
+            node_outputs,
+            output: out.clone(),
+        };
+
+        // Prove
+        let mut prover_channel = PoseidonChannel::new();
+        let proof = prove_gkr(&circuit, &execution, &weights, &mut prover_channel).unwrap();
+
+        // Assert deferred proofs exist with Weightless kind
+        assert!(
+            !proof.deferred_proofs.is_empty(),
+            "dequantize DAG should produce deferred proofs"
+        );
+        assert!(
+            proof.deferred_proofs.iter().any(|d| !d.has_weights()),
+            "dequantize deferred proof should be Weightless"
+        );
+
+        // Verify
+        let mut verifier_channel = PoseidonChannel::new();
+        verify_gkr_with_weights(&circuit, &proof, &out, &weights, &mut verifier_channel).unwrap();
+    }
+
+    #[cfg(feature = "cuda-runtime")]
+    #[test]
+    fn test_simd_deferred_proof_matmul_dag() {
+        // Test that prove_gkr_simd_gpu correctly generates deferred proofs for DAG Add layers
+        // and that verify_gkr_simd verifies them.
+        //
+        // Circuit: 2 identical blocks, each containing:
+        //   MatMul_A → MatMul_B → Add(MatMul_A, MatMul_B)
+        // The Add layer creates a DAG: trunk = MatMul_B (higher idx), skip = MatMul_A (lower idx).
+        // The skip branch gets a deferred MatMul proof.
+        use crate::gkr::circuit::{CircuitLayer, LayerType, SIMDBatchConfig};
+        use crate::gkr::prover::prove_gkr_simd_gpu;
+
+        let m = 2usize;
+        let k = 4usize;
+        let n = 4usize;
+
+        // Shared weight matrices (same for both blocks, different per layer position)
+        let mut w_a = M31Matrix::new(k, n);
+        for i in 0..(k * n) {
+            w_a.data[i] = M31::from(((i * 3 + 1) % 31 + 1) as u32);
+        }
+        let mut w_b = M31Matrix::new(k, n);
+        for i in 0..(k * n) {
+            w_b.data[i] = M31::from(((i * 7 + 2) % 31 + 1) as u32);
+        }
+
+        let weight_id_a = 100usize;
+        let weight_id_b = 101usize;
+
+        // Build circuit manually: 2 blocks of [MatMul, MatMul, Add]
+        let layers = vec![
+            // Block 0
+            CircuitLayer {
+                layer_type: LayerType::MatMul { m, k, n, weight_node_id: weight_id_a },
+                input_shape: (m, k),
+                output_shape: (m, n),
+                node_id: 0,
+                input_layers: vec![],
+            },
+            CircuitLayer {
+                layer_type: LayerType::MatMul { m, k, n, weight_node_id: weight_id_b },
+                input_shape: (m, k),
+                output_shape: (m, n),
+                node_id: 1,
+                input_layers: vec![0],
+            },
+            CircuitLayer {
+                layer_type: LayerType::Add { size: m * n },
+                input_shape: (m, n),
+                output_shape: (m, n),
+                node_id: 2,
+                input_layers: vec![0, 1],
+            },
+            // Block 1 (mirrors block 0)
+            CircuitLayer {
+                layer_type: LayerType::MatMul { m, k, n, weight_node_id: weight_id_a },
+                input_shape: (m, k),
+                output_shape: (m, n),
+                node_id: 3,
+                input_layers: vec![],
+            },
+            CircuitLayer {
+                layer_type: LayerType::MatMul { m, k, n, weight_node_id: weight_id_b },
+                input_shape: (m, k),
+                output_shape: (m, n),
+                node_id: 4,
+                input_layers: vec![3],
+            },
+            CircuitLayer {
+                layer_type: LayerType::Add { size: m * n },
+                input_shape: (m, n),
+                output_shape: (m, n),
+                node_id: 5,
+                input_layers: vec![3, 4],
+            },
+        ];
+
+        let circuit = LayeredCircuit {
+            layers,
+            block_ranges: vec![0..3, 3..6],
+            simd_config: Some(SIMDBatchConfig {
+                num_blocks: 2,
+                template_range: 0..3,
+                simd_log_size: 1,
+            }),
+            input_shape: (m, k),
+            output_shape: (m, n),
+        };
+
+        // Different input activations per block
+        let mut input_0 = M31Matrix::new(m, k);
+        for i in 0..(m * k) {
+            input_0.data[i] = M31::from((i + 1) as u32);
+        }
+        let mut input_1 = M31Matrix::new(m, k);
+        for i in 0..(m * k) {
+            input_1.data[i] = M31::from((i * 5 + 3) as u32 % 31 + 1);
+        }
+
+        // Forward pass for block 0
+        let a_out_0 = matmul_forward(&input_0, &w_a); // MatMul_A output
+        let b_out_0 = matmul_forward(&a_out_0, &w_b); // MatMul_B output
+        let mut add_out_0 = M31Matrix::new(m, n);
+        for i in 0..(m * n) {
+            add_out_0.data[i] = a_out_0.data[i] + b_out_0.data[i];
+        }
+
+        // Forward pass for block 1
+        let a_out_1 = matmul_forward(&input_1, &w_a);
+        let b_out_1 = matmul_forward(&a_out_1, &w_b);
+        let mut add_out_1 = M31Matrix::new(m, n);
+        for i in 0..(m * n) {
+            add_out_1.data[i] = a_out_1.data[i] + b_out_1.data[i];
+        }
+
+        // Build block executions
+        let mut node_outputs_0 = std::collections::HashMap::new();
+        node_outputs_0.insert(0usize, a_out_0.clone());
+        node_outputs_0.insert(1usize, b_out_0.clone());
+        let exec_0 = GraphExecution {
+            intermediates: vec![
+                (0, input_0.clone()),   // input to MatMul_A
+                (1, a_out_0.clone()),   // input to MatMul_B = MatMul_A output
+            ],
+            node_outputs: node_outputs_0,
+            output: add_out_0.clone(),
+        };
+
+        let mut node_outputs_1 = std::collections::HashMap::new();
+        node_outputs_1.insert(3usize, a_out_1.clone());
+        node_outputs_1.insert(4usize, b_out_1.clone());
+        let exec_1 = GraphExecution {
+            intermediates: vec![
+                (3, input_1.clone()),   // input to MatMul_C
+                (4, a_out_1.clone()),   // input to MatMul_D = MatMul_C output
+            ],
+            node_outputs: node_outputs_1,
+            output: add_out_1.clone(),
+        };
+
+        let block_executions = vec![exec_0, exec_1];
+
+        // Build weights
+        let mut weights = GraphWeights::new();
+        weights.add_weight(weight_id_a, w_a);
+        weights.add_weight(weight_id_b, w_b);
+
+        // Prove
+        let mut prover_channel = PoseidonChannel::new();
+        let proof = prove_gkr_simd_gpu(&circuit, &block_executions, &weights, &mut prover_channel)
+            .expect("SIMD GPU proving with DAG Add should succeed");
+
+        // Assert deferred proofs were generated
+        assert!(
+            !proof.deferred_proofs.is_empty(),
+            "DAG Add in SIMD path should produce deferred proofs, got 0"
+        );
+        assert_eq!(
+            proof.deferred_proofs.len(),
+            1,
+            "One Add layer = one deferred proof"
+        );
+        assert!(
+            proof.deferred_proofs[0].has_weights(),
+            "Deferred proof for MatMul skip should be MatMul kind (has weights)"
+        );
+
+        // Compute combined output for verifier
+        use crate::components::matmul::{
+            compute_lagrange_basis_pub, pad_matrix_pow2,
+        };
+        let r_simd_replay = {
+            let mut ch = PoseidonChannel::new();
+            ch.mix_u64(circuit.layers.len() as u64);
+            ch.mix_u64(circuit.input_shape.0 as u64);
+            ch.mix_u64(circuit.input_shape.1 as u64);
+            ch.mix_u64(2u64); // num_blocks
+            ch.draw_qm31s(1) // simd_log_size = 1
+        };
+        let block_weights_replay = compute_lagrange_basis_pub(&r_simd_replay);
+        let w0 = block_weights_replay[0];
+        let w1 = block_weights_replay[1];
+
+        let out_0_padded = pad_matrix_pow2(&add_out_0);
+        let out_1_padded = pad_matrix_pow2(&add_out_1);
+        let out_0_mle = crate::components::matmul::matrix_to_mle_pub(&out_0_padded);
+        let out_1_mle = crate::components::matmul::matrix_to_mle_pub(&out_1_padded);
+        let combined_output: Vec<SecureField> = out_0_mle
+            .iter()
+            .zip(&out_1_mle)
+            .map(|(&a, &b)| w0 * a + w1 * b)
+            .collect();
+
+        // Verify
+        let mut verifier_channel = PoseidonChannel::new();
+        let claim = verify_gkr_simd(&circuit, &proof, &combined_output, &mut verifier_channel)
+            .expect("SIMD verify with deferred proofs should succeed");
+
+        // The final claim should match the proof's input claim
+        assert_eq!(claim.point, proof.input_claim.point);
+        assert_eq!(claim.value, proof.input_claim.value);
     }
 }
