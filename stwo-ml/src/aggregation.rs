@@ -4006,6 +4006,7 @@ pub fn prove_model_aggregated_onchain_auto(
 /// - Phase 1 forward pass using precomputed C matrices (no weight loading)
 /// - Phase 2 skipped (proofs already provided)
 /// - Phase 3 STARK for non-matmul components (activations, add, mul, layernorm)
+#[allow(dead_code)] // Used by streaming pipeline when enabled
 pub(crate) fn prove_model_aggregated_onchain_with_precomputed(
     graph: &ComputationGraph,
     input: &M31Matrix,
