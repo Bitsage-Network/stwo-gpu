@@ -3112,9 +3112,9 @@ fn reduce_matmul_layer_dual_simd_gpu(
     assert_eq!(n_blocks, block_b_matrices.len());
     assert_eq!(n_blocks, block_weights.len());
     assert!(n_blocks.is_power_of_two(), "num_blocks must be power of 2");
-    debug_assert!(m <= (1 << 30), "matmul m={} exceeds 2^30", m);
-    debug_assert!(k <= (1 << 30), "matmul k={} exceeds 2^30", k);
-    debug_assert!(n <= (1 << 30), "matmul n={} exceeds 2^30", n);
+    assert!(m <= (1 << 30), "matmul m={} exceeds 2^30", m);
+    assert!(k <= (1 << 30), "matmul k={} exceeds 2^30", k);
+    assert!(n <= (1 << 30), "matmul n={} exceeds 2^30", n);
 
     let pm = m.next_power_of_two();
     let pk = k.next_power_of_two();
@@ -3434,9 +3434,9 @@ fn reduce_matmul_layer_with_backend<B: crate::backend::ZkmlOps>(
     // Preserve CPU reducer semantics: derive variable counts from actual
     // matrix shapes (after conceptual pow2 padding), while keeping the
     // original layer dims for transcript mixing.
-    debug_assert!(a.rows <= (1 << 30), "matmul rows={} exceeds 2^30", a.rows);
-    debug_assert!(a.cols <= (1 << 30), "matmul cols={} exceeds 2^30", a.cols);
-    debug_assert!(b.cols <= (1 << 30), "matmul b.cols={} exceeds 2^30", b.cols);
+    assert!(a.rows <= (1 << 30), "matmul rows={} exceeds 2^30", a.rows);
+    assert!(a.cols <= (1 << 30), "matmul cols={} exceeds 2^30", a.cols);
+    assert!(b.cols <= (1 << 30), "matmul b.cols={} exceeds 2^30", b.cols);
     let pm = a.rows.next_power_of_two();
     let pk = a.cols.next_power_of_two();
     let pn = b.cols.next_power_of_two();
