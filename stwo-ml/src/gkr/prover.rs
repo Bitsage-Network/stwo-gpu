@@ -25,9 +25,11 @@ use crate::components::matmul::matrix_to_mle_col_major_u32_padded_pub as matrix_
 #[cfg(test)]
 use crate::components::matmul::restrict_mle_pub as restrict_mle;
 use crate::components::matmul::{
-    evaluate_mle_pub as evaluate_mle, matrix_to_mle_col_major_pub as matrix_to_mle_col_major,
-    matrix_to_mle_pub as matrix_to_mle, pad_matrix_pow2, M31Matrix,
+    evaluate_mle_pub as evaluate_mle, matrix_to_mle_pub as matrix_to_mle, pad_matrix_pow2,
+    M31Matrix,
 };
+#[cfg(test)]
+use crate::components::matmul::matrix_to_mle_col_major_pub as matrix_to_mle_col_major;
 #[cfg(feature = "cuda-runtime")]
 use crate::crypto::aggregated_opening::prove_aggregated_binding_gpu;
 #[cfg(not(feature = "cuda-runtime"))]
@@ -276,7 +278,7 @@ fn apply_aggregated_oracle_sumcheck(
             .ok_or(GKRError::MissingWeight {
                 node_id: *weight_node_id,
             })?;
-        let b_mle = matrix_to_mle_col_major(b_matrix);
+        let b_mle = matrix_to_mle_col_major_padded(b_matrix);
         let n_vars = b_mle.len().trailing_zeros() as usize;
         let commitment = crate::crypto::mle_opening::commit_mle_root_only(&b_mle);
         weight_commitments.push(commitment);
@@ -311,7 +313,7 @@ fn apply_aggregated_oracle_sumcheck(
             .ok_or(GKRError::MissingWeight {
                 node_id: *weight_node_id,
             })?;
-        let b_mle = matrix_to_mle_col_major(b_matrix);
+        let b_mle = matrix_to_mle_col_major_padded(b_matrix);
         let n_vars = b_mle.len().trailing_zeros() as usize;
         let commitment = crate::crypto::mle_opening::commit_mle_root_only(&b_mle);
 
