@@ -1,0 +1,47 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          track_progress: true
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            You are reviewing a ZKML (zero-knowledge machine learning) protocol codebase.
+            This is a Rust project using the STWO prover framework for GKR-based ML verification.
+
+            Review this PR with focus on:
+            1. **Soundness**: Verify dimension checks use `!=` not `<`, no silent fallbacks
+            2. **Security**: No hardcoded keys, proper zeroization, no command injection
+            3. **Correctness**: Proper error handling, no unwrap() in non-test code
+            4. **Performance**: No O(n) lookups where O(1) is possible, no redundant clones
+            5. **STWO patterns**: Correct tree indices, proper LogUp finalization
+
+            Use inline comments for specific code issues.
+            Post a summary comment with overall assessment.
+
+          claude_args: |
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
