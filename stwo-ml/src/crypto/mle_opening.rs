@@ -504,6 +504,61 @@ pub fn commit_mle_root_only_gpu(
     Ok(root)
 }
 
+/// Compute the MLE commitment root from pre-packed u64 limbs on GPU.
+///
+/// Skips the SecureField → u64 conversion entirely. The caller provides
+/// `leaf_limbs` already in GPU Poseidon format (4 u64s per element, padded
+/// to power-of-2 with zeros). `n_elements` is the total padded element count.
+///
+/// The limb buffer is borrowed, not consumed — callers can reuse it across
+/// matrices (optimization #1: buffer reuse).
+#[cfg(feature = "cuda-runtime")]
+pub fn commit_mle_root_only_gpu_from_limbs(
+    leaf_limbs: &[u64],
+    n_elements: usize,
+    executor: &CudaFftExecutor,
+    d_round_constants: &CudaSlice<u64>,
+) -> Result<FieldElement, String> {
+    assert!(n_elements >= 2, "need at least 2 elements");
+    assert!(n_elements.is_power_of_two(), "n_elements must be power of 2");
+    assert!(
+        leaf_limbs.len() >= n_elements * 4,
+        "limb buffer too small: need {} got {}",
+        n_elements * 4,
+        leaf_limbs.len()
+    );
+    let n_leaf_hashes = n_elements / 2;
+
+    // Upload leaf limbs to GPU (borrow — caller keeps ownership for reuse)
+    let d_prev_leaf = executor
+        .device
+        .htod_sync_copy(&leaf_limbs[..n_elements * 4])
+        .map_err(|e| format!("H2D leaf limbs: {:?}", e))?;
+    let d_dummy_columns = executor
+        .device
+        .htod_sync_copy(&[0u32])
+        .map_err(|e| format!("H2D dummy columns: {:?}", e))?;
+
+    // Run GPU Poseidon Merkle — layers stay on device, download only root.
+    let gpu_tree = executor
+        .execute_poseidon252_merkle_full_tree_gpu_layers(
+            &d_dummy_columns,
+            0,
+            Some(&d_prev_leaf),
+            n_leaf_hashes,
+            d_round_constants,
+        )
+        .map_err(|e| format!("execute full-tree: {e}"))?;
+
+    let root_limbs = gpu_tree
+        .root_u64()
+        .map_err(|e| format!("download GPU root: {e}"))?;
+    let root = u64_limbs_to_field_element(&root_limbs)
+        .ok_or_else(|| "invalid root limbs from GPU Merkle tree".to_string())?;
+
+    Ok(root)
+}
+
 /// Generate an MLE opening proof.
 ///
 /// Given evaluations `evals` on `{0,1}^n`, challenges `challenges` (the sumcheck

@@ -1524,6 +1524,83 @@ pub fn matrix_to_mle_col_major_u32_padded_pub(matrix: &M31Matrix) -> Vec<u32> {
     matrix_to_mle_col_major_u32_padded(matrix)
 }
 
+/// Fused single-pass MLE construction producing all three representations at once.
+///
+/// Traverses the matrix once in column-major order and produces:
+/// - `Vec<SecureField>`: padded MLE evaluations (for aggregated binding)
+/// - `Vec<u32>`: padded QM31 AoS u32 words (for GPU opening proofs)
+/// - u64 limbs written into `limb_buf` (for GPU Poseidon commitment)
+///
+/// `limb_buf` must have length >= `padded_rows * padded_cols * 4` and is zero-filled
+/// by the caller. Only elements corresponding to actual matrix data are written.
+///
+/// Eliminates 2 redundant passes over the matrix vs calling the three functions separately.
+#[cfg(feature = "cuda-runtime")]
+pub fn matrix_to_mle_col_major_all_padded(
+    matrix: &M31Matrix,
+    limb_buf: &mut [u64],
+) -> (Vec<SecureField>, Vec<u32>) {
+    let padded_rows = matrix.rows.next_power_of_two();
+    let padded_cols = matrix.cols.next_power_of_two();
+    let n = padded_rows * padded_cols;
+    assert!(n.is_power_of_two(), "matrix size must be power of 2");
+    assert!(
+        limb_buf.len() >= n * 4,
+        "limb_buf too small: need {} got {}",
+        n * 4,
+        limb_buf.len()
+    );
+
+    let mut evals = vec![SecureField::zero(); n];
+    let mut evals_u32 = vec![0u32; n * 4];
+
+    if n >= 65536 {
+        use rayon::prelude::*;
+        let src_rows = matrix.rows;
+        let src_cols = matrix.cols;
+
+        // Split all three outputs into column-sized chunks and process in parallel.
+        // Each column chunk is independent — no synchronization needed.
+        let secure_chunks = evals.par_chunks_mut(padded_rows);
+        let u32_chunks = evals_u32.par_chunks_mut(padded_rows * 4);
+        let limb_chunks = limb_buf[..n * 4].par_chunks_mut(padded_rows * 4);
+
+        secure_chunks
+            .zip(u32_chunks)
+            .zip(limb_chunks)
+            .enumerate()
+            .for_each(|(j, ((sec_col, u32_col), limb_col))| {
+                if j < src_cols {
+                    for i in 0..src_rows {
+                        let val = matrix.data[i * src_cols + j].0;
+                        sec_col[i] = SecureField::from(stwo::core::fields::m31::M31::from(val));
+                        u32_col[i * 4] = val;
+                        // Pack: (1 << 124) | (val << 93) — b,c,d are 0
+                        let packed = (1u128 << 124) | ((val as u128) << 93);
+                        limb_col[i * 4] = packed as u64;
+                        limb_col[i * 4 + 1] = (packed >> 64) as u64;
+                        // limb_col[i*4+2] and [i*4+3] stay 0 (pre-zeroed by caller)
+                    }
+                }
+                // Padding rows/cols stay zero in all three representations
+            });
+    } else {
+        for i in 0..matrix.rows {
+            for j in 0..matrix.cols {
+                let idx = j * padded_rows + i;
+                let val = matrix.get(i, j).0;
+                evals[idx] = SecureField::from(stwo::core::fields::m31::M31::from(val));
+                evals_u32[idx * 4] = val;
+                let packed = (1u128 << 124) | ((val as u128) << 93);
+                limb_buf[idx * 4] = packed as u64;
+                limb_buf[idx * 4 + 1] = (packed >> 64) as u64;
+            }
+        }
+    }
+
+    (evals, evals_u32)
+}
+
 /// Public wrapper for `compute_lagrange_basis`.
 pub fn compute_lagrange_basis_pub(challenges: &[SecureField]) -> Vec<SecureField> {
     compute_lagrange_basis(challenges)

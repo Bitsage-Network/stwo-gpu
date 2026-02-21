@@ -21,6 +21,8 @@ use crate::components::matmul::matmul_m31;
 use crate::components::matmul::matrix_to_mle_col_major_padded_pub as matrix_to_mle_col_major_padded;
 #[cfg(feature = "cuda-runtime")]
 use crate::components::matmul::matrix_to_mle_col_major_u32_padded_pub as matrix_to_mle_col_major_u32_padded;
+#[cfg(feature = "cuda-runtime")]
+use crate::components::matmul::matrix_to_mle_col_major_all_padded;
 #[cfg(test)]
 use crate::components::matmul::restrict_mle_pub as restrict_mle;
 use crate::components::matmul::{
@@ -383,83 +385,223 @@ fn apply_aggregated_oracle_sumcheck(
 
             if !GPU_COMMITMENT_LOGGED.swap(true, AtomicOrdering::Relaxed) {
                 eprintln!(
-                    "  [{log_tag}] weight commitment backend: GPU Poseidon Merkle",
+                    "  [{log_tag}] weight commitment backend: GPU Poseidon Merkle (pipelined)",
                 );
             }
+
+            // Optimization 1: Reusable limb buffers — allocate once for the max
+            // padded matrix size, reuse across all 160+ matrices.
+            // Two buffers for double-buffering (optimization 3: pipelining).
+            let max_padded_n = prep_inputs.iter().map(|input| {
+                let b = weights.get_weight(input.weight_node_id);
+                b.map(|m| {
+                    m.rows.next_power_of_two() * m.cols.next_power_of_two()
+                }).unwrap_or(0)
+            }).max().unwrap_or(0);
+            let limb_buf_size = max_padded_n * 4;
+
+            let mut limb_buf_a = vec![0u64; limb_buf_size];
+            let mut limb_buf_b = vec![0u64; limb_buf_size];
+
+            // Pipelined processing: while GPU commits matrix N, CPU prepares matrix N+1.
+            //
+            // Optimization 2: fused matrix_to_mle_col_major_all_padded produces
+            // SecureField MLE + u32 MLE + u64 limbs in a single matrix traversal.
+            //
+            // Optimization 3: std::thread::scope overlaps CPU prep with GPU work.
+            struct PreparedMatrix {
+                mle: Vec<SecureField>,
+                mle_u32: Vec<u32>,
+                n_elements: usize,
+                n_vars: usize,
+            }
+
+            // Prepare first matrix eagerly (no overlap possible for matrix 0)
+            let first_input = &prep_inputs[0];
+            let first_matrix = weights
+                .get_weight(first_input.weight_node_id)
+                .ok_or(GKRError::MissingWeight {
+                    node_id: first_input.weight_node_id,
+                })?;
+            let first_n = first_matrix.rows.next_power_of_two()
+                * first_matrix.cols.next_power_of_two();
+            // Zero the active region for the first matrix
+            limb_buf_a[..first_n * 4].fill(0);
+            let (first_mle, first_u32) =
+                matrix_to_mle_col_major_all_padded(first_matrix, &mut limb_buf_a);
+            let mut current_prep = PreparedMatrix {
+                n_vars: first_mle.len().trailing_zeros() as usize,
+                n_elements: first_n,
+                mle: first_mle,
+                mle_u32: first_u32,
+            };
 
             let mut results = Vec::with_capacity(total_claims);
             let mut gpu_count = 0usize;
             let mut cpu_fallback_count = 0usize;
-            for (idx, input) in prep_inputs.iter().enumerate() {
-                let b_matrix = weights
-                    .get_weight(input.weight_node_id)
-                    .ok_or(GKRError::MissingWeight {
-                        node_id: input.weight_node_id,
-                    })?;
-                let b_mle = matrix_to_mle_col_major_padded(b_matrix);
-                let n_vars = b_mle.len().trailing_zeros() as usize;
+            // Track which buffer has current limbs (true = A, false = B)
+            let mut current_is_a = true;
 
-                // Try GPU Poseidon Merkle root (~100-200ms per matrix vs ~3-5s CPU).
-                // On failure, fall back to CPU for this matrix unless strict mode.
-                let commitment = match crate::crypto::mle_opening::commit_mle_root_only_gpu(
-                    &b_mle, executor, &d_rc,
-                ) {
-                    Ok(root) => {
-                        gpu_count += 1;
-                        root
-                    }
-                    Err(e) => {
-                        if gpu_strict {
-                            return Err(GKRError::ReductionError {
-                                layer_idx: 0,
-                                reason: format!(
-                                    "GPU MLE commitment strict mode: GPU failed for matrix {}: {e}",
-                                    idx
-                                ),
-                            });
-                        }
-                        if !GPU_COMMITMENT_FALLBACK_LOGGED.swap(true, AtomicOrdering::Relaxed) {
+            for idx in 0..total_claims {
+                let input = &prep_inputs[idx];
+
+                // GPU: commit current matrix from the active limb buffer.
+                // CPU (parallel thread): prepare next matrix into the OTHER buffer.
+                let current_limb_buf = if current_is_a { &limb_buf_a } else { &limb_buf_b };
+                let cur_n_elements = current_prep.n_elements;
+
+                // If there's a next matrix, prepare it in parallel with GPU work.
+                let next_prep = if idx + 1 < total_claims {
+                    let next_input = &prep_inputs[idx + 1];
+                    let next_matrix = weights
+                        .get_weight(next_input.weight_node_id)
+                        .ok_or(GKRError::MissingWeight {
+                            node_id: next_input.weight_node_id,
+                        })?;
+                    let next_n = next_matrix.rows.next_power_of_two()
+                        * next_matrix.cols.next_power_of_two();
+                    let next_buf = if current_is_a { &mut limb_buf_b } else { &mut limb_buf_a };
+                    // Zero the active region before fused write
+                    next_buf[..next_n * 4].fill(0);
+                    // Spawn CPU prep in a scoped thread — runs concurrently with GPU below.
+                    // Using Option to move result out of the scope.
+                    let mut next_result: Option<PreparedMatrix> = None;
+                    std::thread::scope(|s| {
+                        let cpu_handle = s.spawn(|| {
+                            let (mle, u32_mle) =
+                                matrix_to_mle_col_major_all_padded(next_matrix, next_buf);
+                            PreparedMatrix {
+                                n_vars: mle.len().trailing_zeros() as usize,
+                                n_elements: next_n,
+                                mle,
+                                mle_u32: u32_mle,
+                            }
+                        });
+
+                        // GPU: commit current matrix (runs while CPU thread prepares next)
+                        let commitment = match crate::crypto::mle_opening::commit_mle_root_only_gpu_from_limbs(
+                            current_limb_buf, cur_n_elements, executor, &d_rc,
+                        ) {
+                            Ok(root) => {
+                                gpu_count += 1;
+                                root
+                            }
+                            Err(e) => {
+                                if gpu_strict {
+                                    // Can't return Err from scope, so we push Err result
+                                    results.push(Err(GKRError::ReductionError {
+                                        layer_idx: 0,
+                                        reason: format!(
+                                            "GPU MLE commitment strict mode: GPU failed for matrix {}: {e}",
+                                            idx
+                                        ),
+                                    }));
+                                    // Still need to join the CPU thread
+                                    next_result = Some(cpu_handle.join().expect("CPU prep thread panicked"));
+                                    return;
+                                }
+                                if !GPU_COMMITMENT_FALLBACK_LOGGED.swap(true, AtomicOrdering::Relaxed) {
+                                    eprintln!(
+                                        "  [{log_tag}] weight commitment: GPU failed for matrix {}, falling back to CPU ({e})",
+                                        idx
+                                    );
+                                }
+                                cpu_fallback_count += 1;
+                                crate::crypto::mle_opening::commit_mle_root_only(&current_prep.mle)
+                            }
+                        };
+
+                        // Wait for CPU prep to finish
+                        next_result = Some(cpu_handle.join().expect("CPU prep thread panicked"));
+
+                        let finished = idx + 1;
+                        if finished % 10 == 0 || finished == total_claims {
                             eprintln!(
-                                "  [{log_tag}] weight commitment: GPU failed for matrix {}, falling back to CPU ({e})",
-                                idx
+                                "  [{log_tag}] weight commitments: {finished}/{total_claims} done ({:.1}s, gpu={gpu_count} cpu={cpu_fallback_count})",
+                                t_commit.elapsed().as_secs_f64(),
                             );
                         }
-                        cpu_fallback_count += 1;
-                        crate::crypto::mle_opening::commit_mle_root_only(&b_mle)
+
+                        // Check if we pushed an error (strict mode GPU failure)
+                        if results.last().map(|r| r.is_err()).unwrap_or(false) {
+                            return;
+                        }
+
+                        results.push(Ok(WeightPrepResult {
+                            matrix_index: input.matrix_index,
+                            n_vars: current_prep.n_vars,
+                            commitment,
+                            eval_point: input.eval_point.to_vec(),
+                            expected_value: input.expected_value,
+                            mle: std::mem::take(&mut current_prep.mle),
+                            mle_u32: std::mem::take(&mut current_prep.mle_u32),
+                            is_deferred: input.is_deferred,
+                            deferred_idx: input.deferred_idx,
+                        }));
+                    }); // end thread::scope
+
+                    // Propagate strict-mode errors
+                    if results.last().map(|r| r.is_err()).unwrap_or(false) {
+                        break;
                     }
-                };
 
-                let mle_u32 = {
-                    let u32_mle = matrix_to_mle_col_major_u32_padded(b_matrix);
-                    debug_assert_eq!(
-                        n_vars,
-                        (u32_mle.len() / 4).trailing_zeros() as usize,
-                        "n_vars mismatch: SecureField MLE has {n_vars} vars, u32 MLE has {} vars (weight node {})",
-                        (u32_mle.len() / 4).trailing_zeros(),
-                        input.weight_node_id,
-                    );
-                    u32_mle
-                };
+                    next_result
+                } else {
+                    // Last matrix — no next to prefetch, just GPU commit.
+                    let commitment = match crate::crypto::mle_opening::commit_mle_root_only_gpu_from_limbs(
+                        current_limb_buf, cur_n_elements, executor, &d_rc,
+                    ) {
+                        Ok(root) => {
+                            gpu_count += 1;
+                            root
+                        }
+                        Err(e) => {
+                            if gpu_strict {
+                                results.push(Err(GKRError::ReductionError {
+                                    layer_idx: 0,
+                                    reason: format!(
+                                        "GPU MLE commitment strict mode: GPU failed for matrix {}: {e}",
+                                        idx
+                                    ),
+                                }));
+                                break;
+                            }
+                            if !GPU_COMMITMENT_FALLBACK_LOGGED.swap(true, AtomicOrdering::Relaxed) {
+                                eprintln!(
+                                    "  [{log_tag}] weight commitment: GPU failed for matrix {}, falling back to CPU ({e})",
+                                    idx
+                                );
+                            }
+                            cpu_fallback_count += 1;
+                            crate::crypto::mle_opening::commit_mle_root_only(&current_prep.mle)
+                        }
+                    };
 
-                let finished = idx + 1;
-                if finished % 10 == 0 || finished == total_claims {
                     eprintln!(
-                        "  [{log_tag}] weight commitments: {finished}/{total_claims} done ({:.1}s, gpu={gpu_count} cpu={cpu_fallback_count})",
+                        "  [{log_tag}] weight commitments: {}/{total_claims} done ({:.1}s, gpu={gpu_count} cpu={cpu_fallback_count})",
+                        idx + 1,
                         t_commit.elapsed().as_secs_f64(),
                     );
-                }
 
-                results.push(Ok(WeightPrepResult {
-                    matrix_index: input.matrix_index,
-                    n_vars,
-                    commitment,
-                    eval_point: input.eval_point.to_vec(),
-                    expected_value: input.expected_value,
-                    mle: b_mle,
-                    mle_u32,
-                    is_deferred: input.is_deferred,
-                    deferred_idx: input.deferred_idx,
-                }));
+                    results.push(Ok(WeightPrepResult {
+                        matrix_index: input.matrix_index,
+                        n_vars: current_prep.n_vars,
+                        commitment,
+                        eval_point: input.eval_point.to_vec(),
+                        expected_value: input.expected_value,
+                        mle: std::mem::take(&mut current_prep.mle),
+                        mle_u32: std::mem::take(&mut current_prep.mle_u32),
+                        is_deferred: input.is_deferred,
+                        deferred_idx: input.deferred_idx,
+                    }));
+                    None
+                };
+
+                // Swap buffers + advance prepared data for next iteration
+                if let Some(next) = next_prep {
+                    current_prep = next;
+                    current_is_a = !current_is_a;
+                }
             }
             results
         } else {
