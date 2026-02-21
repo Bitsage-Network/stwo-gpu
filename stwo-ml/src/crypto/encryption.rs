@@ -129,7 +129,7 @@ fn verify_mac(expected: &[M31; 4], actual: &[M31; 4]) -> bool {
 /// Encrypt a note memo with Encrypt-then-MAC authentication.
 ///
 /// Payload: (asset_id, amount_lo, amount_hi, blinding[0..4]) = 7 M31 elements.
-/// Returns: encrypted payload (8 M31) + MAC tag (4 M31) = 12 elements total.
+/// Returns: encrypted payload (7 M31) + MAC tag (4 M31) = 11 elements total.
 ///
 /// The MAC provides ciphertext integrity: any tampering is detected by
 /// `decrypt_note_memo` before decryption is returned.
