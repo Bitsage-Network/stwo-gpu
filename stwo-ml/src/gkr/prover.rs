@@ -368,6 +368,11 @@ fn apply_aggregated_oracle_sumcheck(
 /// Apply aggregated RLC weight binding.
 ///
 /// Returns weight claims with the combined expected value mixed into the channel.
+///
+/// SECURITY: Off-chain verifier only — the Fiat-Shamir ordering (draw rho before
+/// committing evaluations) is sound only when the verifier independently recomputes
+/// combined_actual via `verify_gkr_with_weights`. Must NOT be used on a trustless
+/// verifier path without reordering commit-before-challenge.
 fn apply_aggregated_rlc_binding(
     weight_data: &[(usize, Vec<SecureField>, SecureField)],
     deferred_weight_claims_data: &[(usize, Vec<SecureField>, SecureField)],

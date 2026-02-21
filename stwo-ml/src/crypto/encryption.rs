@@ -240,8 +240,12 @@ pub trait AuditEncryption {
         recipient_keys: &[[M31; RATE]],
     ) -> Vec<Vec<M31>>;
 
-    /// Decrypt ciphertext with a private key.
-    /// The `nonce` must match the one used during encryption.
+    /// Decrypt ciphertext with a private key (raw, no MAC verification).
+    ///
+    /// WARNING: This does NOT verify ciphertext integrity. Callers MUST use
+    /// `decrypt_note_memo` (which checks the Encrypt-then-MAC tag) for any
+    /// security-sensitive path. This raw decryption is only suitable for
+    /// audit log replay where integrity is verified externally.
     fn decrypt_with_key(
         &self,
         ciphertext: &[M31],
