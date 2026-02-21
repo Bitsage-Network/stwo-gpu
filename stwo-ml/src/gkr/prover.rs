@@ -2853,8 +2853,7 @@ pub fn prove_gkr_simd_gpu(
     // IO commitment from first block's input and combined output
     let model_input = block_executions[0]
         .intermediates
-        .first()
-        .map(|(_, m)| m)
+        .get(&0)
         .unwrap_or(&block_executions[0].output);
     let io_commitment =
         crate::aggregation::compute_io_commitment(model_input, &block_executions[0].output);
