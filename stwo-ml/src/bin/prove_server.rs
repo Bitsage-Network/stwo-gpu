@@ -430,9 +430,24 @@ async fn load_model(
     State(state): State<Arc<AppState>>,
     Json(req): Json<LoadModelRequest>,
 ) -> Result<(StatusCode, Json<LoadModelResponse>), (StatusCode, Json<ErrorResponse>)> {
+    // Validate model paths — reject traversal attempts
+    let reject_traversal = |p: &std::path::Path| -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        let s = p.to_string_lossy();
+        if s.contains("..") {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Path traversal not allowed".to_string(),
+                }),
+            ));
+        }
+        Ok(())
+    };
+
     // Support either ONNX file or HF directory
     let onnx = if let Some(ref model_dir) = req.model_dir {
         let path = std::path::PathBuf::from(model_dir);
+        reject_traversal(&path)?;
         load_hf_model(&path, None).map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
@@ -443,6 +458,7 @@ async fn load_model(
         })?
     } else {
         let path = std::path::PathBuf::from(&req.model_path);
+        reject_traversal(&path)?;
         load_onnx(&path).map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
