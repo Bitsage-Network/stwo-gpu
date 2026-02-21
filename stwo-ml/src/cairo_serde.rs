@@ -671,52 +671,6 @@ fn serialize_batched_matmul_for_recursive(
     }
 }
 
-/// Compressed variant: round polys use 8 felts (c0, c2) instead of 12.
-fn serialize_matmul_for_recursive_compressed(
-    proof: &MatMulSumcheckProofOnChain,
-    output: &mut Vec<FieldElement>,
-) {
-    serialize_u32(proof.m, output);
-    serialize_u32(proof.k, output);
-    serialize_u32(proof.n, output);
-    serialize_u32(proof.num_rounds, output);
-    serialize_qm31(proof.claimed_sum, output);
-    serialize_u32(proof.round_polys.len() as u32, output);
-    for rp in &proof.round_polys {
-        serialize_round_poly_compressed(&rp.compress(), output);
-    }
-    serialize_qm31(proof.final_a_eval, output);
-    serialize_qm31(proof.final_b_eval, output);
-    output.push(proof.a_commitment);
-    output.push(proof.b_commitment);
-}
-
-/// Compressed variant: round polys use 8 felts (c0, c2) instead of 12.
-fn serialize_batched_matmul_for_recursive_compressed(
-    batch: &BatchedMatMulProofOnChain,
-    output: &mut Vec<FieldElement>,
-) {
-    serialize_u32(batch.k, output);
-    serialize_u32(batch.num_rounds, output);
-    serialize_qm31(batch.lambda, output);
-    serialize_qm31(batch.combined_claimed_sum, output);
-    serialize_u32(batch.round_polys.len() as u32, output);
-    for rp in &batch.round_polys {
-        serialize_round_poly_compressed(&rp.compress(), output);
-    }
-    serialize_u32(batch.entries.len() as u32, output);
-    for entry in &batch.entries {
-        serialize_u32(entry.node_id as u32, output);
-        serialize_u32(entry.m, output);
-        serialize_u32(entry.n, output);
-        serialize_qm31(entry.claimed_sum, output);
-        serialize_qm31(entry.final_a_eval, output);
-        serialize_qm31(entry.final_b_eval, output);
-        output.push(entry.a_commitment);
-        output.push(entry.b_commitment);
-    }
-}
-
 // === Unified STARK Proof Serialization ===
 
 /// Bridge from Rust `LayerClaim` to Cairo's `ActivationClaim` fields.

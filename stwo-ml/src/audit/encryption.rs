@@ -721,7 +721,7 @@ mod poseidon2_impl {
 
     use super::*;
     use crate::crypto::encryption::{derive_key, poseidon2_decrypt, poseidon2_encrypt};
-    use crate::crypto::poseidon2_m31::{poseidon2_hash, RATE};
+    use crate::crypto::poseidon2_m31::RATE;
 
     /// M31 field modulus: P = 2^31 - 1.
     const P: u32 = 2147483647;

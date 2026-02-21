@@ -22,7 +22,7 @@ use crate::components::matmul::matmul_m31;
 use crate::components::matmul::matrix_to_mle_col_major_padded_pub as matrix_to_mle_col_major_padded;
 #[cfg(feature = "cuda-runtime")]
 use crate::components::matmul::matrix_to_mle_col_major_u32_padded_pub as matrix_to_mle_col_major_u32_padded;
-#[cfg(any(feature = "cuda-runtime", test))]
+#[cfg(test)]
 use crate::components::matmul::restrict_mle_pub as restrict_mle;
 use crate::components::matmul::{
     evaluate_mle_pub as evaluate_mle, matrix_to_mle_col_major_pub as matrix_to_mle_col_major,
@@ -30,7 +30,9 @@ use crate::components::matmul::{
 };
 #[cfg(feature = "cuda-runtime")]
 use crate::crypto::aggregated_opening::prove_aggregated_binding_gpu;
-use crate::crypto::aggregated_opening::{prove_aggregated_binding, AggregatedWeightClaim};
+#[cfg(not(feature = "cuda-runtime"))]
+use crate::crypto::aggregated_opening::prove_aggregated_binding;
+use crate::crypto::aggregated_opening::AggregatedWeightClaim;
 use crate::crypto::poseidon_channel::PoseidonChannel;
 
 use super::circuit::{LayerType, LayeredCircuit};
@@ -922,7 +924,7 @@ pub fn prove_gkr(
         && (!weight_data.is_empty() || !deferred_weight_claims_data.is_empty())
         && !use_aggregated_oracle_sumcheck;
 
-    let (mut weight_claims, weight_commitments_new);
+    let (weight_claims, weight_commitments_new);
 
     if use_aggregated_oracle_sumcheck {
         weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
@@ -1612,7 +1614,7 @@ pub fn prove_gkr_gpu(
         && (total_openings > 0 || !deferred_weight_claims_data.is_empty())
         && !use_aggregated_oracle_sumcheck;
 
-    let mut weight_commitments_new;
+    let weight_commitments_new;
     if use_aggregated_oracle_sumcheck {
         weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
         let (wc, claims, proof) = apply_aggregated_oracle_sumcheck(
@@ -2759,7 +2761,7 @@ pub fn prove_gkr_simd_gpu(
         && (!weight_data.is_empty() || !deferred_weight_claims_data.is_empty())
         && !use_aggregated_oracle_sumcheck;
 
-    let mut weight_commitments_new;
+    let weight_commitments_new;
     if use_aggregated_oracle_sumcheck {
         weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
         let (wc, claims, proof) = apply_aggregated_oracle_sumcheck(

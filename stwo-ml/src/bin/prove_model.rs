@@ -1604,7 +1604,9 @@ fn submit_gkr_onchain(
         let circuit_desc = build_circuit_descriptor(&circuit);
         let mut register_weight_commitments = gkr_proof.weight_commitments.clone();
         for deferred in &gkr_proof.deferred_proofs {
-            register_weight_commitments.push(deferred.weight_commitment);
+            if let Some(wc) = deferred.weight_commitment() {
+                register_weight_commitments.push(wc);
+            }
         }
         let register_calldata =
             build_register_gkr_calldata(model_id, &register_weight_commitments, &circuit_desc);

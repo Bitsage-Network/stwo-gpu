@@ -275,30 +275,6 @@ fn global_point(
     g
 }
 
-/// Which matrix is "active" at a partial assignment of selector bits?
-///
-/// For a partial point with `assigned` selector bits, returns the matrix index
-/// range that could match.
-fn active_matrix_for_selector(selector_bits: &[SecureField], n_selector: usize) -> Option<usize> {
-    // Only works on boolean selector assignments
-    let one = SecureField::from(M31::from(1));
-    let zero = SecureField::zero();
-
-    let mut idx = 0usize;
-    for (i, &bit) in selector_bits.iter().enumerate() {
-        let bit_pos = n_selector - 1 - i;
-        if bit == one {
-            idx |= 1 << bit_pos;
-        } else if bit == zero {
-            // ok
-        } else {
-            // Non-boolean — we're in the sumcheck random challenge domain
-            return None;
-        }
-    }
-    Some(idx)
-}
-
 /// Evaluate the virtual unified oracle at a global point `t`.
 ///
 /// `t` = [selector_bits || local_bits] where selector picks the matrix
@@ -532,7 +508,7 @@ fn eval_round_at_value(
     // For each claim, compute its contribution
     for (i, claim) in claims.iter().enumerate() {
         let gp = &global_points[i];
-        let n_vars = claim.local_n_vars;
+        let _n_vars = claim.local_n_vars;
 
         // eq factor for this round variable
         let eq_round = gp[round] * value + (one - gp[round]) * (one - value);
