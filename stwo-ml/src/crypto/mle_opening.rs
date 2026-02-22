@@ -298,66 +298,6 @@ fn commit_mle_from_qm31_u32_aos(evals_u32: &[u32]) -> (FieldElement, PoseidonMer
 }
 
 #[cfg(feature = "cuda-runtime")]
-fn build_gpu_opening_tree_from_qm31_u32_device_with_ctx(
-    executor: &CudaFftExecutor,
-    d_rc: &CudaSlice<u64>,
-    d_dummy_columns: &CudaSlice<u32>,
-    d_qm31_aos: &CudaSlice<u32>,
-    n_points: usize,
-) -> Result<(FieldElement, Poseidon252MerkleGpuTree), String> {
-    assert!(n_points > 0);
-    assert!(n_points.is_power_of_two());
-    if d_qm31_aos.len() != n_points * 4 {
-        return Err(format!(
-            "device QM31 AoS size mismatch: expected {} words, got {}",
-            n_points * 4,
-            d_qm31_aos.len()
-        ));
-    }
-
-    let n_leaf_hashes = n_points / 2;
-    if n_leaf_hashes == 0 {
-        return Err("cannot build gpu opening tree for single-point input".to_string());
-    }
-
-    // Pack QM31 AoS words into felt252 limbs.
-    // NOTE: this uses a host-side conversion step when a dedicated CUDA pack
-    // kernel is unavailable in the linked stwo backend.
-    let mut qm31_words = vec![0u32; n_points * 4];
-    executor
-        .device
-        .dtoh_sync_copy_into(d_qm31_aos, &mut qm31_words)
-        .map_err(|e| format!("D2H qm31 words: {:?}", e))?;
-    let mut leaf_limbs = vec![0u64; n_points * 4];
-    leaf_limbs
-        .par_chunks_mut(4)
-        .zip(qm31_words.par_chunks_exact(4))
-        .for_each(|(dst, src)| {
-            dst.copy_from_slice(&qm31_u32_to_u64_limbs_direct(src));
-        });
-    let d_prev_leaf = executor
-        .device
-        .htod_sync_copy(&leaf_limbs)
-        .map_err(|e| format!("H2D packed felt252 limbs: {:?}", e))?;
-
-    let tree = executor
-        .execute_poseidon252_merkle_full_tree_gpu_layers(
-            d_dummy_columns,
-            0,
-            Some(&d_prev_leaf),
-            n_leaf_hashes,
-            d_rc,
-        )
-        .map_err(|e| format!("execute full-tree gpu layers: {e}"))?;
-    let root_limbs = tree
-        .root_u64()
-        .map_err(|e| format!("download gpu root: {e}"))?;
-    let root = u64_limbs_to_felt252(&root_limbs)
-        .ok_or_else(|| "invalid root limbs from gpu merkle tree".to_string())?;
-    Ok((root, tree))
-}
-
-#[cfg(feature = "cuda-runtime")]
 fn build_gpu_merkle_path_with_leaf_sibling(
     tree: &Poseidon252MerkleGpuTree,
     leaf_idx: usize,
