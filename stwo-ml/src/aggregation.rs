@@ -3297,11 +3297,12 @@ where
 
     let has_logup = !activation_layers.is_empty()
         || !layernorm_layers.is_empty()
+        || !rmsnorm_layers.is_empty()
         || !embedding_layers.is_empty()
         || !quantize_layers.is_empty()
         || !dequantize_layers.is_empty();
 
-    // Tree 0: Preprocessed (activation tables + layernorm rsqrt tables + embedding tables + quantize range tables)
+    // Tree 0: Preprocessed (activation tables + layernorm rsqrt tables + rmsnorm rsqrt tables + embedding tables + quantize range tables)
     {
         let mut tree_builder = commitment_scheme.tree_builder();
         for layer in &activation_layers {
@@ -3322,6 +3323,17 @@ where
                 build_table_columns::<SimdBackend>(&layer.rsqrt_table, layer_size);
             let simd_evals = vec![
                 CircleEvaluation::new(layer_domain, table_var_col),
+                CircleEvaluation::new(layer_domain, table_rsqrt_col),
+            ];
+            tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
+        }
+        for layer in &rmsnorm_layers {
+            let layer_size = 1usize << layer.log_size;
+            let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
+            let (table_rms_col, table_rsqrt_col) =
+                build_table_columns::<SimdBackend>(&layer.rsqrt_table, layer_size);
+            let simd_evals = vec![
+                CircleEvaluation::new(layer_domain, table_rms_col),
                 CircleEvaluation::new(layer_domain, table_rsqrt_col),
             ];
             tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
