@@ -201,6 +201,43 @@ impl PoseidonMerkleTree {
         Self { layers }
     }
 
+    /// Compute only the Merkle root from QM31 u32 AoS data.
+    ///
+    /// Input layout: `[a0,b0,c0,d0, a1,b1,c1,d1, ...]`.
+    /// Converts to FieldElement leaves and computes root without storing layers.
+    pub fn root_only_from_qm31_u32_aos(words: &[u32]) -> FieldElement {
+        assert!(!words.is_empty(), "cannot compute root from empty words");
+        assert!(words.len() % 4 == 0, "QM31 AoS words must be multiple of 4");
+        let n_points = words.len() / 4;
+
+        let leaves: Vec<FieldElement> = if n_points >= 256 {
+            words
+                .par_chunks_exact(4)
+                .map(|c| {
+                    let packed = (1u128 << 124)
+                        | ((c[0] as u128) << 93)
+                        | ((c[1] as u128) << 62)
+                        | ((c[2] as u128) << 31)
+                        | (c[3] as u128);
+                    FieldElement::from(packed)
+                })
+                .collect()
+        } else {
+            words
+                .chunks_exact(4)
+                .map(|c| {
+                    let packed = (1u128 << 124)
+                        | ((c[0] as u128) << 93)
+                        | ((c[1] as u128) << 62)
+                        | ((c[2] as u128) << 31)
+                        | (c[3] as u128);
+                    FieldElement::from(packed)
+                })
+                .collect()
+        };
+        Self::root_only_parallel(leaves)
+    }
+
     /// Compute only the Merkle root without storing intermediate layers.
     ///
     /// Uses rayon for large layers. Returns just the root FieldElement.

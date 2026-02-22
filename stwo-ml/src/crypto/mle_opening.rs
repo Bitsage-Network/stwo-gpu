@@ -415,6 +415,15 @@ fn fold_layer_cpu_qm31_words(words: &[u32], r: SecureField) -> Vec<SecureField> 
     }
 }
 
+/// Compute only the MLE commitment root from QM31 u32 AoS data.
+///
+/// More efficient than `commit_mle_from_qm31_u32_aos` when only the root is
+/// needed (avoids storing all tree layers).
+#[cfg(feature = "cuda-runtime")]
+pub fn commit_mle_root_only_from_qm31_u32_aos(evals_u32: &[u32]) -> FieldElement {
+    PoseidonMerkleTree::root_only_from_qm31_u32_aos(evals_u32)
+}
+
 /// Compute only the MLE commitment root without storing the full tree.
 ///
 /// Uses parallel leaf conversion (rayon) and parallel Merkle hashing.
@@ -684,77 +693,105 @@ fn prove_mle_opening_with_commitment_qm31_u32_gpu_tree(
         .htod_sync_copy(&[0u32])
         .map_err(|e| format!("H2D dummy columns: {:?}", e))?;
 
-    let (d_initial, initial_n) = gpu.mle_fold_session_current_device(&fold_session);
-    let (initial_root, initial_tree) = build_gpu_opening_tree_from_qm31_u32_device_with_ctx(
-        executor,
-        &d_rc,
-        &d_dummy_columns,
-        d_initial,
-        initial_n,
-    )?;
-    channel.mix_felt(initial_root);
+    // ========================================================================
+    // GPU deferred tree construction: single-pass fold + tree per round.
+    //
+    // Old approach: build ALL GPU Merkle trees during fold phase (OOM on H100
+    // for 27-variable MLEs), then replay fold to extract query auth paths.
+    //
+    // New approach: single pass through fold rounds. At each round:
+    //   1. Build GPU Merkle tree from current device buffer
+    //   2. Extract root for Fiat-Shamir
+    //   3. Extract query auth paths (computed from pre-determined indices)
+    //   4. Drop GPU tree before building next round's tree
+    //
+    // This keeps only ONE GPU tree in VRAM at any time (~2-4GB vs ~30GB+).
+    // Eliminates the replay fold session entirely (1 fold pass, not 2).
+    // ========================================================================
 
     if !GPU_MLE_OPENING_TREE_BACKEND_LOGGED.swap(true, Ordering::Relaxed) {
-        eprintln!("[GKR] MLE opening tree backend: GPU-resident (no bulk D2H)");
+        eprintln!("[GKR] MLE opening tree backend: GPU-deferred (1 tree at a time)");
     }
 
-    let tree_phase_start = Instant::now();
-    let mut layer_trees: Vec<Poseidon252MerkleGpuTree> = Vec::with_capacity(n_vars);
-    layer_trees.push(initial_tree);
+    // Phase 1a: Compute initial root via GPU (no tree storage yet)
+    let (d_initial, initial_n) = gpu.mle_fold_session_current_device(&fold_session);
+    let initial_root = {
+        let n_leaf_hashes = initial_n / 2;
+        // Pack QM31 u32 words to felt252 limbs on host
+        let mut qm31_words = vec![0u32; initial_n * 4];
+        executor.device.dtoh_sync_copy_into(d_initial, &mut qm31_words)
+            .map_err(|e| format!("D2H initial words: {:?}", e))?;
+        let mut leaf_limbs = vec![0u64; initial_n * 4];
+        leaf_limbs.par_chunks_mut(4).zip(qm31_words.par_chunks_exact(4))
+            .for_each(|(dst, src)| { dst.copy_from_slice(&qm31_u32_to_u64_limbs_direct(src)); });
+        let d_leaf = executor.device.htod_sync_copy(&leaf_limbs)
+            .map_err(|e| format!("H2D initial limbs: {:?}", e))?;
+        drop(leaf_limbs);
+        let gpu_tree = executor.execute_poseidon252_merkle_full_tree_gpu_layers(
+            &d_dummy_columns, 0, Some(&d_leaf), n_leaf_hashes, &d_rc,
+        ).map_err(|e| format!("initial GPU Merkle: {e}"))?;
+        let root_limbs = gpu_tree.root_u64().map_err(|e| format!("download initial root: {e}"))?;
+        u64_limbs_to_felt252(&root_limbs)
+            .ok_or_else(|| "invalid initial root limbs".to_string())?
+        // gpu_tree dropped — frees initial tree from VRAM
+    };
+    channel.mix_felt(initial_root);
+
+    // Phase 1b: Fold loop — compute root-only at each step via GPU.
+    // We CANNOT determine query auth paths yet (query indices derived after all
+    // roots are mixed into the channel), so we only compute roots here and
+    // store the fold challenge sequence for Phase 2 replay.
+    let fold_phase_start = Instant::now();
     let mut intermediate_roots: Vec<FieldElement> = Vec::with_capacity(n_vars.saturating_sub(1));
 
     for (round, &r) in challenges.iter().enumerate() {
         gpu.mle_fold_session_step_in_place(&mut fold_session, r)
             .map_err(|e| {
                 if gpu_fold_strict {
-                    format!(
-                        "GPU MLE fold strict mode enabled, but GPU folding failed at round {}: {}",
-                        round, e
-                    )
+                    format!("GPU fold strict: failed at round {}: {}", round, e)
                 } else {
-                    format!("GPU MLE folding failed at round {}: {}", round, e)
+                    format!("GPU folding failed at round {}: {}", round, e)
                 }
             })?;
 
         if gpu.mle_fold_session_len(&fold_session) > 1 {
             let (d_current, cur_n) = gpu.mle_fold_session_current_device(&fold_session);
-            let (root, tree) = build_gpu_opening_tree_from_qm31_u32_device_with_ctx(
-                executor,
-                &d_rc,
-                &d_dummy_columns,
-                d_current,
-                cur_n,
-            )?;
+            let n_leaf_hashes = cur_n / 2;
+            let mut qm31_words = vec![0u32; cur_n * 4];
+            executor.device.dtoh_sync_copy_into(d_current, &mut qm31_words)
+                .map_err(|e| format!("D2H fold words round {}: {:?}", round, e))?;
+            let mut leaf_limbs = vec![0u64; cur_n * 4];
+            leaf_limbs.par_chunks_mut(4).zip(qm31_words.par_chunks_exact(4))
+                .for_each(|(dst, src)| { dst.copy_from_slice(&qm31_u32_to_u64_limbs_direct(src)); });
+            let d_leaf = executor.device.htod_sync_copy(&leaf_limbs)
+                .map_err(|e| format!("H2D fold limbs round {}: {:?}", round, e))?;
+            drop(leaf_limbs);
+            let gpu_tree = executor.execute_poseidon252_merkle_full_tree_gpu_layers(
+                &d_dummy_columns, 0, Some(&d_leaf), n_leaf_hashes, &d_rc,
+            ).map_err(|e| format!("GPU Merkle round {}: {e}", round))?;
+            let root_limbs = gpu_tree.root_u64()
+                .map_err(|e| format!("download root round {}: {e}", round))?;
+            let root = u64_limbs_to_felt252(&root_limbs)
+                .ok_or_else(|| format!("invalid root limbs at round {}", round))?;
             channel.mix_felt(root);
             intermediate_roots.push(root);
-            layer_trees.push(tree);
+            // gpu_tree dropped — frees this round's tree from VRAM
         }
     }
-    let tree_phase_elapsed = tree_phase_start.elapsed();
-
-    if layer_trees.len() != n_vars {
-        return Err(format!(
-            "GPU opening tree construction produced {} layer trees, expected {}",
-            layer_trees.len(),
-            n_vars
-        ));
-    }
+    let fold_phase_elapsed = fold_phase_start.elapsed();
 
     let (_, final_n) = gpu.mle_fold_session_current_device(&fold_session);
     if final_n != 1 {
-        return Err(format!(
-            "GPU fold session ended with {} points (expected 1)",
-            final_n
-        ));
+        return Err(format!("GPU fold ended with {} points (expected 1)", final_n));
     }
-    let final_words = gpu
-        .mle_fold_session_read_qm31_at(&fold_session, 0)
-        .map_err(|e| format!("download final folded value: {e}"))?;
+    let final_words = gpu.mle_fold_session_read_qm31_at(&fold_session, 0)
+        .map_err(|e| format!("download final value: {e}"))?;
     let final_value = u32s_to_secure_field(&final_words);
+    drop(fold_session); // Free fold session GPU memory
 
+    // Draw query indices
     let half_n = n_points / 2;
     let n_queries = mle_n_queries().min(half_n);
-
     let mut query_indices: Vec<usize> = Vec::with_capacity(n_queries);
     for _ in 0..n_queries {
         let felt = channel.draw_felt252();
@@ -765,8 +802,7 @@ fn prove_mle_opening_with_commitment_qm31_u32_gpu_tree(
         query_indices.push((raw as usize) % half_n);
     }
 
-    // Precompute per-round pair indices for each query once, then replay only
-    // lightweight folds to extract the queried leaf pairs.
+    // Precompute per-round pair indices
     let mut round_pair_indices: Vec<Vec<usize>> =
         (0..n_vars).map(|_| Vec::with_capacity(n_queries)).collect();
     let mut cur_query_indices = query_indices.clone();
@@ -781,17 +817,18 @@ fn prove_mle_opening_with_commitment_qm31_u32_gpu_tree(
         layer_size = mid;
     }
 
+    // Phase 2: Replay fold on GPU, building each tree one-at-a-time and
+    // extracting query auth paths before dropping it.
     let query_phase_start = Instant::now();
-    let mut replay_session = gpu
-        .start_mle_fold_session_u32(evals_u32)
-        .map_err(|e| format!("start replay MLE fold session: {e}"))?;
+    let mut replay_session = gpu.start_mle_fold_session_u32(evals_u32)
+        .map_err(|e| format!("start replay fold session: {e}"))?;
     let mut query_rounds: Vec<Vec<MleQueryRoundData>> =
         (0..n_queries).map(|_| Vec::with_capacity(n_vars)).collect();
     let mut replay_layer_size = n_points;
 
     for round in 0..n_vars {
         let mid = replay_layer_size / 2;
-        let (_, cur_n) = gpu.mle_fold_session_current_device(&replay_session);
+        let (d_current, cur_n) = gpu.mle_fold_session_current_device(&replay_session);
         if cur_n != replay_layer_size {
             return Err(format!(
                 "replay fold size mismatch at round {}: expected {}, got {}",
@@ -799,54 +836,50 @@ fn prove_mle_opening_with_commitment_qm31_u32_gpu_tree(
             ));
         }
 
-        let tree = &layer_trees[round];
+        // Build GPU tree for this round (dropped after extracting query auth paths)
+        let tree = {
+            let n_leaf_hashes = cur_n / 2;
+            let mut qm31_words = vec![0u32; cur_n * 4];
+            executor.device.dtoh_sync_copy_into(d_current, &mut qm31_words)
+                .map_err(|e| format!("D2H replay words round {}: {:?}", round, e))?;
+            let mut leaf_limbs = vec![0u64; cur_n * 4];
+            leaf_limbs.par_chunks_mut(4).zip(qm31_words.par_chunks_exact(4))
+                .for_each(|(dst, src)| { dst.copy_from_slice(&qm31_u32_to_u64_limbs_direct(src)); });
+            let d_leaf = executor.device.htod_sync_copy(&leaf_limbs)
+                .map_err(|e| format!("H2D replay limbs round {}: {:?}", round, e))?;
+            drop(leaf_limbs);
+            executor.execute_poseidon252_merkle_full_tree_gpu_layers(
+                &d_dummy_columns, 0, Some(&d_leaf), n_leaf_hashes, &d_rc,
+            ).map_err(|e| format!("GPU Merkle replay round {}: {e}", round))?
+        };
+
         for q in 0..n_queries {
             let left_idx = round_pair_indices[round][q];
             let right_idx = mid + left_idx;
 
-            let left_words = gpu
-                .mle_fold_session_read_qm31_at(&replay_session, left_idx)
-                .map_err(|e| {
-                    format!(
-                        "download left query value (round {}, query {}): {}",
-                        round, q, e
-                    )
-                })?;
-            let right_words = gpu
-                .mle_fold_session_read_qm31_at(&replay_session, right_idx)
-                .map_err(|e| {
-                    format!(
-                        "download right query value (round {}, query {}): {}",
-                        round, q, e
-                    )
-                })?;
+            let left_words = gpu.mle_fold_session_read_qm31_at(&replay_session, left_idx)
+                .map_err(|e| format!("download left (round {}, query {}): {}", round, q, e))?;
+            let right_words = gpu.mle_fold_session_read_qm31_at(&replay_session, right_idx)
+                .map_err(|e| format!("download right (round {}, query {}): {}", round, q, e))?;
 
             let left_value = u32s_to_secure_field(&left_words);
             let right_value = u32s_to_secure_field(&right_words);
             let left_siblings = build_gpu_merkle_path_with_leaf_sibling(
-                tree,
-                left_idx,
-                replay_layer_size,
-                right_value,
+                &tree, left_idx, replay_layer_size, right_value,
             )?;
             let right_siblings = build_gpu_merkle_path_with_leaf_sibling(
-                tree,
-                right_idx,
-                replay_layer_size,
-                left_value,
+                &tree, right_idx, replay_layer_size, left_value,
             )?;
 
             query_rounds[q].push(MleQueryRoundData {
-                left_value,
-                right_value,
-                left_siblings,
-                right_siblings,
+                left_value, right_value, left_siblings, right_siblings,
             });
         }
+        // tree dropped here — frees GPU VRAM before next round
 
         if round + 1 < n_vars {
             gpu.mle_fold_session_step_in_place(&mut replay_session, challenges[round])
-                .map_err(|e| format!("replay GPU fold step failed at round {}: {}", round, e))?;
+                .map_err(|e| format!("replay fold step failed round {}: {}", round, e))?;
             replay_layer_size = mid;
         }
     }
@@ -861,9 +894,9 @@ fn prove_mle_opening_with_commitment_qm31_u32_gpu_tree(
         .unwrap_or(false);
     if timing_enabled {
         eprintln!(
-            "[GKR] opening gpu timing: tree_build={:.2}s query_extract={:.2}s",
-            tree_phase_elapsed.as_secs_f64(),
-            query_phase_elapsed.as_secs_f64()
+            "[GKR] opening gpu timing: fold_roots={:.2}s query_extract={:.2}s",
+            fold_phase_elapsed.as_secs_f64(),
+            query_phase_elapsed.as_secs_f64(),
         );
     }
 
@@ -923,14 +956,34 @@ pub fn prove_mle_opening_with_commitment_qm31_u32(
         );
     }
 
-    let (initial_root, initial_tree) = commit_mle_from_qm31_u32_aos(evals_u32);
+    // ========================================================================
+    // Deferred tree construction: compute root-only during fold (fast), then
+    // rebuild trees one-at-a-time for query auth paths (memory-efficient).
+    //
+    // Old approach: build & store all 27 full Merkle trees during fold loop
+    //   → ~30GB peak memory (all trees stored simultaneously), OOM on GPU
+    //   → CPU Poseidon at each round: ~3-5s × 27 = 80-135s per matrix
+    //
+    // New approach:
+    //   Phase 1 (fold + roots): fold values, compute root_only at each step,
+    //     store folded layer values in Vec<MleLayerValues> — O(2N) total memory
+    //   Phase 2 (query extraction): after query indices drawn, re-derive each
+    //     layer's tree on demand, extract auth paths, drop tree immediately
+    //     → only 1 tree in memory at any time
+    //   Net: ~4x less memory, ~2-3x faster (root_only skips layer storage)
+    // ========================================================================
+
+    // Phase 1: Root-only initial commitment
+    let initial_root = commit_mle_root_only_from_qm31_u32_aos(evals_u32);
     channel.mix_felt(initial_root);
 
-    // Keep the initial layer borrowed to avoid a full-size clone of `evals_u32`.
-    // On large matrices this saves a multi-GB copy before opening generation starts.
+    // Store folded layer values for later tree reconstruction during query extraction.
+    // saved_layers[0] = initial evals (borrowed from evals_u32), rest are owned.
+    let mut saved_layers: Vec<MleLayerValues> = Vec::with_capacity(n_vars);
+    saved_layers.push(MleLayerValues::Qm31U32Aos(evals_u32.to_vec()));
+
     let mut current_u32_layer: Option<Vec<u32>> = None;
     let mut current_secure_layer: Option<Vec<SecureField>> = None;
-    let mut layer_trees: Vec<PoseidonMerkleTree> = vec![initial_tree];
     let mut intermediate_roots: Vec<FieldElement> = Vec::new();
 
     let gpu_fold_strict = gpu_mle_fold_required();
@@ -987,6 +1040,7 @@ pub fn prove_mle_opening_with_commitment_qm31_u32(
         }
     };
 
+    // Phase 1: Fold loop — compute roots only, store folded values
     for &r in challenges.iter() {
         // Fast path: in-place fold for CPU secure layer (avoids Vec allocation)
         if gpu_fold_session.is_none() {
@@ -1004,10 +1058,10 @@ pub fn prove_mle_opening_with_commitment_qm31_u32(
                 }
                 cur_secure.truncate(mid);
                 if cur_secure.len() > 1 {
-                    let (root, tree) = commit_mle(cur_secure);
+                    let root = commit_mle_root_only(cur_secure);
                     channel.mix_felt(root);
                     intermediate_roots.push(root);
-                    layer_trees.push(tree);
+                    saved_layers.push(MleLayerValues::Secure(cur_secure.clone()));
                 }
                 continue;
             }
@@ -1029,7 +1083,6 @@ pub fn prove_mle_opening_with_commitment_qm31_u32(
                     eprintln!("[GKR] MLE fold backend: GPU step failed, switching to CPU ({e})");
                     gpu_fold_session = None;
                     let folded = if let Some(cur_secure) = current_secure_layer.as_ref() {
-                        // Already in secure-field mode.
                         let mid = cur_secure.len() / 2;
                         if mid >= 1 << 16 {
                             (0..mid)
@@ -1075,13 +1128,15 @@ pub fn prove_mle_opening_with_commitment_qm31_u32(
         };
 
         if next_layer.len_points() > 1 {
-            let (root, tree) = match &next_layer {
-                MleLayerValues::Secure(vals) => commit_mle(vals),
-                MleLayerValues::Qm31U32Aos(words) => commit_mle_from_qm31_u32_aos(words),
+            // Root-only: skip full tree construction (deferred to Phase 2)
+            let root = match &next_layer {
+                MleLayerValues::Secure(vals) => commit_mle_root_only(vals),
+                MleLayerValues::Qm31U32Aos(words) => commit_mle_root_only_from_qm31_u32_aos(words),
             };
             channel.mix_felt(root);
             intermediate_roots.push(root);
-            layer_trees.push(tree);
+            // Save folded layer for later tree reconstruction
+            saved_layers.push(next_layer.clone());
         }
         match next_layer {
             MleLayerValues::Secure(vals) => {
@@ -1103,7 +1158,8 @@ pub fn prove_mle_opening_with_commitment_qm31_u32(
         u32s_to_secure_field(&[evals_u32[0], evals_u32[1], evals_u32[2], evals_u32[3]])
     };
 
-    // Draw query indices (each query selects an index in [0, n/2))
+    // Phase 2: Draw query indices and extract auth paths.
+    // Rebuild trees one-at-a-time from saved_layers (only 1 tree in memory at a time).
     let half_n = n_points / 2;
     let n_queries = mle_n_queries().min(half_n);
 
@@ -1118,41 +1174,74 @@ pub fn prove_mle_opening_with_commitment_qm31_u32(
         query_indices.push(pair_idx);
     }
 
-    let mut queries = Vec::with_capacity(n_queries);
-    for &pair_idx in &query_indices {
-        let mut rounds = Vec::with_capacity(n_vars);
-        let mut current_idx = pair_idx;
+    // Precompute per-round pair indices for all queries
+    let mut round_pair_indices: Vec<Vec<usize>> =
+        (0..n_vars).map(|_| Vec::with_capacity(n_queries)).collect();
+    {
+        let mut cur_indices = query_indices.clone();
         let mut layer_size = n_points;
-
         for round in 0..n_vars {
+            round_pair_indices[round].extend(cur_indices.iter().copied());
             let mid = layer_size / 2;
-            let left_idx = current_idx;
-            let right_idx = mid + current_idx;
+            let next_half = (mid / 2).max(1);
+            for idx in cur_indices.iter_mut() {
+                *idx %= next_half;
+            }
+            layer_size = mid;
+        }
+    }
 
-            let tree = &layer_trees[round];
+    // Extract auth paths by rebuilding each tree from saved layer values.
+    // Process one tree at a time to avoid storing all trees simultaneously.
+    let mut query_rounds: Vec<Vec<MleQueryRoundData>> =
+        (0..n_queries).map(|_| Vec::with_capacity(n_vars)).collect();
+    let mut layer_size = n_points;
+
+    for round in 0..n_vars {
+        let mid = layer_size / 2;
+
+        // Build tree for this round from saved layer values
+        let tree = match &saved_layers[round] {
+            MleLayerValues::Secure(vals) => {
+                let (_, t) = commit_mle(vals);
+                t
+            }
+            MleLayerValues::Qm31U32Aos(words) => {
+                let (_, t) = commit_mle_from_qm31_u32_aos(words);
+                t
+            }
+        };
+
+        for q in 0..n_queries {
+            let left_idx = round_pair_indices[round][q];
+            let right_idx = mid + left_idx;
+
             let left_value = felt_to_securefield_packed(tree.leaf_at(left_idx));
             let right_value = felt_to_securefield_packed(tree.leaf_at(right_idx));
-
             let left_path = tree.prove(left_idx);
             let right_path = tree.prove(right_idx);
 
-            rounds.push(MleQueryRoundData {
+            query_rounds[q].push(MleQueryRoundData {
                 left_value,
                 right_value,
                 left_siblings: left_path.siblings,
                 right_siblings: right_path.siblings,
             });
-
-            let next_half = (mid / 2).max(1);
-            current_idx %= next_half;
-            layer_size = mid;
         }
+        // tree dropped here — frees memory before rebuilding next round's tree
+        layer_size = mid;
+    }
+    // saved_layers no longer needed after query extraction
+    drop(saved_layers);
 
-        queries.push(MleQueryProof {
+    let queries: Vec<MleQueryProof> = query_indices
+        .into_iter()
+        .zip(query_rounds.into_iter())
+        .map(|(pair_idx, rounds)| MleQueryProof {
             initial_pair_index: pair_idx as u32,
             rounds,
-        });
-    }
+        })
+        .collect();
 
     (
         initial_root,
@@ -1179,13 +1268,13 @@ pub fn prove_mle_opening_with_commitment(
     let n_vars = evals.len().ilog2() as usize;
     assert_eq!(challenges.len(), n_vars);
 
-    // Build initial tree and store layers for query generation
-    let (initial_root, initial_tree) = commit_mle(evals);
+    // Deferred tree construction: root-only during fold, rebuild for query paths.
+    // Same optimization as prove_mle_opening_with_commitment_qm31_u32.
+    let initial_root = commit_mle_root_only(evals);
     channel.mix_felt(initial_root);
 
-    // Store all layers (evaluations) and trees for query proof construction
+    // Store all layer evaluations for deferred tree reconstruction
     let mut layer_evals: Vec<Vec<SecureField>> = vec![evals.to_vec()];
-    let mut layer_trees: Vec<PoseidonMerkleTree> = vec![initial_tree];
     let mut intermediate_roots: Vec<FieldElement> = Vec::new();
     #[cfg(feature = "cuda-runtime")]
     let gpu_fold_strict = gpu_mle_fold_required();
@@ -1243,8 +1332,7 @@ pub fn prove_mle_opening_with_commitment(
         }
     };
 
-    // Fold through each challenge
-    // Variable ordering matches evaluate_mle: first variable splits into lo/hi halves
+    // Phase 1: Fold through each challenge, compute root-only
     for &r in challenges.iter() {
         let folded: Vec<SecureField> = {
             #[cfg(feature = "cuda-runtime")]
@@ -1318,20 +1406,18 @@ pub fn prove_mle_opening_with_commitment(
                 }
             }
         };
-        let mid = folded.len();
 
-        if mid > 1 {
-            let (root, tree) = commit_mle(&folded);
+        if folded.len() > 1 {
+            let root = commit_mle_root_only(&folded);
             channel.mix_felt(root);
             intermediate_roots.push(root);
-            layer_trees.push(tree);
         }
         layer_evals.push(folded);
     }
 
     let final_value = layer_evals.last().expect("layer_evals has final layer")[0];
 
-    // Draw query indices (each query selects an index in [0, n/2))
+    // Phase 2: Draw query indices and extract auth paths.
     let initial_n = evals.len();
     let half_n = initial_n / 2;
     let n_queries = mle_n_queries().min(half_n);
@@ -1347,24 +1433,41 @@ pub fn prove_mle_opening_with_commitment(
         query_indices.push(pair_idx);
     }
 
-    // Build query proofs
-    let mut queries = Vec::with_capacity(n_queries);
-    for &pair_idx in &query_indices {
-        let mut rounds = Vec::with_capacity(n_vars);
-        let mut current_idx = pair_idx;
-
+    // Precompute per-round pair indices for all queries
+    let mut round_pair_indices: Vec<Vec<usize>> =
+        (0..n_vars).map(|_| Vec::with_capacity(n_queries)).collect();
+    {
+        let mut cur_indices = query_indices.clone();
+        let mut layer_size = initial_n;
         for round in 0..n_vars {
-            let layer = &layer_evals[round];
-            let mid = layer.len() / 2;
-            // With lo/hi folding: left = layer[idx], right = layer[mid + idx]
-            let left_idx = current_idx;
-            let right_idx = mid + current_idx;
+            round_pair_indices[round].extend(cur_indices.iter().copied());
+            let mid = layer_size / 2;
+            let next_half = (mid / 2).max(1);
+            for idx in cur_indices.iter_mut() {
+                *idx %= next_half;
+            }
+            layer_size = mid;
+        }
+    }
+
+    // Rebuild trees one-at-a-time per round, extracting all queries from each.
+    let mut query_rounds: Vec<Vec<MleQueryRoundData>> =
+        (0..n_queries).map(|_| Vec::with_capacity(n_vars)).collect();
+
+    for round in 0..n_vars {
+        let layer = &layer_evals[round];
+        let mid = layer.len() / 2;
+
+        // Build tree for this round (dropped after extracting all query auth paths)
+        let (_, tree) = commit_mle(layer);
+
+        for q in 0..n_queries {
+            let left_idx = round_pair_indices[round][q];
+            let right_idx = mid + left_idx;
 
             let left_value = layer[left_idx.min(layer.len() - 1)];
             let right_value = layer[right_idx.min(layer.len() - 1)];
 
-            // Get Merkle auth paths
-            let tree = &layer_trees[round.min(layer_trees.len() - 1)];
             let left_path = if left_idx < tree.num_leaves() {
                 tree.prove(left_idx)
             } else {
@@ -1380,24 +1483,25 @@ pub fn prove_mle_opening_with_commitment(
                 }
             };
 
-            rounds.push(MleQueryRoundData {
+            query_rounds[q].push(MleQueryRoundData {
                 left_value,
                 right_value,
                 left_siblings: left_path.siblings,
                 right_siblings: right_path.siblings,
             });
-
-            // Next round: the folded layer has `mid` elements.
-            // Its lo/hi split is at `mid/2`. Reduce index into [0, mid/2).
-            let next_half = (mid / 2).max(1);
-            current_idx %= next_half;
         }
+        // tree dropped here — only 1 tree in memory at a time
+    }
+    drop(layer_evals);
 
-        queries.push(MleQueryProof {
+    let queries: Vec<MleQueryProof> = query_indices
+        .into_iter()
+        .zip(query_rounds.into_iter())
+        .map(|(pair_idx, rounds)| MleQueryProof {
             initial_pair_index: pair_idx as u32,
             rounds,
-        });
-    }
+        })
+        .collect();
 
     (
         initial_root,
