@@ -4222,7 +4222,23 @@ fn prove_model_aggregated_onchain_gpu(
     #[cfg(feature = "cuda-runtime")]
     {
         use stwo::prover::backend::gpu::GpuBackend;
-        return prove_model_aggregated_onchain_with::<GpuBackend>(graph, input, weights);
+        let result = prove_model_aggregated_onchain_with::<GpuBackend>(graph, input, weights);
+        // GPU unified STARK may fail with ConstraintsNotSatisfied due to the
+        // GPU component prover's preprocessed column handling. Fall back to
+        // SIMD which is fast (<1s) for the unified STARK phase.
+        if let Err(AggregationError::ProvingError(ref msg)) = result {
+            if msg.contains("ConstraintsNotSatisfied")
+                && !flag_enabled("STWO_UNIFIED_STARK_NO_FALLBACK")
+            {
+                eprintln!(
+                    "  [GPU→SIMD fallback] GPU unified STARK failed, retrying with SimdBackend..."
+                );
+                return prove_model_aggregated_onchain_with::<SimdBackend>(
+                    graph, input, weights,
+                );
+            }
+        }
+        return result;
     }
 
     #[cfg(not(feature = "cuda-runtime"))]
