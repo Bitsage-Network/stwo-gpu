@@ -127,6 +127,9 @@ pub fn build_rsqrt_table(log_size: u32) -> PrecomputedTable {
 /// Generate RMSNorm execution trace columns (5 columns).
 ///
 /// Generic over backend `B` — works with `SimdBackend`, `CpuBackend`, or `GpuBackend`.
+///
+/// Padding rows use the first rsqrt table entry for `rms_sq` and `rsqrt_val`
+/// so the LogUp evaluator sees valid `(rms_sq, rsqrt_val)` pairs in the table.
 pub fn generate_rmsnorm_trace<B: ColumnOps<BaseField>>(
     inputs: &[M31],
     rms_sq_vals: &[M31],
@@ -134,22 +137,44 @@ pub fn generate_rmsnorm_trace<B: ColumnOps<BaseField>>(
     outputs: &[M31],
     multiplicities: &[M31],
     log_size: u32,
+    rsqrt_table: &PrecomputedTable,
 ) -> Vec<CircleEvaluation<B, BaseField, BitReversedOrder>> {
     let size = 1usize << log_size;
     let domain = CanonicCoset::new(log_size).circle_domain();
 
-    let cols_data: Vec<&[M31]> = vec![inputs, rms_sq_vals, rsqrt_vals, outputs, multiplicities];
-    let mut result = Vec::with_capacity(5);
+    let pad_rms = rsqrt_table.inputs.first().copied().unwrap_or(M31::from(0));
+    let pad_rsqrt = rsqrt_table.outputs.first().copied().unwrap_or(M31::from(0));
 
-    for data in cols_data {
-        let mut col = Col::<B, BaseField>::zeros(size);
-        for (i, &val) in data.iter().enumerate().take(size) {
-            col.set(i, val);
-        }
-        result.push(CircleEvaluation::new(domain, col));
+    let n = inputs.len().min(size);
+
+    let mut input_col = Col::<B, BaseField>::zeros(size);
+    let mut rms_col = Col::<B, BaseField>::zeros(size);
+    let mut rsqrt_col = Col::<B, BaseField>::zeros(size);
+    let mut output_col = Col::<B, BaseField>::zeros(size);
+    let mut mult_col = Col::<B, BaseField>::zeros(size);
+
+    for i in 0..n {
+        input_col.set(i, inputs[i]);
+        rms_col.set(i, rms_sq_vals[i]);
+        rsqrt_col.set(i, rsqrt_vals[i]);
+        output_col.set(i, outputs[i]);
+    }
+    // Pad rms_sq and rsqrt with first table entry so LogUp sees valid pairs.
+    for i in n..size {
+        rms_col.set(i, pad_rms);
+        rsqrt_col.set(i, pad_rsqrt);
+    }
+    for (i, &m) in multiplicities.iter().enumerate().take(size) {
+        mult_col.set(i, m);
     }
 
-    result
+    vec![
+        CircleEvaluation::new(domain, input_col),
+        CircleEvaluation::new(domain, rms_col),
+        CircleEvaluation::new(domain, rsqrt_col),
+        CircleEvaluation::new(domain, output_col),
+        CircleEvaluation::new(domain, mult_col),
+    ]
 }
 
 #[cfg(test)]
@@ -183,6 +208,7 @@ mod tests {
         let outputs = vec![M31::from(0); n];
         let mults = vec![M31::from(1); n];
 
+        let table = build_rsqrt_table(4);
         let trace = generate_rmsnorm_trace::<SimdBackend>(
             &inputs,
             &rms_sq,
@@ -190,6 +216,7 @@ mod tests {
             &outputs,
             &mults,
             4,
+            &table,
         );
         // 5 columns: input, rms_sq, rsqrt, output, multiplicity
         assert_eq!(trace.len(), 5);

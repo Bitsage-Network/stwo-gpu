@@ -5064,6 +5064,7 @@ where
         || !add_layers.is_empty()
         || !mul_layers.is_empty()
         || !layernorm_layers.is_empty()
+        || !rmsnorm_layers.is_empty()
         || !embedding_layers.is_empty()
         || !quantize_layers.is_empty()
         || !dequantize_layers.is_empty();
@@ -6003,6 +6004,7 @@ where
             &layer.outputs,
             &mults,
             layer.log_size,
+            &layer.rsqrt_table,
         );
         tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(cols));
         rmsnorm_mults.push(mults);
@@ -10666,6 +10668,81 @@ mod tests {
         // Commitments should be non-zero
         assert_ne!(proof.layer_chain_commitment, FieldElement::ZERO);
         assert_ne!(proof.io_commitment, FieldElement::ZERO);
+    }
+
+    #[test]
+    fn test_pure_gkr_with_rmsnorm() {
+        // matmul → rmsnorm → matmul — tests RMSNorm in unified STARK
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(4).rms_norm().linear(2);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
+
+        let mut weights = GraphWeights::new();
+        let mut w0 = M31Matrix::new(4, 4);
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32));
+            }
+        }
+        weights.add_weight(0, w0);
+        let mut w2 = M31Matrix::new(4, 2);
+        for i in 0..4 {
+            for j in 0..2 {
+                w2.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
+        weights.add_weight(2, w2);
+
+        let proof = prove_model_pure_gkr(&graph, &input, &weights)
+            .expect("pure GKR with RMSNorm should succeed");
+
+        assert!(proof.gkr_proof.is_some(), "should have GKR proof");
+        assert!(
+            proof.unified_stark.is_some(),
+            "should have unified STARK for RMSNorm"
+        );
+        assert_eq!(proof.rmsnorm_claims.len(), 1, "1 RMSNorm layer in STARK");
+    }
+
+    #[test]
+    fn test_rmsnorm_constraint_sanity() {
+        // Verify RMSNorm trace data satisfies constraints pointwise
+        use crate::compiler::prove::apply_rmsnorm_detailed;
+        use crate::components::rmsnorm::RMSNormConfig;
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
+
+        let dim = 4;
+        let rn = apply_rmsnorm_detailed(&input, dim);
+
+        // Verify: output = input * rsqrt for each element
+        for i in 0..rn.inputs.len() {
+            let expected = rn.inputs[i] * rn.rsqrt_vals[i];
+            assert_eq!(
+                rn.outputs[i], expected,
+                "constraint fail at i={}: output={:?} != input*rsqrt={:?}*{:?}={:?}",
+                i, rn.outputs[i], rn.inputs[i], rn.rsqrt_vals[i], expected
+            );
+        }
+
+        // Verify: all rms_sq values are in table range
+        let config = RMSNormConfig::new(dim);
+        let table = crate::components::rmsnorm::build_rsqrt_table(config.rsqrt_table_log_size);
+        for &v in &rn.rms_sq_vals {
+            assert!(
+                table.lookup(v).is_some(),
+                "rms_sq={:?} not in table",
+                v
+            );
+        }
     }
 
     #[test]
