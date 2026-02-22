@@ -3909,7 +3909,7 @@ where
     let mut add_claims: Vec<LayerClaim> = Vec::new();
     let mut mul_claims: Vec<LayerClaim> = Vec::new();
     let mut layernorm_claims: Vec<LayerClaim> = Vec::new();
-    let rmsnorm_claims: Vec<LayerClaim> = Vec::new();
+    let mut rmsnorm_claims: Vec<LayerClaim> = Vec::new();
     let mut embedding_claims: Vec<LayerClaim> = Vec::new();
     let mut quantize_claims_vec: Vec<LayerClaim> = Vec::new();
 
@@ -3987,6 +3987,29 @@ where
             );
             component_refs_storage.push(Box::new(component));
             layernorm_claims.push(LayerClaim {
+                layer_index: layer.node_id,
+                claimed_sum,
+                trace_rows: 1 << layer.log_size,
+            });
+        }
+    }
+
+    // RMSNorm components (LogUp)
+    if let Some(ref lookup) = rmsnorm_lookup {
+        for (idx, layer) in rmsnorm_layers.iter().enumerate() {
+            let claimed_sum = rmsnorm_claimed_sums[idx];
+            let component = FrameworkComponent::new(
+                &mut allocator,
+                RMSNormEval {
+                    log_n_rows: layer.log_size,
+                    dim: layer.inputs.len(),
+                    lookup_elements: lookup.clone(),
+                    claimed_sum,
+                },
+                claimed_sum,
+            );
+            component_refs_storage.push(Box::new(component));
+            rmsnorm_claims.push(LayerClaim {
                 layer_index: layer.node_id,
                 claimed_sum,
                 trace_rows: 1 << layer.log_size,
