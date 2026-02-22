@@ -2338,7 +2338,6 @@ where
     }
     eprintln!("========================");
 
-    let config = PcsConfig::default();
     let mut intermediates: Vec<(usize, M31Matrix)> = Vec::new();
     let mut node_outputs: HashMap<usize, M31Matrix> = HashMap::new();
     let mut current = input.clone();
@@ -3269,851 +3268,16 @@ where
         });
     }
 
-    // Build unified STARK using backend B + Blake2sMerkleChannel
+    // Build unified STARK — always use SimdBackend for the STARK phase.
+    // GpuBackend hits ConstraintsNotSatisfied due to preprocessed column handling
+    // in the GPU component prover. SimdBackend is fast (<1s) for this phase.
     eprintln!(
         "Phase 3/3: {} Building unified STARK proof (all non-matmul components)...",
         tag
     );
     let t_stark = std::time::Instant::now();
-    // Per-component log_sizes: each component uses its own size derived from
-    // its table or data length. The max_log_size drives twiddle precomputation.
-    let all_log_sizes: Vec<u32> = activation_layers
-        .iter()
-        .map(|l| l.log_size)
-        .chain(add_layers.iter().map(|l| l.log_size))
-        .chain(mul_layers.iter().map(|l| l.log_size))
-        .chain(layernorm_layers.iter().map(|l| l.log_size))
-        .chain(rmsnorm_layers.iter().map(|l| l.log_size))
-        .chain(embedding_layers.iter().map(|l| l.log_size))
-        .chain(quantize_layers.iter().map(|l| l.log_size))
-        .chain(dequantize_layers.iter().map(|l| l.log_size))
-        .collect();
-    let max_log_size = *all_log_sizes.iter().max().unwrap();
 
-    let max_degree_bound = max_log_size + 1;
-    let twiddles = B::precompute_twiddles(
-        CanonicCoset::new(max_degree_bound + config.fri_config.log_blowup_factor)
-            .circle_domain()
-            .half_coset,
-    );
-
-    let channel = &mut <Blake2sMerkleChannel as MerkleChannel>::C::default();
-    let mut commitment_scheme =
-        CommitmentSchemeProver::<B, Blake2sMerkleChannel>::new(config, &twiddles);
-
-    let has_logup = !activation_layers.is_empty()
-        || !layernorm_layers.is_empty()
-        || !rmsnorm_layers.is_empty()
-        || !embedding_layers.is_empty()
-        || !quantize_layers.is_empty()
-        || !dequantize_layers.is_empty();
-
-    // Tree 0: Preprocessed (activation tables + layernorm rsqrt tables + rmsnorm rsqrt tables + embedding tables + quantize range tables)
-    {
-        let mut tree_builder = commitment_scheme.tree_builder();
-        for layer in &activation_layers {
-            let layer_size = 1usize << layer.log_size;
-            let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-            let (table_input_col, table_output_col) =
-                build_table_columns::<SimdBackend>(&layer.table, layer_size);
-            let simd_evals = vec![
-                CircleEvaluation::new(layer_domain, table_input_col),
-                CircleEvaluation::new(layer_domain, table_output_col),
-            ];
-            tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
-        }
-        for layer in &layernorm_layers {
-            let layer_size = 1usize << layer.log_size;
-            let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-            let (table_var_col, table_rsqrt_col) =
-                build_table_columns::<SimdBackend>(&layer.rsqrt_table, layer_size);
-            let simd_evals = vec![
-                CircleEvaluation::new(layer_domain, table_var_col),
-                CircleEvaluation::new(layer_domain, table_rsqrt_col),
-            ];
-            tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
-        }
-        for layer in &rmsnorm_layers {
-            let layer_size = 1usize << layer.log_size;
-            let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-            let (table_rms_col, table_rsqrt_col) =
-                build_table_columns::<SimdBackend>(&layer.rsqrt_table, layer_size);
-            let simd_evals = vec![
-                CircleEvaluation::new(layer_domain, table_rms_col),
-                CircleEvaluation::new(layer_domain, table_rsqrt_col),
-            ];
-            tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
-        }
-        for layer in &embedding_layers {
-            let layer_size = 1usize << layer.log_size;
-            let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-            let simd_evals = build_embedding_preprocessed_columns::<SimdBackend>(
-                &layer.table_tokens,
-                &layer.table_cols,
-                &layer.table_values,
-                layer_size,
-                layer_domain,
-            );
-            tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
-        }
-        for layer in &quantize_layers {
-            let table = build_quantize_table(&layer.params, &layer.input_values);
-            let layer_size = 1usize << layer.log_size;
-            let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-            let (table_input_col, table_output_col) =
-                build_quantize_table_columns::<SimdBackend>(&table, layer_size);
-            let simd_evals = vec![
-                CircleEvaluation::new(layer_domain, table_input_col),
-                CircleEvaluation::new(layer_domain, table_output_col),
-            ];
-            tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
-        }
-        for layer in &dequantize_layers {
-            let table = build_dequantize_table(&layer.params);
-            let layer_size = 1usize << layer.log_size;
-            let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-            let (table_input_col, table_output_col) =
-                build_table_columns::<SimdBackend>(&table, layer_size);
-            let simd_evals = vec![
-                CircleEvaluation::new(layer_domain, table_input_col),
-                CircleEvaluation::new(layer_domain, table_output_col),
-            ];
-            tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
-        }
-        tree_builder.commit(channel);
-    }
-
-    // Tree 1: Execution traces (activation + add + mul + layernorm + embedding + quantize + dequantize)
-    let mut tree_builder = commitment_scheme.tree_builder();
-    let mut activation_mults: Vec<Vec<M31>> = Vec::new();
-    for layer in &activation_layers {
-        let layer_size = 1usize << layer.log_size;
-        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-        let pad_input = layer.table.inputs[0];
-        let pad_output = layer.table.outputs[0];
-        let padding_count = layer_size.saturating_sub(layer.inputs.len());
-
-        let mut mults = compute_multiplicities(&layer.inputs, &layer.table);
-        if padding_count > 0 {
-            mults[0] += M31::from(padding_count as u32);
-        }
-
-        let (trace_in, trace_out, mult_col) = build_trace_columns::<SimdBackend>(
-            &layer.inputs,
-            &layer.outputs,
-            &mults,
-            pad_input,
-            pad_output,
-            layer_size,
-        );
-        let simd_evals = vec![
-            CircleEvaluation::new(layer_domain, trace_in),
-            CircleEvaluation::new(layer_domain, trace_out),
-            CircleEvaluation::new(layer_domain, mult_col),
-        ];
-        tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
-        activation_mults.push(mults);
-    }
-    for layer in &add_layers {
-        let layer_size = 1usize << layer.log_size;
-        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-        let (lhs_col, rhs_col, out_col) = build_elementwise_trace_columns::<SimdBackend>(
-            &layer.lhs,
-            &layer.rhs,
-            &layer.output,
-            layer_size,
-        );
-        let simd_evals = vec![
-            CircleEvaluation::new(layer_domain, lhs_col),
-            CircleEvaluation::new(layer_domain, rhs_col),
-            CircleEvaluation::new(layer_domain, out_col),
-        ];
-        tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
-    }
-    for layer in &mul_layers {
-        let layer_size = 1usize << layer.log_size;
-        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-        let (lhs_col, rhs_col, out_col) = build_elementwise_trace_columns::<SimdBackend>(
-            &layer.lhs,
-            &layer.rhs,
-            &layer.output,
-            layer_size,
-        );
-        let simd_evals = vec![
-            CircleEvaluation::new(layer_domain, lhs_col),
-            CircleEvaluation::new(layer_domain, rhs_col),
-            CircleEvaluation::new(layer_domain, out_col),
-        ];
-        tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
-    }
-    let mut layernorm_mults: Vec<Vec<M31>> = Vec::new();
-    for layer in &layernorm_layers {
-        let layer_size = 1usize << layer.log_size;
-        let padding = layer_size.saturating_sub(layer.variances.len());
-        let mut mults = compute_multiplicities(&layer.variances, &layer.rsqrt_table);
-        if padding > 0 {
-            mults[0] += M31::from(padding as u32);
-        }
-        let cols = build_layernorm_trace_columns::<SimdBackend>(
-            &layer.inputs,
-            &layer.means,
-            &layer.variances,
-            &layer.rsqrt_vals,
-            &layer.outputs,
-            &mults,
-            &layer.rsqrt_table,
-            layer_size,
-        );
-        tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(cols));
-        layernorm_mults.push(mults);
-    }
-    let mut rmsnorm_mults: Vec<Vec<M31>> = Vec::new();
-    for layer in &rmsnorm_layers {
-        let layer_size = 1usize << layer.log_size;
-        let padding = layer_size.saturating_sub(layer.rms_sq_vals.len());
-        let mut mults = compute_multiplicities(&layer.rms_sq_vals, &layer.rsqrt_table);
-        if padding > 0 {
-            mults[0] += M31::from(padding as u32);
-        }
-        let cols = build_rmsnorm_trace_columns::<SimdBackend>(
-            &layer.inputs,
-            &layer.rms_sq_vals,
-            &layer.rsqrt_vals,
-            &layer.outputs,
-            &mults,
-            &layer.rsqrt_table,
-            layer_size,
-        );
-        tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(cols));
-        rmsnorm_mults.push(mults);
-    }
-    for layer in &embedding_layers {
-        let layer_size = 1usize << layer.log_size;
-        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-        let simd_evals = build_embedding_trace_columns::<SimdBackend>(
-            &layer.token_ids,
-            &layer.col_indices,
-            &layer.values,
-            &layer.multiplicities,
-            layer_size,
-            layer_domain,
-        );
-        tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
-    }
-    let mut quantize_mults: Vec<Vec<M31>> = Vec::new();
-    for layer in &quantize_layers {
-        let table = build_quantize_table(&layer.params, &layer.input_values);
-        let layer_size = 1usize << layer.log_size;
-        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-        let pad_input = table.inputs[0];
-        let pad_output = table.outputs[0];
-        let padding_count = layer_size.saturating_sub(layer.input_values.len());
-        let mut mults = layer.multiplicities.clone();
-        if padding_count > 0 {
-            mults[0] += M31::from(padding_count as u32);
-        }
-        let simd_evals = build_quantize_trace_columns_2d::<SimdBackend>(
-            &layer.input_values,
-            &layer.values,
-            &mults,
-            pad_input,
-            pad_output,
-            layer_size,
-            layer_domain,
-        );
-        tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
-        quantize_mults.push(mults);
-    }
-    let mut dequantize_mults: Vec<Vec<M31>> = Vec::new();
-    for layer in &dequantize_layers {
-        let table = build_dequantize_table(&layer.params);
-        let layer_size = 1usize << layer.log_size;
-        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-        let pad_input = table.inputs[0];
-        let pad_output = table.outputs[0];
-        let padding_count = layer_size.saturating_sub(layer.input_values.len());
-        let mut mults = layer.multiplicities.clone();
-        if padding_count > 0 {
-            mults[0] += M31::from(padding_count as u32);
-        }
-        let (trace_in, trace_out, mult_col) = build_trace_columns::<SimdBackend>(
-            &layer.input_values,
-            &layer.output_values,
-            &mults,
-            pad_input,
-            pad_output,
-            layer_size,
-        );
-        let simd_evals = vec![
-            CircleEvaluation::new(layer_domain, trace_in),
-            CircleEvaluation::new(layer_domain, trace_out),
-            CircleEvaluation::new(layer_domain, mult_col),
-        ];
-        tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(simd_evals));
-        dequantize_mults.push(mults);
-    }
-    tree_builder.commit(channel);
-
-    // Interaction PoW: mix nonce into channel (matches Cairo verifier protocol).
-    channel.mix_u64(0);
-
-    // Draw relation elements and build Tree 2 — only if LogUp components exist
-    let mut activation_lookup: Option<ActivationRelation> = None;
-    let mut layernorm_lookup: Option<LayerNormRelation> = None;
-    let mut rmsnorm_lookup: Option<RMSNormRelation> = None;
-    let mut embedding_lookup_rel: Option<EmbeddingRelation> = None;
-    let mut quantize_lookup: Option<QuantizeRelation> = None;
-    let mut dequantize_lookup: Option<DequantizeRelation> = None;
-    let mut activation_claimed_sums: Vec<SecureField> = Vec::new();
-    let mut layernorm_claimed_sums: Vec<SecureField> = Vec::new();
-    let mut rmsnorm_claimed_sums: Vec<SecureField> = Vec::new();
-    let mut embedding_claimed_sums: Vec<SecureField> = Vec::new();
-    let mut quantize_claimed_sums: Vec<SecureField> = Vec::new();
-    let mut dequantize_claimed_sums: Vec<SecureField> = Vec::new();
-
-    if has_logup {
-        if !activation_layers.is_empty() {
-            activation_lookup = Some(ActivationRelation::draw(channel));
-        }
-        if !layernorm_layers.is_empty() {
-            layernorm_lookup = Some(LayerNormRelation::draw(channel));
-        }
-        if !rmsnorm_layers.is_empty() {
-            rmsnorm_lookup = Some(RMSNormRelation::draw(channel));
-        }
-        if !embedding_layers.is_empty() {
-            embedding_lookup_rel = Some(EmbeddingRelation::draw(channel));
-        }
-        if !quantize_layers.is_empty() {
-            quantize_lookup = Some(QuantizeRelation::draw(channel));
-        }
-        if !dequantize_layers.is_empty() {
-            dequantize_lookup = Some(DequantizeRelation::draw(channel));
-        }
-
-        // Tree 2: Interaction traces (LogUp for activation + layernorm + embedding)
-        let mut tree_builder = commitment_scheme.tree_builder();
-
-        if let Some(ref lookup) = activation_lookup {
-            for (idx, layer) in activation_layers.iter().enumerate() {
-                let layer_size = 1usize << layer.log_size;
-                let layer_vec_size = layer_size >> LOG_N_LANES;
-                let pad_input = layer.table.inputs[0];
-                let pad_output = layer.table.outputs[0];
-
-                let (table_in_col, table_out_col) =
-                    build_table_columns::<SimdBackend>(&layer.table, layer_size);
-                let (trace_in_col, trace_out_col, _) = build_trace_columns::<SimdBackend>(
-                    &layer.inputs,
-                    &layer.outputs,
-                    &activation_mults[idx],
-                    pad_input,
-                    pad_output,
-                    layer_size,
-                );
-
-                let mut logup_gen = LogupTraceGenerator::new(layer.log_size);
-                let mut col_gen = logup_gen.new_col();
-
-                // Type tag broadcast — domain separates activation types in LogUp (M1 fix).
-                let tag_packed = PackedBaseField::broadcast(M31::from(layer.type_tag));
-
-                for vec_row in 0..layer_vec_size {
-                    let q_table: PackedSecureField = lookup.lookup_elements().combine(&[
-                        tag_packed,
-                        table_in_col.data[vec_row],
-                        table_out_col.data[vec_row],
-                    ]);
-                    let q_trace: PackedSecureField = lookup.lookup_elements().combine(&[
-                        tag_packed,
-                        trace_in_col.data[vec_row],
-                        trace_out_col.data[vec_row],
-                    ]);
-
-                    let mult_packed = pack_multiplicities(&activation_mults[idx], vec_row);
-                    let numerator = q_table - mult_packed * q_trace;
-                    let denominator = q_table * q_trace;
-
-                    col_gen.write_frac(vec_row, numerator, denominator);
-                }
-                col_gen.finalize_col();
-
-                let (interaction_trace, claimed_sum) = logup_gen.finalize_last();
-                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(
-                    interaction_trace,
-                ));
-                activation_claimed_sums.push(claimed_sum);
-            }
-        }
-
-        if let Some(ref lookup) = layernorm_lookup {
-            for (idx, layer) in layernorm_layers.iter().enumerate() {
-                let layer_size = 1usize << layer.log_size;
-                let layer_vec_size = layer_size >> LOG_N_LANES;
-                let (table_var_col, table_rsqrt_col) =
-                    build_table_columns::<SimdBackend>(&layer.rsqrt_table, layer_size);
-
-                let mut var_col = Col::<SimdBackend, BaseField>::zeros(layer_size);
-                let mut rsqrt_col = Col::<SimdBackend, BaseField>::zeros(layer_size);
-                let n = layer.variances.len().min(layer_size);
-                for i in 0..n {
-                    var_col.set(i, layer.variances[i]);
-                    rsqrt_col.set(i, layer.rsqrt_vals[i]);
-                }
-                let pad_var = layer
-                    .rsqrt_table
-                    .inputs
-                    .first()
-                    .copied()
-                    .unwrap_or(M31::from(0));
-                let pad_rsqrt = layer
-                    .rsqrt_table
-                    .outputs
-                    .first()
-                    .copied()
-                    .unwrap_or(M31::from(0));
-                for i in n..layer_size {
-                    var_col.set(i, pad_var);
-                    rsqrt_col.set(i, pad_rsqrt);
-                }
-
-                let mut logup_gen = LogupTraceGenerator::new(layer.log_size);
-                let mut col_gen = logup_gen.new_col();
-
-                for vec_row in 0..layer_vec_size {
-                    let q_table: PackedSecureField = lookup
-                        .lookup_elements()
-                        .combine(&[table_var_col.data[vec_row], table_rsqrt_col.data[vec_row]]);
-                    let q_trace: PackedSecureField = lookup
-                        .lookup_elements()
-                        .combine(&[var_col.data[vec_row], rsqrt_col.data[vec_row]]);
-
-                    let mult_packed = pack_multiplicities(&layernorm_mults[idx], vec_row);
-                    let numerator = q_table - mult_packed * q_trace;
-                    let denominator = q_table * q_trace;
-
-                    col_gen.write_frac(vec_row, numerator, denominator);
-                }
-                col_gen.finalize_col();
-
-                let (interaction_trace, claimed_sum) = logup_gen.finalize_last();
-                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(
-                    interaction_trace,
-                ));
-                layernorm_claimed_sums.push(claimed_sum);
-            }
-        }
-
-        // RMSNorm LogUp interaction traces
-        if let Some(ref lookup) = rmsnorm_lookup {
-            for (idx, layer) in rmsnorm_layers.iter().enumerate() {
-                let layer_size = 1usize << layer.log_size;
-                let layer_vec_size = layer_size >> LOG_N_LANES;
-                let (table_rms_col, table_rsqrt_col) =
-                    build_table_columns::<SimdBackend>(&layer.rsqrt_table, layer_size);
-
-                let mut rms_col = Col::<SimdBackend, BaseField>::zeros(layer_size);
-                let mut rsqrt_col = Col::<SimdBackend, BaseField>::zeros(layer_size);
-                let n = layer.rms_sq_vals.len().min(layer_size);
-                for i in 0..n {
-                    rms_col.set(i, layer.rms_sq_vals[i]);
-                    rsqrt_col.set(i, layer.rsqrt_vals[i]);
-                }
-                let pad_rms = layer
-                    .rsqrt_table
-                    .inputs
-                    .first()
-                    .copied()
-                    .unwrap_or(M31::from(0));
-                let pad_rsqrt = layer
-                    .rsqrt_table
-                    .outputs
-                    .first()
-                    .copied()
-                    .unwrap_or(M31::from(0));
-                for i in n..layer_size {
-                    rms_col.set(i, pad_rms);
-                    rsqrt_col.set(i, pad_rsqrt);
-                }
-
-                let mut logup_gen = LogupTraceGenerator::new(layer.log_size);
-                let mut col_gen = logup_gen.new_col();
-
-                for vec_row in 0..layer_vec_size {
-                    let q_table: PackedSecureField = lookup
-                        .lookup_elements()
-                        .combine(&[table_rms_col.data[vec_row], table_rsqrt_col.data[vec_row]]);
-                    let q_trace: PackedSecureField = lookup
-                        .lookup_elements()
-                        .combine(&[rms_col.data[vec_row], rsqrt_col.data[vec_row]]);
-
-                    let mult_packed = pack_multiplicities(&rmsnorm_mults[idx], vec_row);
-                    let numerator = q_table - mult_packed * q_trace;
-                    let denominator = q_table * q_trace;
-
-                    col_gen.write_frac(vec_row, numerator, denominator);
-                }
-                col_gen.finalize_col();
-
-                let (interaction_trace, claimed_sum) = logup_gen.finalize_last();
-                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(
-                    interaction_trace,
-                ));
-                rmsnorm_claimed_sums.push(claimed_sum);
-            }
-        }
-
-        // Embedding LogUp interaction traces
-        if let Some(ref lookup) = embedding_lookup_rel {
-            for layer in &embedding_layers {
-                let layer_size = 1usize << layer.log_size;
-                let layer_vec_size = layer_size >> LOG_N_LANES;
-
-                let mut tbl_tok = Col::<SimdBackend, BaseField>::zeros(layer_size);
-                let mut tbl_col = Col::<SimdBackend, BaseField>::zeros(layer_size);
-                let mut tbl_val = Col::<SimdBackend, BaseField>::zeros(layer_size);
-                let n_table = layer.table_tokens.len().min(layer_size);
-                for i in 0..n_table {
-                    tbl_tok.set(i, layer.table_tokens[i]);
-                    tbl_col.set(i, layer.table_cols[i]);
-                    tbl_val.set(i, layer.table_values[i]);
-                }
-
-                let mut tr_tok = Col::<SimdBackend, BaseField>::zeros(layer_size);
-                let mut tr_col = Col::<SimdBackend, BaseField>::zeros(layer_size);
-                let mut tr_val = Col::<SimdBackend, BaseField>::zeros(layer_size);
-                let n_trace = layer.token_ids.len().min(layer_size);
-                for i in 0..n_trace {
-                    tr_tok.set(i, layer.token_ids[i]);
-                    tr_col.set(i, layer.col_indices[i]);
-                    tr_val.set(i, layer.values[i]);
-                }
-
-                let mut logup_gen = LogupTraceGenerator::new(layer.log_size);
-
-                let mut col_gen = logup_gen.new_col();
-                for vec_row in 0..layer_vec_size {
-                    let q_table: PackedSecureField = lookup.lookup_elements().combine(&[
-                        tbl_tok.data[vec_row],
-                        tbl_col.data[vec_row],
-                        tbl_val.data[vec_row],
-                    ]);
-                    let mult_packed = pack_multiplicities(&layer.multiplicities, vec_row);
-                    col_gen.write_frac(vec_row, -mult_packed, q_table);
-                }
-                col_gen.finalize_col();
-
-                let mut col_gen = logup_gen.new_col();
-                for vec_row in 0..layer_vec_size {
-                    let q_trace: PackedSecureField = lookup.lookup_elements().combine(&[
-                        tr_tok.data[vec_row],
-                        tr_col.data[vec_row],
-                        tr_val.data[vec_row],
-                    ]);
-                    col_gen.write_frac(vec_row, PackedSecureField::one(), q_trace);
-                }
-                col_gen.finalize_col();
-
-                let (interaction_trace, claimed_sum) = logup_gen.finalize_last();
-                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(
-                    interaction_trace,
-                ));
-                embedding_claimed_sums.push(claimed_sum);
-            }
-        }
-
-        // Quantize LogUp interaction traces (2D: input, output)
-        if let Some(ref lookup) = quantize_lookup {
-            for (idx, layer) in quantize_layers.iter().enumerate() {
-                let table = build_quantize_table(&layer.params, &layer.input_values);
-                let layer_size = 1usize << layer.log_size;
-                let layer_vec_size = layer_size >> LOG_N_LANES;
-                let pad_input = table.inputs[0];
-                let pad_output = table.outputs[0];
-
-                let (table_in_col, table_out_col) =
-                    build_quantize_table_columns::<SimdBackend>(&table, layer_size);
-                let (trace_in_col, trace_out_col, _) = build_quantize_trace_simd_2d::<SimdBackend>(
-                    &layer.input_values,
-                    &layer.values,
-                    &quantize_mults[idx],
-                    pad_input,
-                    pad_output,
-                    layer_size,
-                );
-
-                let mut logup_gen = LogupTraceGenerator::new(layer.log_size);
-                let mut col_gen = logup_gen.new_col();
-
-                for vec_row in 0..layer_vec_size {
-                    let q_table: PackedSecureField = lookup
-                        .lookup_elements()
-                        .combine(&[table_in_col.data[vec_row], table_out_col.data[vec_row]]);
-                    let q_trace: PackedSecureField = lookup
-                        .lookup_elements()
-                        .combine(&[trace_in_col.data[vec_row], trace_out_col.data[vec_row]]);
-
-                    let mult_packed = pack_multiplicities(&quantize_mults[idx], vec_row);
-                    let numerator = q_table - mult_packed * q_trace;
-                    let denominator = q_table * q_trace;
-
-                    col_gen.write_frac(vec_row, numerator, denominator);
-                }
-                col_gen.finalize_col();
-
-                let (interaction_trace, claimed_sum) = logup_gen.finalize_last();
-                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(
-                    interaction_trace,
-                ));
-                quantize_claimed_sums.push(claimed_sum);
-            }
-        }
-
-        // Dequantize LogUp interaction traces
-        // Combined fraction matching DequantizeEval's finalize_logup_in_pairs()
-        if let Some(ref lookup) = dequantize_lookup {
-            for (idx, layer) in dequantize_layers.iter().enumerate() {
-                let table = build_dequantize_table(&layer.params);
-                let layer_size = 1usize << layer.log_size;
-                let layer_vec_size = layer_size >> LOG_N_LANES;
-                let pad_input = table.inputs[0];
-                let pad_output = table.outputs[0];
-
-                let (table_in_col, table_out_col) =
-                    build_table_columns::<SimdBackend>(&table, layer_size);
-                let (trace_in_col, trace_out_col, _) = build_trace_columns::<SimdBackend>(
-                    &layer.input_values,
-                    &layer.output_values,
-                    &dequantize_mults[idx],
-                    pad_input,
-                    pad_output,
-                    layer_size,
-                );
-
-                let mut logup_gen = LogupTraceGenerator::new(layer.log_size);
-                let mut col_gen = logup_gen.new_col();
-
-                for vec_row in 0..layer_vec_size {
-                    let q_table: PackedSecureField = lookup
-                        .lookup_elements()
-                        .combine(&[table_in_col.data[vec_row], table_out_col.data[vec_row]]);
-                    let q_trace: PackedSecureField = lookup
-                        .lookup_elements()
-                        .combine(&[trace_in_col.data[vec_row], trace_out_col.data[vec_row]]);
-
-                    let mult_packed = pack_multiplicities(&dequantize_mults[idx], vec_row);
-                    let numerator = q_table - mult_packed * q_trace;
-                    let denominator = q_table * q_trace;
-
-                    col_gen.write_frac(vec_row, numerator, denominator);
-                }
-                col_gen.finalize_col();
-
-                let (interaction_trace, claimed_sum) = logup_gen.finalize_last();
-                tree_builder.extend_evals(convert_evaluations::<SimdBackend, B, BaseField>(
-                    interaction_trace,
-                ));
-                dequantize_claimed_sums.push(claimed_sum);
-            }
-        }
-
-        tree_builder.commit(channel);
-    } // end if has_logup
-
-    // Build all components with shared allocator
-    let mut allocator = TraceLocationAllocator::default();
-    let mut component_refs_storage: Vec<Box<dyn ComponentProverErased<B>>> = Vec::new();
-    let mut activation_claims: Vec<LayerClaim> = Vec::new();
-    let mut add_claims: Vec<LayerClaim> = Vec::new();
-    let mut mul_claims: Vec<LayerClaim> = Vec::new();
-    let mut layernorm_claims: Vec<LayerClaim> = Vec::new();
-    let mut rmsnorm_claims: Vec<LayerClaim> = Vec::new();
-    let mut embedding_claims: Vec<LayerClaim> = Vec::new();
-    let mut quantize_claims_vec: Vec<LayerClaim> = Vec::new();
-
-    // Activation components
-    if let Some(ref lookup) = activation_lookup {
-        for (idx, layer) in activation_layers.iter().enumerate() {
-            let claimed_sum = activation_claimed_sums[idx];
-            let component = FrameworkComponent::new(
-                &mut allocator,
-                ActivationEval {
-                    log_n_rows: layer.log_size,
-                    lookup_elements: lookup.clone(),
-                    claimed_sum,
-                    total_sum: claimed_sum,
-                    activation_type_tag: layer.type_tag,
-                    instance_id: idx,
-                },
-                claimed_sum,
-            );
-            component_refs_storage.push(Box::new(component));
-            activation_claims.push(LayerClaim {
-                layer_index: layer.node_id,
-                claimed_sum,
-                trace_rows: 1 << layer.log_size,
-            });
-        }
-    }
-
-    // Add components
-    for layer in &add_layers {
-        let component = FrameworkComponent::new(
-            &mut allocator,
-            ElementwiseAddEval {
-                log_n_rows: layer.log_size,
-            },
-            SecureField::default(),
-        );
-        component_refs_storage.push(Box::new(component));
-        add_claims.push(LayerClaim {
-            layer_index: layer.node_id,
-            claimed_sum: SecureField::default(),
-            trace_rows: 1 << layer.log_size,
-        });
-    }
-
-    // Mul components
-    for layer in &mul_layers {
-        let component = FrameworkComponent::new(
-            &mut allocator,
-            ElementwiseMulEval {
-                log_n_rows: layer.log_size,
-            },
-            SecureField::default(),
-        );
-        component_refs_storage.push(Box::new(component));
-        mul_claims.push(LayerClaim {
-            layer_index: layer.node_id,
-            claimed_sum: SecureField::default(),
-            trace_rows: 1 << layer.log_size,
-        });
-    }
-
-    // LayerNorm components
-    if let Some(ref lookup) = layernorm_lookup {
-        for (idx, layer) in layernorm_layers.iter().enumerate() {
-            let claimed_sum = layernorm_claimed_sums[idx];
-            let component = FrameworkComponent::new(
-                &mut allocator,
-                LayerNormEval {
-                    log_n_rows: layer.log_size,
-                    dim: layer.inputs.len(),
-                    lookup_elements: lookup.clone(),
-                    claimed_sum,
-                    instance_id: idx,
-                },
-                claimed_sum,
-            );
-            component_refs_storage.push(Box::new(component));
-            layernorm_claims.push(LayerClaim {
-                layer_index: layer.node_id,
-                claimed_sum,
-                trace_rows: 1 << layer.log_size,
-            });
-        }
-    }
-
-    // RMSNorm components (LogUp)
-    if let Some(ref lookup) = rmsnorm_lookup {
-        for (idx, layer) in rmsnorm_layers.iter().enumerate() {
-            let claimed_sum = rmsnorm_claimed_sums[idx];
-            let component = FrameworkComponent::new(
-                &mut allocator,
-                RMSNormEval {
-                    log_n_rows: layer.log_size,
-                    dim: layer.inputs.len(),
-                    lookup_elements: lookup.clone(),
-                    claimed_sum,
-                    instance_id: idx,
-                },
-                claimed_sum,
-            );
-            component_refs_storage.push(Box::new(component));
-            rmsnorm_claims.push(LayerClaim {
-                layer_index: layer.node_id,
-                claimed_sum,
-                trace_rows: 1 << layer.log_size,
-            });
-        }
-    }
-
-    // Embedding components (LogUp)
-    if let Some(ref lookup) = embedding_lookup_rel {
-        for (idx, layer) in embedding_layers.iter().enumerate() {
-            let claimed_sum = embedding_claimed_sums[idx];
-            let component = FrameworkComponent::new(
-                &mut allocator,
-                EmbeddingEval {
-                    log_n_rows: layer.log_size,
-                    lookup_elements: lookup.clone(),
-                    claimed_sum,
-                    instance_id: idx,
-                },
-                claimed_sum,
-            );
-            component_refs_storage.push(Box::new(component));
-            embedding_claims.push(LayerClaim {
-                layer_index: layer.node_id,
-                claimed_sum,
-                trace_rows: 1 << layer.log_size,
-            });
-        }
-    }
-
-    // Quantize components (LogUp range-check)
-    if let Some(ref lookup) = quantize_lookup {
-        for (idx, layer) in quantize_layers.iter().enumerate() {
-            let claimed_sum = quantize_claimed_sums[idx];
-            let component = FrameworkComponent::new(
-                &mut allocator,
-                QuantizeEval {
-                    log_n_rows: layer.log_size,
-                    lookup_elements: lookup.clone(),
-                    claimed_sum,
-                    instance_id: idx,
-                },
-                claimed_sum,
-            );
-            component_refs_storage.push(Box::new(component));
-            quantize_claims_vec.push(LayerClaim {
-                layer_index: layer.node_id,
-                claimed_sum,
-                trace_rows: 1 << layer.log_size,
-            });
-        }
-    }
-
-    // Dequantize components (LogUp lookup)
-    let mut dequantize_claims_vec: Vec<LayerClaim> = Vec::new();
-    if let Some(ref lookup) = dequantize_lookup {
-        for (idx, layer) in dequantize_layers.iter().enumerate() {
-            let claimed_sum = dequantize_claimed_sums[idx];
-            let component = FrameworkComponent::new(
-                &mut allocator,
-                DequantizeEval {
-                    log_n_rows: layer.log_size,
-                    lookup_elements: lookup.clone(),
-                    claimed_sum,
-                    instance_id: idx,
-                },
-                claimed_sum,
-            );
-            component_refs_storage.push(Box::new(component));
-            dequantize_claims_vec.push(LayerClaim {
-                layer_index: layer.node_id,
-                claimed_sum,
-                trace_rows: 1 << layer.log_size,
-            });
-        }
-    }
-
-    let component_refs: Vec<&dyn ComponentProver<B>> = component_refs_storage
-        .iter()
-        .map(|c| c.as_component_prover())
-        .collect();
-
-    let max_log_size = unified_stark_max_log_size(
+    let result = build_unified_stark::<SimdBackend>(
         &activation_layers,
         &add_layers,
         &mul_layers,
@@ -4122,12 +3286,6 @@ where
         &embedding_layers,
         &quantize_layers,
         &dequantize_layers,
-    );
-    let stark_proof = prove_unified_stark_with_gpu_pipeline::<B, Blake2sMerkleChannel>(
-        &component_refs,
-        channel,
-        commitment_scheme,
-        max_log_size,
     )?;
 
     eprintln!(
@@ -4139,19 +3297,19 @@ where
     let quantize_params_commitment = compute_quantize_params_commitment(&quantize_layers);
 
     Ok(AggregatedModelProofOnChain {
-        unified_stark: Some(stark_proof),
+        unified_stark: Some(result.stark_proof),
         matmul_proofs,
         batched_matmul_proofs,
-        add_claims,
-        mul_claims,
-        layernorm_claims,
-        rmsnorm_claims,
+        add_claims: result.add_claims,
+        mul_claims: result.mul_claims,
+        layernorm_claims: result.layernorm_claims,
+        rmsnorm_claims: result.rmsnorm_claims,
         execution,
-        activation_claims,
+        activation_claims: result.activation_claims,
         attention_proofs,
-        embedding_claims,
-        quantize_claims: quantize_claims_vec,
-        dequantize_claims: dequantize_claims_vec,
+        embedding_claims: result.embedding_claims,
+        quantize_claims: result.quantize_claims,
+        dequantize_claims: result.dequantize_claims,
         layer_chain_commitment,
         io_commitment,
         layernorm_mean_var_commitments,
@@ -4161,6 +3319,7 @@ where
         gkr_batch_data: None,
     })
 }
+
 
 /// Prove with auto GPU dispatch for on-chain format.
 ///
@@ -4231,26 +3390,13 @@ fn prove_model_aggregated_onchain_gpu(
     input: &M31Matrix,
     weights: &GraphWeights,
 ) -> Result<AggregatedModelProofOnChain, AggregationError> {
+    // Phase 3 (unified STARK) always uses SimdBackend internally,
+    // so GpuBackend is only used for Phase 1+2 (matmul forward/sumcheck).
+    // No outer fallback needed.
     #[cfg(feature = "cuda-runtime")]
     {
         use stwo::prover::backend::gpu::GpuBackend;
-        let result = prove_model_aggregated_onchain_with::<GpuBackend>(graph, input, weights);
-        // GPU unified STARK may fail with ConstraintsNotSatisfied due to the
-        // GPU component prover's preprocessed column handling. Fall back to
-        // SIMD which is fast (<1s) for the unified STARK phase.
-        if let Err(AggregationError::ProvingError(ref msg)) = result {
-            if msg.contains("ConstraintsNotSatisfied")
-                && !flag_enabled("STWO_UNIFIED_STARK_NO_FALLBACK")
-            {
-                eprintln!(
-                    "  [GPU→SIMD fallback] GPU unified STARK failed, retrying with SimdBackend..."
-                );
-                return prove_model_aggregated_onchain_with::<SimdBackend>(
-                    graph, input, weights,
-                );
-            }
-        }
-        return result;
+        return prove_model_aggregated_onchain_with::<GpuBackend>(graph, input, weights);
     }
 
     #[cfg(not(feature = "cuda-runtime"))]
@@ -4297,36 +3443,17 @@ fn prove_model_aggregated_onchain_gpu_cached(
     weights: &GraphWeights,
     weight_cache: &crate::weight_cache::SharedWeightCache,
 ) -> Result<AggregatedModelProofOnChain, AggregationError> {
+    // Phase 3 (unified STARK) always uses SimdBackend internally,
+    // so GpuBackend is only used for Phase 1+2 (matmul forward/sumcheck).
+    // No outer fallback needed.
     use stwo::prover::backend::gpu::GpuBackend;
-    let result = prove_model_aggregated_onchain_with_cache::<GpuBackend>(
+    prove_model_aggregated_onchain_with_cache::<GpuBackend>(
         graph,
         input,
         weights,
         Some(weight_cache),
         None,
-    );
-    // Fallback: if GPU unified STARK fails with ConstraintsNotSatisfied (known
-    // GPU component prover issue with shared preprocessed columns), retry with
-    // SIMD backend. The unified STARK is fast (<1s) so the fallback is cheap.
-    match &result {
-        Err(AggregationError::ProvingError(msg))
-            if msg.contains("ConstraintsNotSatisfied")
-                && !flag_enabled("STWO_UNIFIED_STARK_NO_FALLBACK") =>
-        {
-            eprintln!(
-                "  [GPU→SIMD fallback] GPU unified STARK failed ({}), retrying with SimdBackend...",
-                msg
-            );
-            prove_model_aggregated_onchain_with_cache::<SimdBackend>(
-                graph,
-                input,
-                weights,
-                Some(weight_cache),
-                None,
-            )
-        }
-        _ => result,
-    }
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -4610,14 +3737,6 @@ where
     FrameworkComponent<EmbeddingEval>: ComponentProver<B>,
     FrameworkComponent<QuantizeEval>: ComponentProver<B>,
     FrameworkComponent<DequantizeEval>: ComponentProver<B>,
-    FrameworkComponent<ActivationEval>: ComponentProver<SimdBackend>,
-    FrameworkComponent<ElementwiseAddEval>: ComponentProver<SimdBackend>,
-    FrameworkComponent<ElementwiseMulEval>: ComponentProver<SimdBackend>,
-    FrameworkComponent<LayerNormEval>: ComponentProver<SimdBackend>,
-    FrameworkComponent<RMSNormEval>: ComponentProver<SimdBackend>,
-    FrameworkComponent<EmbeddingEval>: ComponentProver<SimdBackend>,
-    FrameworkComponent<QuantizeEval>: ComponentProver<SimdBackend>,
-    FrameworkComponent<DequantizeEval>: ComponentProver<SimdBackend>,
 {
     let gpu_active = crate::backend::gpu_is_available();
     let _ = gpu_active; // used only with cuda-runtime
@@ -5283,10 +4402,13 @@ where
         }
     }
 
+    // Always use SimdBackend for the unified STARK — GpuBackend hits
+    // ConstraintsNotSatisfied due to preprocessed column handling, and
+    // SimdBackend is fast (<1s) for this phase.
     eprintln!("Phase 3/3: Building unified STARK (non-matmul components)...");
     let t_stark = std::time::Instant::now();
 
-    let result = match build_unified_stark::<B>(
+    let result = build_unified_stark::<SimdBackend>(
         &activation_layers,
         &add_layers,
         &mul_layers,
@@ -5295,37 +4417,7 @@ where
         &embedding_layers,
         &quantize_layers,
         &dequantize_layers,
-    ) {
-        Ok(v) => v,
-        Err(err) => {
-            let is_gpu_backend = std::any::type_name::<B>().contains("GpuBackend");
-            let gpu_only = flag_enabled("STWO_GPU_ONLY");
-            let no_fallback = flag_enabled("STWO_UNIFIED_STARK_NO_FALLBACK");
-            let is_constraint_sanity = format!("{err}").contains("ConstraintsNotSatisfied");
-
-            if is_gpu_backend && is_constraint_sanity && !gpu_only && !no_fallback {
-                tracing::warn!(
-                    error = %err,
-                    "Unified STARK GPU path hit ConstraintsNotSatisfied; retrying SIMD fallback"
-                );
-                tracing::warn!(
-                    "Set STWO_GPU_ONLY=1 or STWO_UNIFIED_STARK_NO_FALLBACK=1 to fail closed instead"
-                );
-                build_unified_stark::<SimdBackend>(
-                    &activation_layers,
-                    &add_layers,
-                    &mul_layers,
-                    &layernorm_layers,
-                    &rmsnorm_layers,
-                    &embedding_layers,
-                    &quantize_layers,
-                    &dequantize_layers,
-                )?
-            } else {
-                return Err(err);
-            }
-        }
-    };
+    )?;
 
     eprintln!(
         "  Unified STARK in {:.2}s (total: {:.1}s)",
