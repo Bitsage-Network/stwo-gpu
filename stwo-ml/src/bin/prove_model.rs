@@ -1585,9 +1585,9 @@ fn submit_gkr_onchain(
         .args([
             "--account",
             &cli.account,
+            "call",
             "--url",
             rpc_url,
-            "call",
             "--contract-address",
             &cli.contract,
             "--function",
@@ -1627,9 +1627,9 @@ fn submit_gkr_onchain(
             .args([
                 "--account",
                 &cli.account,
+                "invoke",
                 "--url",
                 rpc_url,
-                "invoke",
                 "--contract-address",
                 &cli.contract,
                 "--function",
@@ -1676,7 +1676,8 @@ fn submit_gkr_onchain(
     let verify_result = std::process::Command::new("sh")
         .arg("-c")
         .arg(format!(
-            "sncast --account '{}' --url '{}' invoke \
+            "sncast --account '{}' invoke \
+             --url '{}' \
              --contract-address '{}' \
              --function {} \
              --calldata $(cat '{}') \
@@ -3233,7 +3234,8 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
             let submit_result = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(format!(
-                    "sncast --account '{}' --url '{}' invoke \
+                    "sncast --account '{}' invoke \
+                     --url '{}' \
                      --contract-address '{}' \
                      --function submit_audit \
                      --calldata $(cat '{}') \
