@@ -215,28 +215,31 @@ pub fn prove_recursive_with_policy(
     //   pow_bits=16    (proof-of-work grinding protection)
     //   Total: 90 + 16 = 106 bits
     //
-    // Override via OBELYZK_RECURSIVE_SECURITY env var:
-    //   "test"       → 13 bits  (fast, for unit tests)
-    //   "production" → 106 bits (default)
+    // Test-only override via thread-local guard `RecursiveTestModeGuard::enter()`.
+    // Production builds never enter the test path (the entire `#[cfg(test)]`
+    // arm compiles out). The thread-local replaces a process-global env var
+    // (`OBELYZK_RECURSIVE_SECURITY`) that previously raced across parallel
+    // test threads.
     let config = {
-        // In test builds only, allow env var override for fast testing.
-        // Production builds always use the hardened config.
         #[cfg(test)]
-        let level = std::env::var("OBELYZK_RECURSIVE_SECURITY")
-            .unwrap_or_else(|_| "production".to_string());
+        let test_mode = super::recursive_test_mode_active();
         #[cfg(not(test))]
-        let level = "production".to_string();
-        match level.as_str() {
+        let test_mode = false;
+        if test_mode {
             #[cfg(test)]
-            "test" => PcsConfig::default(), // 13 bits — unit tests only
-            _ => PcsConfig {
+            { PcsConfig::default() } // 13 bits — unit tests only
+            #[cfg(not(test))]
+            { unreachable!() }
+        } else {
+            PcsConfig {
                 pow_bits: 20,
-                // 120 bits: pow(20) + blowup(5)*queries(20) = 20+100 = 120
-                // Reduced from 28 to 20 queries to fit Alchemy RPC 5000-felt limit
-                // log_last_layer_degree_bound=0 required by Cairo FRI verifier
-                fri_config: stwo::core::fri::FriConfig::new(0, 5, 20, 1),
+                // 100 bits: pow(20) + blowup(5)*queries(16) = 20+80 = 100
+                // Reduced from 20→16 to keep recursive proof under Sepolia's 5000-felt
+                // sequencer cap on full 30L SmolLM2 (was 5,405 felts at queries=20).
+                // log_last_layer_degree_bound=0 required by Cairo FRI verifier.
+                fri_config: stwo::core::fri::FriConfig::new(0, 5, 16, 1),
                 lifting_log_size: None,
-            },
+            }
         }
     };
     let chain_log_size = trace_data.log_size;
@@ -282,6 +285,26 @@ pub fn prove_recursive_with_policy(
     // Two-level recursion: the chain STARK transitively attests Hades correctness.
     {
         let bytes = witness.public_inputs.hades_commitment.to_bytes_be();
+        let u0 = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
+        let u1 = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
+        let u2 = u64::from_be_bytes(bytes[16..24].try_into().unwrap());
+        let u3 = u64::from_be_bytes(bytes[24..32].try_into().unwrap());
+        channel.mix_u64(u0);
+        channel.mix_u64(u1);
+        channel.mix_u64(u2);
+        channel.mix_u64(u3);
+    }
+
+    // SECURITY: KV-cache continuity binding. Multi-token autoregressive sessions
+    // require step N's input cache == step N-1's output cache. Mixing both
+    // commitments here makes any tampering with the chain (reorder, skip a
+    // step, swap caches) cause Fiat-Shamir divergence and FRI rejection.
+    // Both are FieldElement::ZERO on prefill / single-pass / non-decode proofs.
+    for fe in [
+        witness.public_inputs.prev_kv_cache_commitment,
+        witness.public_inputs.kv_cache_commitment,
+    ] {
+        let bytes = fe.to_bytes_be();
         let u0 = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
         let u1 = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
         let u2 = u64::from_be_bytes(bytes[16..24].try_into().unwrap());
@@ -403,16 +426,17 @@ pub fn prove_recursive_with_policy(
         if unified_log_size > chain_log_size {
             let unified_n = 1usize << unified_log_size;
             let n_real = trace_data.n_real_rows;
-            // Slim 48-column layout offsets
-            let col_is_active = 45;
-            let col_ac = 46;
-            let col_ac_next = 47;
+            // 56-column layout offsets (pos/neg signed carry split)
+            let col_is_active = 53;
+            let col_ac = 54;
+            let col_ac_next = 55;
             let col_shifted = 18;
             let col_digest_before = 0;
             let col_digest_after = 9;
             let col_addition = 27;
-            let col_carry = 36;
-            let col_k = 44;
+            let col_carry_pos = 36;
+            let col_carry_neg = 44;
+            let col_k = 52;
 
             // Pad execution columns to unified size first
             for col in trace_data.execution_trace.iter_mut() {
@@ -452,10 +476,11 @@ pub fn prove_recursive_with_policy(
                     std::array::from_fn(|j| trace_data.execution_trace[col_addition + j][row_idx]);
                 let next_before_limbs: [M31; super::air::LIMBS_PER_FELT] =
                     std::array::from_fn(|j| trace_data.execution_trace[col_digest_before + j][row_idx + 1]);
-                let (carries, k) =
+                let (carry_pos, carry_neg, k) =
                     super::air::compute_addition_carry_chain(&da_limbs, &add_limbs, &next_before_limbs);
                 for j in 0..8 {
-                    trace_data.execution_trace[col_carry + j][row_idx] = carries[j];
+                    trace_data.execution_trace[col_carry_pos + j][row_idx] = carry_pos[j];
+                    trace_data.execution_trace[col_carry_neg + j][row_idx] = carry_neg[j];
                 }
                 trace_data.execution_trace[col_k][row_idx] = k;
             }
@@ -466,7 +491,7 @@ pub fn prove_recursive_with_policy(
             );
         }
 
-        // Chain columns: 48 columns, padded to unified_log_size
+        // Chain columns: 56 columns, padded to unified_log_size
         let chain_evals: Vec<CircleEvaluation<SimdBackend, M31, _>> = trace_data
             .execution_trace
             .iter()
@@ -648,9 +673,7 @@ pub fn prove_recursive_with_policy(
         initial_digest_limbs: zero_limbs,
         final_digest_limbs: final_limbs,
         hades_lookup: logup_relation.clone(),
-        hades_enabled: false, // chain-only STARK (48 cols) for 1-TX proof size
-        // Hades verification is pre-flight (Rust-side). Hades commitment
-        // bound to Fiat-Shamir channel prevents forgery.
+        hades_enabled, // true = 1273 cols (48 chain + 1225 Hades), false = 48 cols chain-only
     };
     let chain_component =
         FrameworkComponent::new(&mut allocator, chain_eval, chain_claimed_sum);
@@ -770,29 +793,37 @@ pub fn prove_recursive_with_policy(
         }
     }
 
-    // Verify chain constraints before proving (slim 48-column offsets)
+    // Verify chain constraints before proving (56-column pos/neg layout)
     {
         let n_real = trace_data.n_real_rows;
         let n_padded = 1usize << unified_log_size;
-        // Slim layout offsets
+        // 56-column layout offsets
         let col_digest_after = 9;
         let col_shifted = 18;
         let col_addition = 27;
-        let col_carry = 36;
-        let col_k_idx = 44;
-        let col_is_active_offset = 45;
-        let col_ac = 46;
-        let col_ac_next = 47;
+        let col_carry_pos = 36;
+        let col_carry_neg = 44;
+        let col_k_idx = 52;
+        let col_is_active_offset = 53;
+        let col_ac = 54;
+        let col_ac_next = 55;
 
         let mut chain_failures = 0usize;
+        let mut failed_rows: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        // Signed carry at limb j = pos[j] - neg[j] ∈ {-1, 0, 1}.
+        let signed_carry = |i: usize, j: usize| -> i64 {
+            let pos = trace_data.execution_trace[col_carry_pos + j][i].0 as i64;
+            let neg = trace_data.execution_trace[col_carry_neg + j][i].0 as i64;
+            pos - neg
+        };
         for i in 0..n_real.saturating_sub(1) {
             for j in 0..super::air::LIMBS_PER_FELT {
                 let da = trace_data.execution_trace[col_digest_after + j][i].0 as i64;
                 let add = trace_data.execution_trace[col_addition + j][i].0 as i64;
-                let carry_in = if j == 0 { 0i64 } else { trace_data.execution_trace[col_carry + j - 1][i].0 as i64 };
+                let carry_in = if j == 0 { 0i64 } else { signed_carry(i, j - 1) };
                 let snb = trace_data.execution_trace[col_shifted + j][i].0 as i64;
                 let k = trace_data.execution_trace[col_k_idx][i].0 as i64;
-                let carry_out = if j < 8 { trace_data.execution_trace[col_carry + j][i].0 as i64 } else { 0 };
+                let carry_out = if j < 8 { signed_carry(i, j) } else { 0 };
                 let p_j = super::air::P_LIMBS_28[j] as i64;
                 let residual = da + add + carry_in - snb - k * p_j - carry_out * (1i64 << 28);
                 if residual != 0 {
@@ -800,8 +831,27 @@ pub fn prove_recursive_with_policy(
                         eprintln!("[chain-check] FAIL row {i} limb {j}: residual={residual} (da={da} add={add} cin={carry_in} snb={snb} k={k} cout={carry_out})");
                     }
                     chain_failures += 1;
+                    failed_rows.insert(i);
                 }
             }
+        }
+        // Reconstruct felts at each failing row to compare felt-level vs limb-level.
+        for &i in failed_rows.iter().take(3) {
+            let da_limbs: [M31; super::air::LIMBS_PER_FELT] =
+                std::array::from_fn(|j| trace_data.execution_trace[col_digest_after + j][i]);
+            let add_limbs: [M31; super::air::LIMBS_PER_FELT] =
+                std::array::from_fn(|j| trace_data.execution_trace[col_addition + j][i]);
+            let snb_limbs: [M31; super::air::LIMBS_PER_FELT] =
+                std::array::from_fn(|j| trace_data.execution_trace[col_shifted + j][i]);
+            let da_felt = super::air::limbs_to_felt252(&da_limbs);
+            let add_felt = super::air::limbs_to_felt252(&add_limbs);
+            let snb_felt = super::air::limbs_to_felt252(&snb_limbs);
+            let sum = da_felt + add_felt;
+            let diff = sum - snb_felt;
+            eprintln!(
+                "[chain-check FELT] row {i}: da={:#066x} add={:#066x} snb={:#066x} sum-snb={:#066x}",
+                da_felt, add_felt, snb_felt, diff,
+            );
         }
         if chain_failures > 0 {
             eprintln!("[chain-check] {} total constraint failures across {} chain rows", chain_failures, n_real - 1);
@@ -1013,7 +1063,7 @@ mod tests {
 
     #[test]
     fn test_prove_recursive_1layer() {
-        std::env::set_var("OBELYZK_RECURSIVE_SECURITY", "test");
+        let _g = super::super::RecursiveTestModeGuard::enter();
         // End-to-end: prove a 1-layer MatMul GKR → recursive STARK.
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);

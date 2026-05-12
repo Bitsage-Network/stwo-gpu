@@ -39,20 +39,23 @@ pub fn verify_recursive(
 ) -> Result<(), RecursiveError> {
     // PcsConfig must match what the prover used. The Cairo verifier reads
     // it from the proof body. For Rust pre-flight, match the prover's config.
+    // See `recursive/mod.rs` for the test-mode thread-local override.
     let pcs_config = {
         #[cfg(test)]
-        let level = std::env::var("OBELYZK_RECURSIVE_SECURITY")
-            .unwrap_or_else(|_| "production".to_string());
+        let test_mode = super::recursive_test_mode_active();
         #[cfg(not(test))]
-        let level = "production".to_string();
-        match level.as_str() {
+        let test_mode = false;
+        if test_mode {
             #[cfg(test)]
-            "test" => PcsConfig::default(),
-            _ => PcsConfig {
+            { PcsConfig::default() }
+            #[cfg(not(test))]
+            { unreachable!() }
+        } else {
+            PcsConfig {
                 pow_bits: 20,
-                fri_config: stwo::core::fri::FriConfig::new(0, 5, 20, 1),
+                fri_config: stwo::core::fri::FriConfig::new(0, 5, 16, 1),
                 lifting_log_size: None,
-            },
+            }
         }
     };
 
@@ -91,6 +94,20 @@ pub fn verify_recursive(
     // hades_commitment binding (two-level recursion)
     {
         let bytes = public_inputs.hades_commitment.to_bytes_be();
+        channel.mix_u64(u64::from_be_bytes(bytes[0..8].try_into().unwrap()));
+        channel.mix_u64(u64::from_be_bytes(bytes[8..16].try_into().unwrap()));
+        channel.mix_u64(u64::from_be_bytes(bytes[16..24].try_into().unwrap()));
+        channel.mix_u64(u64::from_be_bytes(bytes[24..32].try_into().unwrap()));
+    }
+
+    // KV-cache continuity binding (multi-token autoregressive sessions).
+    // Both ZERO on prefill / single-pass; non-zero on decode steps.
+    // Order MUST match prover.rs: prev first, then curr.
+    for fe in [
+        public_inputs.prev_kv_cache_commitment,
+        public_inputs.kv_cache_commitment,
+    ] {
+        let bytes = fe.to_bytes_be();
         channel.mix_u64(u64::from_be_bytes(bytes[0..8].try_into().unwrap()));
         channel.mix_u64(u64::from_be_bytes(bytes[8..16].try_into().unwrap()));
         channel.mix_u64(u64::from_be_bytes(bytes[16..24].try_into().unwrap()));
@@ -200,7 +217,7 @@ mod tests {
         // The Cairo contract uses mix_into(), so the prover must too.
         let config = PcsConfig {
             pow_bits: 20,
-            fri_config: stwo::core::fri::FriConfig::new(0, 5, 20, 1),
+            fri_config: stwo::core::fri::FriConfig::new(0, 5, 16, 1),
             lifting_log_size: None,
         };
 
@@ -223,7 +240,7 @@ mod tests {
 
     #[test]
     fn test_verify_recursive_roundtrip() {
-        std::env::set_var("OBELYZK_RECURSIVE_SECURITY", "test");
+        let _g = super::super::RecursiveTestModeGuard::enter();
         // Full roundtrip: prove GKR → prove recursive → verify recursive.
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);
@@ -308,8 +325,13 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════
 
     /// Helper: produce a valid recursive proof for adversarial testing.
+    /// Caller must hold a `RecursiveTestModeGuard` for the duration of the
+    /// test (the guard governs both prove and verify-side PcsConfig choice).
     fn adversarial_proof() -> super::super::types::RecursiveProof {
-        std::env::set_var("OBELYZK_RECURSIVE_SECURITY", "test");
+        debug_assert!(
+            super::super::recursive_test_mode_active(),
+            "adversarial_proof requires the caller to enter RecursiveTestModeGuard first"
+        );
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(2);
         let graph = builder.build();
@@ -357,7 +379,7 @@ mod tests {
         use stwo::core::fields::FieldExpOps;
         use stwo::core::poly::circle::CanonicCoset;
 
-        std::env::set_var("OBELYZK_RECURSIVE_SECURITY", "test");
+        let _g = super::super::RecursiveTestModeGuard::enter();
         std::env::set_var("OBELYZK_LOGUP", "0");
         let rp = adversarial_proof();
 
@@ -511,7 +533,8 @@ mod tests {
     fn test_adversarial_tampered_io_commitment_rejected() {
         // Relabeling attack: same proof body, different io_commitment.
         // Fiat-Shamir channel binding causes FRI divergence → rejection.
-        let rp = adversarial_proof();
+        let _g = super::super::RecursiveTestModeGuard::enter();
+                let rp = adversarial_proof();
 
         // Valid proof passes
         let ok = verify_recursive(
@@ -544,7 +567,8 @@ mod tests {
     #[test]
     fn test_adversarial_tampered_n_layers_rejected() {
         // n_layers tampering: different layer count with same proof body.
-        let rp = adversarial_proof();
+        let _g = super::super::RecursiveTestModeGuard::enter();
+                let rp = adversarial_proof();
 
         let tampered = RecursivePublicInputs {
             n_layers: rp.public_inputs.n_layers + 100,
@@ -557,7 +581,8 @@ mod tests {
 
     #[test]
     fn test_adversarial_tampered_weight_super_root_rejected() {
-        let rp = adversarial_proof();
+        let _g = super::super::RecursiveTestModeGuard::enter();
+                let rp = adversarial_proof();
 
         let tampered = RecursivePublicInputs {
             weight_super_root: QM31(
@@ -576,7 +601,8 @@ mod tests {
 
     #[test]
     fn test_adversarial_tampered_circuit_hash_rejected() {
-        let rp = adversarial_proof();
+        let _g = super::super::RecursiveTestModeGuard::enter();
+                let rp = adversarial_proof();
 
         let tampered = RecursivePublicInputs {
             circuit_hash: QM31(
@@ -616,6 +642,8 @@ mod tests {
             n_poseidon_perms: 9999,
             seed_digest: QM31::default(),
             hades_commitment: starknet_ff::FieldElement::ZERO,
+            kv_cache_commitment: starknet_ff::FieldElement::ZERO,
+            prev_kv_cache_commitment: starknet_ff::FieldElement::ZERO,
         };
         let err = verify_recursive(&rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest, rp.logup_claimed_sum);
         assert!(
@@ -646,7 +674,8 @@ mod tests {
         // An attacker claims a different n_poseidon_perms to make the trace
         // trivially small. Without the n_poseidon_perms channel binding, this
         // would produce a valid STARK proof without running the GKR verifier.
-        let rp = adversarial_proof();
+        let _g = super::super::RecursiveTestModeGuard::enter();
+                let rp = adversarial_proof();
 
         // Tampered: claim only 2 Poseidon perms (trivially small chain)
         let tampered = RecursivePublicInputs {
@@ -678,6 +707,7 @@ mod tests {
 
     #[test]
     fn test_adversarial_hades_tampered_witness_detected() {
+        let _g = super::super::RecursiveTestModeGuard::enter();
         // Hades permutation integrity: tampered witness must be rejected.
         use crate::recursive::types::WitnessOp;
 

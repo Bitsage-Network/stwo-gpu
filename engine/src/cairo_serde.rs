@@ -3631,6 +3631,14 @@ mod recursive_serde {
         // n_real_rows (number of active HadesPerm rows for accumulator correction)
         serialize_u32(proof.n_real_rows, &mut output);
 
+        // KV-cache continuity (multi-token autoregressive sessions).
+        // ZERO felts on prefill / non-decode proofs.
+        // The on-chain session contract reads these to enforce continuity:
+        //   step N's prev_kv_cache_commitment param MUST equal
+        //   session storage's last_kv_commitment (= step N-1's kv_cache_commitment).
+        output.push(proof.public_inputs.prev_kv_cache_commitment);
+        output.push(proof.public_inputs.kv_cache_commitment);
+
         // ── STARK Proof Body ─────────────────────────────────────────────
         serialize_commitment_scheme_proof_poseidon252(&proof.stark_proof.0, &mut output);
 
@@ -3655,7 +3663,11 @@ mod recursive_serde {
 
         RecursiveCalldataSummary {
             total_felts: calldata.len(),
-            header_felts: 16, // 4+4+4+1+1+1+1
+            // 4 (circuit_hash) + 4 (io_commitment) + 4 (weight_super_root) + 1 (n_layers)
+            // + 1 (n_poseidon_perms) + 4 (seed_digest) + 1 (hades_commitment) + 1 (io_felt)
+            // + 1 (pass1_digest) + 1 (final_digest) + 1 (log_size) + 1 (n_real_rows)
+            // + 1 (prev_kv_cache_commitment) + 1 (kv_cache_commitment) = 26
+            header_felts: 26,
             n_commitments,
             n_fri_layers,
             n_queries,
@@ -4263,7 +4275,8 @@ mod tests {
         let config = PcsConfig::default();
         let mut out = Vec::new();
         serialize_pcs_config(&config, &mut out);
-        assert_eq!(out.len(), 4, "PcsConfig = pow_bits + 3 FriConfig fields");
+        // pow_bits + FriConfig{log_blowup, log_last_layer_deg, n_queries, fold_step} = 5 felts.
+        assert_eq!(out.len(), 5, "PcsConfig = pow_bits + 4 FriConfig fields");
     }
 
     #[test]
@@ -5122,7 +5135,7 @@ mod tests {
         }
         idx += 4;
 
-        // 4.9: pcs_config = 4 felts (pow_bits + fri_config)
+        // 4.9: pcs_config = 5 felts (pow_bits + fri_config{log_blowup, log_last_layer_deg, n_queries, fold_step})
         let default_config = PcsConfig::default();
         assert_eq!(
             felts[idx],
@@ -5146,6 +5159,12 @@ mod tests {
             felts[idx],
             FieldElement::from(default_config.fri_config.n_queries as u64),
             "fri_config.n_queries"
+        );
+        idx += 1;
+        assert_eq!(
+            felts[idx],
+            FieldElement::from(default_config.fri_config.fold_step as u64),
+            "fri_config.fold_step"
         );
         idx += 1;
 
@@ -5594,14 +5613,14 @@ mod tests {
         );
         idx += 4;
 
-        // 9. pcs_config
+        // 9. pcs_config (5 felts: pow_bits + 4 FriConfig fields)
         let default_config = PcsConfig::default();
         assert_eq!(
             felts[idx],
             FieldElement::from(default_config.pow_bits as u64),
             "pcs_config.pow_bits"
         );
-        idx += 4;
+        idx += 5;
 
         // 10. interaction_pow = 0
         assert_eq!(felts[idx], FieldElement::ZERO, "interaction_pow");

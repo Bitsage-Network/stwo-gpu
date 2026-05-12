@@ -445,6 +445,22 @@ pub fn generate_witness_with_policy(
     // outer seeding (that's only in prove_model_aggregated_onchain_gkr_auto).
     let mut prod_channel = crate::crypto::poseidon_channel::PoseidonChannel::new();
 
+    // Decode-step continuity: when the proof carries KV commitments (set by
+    // `prove_model_pure_gkr_decode_step_incremental`), the decode prover
+    // seeds the GKR channel with them in this order before any layer prove:
+    //   gkr_channel.mix_felt(new_kv_commitment);    // = kv_cache_commitment
+    //   gkr_channel.mix_felt(prev_kv_commitment);   // = prev_kv_cache_commitment
+    // The witness's verifier replay MUST mirror this exactly or the
+    // Fiat-Shamir challenges from round 0 onward diverge — which manifested
+    // as the `rmsnorm RMS² round 1: p(0)+p(1) != sum` failure for decode
+    // proofs. (See aggregation.rs:6099-6100 for the prover side.)
+    if let Some(kv) = proof.kv_cache_commitment {
+        prod_channel.mix_felt(kv);
+        if let Some(prev_kv) = proof.prev_kv_cache_commitment {
+            prod_channel.mix_felt(prev_kv);
+        }
+    }
+
     let _claim = if let Some(p) = policy {
         crate::gkr::verifier::verify_gkr_with_policy(
             circuit,
@@ -635,6 +651,13 @@ pub fn generate_witness_with_policy(
         super::prover::compute_hades_commitment(&pairs)
     };
 
+    // Pull KV-cache commitments from the GKR proof (set by decode-step prover).
+    // FieldElement::ZERO on prefill / single-pass / non-decode proofs.
+    let kv_cache_commitment = proof.kv_cache_commitment
+        .unwrap_or(starknet_ff::FieldElement::ZERO);
+    let prev_kv_cache_commitment = proof.prev_kv_cache_commitment
+        .unwrap_or(starknet_ff::FieldElement::ZERO);
+
     let witness = GkrVerifierWitness {
         ops: channel.into_ops(),
         public_inputs: RecursivePublicInputs {
@@ -645,6 +668,8 @@ pub fn generate_witness_with_policy(
             n_poseidon_perms: total_poseidon_calls as u32,
             seed_digest,
             hades_commitment,
+            kv_cache_commitment,
+            prev_kv_cache_commitment,
         },
         // Use the production verifier's total count (covers ALL layer types)
         n_poseidon_perms: total_poseidon_calls,
