@@ -623,6 +623,7 @@ mod tests {
     fn test_adversarial_full_metadata_relabeling() {
         // Full relabeling attack: change ALL metadata fields
         // while keeping the proof body unchanged.
+        let _guard = super::super::RecursiveTestModeGuard::enter();
         let rp = adversarial_proof();
 
         let tampered = RecursivePublicInputs {

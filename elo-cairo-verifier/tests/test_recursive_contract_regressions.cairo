@@ -19,6 +19,8 @@ const TRACE_LOG_SIZE: u32 = 14;
 const N_MATMULS: u32 = 192;
 const HIDDEN_SIZE: u32 = 5120;
 const NUM_TRANSFORMER_BLOCKS: u32 = 48;
+const EXPECTED_N_POSEIDON_PERMS: u32 = 145;
+const LEVEL1_PROOF_HASH: felt252 = 0xCAFE;
 
 fn deploy_verifier() -> IRecursiveVerifierDispatcher {
     let contract = declare("RecursiveVerifierContract").unwrap().contract_class();
@@ -46,6 +48,8 @@ fn register_default_model(ref verifier: IRecursiveVerifierDispatcher) {
         N_MATMULS,
         HIDDEN_SIZE,
         NUM_TRANSFORMER_BLOCKS,
+        EXPECTED_N_POSEIDON_PERMS,
+        LEVEL1_PROOF_HASH,
     );
 }
 
@@ -64,10 +68,15 @@ fn build_fake_recursive_header(
     data.append(0); data.append(0); data.append(0); data.append(io_commitment);
     data.append(0); data.append(0); data.append(0); data.append(weight_root);
     data.append(proof_n_layers.into());
+    data.append(EXPECTED_N_POSEIDON_PERMS.into());
+    data.append(0); data.append(0); data.append(0); data.append(0);
+    data.append(0);
     data.append(io_commitment);
+    data.append(0x9999);
     data.append(final_digest);
     data.append(proof_log_size.into());
-    data.append(0); data.append(0); data.append(0); data.append(0);
+    data.append(EXPECTED_N_POSEIDON_PERMS.into());
+    data.append(0); data.append(0);
     data
 }
 
