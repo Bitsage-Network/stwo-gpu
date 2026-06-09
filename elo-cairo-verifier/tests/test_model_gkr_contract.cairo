@@ -1,3 +1,4 @@
+use elo_cairo_verifier::verifier::{ISumcheckVerifierDispatcher, ISumcheckVerifierDispatcherTrait};
 /// Tests for A7: Contract-level GKR model verification.
 ///
 /// Tests register_model_gkr() and verify_model_gkr_v4_packed_io() through the
@@ -9,11 +10,8 @@
 /// require Rust-generated test vectors (see e2e_cairo_verify.rs).
 /// The tests here focus on registration, access control, and early rejection.
 
-use snforge_std::{declare, DeclareResultTrait, ContractClassTrait};
+use snforge_std::{ContractClassTrait, DeclareResultTrait, declare};
 use starknet::ContractAddress;
-use elo_cairo_verifier::verifier::{
-    ISumcheckVerifierDispatcher, ISumcheckVerifierDispatcherTrait,
-};
 
 // ============================================================================
 // Helpers
@@ -39,11 +37,11 @@ fn test_register_and_verify_model_gkr() {
     let model_id: felt252 = 0xABC;
 
     // Register model for GKR (no matmul layers -> no weight commitments)
-    dispatcher.register_model_gkr(
-        model_id,
-        array![],                    // no weight commitments
-        array![1],                   // circuit descriptor: [Add]
-    );
+    dispatcher
+        .register_model_gkr(
+            model_id, array![], // no weight commitments
+            array![1] // circuit descriptor: [Add]
+        );
 
     // Verify registration
     let circuit_hash = dispatcher.get_model_circuit_hash(model_id);
@@ -64,10 +62,7 @@ fn test_register_model_gkr_non_owner_rejected() {
     let attacker: ContractAddress = 0xBAD_felt252.try_into().unwrap();
     snforge_std::start_cheat_caller_address(dispatcher.contract_address, attacker);
 
-    dispatcher.register_model_gkr(
-        0xABC,
-        array![0x111],
-        array![0, 1],   // MatMul, Add
+    dispatcher.register_model_gkr(0xABC, array![0x111], array![0, 1] // MatMul, Add
     );
 }
 
@@ -99,11 +94,9 @@ fn test_register_model_gkr_zero_weight_rejected() {
     let owner: ContractAddress = 0x1234_felt252.try_into().unwrap();
     snforge_std::start_cheat_caller_address(dispatcher.contract_address, owner);
 
-    dispatcher.register_model_gkr(
-        0xABC,
-        array![0x111, 0],   // second commitment is zero
-        array![0, 0],
-    );
+    dispatcher
+        .register_model_gkr(0xABC, array![0x111, 0], // second commitment is zero
+        array![0, 0]);
 }
 
 // ============================================================================
@@ -142,7 +135,7 @@ fn test_gkr_and_legacy_registration_independent() {
 /// dimension extraction, or GKR walk). This is the earliest rejection point.
 #[test]
 #[should_panic(expected: "UNSUPPORTED_WEIGHT_BINDING_MODE")]
-    #[ignore] // lean build: stripped module
+#[ignore] // lean build: stripped module
 fn test_verify_model_gkr_unsupported_binding_mode() {
     let dispatcher = deploy_verifier();
     let owner: ContractAddress = 0x1234_felt252.try_into().unwrap();
@@ -151,20 +144,21 @@ fn test_verify_model_gkr_unsupported_binding_mode() {
     dispatcher.register_model_gkr(0xABC, array![], array![1]);
 
     // Use invalid weight_binding_mode=0 — triggers earliest assert
-    dispatcher.verify_model_gkr_v4_packed_io(
-        0xABC,
-        8,                               // original_io_len
-        array![],                        // packed_raw_io
-        1,                               // circuit_depth
-        1,                               // num_layers
-        array![],                        // matmul_dims
-        array![],                        // dequantize_bits
-        array![],                        // proof_data
-        array![],                        // weight_commitments
-        0,                               // weight_binding_mode = 0 (unsupported)
-        array![],                        // weight_binding_data
-        array![],                        // weight_opening_proofs
-    );
+    dispatcher
+        .verify_model_gkr_v4_packed_io(
+            0xABC,
+            8, // original_io_len
+            array![], // packed_raw_io
+            1, // circuit_depth
+            1, // num_layers
+            array![], // matmul_dims
+            array![], // dequantize_bits
+            array![], // proof_data
+            array![], // weight_commitments
+            0, // weight_binding_mode = 0 (unsupported)
+            array![], // weight_binding_data
+            array![] // weight_opening_proofs
+        );
 }
 
 // ============================================================================
@@ -191,8 +185,7 @@ fn test_register_and_query_policy() {
 
     // Query returns the registered hash
     assert!(
-        dispatcher.get_model_policy(model_id) == standard_hash,
-        "registered policy should match"
+        dispatcher.get_model_policy(model_id) == standard_hash, "registered policy should match",
     );
 }
 
@@ -253,5 +246,7 @@ fn test_policy_can_be_updated() {
     // Update to standard policy
     let standard_hash: felt252 = 0x05baf1be3d54bcd383072f79923316ac7124670a117bd5c809b67b651209424b;
     dispatcher.register_model_policy(model_id, standard_hash);
-    assert!(dispatcher.get_model_policy(model_id) == standard_hash, "standard should replace strict");
+    assert!(
+        dispatcher.get_model_policy(model_id) == standard_hash, "standard should replace strict",
+    );
 }

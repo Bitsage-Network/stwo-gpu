@@ -100,12 +100,16 @@ impl Drop for DepositExecution {
         let zero = M31::from_u32_unchecked(0);
         for perm in &mut self.all_permutation_inputs {
             for v in perm.iter_mut() {
-                unsafe { std::ptr::write_volatile(v, zero); }
+                unsafe {
+                    std::ptr::write_volatile(v, zero);
+                }
             }
         }
         for perm in &mut self.all_permutation_outputs {
             for v in perm.iter_mut() {
-                unsafe { std::ptr::write_volatile(v, zero); }
+                unsafe {
+                    std::ptr::write_volatile(v, zero);
+                }
             }
         }
     }

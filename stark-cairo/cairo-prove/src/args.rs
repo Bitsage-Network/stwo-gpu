@@ -32,6 +32,9 @@ pub enum Commands {
         /// enabling on-chain recursive verification (~19K felts = 4 TXs).
         #[arg(long, default_value = "false")]
         poseidon: bool,
+        /// 160-bit Poseidon252 config for on-chain STARK-in-STARK verification.
+        #[arg(long, default_value = "false")]
+        recursive_160: bool,
         /// Program arguments
         #[command(flatten)]
         program_arguments: ProgramArguments,

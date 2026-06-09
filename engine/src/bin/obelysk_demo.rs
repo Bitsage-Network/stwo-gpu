@@ -8,15 +8,15 @@
 
 #[cfg(feature = "tui")]
 fn main() {
-    use std::io;
-    use std::time::Duration;
     use crossterm::{
         event::{self, Event, KeyCode},
-        terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
         execute,
+        terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     };
-    use ratatui::prelude::*;
     use obelyzk::tui::dashboard::{self, DashboardState, PipelineStep};
+    use ratatui::prelude::*;
+    use std::io;
+    use std::time::Duration;
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -92,9 +92,11 @@ fn main() {
 
     // Render loop
     loop {
-        terminal.draw(|frame| {
-            dashboard::render(frame, &state);
-        }).expect("Failed to draw");
+        terminal
+            .draw(|frame| {
+                dashboard::render(frame, &state);
+            })
+            .expect("Failed to draw");
 
         if event::poll(Duration::from_millis(100)).expect("poll") {
             if let Event::Key(key) = event::read().expect("read") {
@@ -107,7 +109,8 @@ fn main() {
 
     // Cleanup
     disable_raw_mode().expect("Failed to disable raw mode");
-    execute!(terminal.backend_mut(), LeaveAlternateScreen).expect("Failed to leave alternate screen");
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)
+        .expect("Failed to leave alternate screen");
 }
 
 #[cfg(not(feature = "tui"))]

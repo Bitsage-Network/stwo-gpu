@@ -7,13 +7,9 @@ use starknet_ff::FieldElement;
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TrustModel {
     /// Full ZK proof — we have the weights and proved the computation.
-    ZkProof {
-        weight_commitment: String,
-    },
+    ZkProof { weight_commitment: String },
     /// TLS attestation — cryptographic proof the API call happened.
-    TlsAttestation {
-        server_domain: String,
-    },
+    TlsAttestation { server_domain: String },
     /// Commitment only — we hash the IO but don't prove computation.
     CommitmentOnly,
 }

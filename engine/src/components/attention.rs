@@ -58,10 +58,7 @@ pub fn softmax_table() -> &'static PrecomputedTable {
     use std::sync::OnceLock;
     static TABLE: OnceLock<PrecomputedTable> = OnceLock::new();
     TABLE.get_or_init(|| {
-        PrecomputedTable::build_parallel(
-            softmax_exp,
-            ActivationType::Softmax.production_log_size(),
-        )
+        PrecomputedTable::build_parallel(softmax_exp, ActivationType::Softmax.production_log_size())
     })
 }
 
@@ -120,10 +117,7 @@ pub fn compute_kv_head_commitment(
 }
 
 /// Compute per-layer KV-cache commitment combining all K/V head roots.
-pub fn compute_kv_layer_commitment(
-    cache: &KVCache,
-    layer_id: usize,
-) -> KVLayerCommitment {
+pub fn compute_kv_layer_commitment(cache: &KVCache, layer_id: usize) -> KVLayerCommitment {
     use starknet_ff::FieldElement;
 
     let k_roots: Vec<FieldElement> = (0..cache.num_kv_heads)
@@ -876,7 +870,9 @@ pub fn softmax_row_m31(row: &[M31]) -> Vec<M31> {
     // A verifier encountering sum=0 should reject the proof — this fallback
     // exists only so the prover doesn't crash on degenerate inputs.
     if sum_m31 == M31::from(0u32) {
-        tracing::warn!("softmax sum is zero mod P — degenerate input, returning uniform distribution");
+        tracing::warn!(
+            "softmax sum is zero mod P — degenerate input, returning uniform distribution"
+        );
         let n = row.len();
         if n == 0 {
             return vec![];
@@ -2584,7 +2580,10 @@ mod tests {
         let t1 = softmax_table();
         let t2 = softmax_table();
         // Same pointer ⇒ OnceLock reuse, no rebuild.
-        assert!(std::ptr::eq(t1, t2), "softmax_table() should return the same static reference");
+        assert!(
+            std::ptr::eq(t1, t2),
+            "softmax_table() should return the same static reference"
+        );
         assert_eq!(t1.log_size, ActivationType::Softmax.production_log_size());
     }
 
@@ -2603,7 +2602,10 @@ mod tests {
         let m = make_test_input(4, 8);
         let ck = compute_kv_head_commitment(&m, DOMAIN_KV_K);
         let cv = compute_kv_head_commitment(&m, DOMAIN_KV_V);
-        assert_ne!(ck, cv, "K vs V domain tags must produce different commitments");
+        assert_ne!(
+            ck, cv,
+            "K vs V domain tags must produce different commitments"
+        );
     }
 
     #[test]

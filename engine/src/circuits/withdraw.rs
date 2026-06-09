@@ -125,12 +125,16 @@ impl Drop for WithdrawExecution {
         for perm in &mut self.all_permutation_inputs {
             for v in perm.iter_mut() {
                 // SAFETY: volatile write prevents compiler from eliding zeroization.
-                unsafe { std::ptr::write_volatile(v, zero); }
+                unsafe {
+                    std::ptr::write_volatile(v, zero);
+                }
             }
         }
         for perm in &mut self.all_permutation_outputs {
             for v in perm.iter_mut() {
-                unsafe { std::ptr::write_volatile(v, zero); }
+                unsafe {
+                    std::ptr::write_volatile(v, zero);
+                }
             }
         }
     }

@@ -53,6 +53,8 @@ pub mod weight_registry;
 
 // Re-export key types for convenience
 pub use encoder::encode_transaction;
-pub use model::{build_classifier_graph, build_test_classifier, build_trained_classifier, ClassifierModel};
+pub use model::{
+    build_classifier_graph, build_test_classifier, build_trained_classifier, ClassifierModel,
+};
 pub use prove::evaluate_transaction;
 pub use types::*;

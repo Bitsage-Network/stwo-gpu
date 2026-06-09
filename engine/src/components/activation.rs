@@ -32,6 +32,8 @@ pub enum ActivationType {
     /// SiLU (Sigmoid Linear Unit): x * sigmoid(x) = x / (1 + exp(-x)).
     /// Used by Llama, Mistral, and most modern LLMs in the FFN gate.
     SiLU,
+    /// Softplus: log(1 + exp(x)).
+    Softplus,
 }
 
 impl ActivationType {
@@ -43,6 +45,7 @@ impl ActivationType {
             ActivationType::Sigmoid => 16,
             ActivationType::Softmax => 20,
             ActivationType::SiLU => 16,
+            ActivationType::Softplus => 16,
         }
     }
 
@@ -54,6 +57,7 @@ impl ActivationType {
             ActivationType::Sigmoid => 16,
             ActivationType::Softmax => 20,
             ActivationType::SiLU => 18,
+            ActivationType::Softplus => 18,
         }
     }
 
@@ -67,6 +71,7 @@ impl ActivationType {
             ActivationType::Sigmoid => 3,
             ActivationType::Softmax => 4,
             ActivationType::SiLU => 5,
+            ActivationType::Softplus => 6,
         }
     }
 
@@ -84,6 +89,7 @@ impl ActivationType {
             ActivationType::Sigmoid => Box::new(activations::sigmoid_approx),
             ActivationType::Softmax => Box::new(activations::softmax_exp),
             ActivationType::SiLU => Box::new(activations::silu_approx),
+            ActivationType::Softplus => Box::new(activations::softplus_approx),
         }
     }
 }
@@ -243,8 +249,14 @@ pub const PIECEWISE_SEGMENT_SHIFT: u32 = 27;
 /// Compute the segment shift for a given number of segments.
 /// `shift = 31 - log2(num_segments)`.
 pub fn segment_shift_for(num_segments: usize) -> u32 {
-    assert!(num_segments.is_power_of_two(), "num_segments must be power of 2");
-    assert!(num_segments >= 2 && num_segments <= (1 << 16), "num_segments must be in [2, 65536]");
+    assert!(
+        num_segments.is_power_of_two(),
+        "num_segments must be power of 2"
+    );
+    assert!(
+        num_segments >= 2 && num_segments <= (1 << 16),
+        "num_segments must be in [2, 65536]"
+    );
     31 - num_segments.ilog2()
 }
 
@@ -326,6 +338,7 @@ fn apply_activation_f64(act_type: ActivationType, val: u32) -> u32 {
         ActivationType::Sigmoid => 2,
         ActivationType::Softmax => 3,
         ActivationType::SiLU => 4,
+        ActivationType::Softplus => 5,
     };
     crate::components::integer_math::apply_activation_integer(tag, val)
 }
@@ -468,7 +481,9 @@ mod tests {
 
             for seg in 0..n {
                 let x_start = (seg as u32).wrapping_mul(coeffs.segment_width);
-                if x_start >= M31_P { continue; }
+                if x_start >= M31_P {
+                    continue;
+                }
 
                 // Piecewise eval at segment start should match the activation value
                 // used to derive the coefficients
@@ -498,6 +513,9 @@ mod tests {
         let c1024 = PiecewiseLinearCoeffs::with_segments(ActivationType::SiLU, 1024);
         assert!(c256.segment_width < c16.segment_width);
         assert!(c1024.segment_width < c256.segment_width);
-        eprintln!("Segment widths: 16={}, 256={}, 1024={}", c16.segment_width, c256.segment_width, c1024.segment_width);
+        eprintln!(
+            "Segment widths: 16={}, 256={}, 1024={}",
+            c16.segment_width, c256.segment_width, c1024.segment_width
+        );
     }
 }

@@ -10,7 +10,7 @@
 //! # Starknet Hades Permutation
 //!
 //! - **State width**: 3 felt252 elements `[s0, s1, s2]`
-//! - **Rounds**: 8 full + 83 partial + 8 full = 99 total
+//! - **Rounds**: 4 full + 83 partial + 4 full = 91 total
 //! - **Full round**:  `add_round_key → S-box(all 3) → MDS`
 //! - **Partial round**: `add_round_key → S-box(s2 only) → MDS`
 //! - **S-box**: `x → x³` over the Stark prime
@@ -106,7 +106,7 @@
 //!
 //! ## Block Boundary
 //!
-//! For each Hades permutation (99 rounds):
+//! For each Hades permutation (91 rounds):
 //! - `is_first_round`: state_before matches the Hades input
 //! - `is_last_round`: mds_result matches the Hades output
 //!
@@ -160,18 +160,35 @@ pub const MUL_WITNESS_COLS: usize = 54 + LIMBS_28; // 82
 ///   is_chain_round:      1             (1 on real rows except last in each 91-block)
 ///   is_first_round:      1             (1 on first round of each 91-block)
 ///   is_last_round:       1             (1 on last round of each 91-block)
+///   input_digest_9bit:   28            (original input digest limbs, carried through block)
+///   next_input_digest:   28            (shifted next row's carried input digest)
 ///   input_digest_28bit:  9             (repacked 28-bit limbs of input digest, last round only)
 ///   output_digest_28bit: 9             (repacked 28-bit limbs of output digest, last round only)
 ///   split_lo_in:         8             (lo split witnesses for input repack)
 ///   split_hi_in:         8             (hi split witnesses for input repack)
 ///   split_lo_out:        8             (lo split witnesses for output repack)
 ///   split_hi_out:        8             (hi split witnesses for output repack)
-///   Total: 1225
+///   Total: 1281
 ///
 /// The repack columns enable LogUp binding: the chain AIR's 28-bit digest
 /// limbs match the Hades AIR's repacked 28-bit limbs, proving every
 /// permutation in the chain was actually verified by the Hades AIR.
-pub const N_HADES_TRACE_COLUMNS: usize = 1225;
+pub const HADES_SHIFTED_NEXT_STATE_COL: usize =
+    84 + 84 + 84 + 84 + 6 * MUL_WITNESS_COLS + 84 + 84 + 3 * 30;
+pub const HADES_IS_FULL_ROUND_COL: usize = HADES_SHIFTED_NEXT_STATE_COL + 3 * LIMBS_28;
+pub const HADES_IS_REAL_COL: usize = HADES_IS_FULL_ROUND_COL + 1;
+pub const HADES_IS_CHAIN_ROUND_COL: usize = HADES_IS_REAL_COL + 1;
+pub const HADES_IS_FIRST_ROUND_COL: usize = HADES_IS_CHAIN_ROUND_COL + 1;
+pub const HADES_IS_LAST_ROUND_COL: usize = HADES_IS_FIRST_ROUND_COL + 1;
+pub const HADES_INPUT_DIGEST_9BIT_COL: usize = HADES_IS_LAST_ROUND_COL + 1;
+pub const HADES_SHIFTED_NEXT_INPUT_DIGEST_9BIT_COL: usize = HADES_INPUT_DIGEST_9BIT_COL + LIMBS_28;
+pub const HADES_INPUT_DIGEST_28BIT_COL: usize = HADES_SHIFTED_NEXT_INPUT_DIGEST_9BIT_COL + LIMBS_28;
+pub const HADES_OUTPUT_DIGEST_28BIT_COL: usize = HADES_INPUT_DIGEST_28BIT_COL + 9;
+pub const HADES_SPLIT_LO_IN_COL: usize = HADES_OUTPUT_DIGEST_28BIT_COL + 9;
+pub const HADES_SPLIT_HI_IN_COL: usize = HADES_SPLIT_LO_IN_COL + 8;
+pub const HADES_SPLIT_LO_OUT_COL: usize = HADES_SPLIT_HI_IN_COL + 8;
+pub const HADES_SPLIT_HI_OUT_COL: usize = HADES_SPLIT_LO_OUT_COL + 8;
+pub const N_HADES_TRACE_COLUMNS: usize = HADES_SPLIT_HI_OUT_COL + 8;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Felt252 in 9-bit limbs
@@ -1186,7 +1203,7 @@ fn compress_round_constants(raw: &[[FieldElement; 3]]) -> Vec<FieldElement> {
 /// AIR evaluation for the Hades permutation verification component.
 ///
 /// Each row constrains one round of the Hades permutation.
-/// The trace has `n_hades_calls × 99` real rows, padded to a power of 2.
+/// The trace has `n_hades_calls × 91` real rows, padded to a power of 2.
 pub struct HadesVerifierEval {
     pub log_n_rows: u32,
     /// Round constants decomposed into 9-bit limbs, per round per element.
@@ -1206,6 +1223,9 @@ impl FrameworkEval for HadesVerifierEval {
     }
 
     fn max_constraint_log_degree_bound(&self) -> u32 {
+        // All current standalone Hades constraints are quadratic at most:
+        // multiplication witness checks, selector booleans, selector-gated
+        // linear constraints, and selector-driven repacking.
         self.log_n_rows + 1
     }
 
@@ -1304,7 +1324,8 @@ impl FrameworkEval for HadesVerifierEval {
         }
 
         // shifted_next_state: state_before of the NEXT row (for round transition)
-        let mut shifted_next_state: [[E::F; LIMBS_28]; 3] = std::array::from_fn(|_| std::array::from_fn(|_| zero_f()));
+        let mut shifted_next_state: [[E::F; LIMBS_28]; 3] =
+            std::array::from_fn(|_| std::array::from_fn(|_| zero_f()));
         for elem in 0..3 {
             for j in 0..LIMBS_28 {
                 shifted_next_state[elem][j] = eval.next_trace_mask();
@@ -1317,9 +1338,13 @@ impl FrameworkEval for HadesVerifierEval {
 
         // LogUp boundary selectors
         let is_first_round = eval.next_trace_mask(); // 1 on first round of each 91-block
-        let is_last_round = eval.next_trace_mask();  // 1 on last round of each 91-block
+        let is_last_round = eval.next_trace_mask(); // 1 on last round of each 91-block
 
-        // Repacked 28-bit limbs (populated on is_last_round rows only)
+        // Original input digest 9-bit limbs carried through the whole block,
+        // its shifted-next copy, and repacked 28-bit limbs used by LogUp.
+        let input_digest_9bit: [E::F; LIMBS_28] = std::array::from_fn(|_| eval.next_trace_mask());
+        let shifted_next_input_digest_9bit: [E::F; LIMBS_28] =
+            std::array::from_fn(|_| eval.next_trace_mask());
         let input_digest_28bit: [E::F; 9] = std::array::from_fn(|_| eval.next_trace_mask());
         let output_digest_28bit: [E::F; 9] = std::array::from_fn(|_| eval.next_trace_mask());
         let split_lo_in: [E::F; 8] = std::array::from_fn(|_| eval.next_trace_mask());
@@ -1417,17 +1442,27 @@ impl FrameworkEval for HadesVerifierEval {
             }
         }
 
+        // The LogUp provider key's input digest must be the actual first
+        // state element of this Hades block and must be carried unchanged
+        // until the last round where the provider contributes to the relation.
+        for j in 0..LIMBS_28 {
+            eval.add_constraint(
+                is_first_round.clone()
+                    * (input_digest_9bit[j].clone() - state_before[0][j].clone()),
+            );
+            eval.add_constraint(
+                is_chain_round.clone()
+                    * (input_digest_9bit[j].clone() - shifted_next_input_digest_9bit[j].clone()),
+            );
+        }
+
         // ── Boolean constraints for new selectors ────────────────────
-        eval.add_constraint(
-            is_first_round.clone() * (is_first_round.clone() - one.clone()),
-        );
-        eval.add_constraint(
-            is_last_round.clone() * (is_last_round.clone() - one.clone()),
-        );
+        eval.add_constraint(is_first_round.clone() * (is_first_round.clone() - one.clone()));
+        eval.add_constraint(is_last_round.clone() * (is_last_round.clone() - one.clone()));
 
         // ── Repack verification (gated by is_last_round) ────────────
         // On last-round rows, verify that the 28-bit repacked limbs match
-        // the 9-bit state_before[0] (input digest) and mds_result[0] (output digest).
+        // the original permutation input digest and mds_result[0] (output digest).
         //
         // Split constraint: a[split_j] = lo + hi × 2^lo_bits
         // Packing constraint: b[k] = hi_prev + a[j1]×shift1 + a[j2]×shift2 + lo_next×shift3
@@ -1440,7 +1475,7 @@ impl FrameworkEval for HadesVerifierEval {
                 let two_pow_lo = E::F::from(M31::from(1u32 << lo_bits[s]));
                 eval.add_constraint(
                     is_last_round.clone()
-                        * (state_before[0][split_limbs[s]].clone()
+                        * (input_digest_9bit[split_limbs[s]].clone()
                             - split_lo_in[s].clone()
                             - split_hi_in[s].clone() * two_pow_lo),
                 );
@@ -1460,9 +1495,9 @@ impl FrameworkEval for HadesVerifierEval {
             // Input digest: verify packing b[0]
             // b[0] = a[0] + a[1]×2^9 + a[2]×2^18 + lo(a[3])×2^27
             {
-                let expected_b0 = state_before[0][0].clone()
-                    + state_before[0][1].clone() * E::F::from(M31::from(1u32 << 9))
-                    + state_before[0][2].clone() * E::F::from(M31::from(1u32 << 18))
+                let expected_b0 = input_digest_9bit[0].clone()
+                    + input_digest_9bit[1].clone() * E::F::from(M31::from(1u32 << 9))
+                    + input_digest_9bit[2].clone() * E::F::from(M31::from(1u32 << 18))
                     + split_lo_in[0].clone() * E::F::from(M31::from(1u32 << 27));
                 eval.add_constraint(
                     is_last_round.clone() * (input_digest_28bit[0].clone() - expected_b0),
@@ -1475,9 +1510,9 @@ impl FrameworkEval for HadesVerifierEval {
                 let j_base = split_limbs[k - 1] + 1;
                 let shift_lo = 28 - lo_bits[k];
                 let expected = split_hi_in[k - 1].clone()
-                    + state_before[0][j_base].clone()
+                    + input_digest_9bit[j_base].clone()
                         * E::F::from(M31::from(1u32 << hi_bits_prev))
-                    + state_before[0][j_base + 1].clone()
+                    + input_digest_9bit[j_base + 1].clone()
                         * E::F::from(M31::from(1u32 << (hi_bits_prev + 9)))
                     + split_lo_in[k].clone() * E::F::from(M31::from(1u32 << shift_lo));
                 eval.add_constraint(
@@ -1489,9 +1524,9 @@ impl FrameworkEval for HadesVerifierEval {
             // b[8] = hi(a[24]) + a[25]×2^1 + a[26]×2^10 + a[27]×2^19
             {
                 let expected_b8 = split_hi_in[7].clone()
-                    + state_before[0][25].clone() * E::F::from(M31::from(1u32 << 1))
-                    + state_before[0][26].clone() * E::F::from(M31::from(1u32 << 10))
-                    + state_before[0][27].clone() * E::F::from(M31::from(1u32 << 19));
+                    + input_digest_9bit[25].clone() * E::F::from(M31::from(1u32 << 1))
+                    + input_digest_9bit[26].clone() * E::F::from(M31::from(1u32 << 10))
+                    + input_digest_9bit[27].clone() * E::F::from(M31::from(1u32 << 19));
                 eval.add_constraint(
                     is_last_round.clone() * (input_digest_28bit[8].clone() - expected_b8),
                 );
@@ -1512,8 +1547,7 @@ impl FrameworkEval for HadesVerifierEval {
                 let j_base = split_limbs[k - 1] + 1;
                 let shift_lo = 28 - lo_bits[k];
                 let expected = split_hi_out[k - 1].clone()
-                    + mds_result[0][j_base].clone()
-                        * E::F::from(M31::from(1u32 << hi_bits_prev))
+                    + mds_result[0][j_base].clone() * E::F::from(M31::from(1u32 << hi_bits_prev))
                     + mds_result[0][j_base + 1].clone()
                         * E::F::from(M31::from(1u32 << (hi_bits_prev + 9)))
                     + split_lo_out[k].clone() * E::F::from(M31::from(1u32 << shift_lo));
@@ -1776,33 +1810,53 @@ pub fn build_hades_trace(hades_perms: &[([FieldElement; 3], [FieldElement; 3])])
             trace[col][row] = M31::from_u32_unchecked(if is_last_in_block { 1 } else { 0 });
             col += 1;
 
-            // LogUp repack columns: only populated on last-round rows
-            if is_last_in_block {
-                // Input digest: state_before of the FIRST round in this block
-                let input_digest_9bit = felt252_to_9bit_limbs(&input[0]);
-                let (input_28bit, in_lo, in_hi) = repack_9bit_to_28bit(&input_digest_9bit);
+            let input_digest_9bit = felt252_to_9bit_limbs(&input[0]);
+            let (input_28bit, in_lo, in_hi) = repack_9bit_to_28bit(&input_digest_9bit);
 
-                // Output digest: mds_result[0] of this (last) round
+            // input_digest_9bit[28], carried on every real row in the block.
+            for j in 0..LIMBS_28 {
+                trace[col + j][row] = input_digest_9bit[j];
+            }
+            col += LIMBS_28;
+
+            // shifted_next_input_digest_9bit: populated in second pass
+            col += LIMBS_28;
+
+            // LogUp repack columns: only populated on last-round rows.
+            if is_last_in_block {
+                // Output digest: mds_result[0] of this (last) round.
                 let output_digest_9bit = felt252_to_9bit_limbs(&round.mds_output[0]);
                 let (output_28bit, out_lo, out_hi) = repack_9bit_to_28bit(&output_digest_9bit);
 
                 // input_digest_28bit[9]
-                for j in 0..9 { trace[col + j][row] = input_28bit[j]; }
+                for j in 0..9 {
+                    trace[col + j][row] = input_28bit[j];
+                }
                 col += 9;
                 // output_digest_28bit[9]
-                for j in 0..9 { trace[col + j][row] = output_28bit[j]; }
+                for j in 0..9 {
+                    trace[col + j][row] = output_28bit[j];
+                }
                 col += 9;
                 // split_lo_in[8]
-                for j in 0..8 { trace[col + j][row] = in_lo[j]; }
+                for j in 0..8 {
+                    trace[col + j][row] = in_lo[j];
+                }
                 col += 8;
                 // split_hi_in[8]
-                for j in 0..8 { trace[col + j][row] = in_hi[j]; }
+                for j in 0..8 {
+                    trace[col + j][row] = in_hi[j];
+                }
                 col += 8;
                 // split_lo_out[8]
-                for j in 0..8 { trace[col + j][row] = out_lo[j]; }
+                for j in 0..8 {
+                    trace[col + j][row] = out_lo[j];
+                }
                 col += 8;
                 // split_hi_out[8]
-                for j in 0..8 { trace[col + j][row] = out_hi[j]; }
+                for j in 0..8 {
+                    trace[col + j][row] = out_hi[j];
+                }
                 // col += 8;
             }
             // Non-last-round rows: repack columns remain zero (initialized above)
@@ -1810,21 +1864,35 @@ pub fn build_hades_trace(hades_perms: &[([FieldElement; 3], [FieldElement; 3])])
 
         // Second pass: populate shifted_next_state_before
         // For each row i, shifted_next[j] = state_before[i+1][j]
-        let shifted_col_start = 84 + 84 + 84 + 84 + 6 * MUL_WITNESS_COLS + 84 + 84 + 3 * 30; // after mds_carries
         for (round_idx, round) in rounds.iter().enumerate() {
             let row = base_row + round_idx;
-            if row >= n_padded || row + 1 >= n_padded { continue; }
+            if row >= n_padded || row + 1 >= n_padded {
+                continue;
+            }
             let next_round_idx = round_idx + 1;
             if next_round_idx < rounds.len() {
                 let next_round = &rounds[next_round_idx];
                 for elem in 0..3 {
                     let limbs = felt252_to_9bit_limbs(&next_round.state_before[elem]);
                     for j in 0..LIMBS_28 {
-                        trace[shifted_col_start + elem * LIMBS_28 + j][row] = limbs[j];
+                        trace[HADES_SHIFTED_NEXT_STATE_COL + elem * LIMBS_28 + j][row] = limbs[j];
                     }
                 }
             }
             // Last row in block and padding rows: shifted stays zero
+        }
+
+        // Third pass: populate shifted_next_input_digest_9bit for propagation.
+        for round_idx in 0..rounds.len().saturating_sub(1) {
+            let row = base_row + round_idx;
+            let next_row = row + 1;
+            if next_row >= n_padded {
+                continue;
+            }
+            for j in 0..LIMBS_28 {
+                trace[HADES_SHIFTED_NEXT_INPUT_DIGEST_9BIT_COL + j][row] =
+                    trace[HADES_INPUT_DIGEST_9BIT_COL + j][next_row];
+            }
         }
 
         // Verify the last round's MDS output matches expected output
@@ -2479,6 +2547,280 @@ fn u512_to_9bit_limbs(val: &U512) -> Vec<i64> {
 mod tests {
     use super::*;
 
+    fn simd_column_from_vec(
+        data: &[M31],
+    ) -> stwo::prover::backend::Col<stwo::prover::backend::simd::SimdBackend, M31> {
+        use stwo::prover::backend::Column;
+
+        let mut col =
+            stwo::prover::backend::Col::<stwo::prover::backend::simd::SimdBackend, M31>::zeros(
+                data.len(),
+            );
+        for (i, &val) in data.iter().enumerate() {
+            col.set(i, val);
+        }
+        col
+    }
+
+    fn assert_mul_row(
+        trace: &[Vec<M31>],
+        row: usize,
+        x_col: usize,
+        y_col: usize,
+        z_col: usize,
+        witness_col: usize,
+    ) {
+        let p_limbs = stark_prime_9bit_limbs();
+        let base = M31::from(512u32);
+        let zero = M31::from(0u32);
+
+        for j in 0..55 {
+            let mut conv = zero;
+            for i in 0..=j {
+                if i < LIMBS_28 && (j - i) < LIMBS_28 {
+                    conv = conv + trace[x_col + i][row] * trace[y_col + j - i][row];
+                }
+            }
+            let z_j = if j < LIMBS_28 {
+                trace[z_col + j][row]
+            } else {
+                zero
+            };
+            let mut kp_j = zero;
+            for l in 0..=j {
+                if l < LIMBS_28 && (j - l) < LIMBS_28 {
+                    kp_j = kp_j + trace[witness_col + 54 + l][row] * M31::from(p_limbs[j - l]);
+                }
+            }
+            let carry_in = if j == 0 {
+                zero
+            } else {
+                trace[witness_col + j - 1][row]
+            };
+            let carry_out = if j < 54 {
+                trace[witness_col + j][row]
+            } else {
+                zero
+            };
+            assert_eq!(
+                conv - z_j - kp_j + carry_in,
+                carry_out * base,
+                "mul row={row} witness_col={witness_col} limb={j}"
+            );
+        }
+    }
+
+    fn assert_mds_row(trace: &[Vec<M31>], row: usize, elem: usize, coeffs: [i64; 3]) {
+        let p_limbs = stark_prime_9bit_limbs();
+        let base = M31::from(512u32);
+        let zero = M31::from(0u32);
+        let post_sbox_col = 828;
+        let mds_result_col = 912 + elem * LIMBS_28;
+        let mds_witness_col = 996 + elem * 30;
+
+        for j in 0..30 {
+            let mut lhs = zero;
+            for (input_elem, coeff) in coeffs.iter().enumerate() {
+                let limb = if j < LIMBS_28 {
+                    trace[post_sbox_col + input_elem * LIMBS_28 + j][row]
+                } else {
+                    zero
+                };
+                lhs = lhs + i64_to_m31(*coeff) * limb;
+            }
+            let out_j = if j < LIMBS_28 {
+                trace[mds_result_col + j][row]
+            } else {
+                zero
+            };
+            let p_j = if j < LIMBS_28 {
+                M31::from(p_limbs[j])
+            } else {
+                zero
+            };
+            let carry_in = if j == 0 {
+                zero
+            } else {
+                trace[mds_witness_col + j - 1][row]
+            };
+            let carry_out = if j < 29 {
+                trace[mds_witness_col + j][row]
+            } else {
+                zero
+            };
+            let k = trace[mds_witness_col + 29][row];
+            assert_eq!(
+                lhs,
+                out_j + k * p_j + carry_out * base - carry_in,
+                "mds row={row} elem={elem} limb={j}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_hades_trace_satisfies_full_row_equations() {
+        let input = [
+            FieldElement::from(1u64),
+            FieldElement::from(2u64),
+            FieldElement::from(3u64),
+        ];
+        let mut output = input;
+        crate::crypto::hades::hades_permutation(&mut output);
+        let trace_data = build_hades_trace(&[(input, output)]);
+
+        for row in 0..trace_data.n_real_rows {
+            for elem in 0..3 {
+                let sbox_col = 84 + elem * LIMBS_28;
+                let cube_col = 168 + elem * LIMBS_28;
+                let square_col = 252 + elem * LIMBS_28;
+                let witness_col = 336 + elem * 2 * MUL_WITNESS_COLS;
+                assert_mul_row(
+                    &trace_data.trace,
+                    row,
+                    sbox_col,
+                    sbox_col,
+                    square_col,
+                    witness_col,
+                );
+                assert_mul_row(
+                    &trace_data.trace,
+                    row,
+                    square_col,
+                    sbox_col,
+                    cube_col,
+                    witness_col + MUL_WITNESS_COLS,
+                );
+            }
+
+            assert_mds_row(&trace_data.trace, row, 0, [3, 1, 1]);
+            assert_mds_row(&trace_data.trace, row, 1, [1, -1, 1]);
+            assert_mds_row(&trace_data.trace, row, 2, [1, 1, -2]);
+        }
+    }
+
+    #[test]
+    fn test_hades_air_framework_constraints_hold_on_trace_domain() {
+        use num_traits::Zero;
+        use stwo::core::pcs::TreeVec;
+        use stwo_constraint_framework::assert_constraints_on_trace;
+
+        let input = [
+            FieldElement::from(1u64),
+            FieldElement::from(2u64),
+            FieldElement::from(3u64),
+        ];
+        let mut output = input;
+        crate::crypto::hades::hades_permutation(&mut output);
+        let trace_data = build_hades_trace(&[(input, output)]);
+        let raw_rc = hades_round_constants();
+        let rc_limbs: Vec<[[M31; LIMBS_28]; 3]> = raw_rc
+            .iter()
+            .map(|round| {
+                [
+                    felt252_to_9bit_limbs(&round[0]),
+                    felt252_to_9bit_limbs(&round[1]),
+                    felt252_to_9bit_limbs(&round[2]),
+                ]
+            })
+            .collect();
+        let eval = HadesVerifierEval {
+            log_n_rows: trace_data.log_size,
+            round_constants_limbs: rc_limbs,
+            range_check: None,
+            hades_logup: None,
+        };
+        let tree0: Vec<&Vec<M31>> = vec![];
+        let tree1: Vec<&Vec<M31>> = trace_data.trace.iter().collect();
+        let trace = TreeVec::new(vec![tree0, tree1]);
+
+        assert_constraints_on_trace(
+            &trace,
+            trace_data.log_size,
+            |row_eval| {
+                eval.evaluate(row_eval);
+            },
+            stwo::core::fields::qm31::SecureField::zero(),
+        );
+    }
+
+    #[test]
+    fn test_hades_air_component_proves_standalone() {
+        use num_traits::Zero;
+        use stwo::core::channel::MerkleChannel;
+        use stwo::core::pcs::PcsConfig;
+        use stwo::core::poly::circle::CanonicCoset;
+        use stwo::core::vcs_lifted::poseidon252_merkle::Poseidon252MerkleChannel;
+        use stwo::prover::backend::simd::SimdBackend;
+        use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
+        use stwo::prover::{prove, CommitmentSchemeProver};
+        use stwo_constraint_framework::{FrameworkComponent, TraceLocationAllocator};
+
+        let input = [
+            FieldElement::from(1u64),
+            FieldElement::from(2u64),
+            FieldElement::from(3u64),
+        ];
+        let mut output = input;
+        crate::crypto::hades::hades_permutation(&mut output);
+        let trace_data = build_hades_trace(&[(input, output)]);
+
+        let config = PcsConfig::default();
+        let twiddles = SimdBackend::precompute_twiddles(
+            CanonicCoset::new(trace_data.log_size + 2 + config.fri_config.log_blowup_factor)
+                .circle_domain()
+                .half_coset,
+        );
+        let channel = &mut <Poseidon252MerkleChannel as MerkleChannel>::C::default();
+        let mut commitment_scheme =
+            CommitmentSchemeProver::<SimdBackend, Poseidon252MerkleChannel>::new(config, &twiddles);
+        commitment_scheme.set_store_polynomials_coefficients();
+        config.mix_into(channel);
+
+        {
+            let mut tree_builder = commitment_scheme.tree_builder();
+            tree_builder.extend_evals(vec![]);
+            tree_builder.commit(channel);
+        }
+        {
+            let domain = CanonicCoset::new(trace_data.log_size).circle_domain();
+            let trace_evals = trace_data
+                .trace
+                .iter()
+                .map(|col| CircleEvaluation::new(domain, simd_column_from_vec(col)))
+                .collect();
+            let mut tree_builder = commitment_scheme.tree_builder();
+            tree_builder.extend_evals(trace_evals);
+            tree_builder.commit(channel);
+        }
+
+        let raw_rc = hades_round_constants();
+        let rc_limbs: Vec<[[M31; LIMBS_28]; 3]> = raw_rc
+            .iter()
+            .map(|round| {
+                [
+                    felt252_to_9bit_limbs(&round[0]),
+                    felt252_to_9bit_limbs(&round[1]),
+                    felt252_to_9bit_limbs(&round[2]),
+                ]
+            })
+            .collect();
+        let eval = HadesVerifierEval {
+            log_n_rows: trace_data.log_size,
+            round_constants_limbs: rc_limbs,
+            range_check: None,
+            hades_logup: None,
+        };
+        let mut allocator = TraceLocationAllocator::default();
+        let component = FrameworkComponent::new(
+            &mut allocator,
+            eval,
+            stwo::core::fields::qm31::SecureField::zero(),
+        );
+
+        prove::<SimdBackend, Poseidon252MerkleChannel>(&[&component], channel, commitment_scheme)
+            .expect("standalone Hades AIR proof should be satisfiable");
+    }
+
     #[test]
     fn test_repack_9bit_to_28bit() {
         // Verify repack produces the same 28-bit limbs as direct decomposition
@@ -2516,7 +2858,10 @@ mod tests {
                 );
             }
         }
-        eprintln!("[test] repack 9-bit→28-bit verified for {} values", values.len());
+        eprintln!(
+            "[test] repack 9-bit→28-bit verified for {} values",
+            values.len()
+        );
     }
 
     #[test]
@@ -2902,11 +3247,49 @@ mod tests {
 
         let trace_data = build_hades_trace(&[(input, output)]);
 
-        // 1 perm × 99 rounds, padded to next power of 2
+        // 1 perm × 91 rounds, padded to next power of 2
         assert!(trace_data.n_real_rows == N_ROUNDS);
         assert!(trace_data.n_perms == 1);
         assert_eq!(trace_data.trace.len(), N_HADES_TRACE_COLUMNS);
         assert_eq!(trace_data.trace[0].len(), 1 << trace_data.log_size);
+    }
+
+    #[test]
+    fn test_provider_input_digest_cannot_be_relabelled_independently() {
+        let input = [
+            FieldElement::from(7u64),
+            FieldElement::from(11u64),
+            FieldElement::TWO,
+        ];
+        let mut output = input;
+        crate::crypto::hades::hades_permutation(&mut output);
+
+        let trace_data = build_hades_trace(&[(input, output)]);
+        let n_padded = 1 << trace_data.log_size;
+        let (failures, first) =
+            check_hades_constraints_rowwise(&trace_data.trace, trace_data.n_real_rows, n_padded);
+        assert_eq!(
+            failures, 0,
+            "honest trace should satisfy row checks: {first}"
+        );
+
+        // Relabel the provider key's input digest across the whole Hades block
+        // without changing the actual first state. This is the attack LogUp must
+        // reject: a provider row claims to verify a chain input it did not use.
+        let mut tampered = trace_data.trace.clone();
+        let bad = M31::from_u32_unchecked(123);
+        for row in 0..N_ROUNDS {
+            tampered[HADES_INPUT_DIGEST_9BIT_COL][row] = bad;
+            if row + 1 < N_ROUNDS {
+                tampered[HADES_SHIFTED_NEXT_INPUT_DIGEST_9BIT_COL][row] = bad;
+            }
+        }
+        let (failures, first) =
+            check_hades_constraints_rowwise(&tampered, trace_data.n_real_rows, n_padded);
+        assert!(
+            failures > 0 && first.contains("provider_input"),
+            "relabelled provider input must fail, got failures={failures}, first={first}"
+        );
     }
 }
 
@@ -2960,16 +3343,26 @@ pub fn check_hades_constraints_rowwise(
         let sns: Vec<i64> = (0..84).map(|j| read(col + j)).collect();
         col = 1170;
         // selectors
-        let is_full = read(col) as u32; col += 1;
-        let is_real_v = read(col) as u32; col += 1;
-        let is_chain = read(col) as u32; col += 1;
-        let is_first = read(col) as u32; col += 1;
-        let is_last = read(col) as u32; col += 1;
+        let is_full = read(col) as u32;
+        col += 1;
+        let is_real_v = read(col) as u32;
+        col += 1;
+        let is_chain = read(col) as u32;
+        col += 1;
+        let is_first = read(col) as u32;
+        col += 1;
+        let is_last = read(col) as u32;
+        col += 1;
+        let provider_input: Vec<i64> = (0..LIMBS_28).map(|j| read(col + j)).collect();
+        col += LIMBS_28;
+        let shifted_provider_input: Vec<i64> = (0..LIMBS_28).map(|j| read(col + j)).collect();
 
         // Check: is_real boolean
         if is_real_v != 0 && is_real_v != 1 {
             let msg = format!("row {row}: is_real={is_real_v} not boolean");
-            if first_fail.is_empty() { first_fail = msg.clone(); }
+            if first_fail.is_empty() {
+                first_fail = msg.clone();
+            }
             failures += 1;
             continue;
         }
@@ -2977,8 +3370,14 @@ pub fn check_hades_constraints_rowwise(
         // Check: post_sbox[2] = cube_result[2] (ungated, should be 0=0 on padding)
         for j in 0..LIMBS_28 {
             if ps[56 + j] != cr[56 + j] {
-                let msg = format!("row {row}: post_sbox[2][{j}]={} != cube_result[2][{j}]={}", ps[56+j], cr[56+j]);
-                if first_fail.is_empty() { first_fail = msg.clone(); }
+                let msg = format!(
+                    "row {row}: post_sbox[2][{j}]={} != cube_result[2][{j}]={}",
+                    ps[56 + j],
+                    cr[56 + j]
+                );
+                if first_fail.is_empty() {
+                    first_fail = msg.clone();
+                }
                 failures += 1;
             }
         }
@@ -2986,10 +3385,17 @@ pub fn check_hades_constraints_rowwise(
         // Check: post_sbox[0,1] = is_full*cube + (1-is_full)*sbox_input
         for elem in 0..2 {
             for j in 0..LIMBS_28 {
-                let expected = is_full as i64 * cr[elem*28+j] + (1 - is_full as i64) * si[elem*28+j];
-                if ps[elem*28+j] != expected {
-                    let msg = format!("row {row}: post_sbox[{elem}][{j}]={} != expected={} (is_full={is_full})", ps[elem*28+j], expected);
-                    if first_fail.is_empty() { first_fail = msg.clone(); }
+                let expected =
+                    is_full as i64 * cr[elem * 28 + j] + (1 - is_full as i64) * si[elem * 28 + j];
+                if ps[elem * 28 + j] != expected {
+                    let msg = format!(
+                        "row {row}: post_sbox[{elem}][{j}]={} != expected={} (is_full={is_full})",
+                        ps[elem * 28 + j],
+                        expected
+                    );
+                    if first_fail.is_empty() {
+                        first_fail = msg.clone();
+                    }
                     failures += 1;
                 }
             }
@@ -2999,11 +3405,44 @@ pub fn check_hades_constraints_rowwise(
         if is_chain != 0 {
             for elem in 0..3 {
                 for j in 0..LIMBS_28 {
-                    if mr[elem*28+j] != sns[elem*28+j] {
-                        let msg = format!("row {row}: round_transition[{elem}][{j}] mds={} != shifted={}", mr[elem*28+j], sns[elem*28+j]);
-                        if first_fail.is_empty() { first_fail = msg.clone(); }
+                    if mr[elem * 28 + j] != sns[elem * 28 + j] {
+                        let msg = format!(
+                            "row {row}: round_transition[{elem}][{j}] mds={} != shifted={}",
+                            mr[elem * 28 + j],
+                            sns[elem * 28 + j]
+                        );
+                        if first_fail.is_empty() {
+                            first_fail = msg.clone();
+                        }
                         failures += 1;
                     }
+                }
+            }
+            for j in 0..LIMBS_28 {
+                if provider_input[j] != shifted_provider_input[j] {
+                    let msg = format!(
+                        "row {row}: provider_input[{j}]={} != shifted_provider_input[{j}]={}",
+                        provider_input[j], shifted_provider_input[j]
+                    );
+                    if first_fail.is_empty() {
+                        first_fail = msg.clone();
+                    }
+                    failures += 1;
+                }
+            }
+        }
+
+        if is_first != 0 {
+            for j in 0..LIMBS_28 {
+                if provider_input[j] != sb[j] {
+                    let msg = format!(
+                        "row {row}: provider_input[{j}]={} != first_state_digest[{j}]={}",
+                        provider_input[j], sb[j]
+                    );
+                    if first_fail.is_empty() {
+                        first_fail = msg.clone();
+                    }
+                    failures += 1;
                 }
             }
         }

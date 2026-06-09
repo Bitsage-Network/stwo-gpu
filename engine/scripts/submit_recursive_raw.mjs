@@ -45,6 +45,10 @@ async function decryptKeystore(path, password) {
   return "0x" + Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString("hex");
 }
 
+function hasStatementHash(value) {
+  return BigInt(value || "0x0") !== 0n;
+}
+
 // V3 resource bounds for big-calldata verify_recursive call.
 // Prices are denominated in fri (STRK base unit). Sequencer charges actual×actual_price.
 // Budgets target ~2 STRK worst case (deployer has ~7.5 STRK).
@@ -78,10 +82,9 @@ async function main() {
   const r = raw.recursive_proof;
   if (!r?.calldata?.length) { console.error("No recursive_proof.calldata"); process.exit(1); }
 
-  // The contract checks `io_commitment param == proof_io_commitment_felt252` where
-  // proof_io_commitment_felt252 is calldata[19] (the lossy QM31->felt252 conversion stored
-  // in the proof header). Top-level j.io_commitment is the full 252-bit Poseidon hash —
-  // different from what the proof body bound. Use proof body's value.
+  // The contract checks `io_commitment param == proof_io_commitment_felt252`.
+  // For current proofs calldata[19] is the full felt252 Poseidon IO commitment
+  // that was mixed into the recursive Fiat-Shamir channel.
   const ioCommitmentParam = r.calldata[19];
   console.log("io_commitment (from proof header [19]): " + ioCommitmentParam);
 
@@ -91,8 +94,17 @@ async function main() {
   const nLayersFromProof = parseInt(r.calldata[12], 16);
   const traceLogSizeFromProof = parseInt(r.calldata[22], 16);
   console.log(`metadata from proof body: n_layers=${nLayersFromProof}, trace_log_size=${traceLogSizeFromProof}`);
+  const conversationStatementHash = raw.conversation_statement_hash || r.conversation_statement_hash || "0x0";
+  const statementVerifier = raw.statement_verifier || r.statement_verifier || process.env.STATEMENT_VERIFIER_CONTRACT || process.env.STWO_STATEMENT_VERIFIER || "0x0";
+  const statementProofHash = raw.statement_proof_hash || r.statement_proof_hash || process.env.STATEMENT_PROOF_HASH || "0x0";
+  const bindStatement = hasStatementHash(conversationStatementHash);
+  const bindStatementFact = bindStatement && hasStatementHash(statementVerifier);
+  const verifyEntrypoint = bindStatementFact ? "verify_recursive_with_statement_fact" : (bindStatement ? "verify_recursive_with_statement" : "verify_recursive");
+  console.log("conversation_statement_hash: " + conversationStatementHash);
+  console.log("statement_verifier: " + statementVerifier);
+  console.log("entrypoint: " + verifyEntrypoint);
 
-  const verifyCalldata = CallData.compile({
+  const verifyFields = {
     model_id: raw.model_id,
     io_commitment: ioCommitmentParam,
     circuit_hash: r.circuit_hash,
@@ -103,12 +115,25 @@ async function main() {
     num_transformer_blocks: parseInt(process.env.NUM_TRANSFORMER_BLOCKS || "1"),
     policy_commitment: raw.policy_commitment || r.policy_commitment || "0x0",
     trace_log_size: traceLogSizeFromProof,
+  };
+  const verifyCalldata = CallData.compile(bindStatementFact ? {
+    ...verifyFields,
+    expected_conversation_statement_hash: conversationStatementHash,
+    statement_verifier: statementVerifier,
+    expected_statement_proof_hash: statementProofHash,
+    stark_proof_data: r.calldata,
+  } : bindStatement ? {
+    ...verifyFields,
+    expected_conversation_statement_hash: conversationStatementHash,
+    stark_proof_data: r.calldata,
+  } : {
+    ...verifyFields,
     stark_proof_data: r.calldata,
   });
 
   const calls = [{
     contractAddress: CONTRACT,
-    entrypoint: "verify_recursive",
+    entrypoint: verifyEntrypoint,
     calldata: verifyCalldata,
   }];
   // Cairo 1 account __execute__ calldata: [n_calls, [{contract, selector, calldata_len, calldata...}]]

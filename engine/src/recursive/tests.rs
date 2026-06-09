@@ -150,6 +150,35 @@ mod unit_tests {
     }
 
     #[test]
+    fn test_instrumented_channel_mix_felts_matches_production() {
+        let mut prod = PoseidonChannel::new();
+        let mut inst = InstrumentedChannel::new();
+
+        let values = [
+            QM31(
+                CM31(M31::from(1), M31::from(2)),
+                CM31(M31::from(3), M31::from(4)),
+            ),
+            QM31(
+                CM31(M31::from(5), M31::from(6)),
+                CM31(M31::from(7), M31::from(8)),
+            ),
+            QM31(
+                CM31(M31::from(9), M31::from(10)),
+                CM31(M31::from(11), M31::from(12)),
+            ),
+        ];
+
+        prod.mix_u64(0xFACE);
+        inst.mix_u64(0xFACE);
+        prod.mix_felts(&values);
+        inst.mix_felts(&values);
+
+        assert_eq!(prod.digest(), inst.inner().digest());
+        assert_eq!(prod.draw_qm31(), inst.draw_qm31());
+    }
+
+    #[test]
     fn test_instrumented_channel_from_existing() {
         // Verify InstrumentedChannel::from_channel preserves state.
         let mut prod = PoseidonChannel::new();
@@ -240,9 +269,10 @@ mod unit_tests {
 
 #[cfg(test)]
 mod integration_tests {
-    use super::super::witness::generate_witness;
+    use super::super::witness::{generate_witness, InstrumentedChannel};
     use crate::compiler::graph::{GraphBuilder, GraphWeights};
     use crate::components::matmul::M31Matrix;
+    use crate::crypto::poseidon_channel::PoseidonChannel;
     use stwo::core::fields::cm31::CM31;
     use stwo::core::fields::m31::M31;
     use stwo::core::fields::qm31::QM31;
@@ -383,6 +413,78 @@ mod integration_tests {
             witness.n_sumcheck_rounds,
             witness.n_qm31_ops,
             witness.n_equality_checks,
+        );
+    }
+
+    #[test]
+    fn test_generic_verifier_instrumented_channel_matches_production_digest() {
+        use crate::components::activation::ActivationType;
+
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(4).activation(ActivationType::ReLU).linear(2);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(1, 4);
+        for j in 0..4 {
+            input.set(0, j, M31::from((j + 1) as u32));
+        }
+
+        let mut weights = GraphWeights::new();
+        let mut w0 = M31Matrix::new(4, 4);
+        for i in 0..4 {
+            for j in 0..4 {
+                w0.set(i, j, M31::from(((i + j) % 7 + 1) as u32));
+            }
+        }
+        weights.add_weight(0, w0);
+
+        let mut w2 = M31Matrix::new(4, 2);
+        for i in 0..4 {
+            for j in 0..2 {
+                w2.set(i, j, M31::from((i + j + 1) as u32));
+            }
+        }
+        weights.add_weight(2, w2);
+
+        let proof = crate::aggregation::prove_model_pure_gkr(&graph, &input, &weights)
+            .expect("GKR proving should succeed");
+        let gkr = proof.gkr_proof.as_ref().expect("should have GKR proof");
+        let circuit = crate::gkr::LayeredCircuit::from_graph(&graph).expect("circuit compile");
+
+        let mut prod_channel = PoseidonChannel::new();
+        crate::gkr::verifier::verify_gkr_with_weights(
+            &circuit,
+            gkr,
+            &proof.execution.output,
+            &weights,
+            &mut prod_channel,
+        )
+        .expect("production verifier should pass");
+
+        let mut inst_channel = InstrumentedChannel::new();
+        crate::gkr::verifier::verify_gkr_on_channel(
+            &circuit,
+            gkr,
+            &proof.execution.output,
+            Some(&weights),
+            &mut inst_channel,
+            None,
+        )
+        .expect("instrumented verifier should pass");
+
+        assert_eq!(
+            prod_channel.digest(),
+            inst_channel.inner().digest(),
+            "generic instrumented verifier must end at the production digest"
+        );
+        assert_eq!(
+            prod_channel.hash_count(),
+            inst_channel.inner().hash_count(),
+            "instrumented verifier must execute the same Poseidon count"
+        );
+        assert!(
+            inst_channel.ops().len() >= prod_channel.hash_count() as usize,
+            "instrumented verifier should record transcript operations"
         );
     }
 

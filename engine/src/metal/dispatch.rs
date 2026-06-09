@@ -16,7 +16,11 @@ pub fn matmul_m31_auto(a: &M31Matrix, b: &M31Matrix) -> M31Matrix {
 pub fn metal_info() -> String {
     match std::panic::catch_unwind(|| {
         let dev = super::device::MetalDevice::global();
-        format!("{} ({}MB)", dev.adapter_name, dev.max_buffer_size / (1024 * 1024))
+        format!(
+            "{} ({}MB)",
+            dev.adapter_name,
+            dev.max_buffer_size / (1024 * 1024)
+        )
     }) {
         Ok(info) => info,
         Err(_) => "not available".to_string(),

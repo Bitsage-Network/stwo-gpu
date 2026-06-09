@@ -17,8 +17,8 @@
 // Folding order: forward (first variable first)
 
 use core::poseidon::hades_permutation;
-use crate::field::{QM31, qm31_add, qm31_sub, qm31_mul, qm31_eq, pack_qm31_to_felt, pow2};
-use crate::channel::{PoseidonChannel, channel_mix_felt, channel_draw_query_indices};
+use crate::channel::{PoseidonChannel, channel_draw_query_indices, channel_mix_felt};
+use crate::field::{QM31, pack_qm31_to_felt, pow2, qm31_add, qm31_eq, qm31_mul, qm31_sub};
 use crate::types::MleOpeningProof;
 
 /// Default number of spot-check queries for the MLE folding protocol.
@@ -49,7 +49,7 @@ fn verify_merkle_path(
         }
         idx = idx / 2;
         i += 1;
-    };
+    }
     current == root
 }
 
@@ -90,7 +90,7 @@ pub fn verify_mle_opening(
         }
         channel_mix_felt(ref ch, *intermediate_roots_span.at(ir_i));
         ir_i += 1;
-    };
+    }
 
     // Build layer roots: layer 0 = commitment, layers 1..n-1 = intermediate_roots
     let layer_roots_len: u32 = 1 + intermediate_roots_span.len();
@@ -190,10 +190,10 @@ pub fn verify_mle_opening(
             layer_size = mid;
 
             round += 1;
-        };
+        }
 
         q_idx += 1;
-    };
+    }
 
     true
 }

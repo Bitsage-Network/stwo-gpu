@@ -8,7 +8,6 @@ use std::sync::Mutex;
 
 use stwo::core::fields::m31::M31;
 
-
 use obelyzk::aggregation::{
     compute_io_commitment, compute_io_commitment_packed, prove_model_pure_gkr,
     verify_kv_cache_binding, verify_kv_cache_commitment_chain, IncrementalKVCommitment,
@@ -73,10 +72,7 @@ fn build_mlp_gelu() -> (
     GraphWeights,
 ) {
     let mut builder = GraphBuilder::new((1, 4));
-    builder
-        .linear(4)
-        .activation(ActivationType::GELU)
-        .linear(2);
+    builder.linear(4).activation(ActivationType::GELU).linear(2);
     let graph = builder.build();
     let input = M31Matrix {
         rows: 1,
@@ -149,8 +145,7 @@ fn security_gate_activation_default_rejects() {
     let _guard = EnvVarGuard::remove("STWO_ALLOW_LOGUP_ACTIVATION");
 
     let (graph, input, weights) = build_mlp_gelu();
-    let mut proof = prove_model_pure_gkr(&graph, &input, &weights)
-        .expect("proving should succeed");
+    let mut proof = prove_model_pure_gkr(&graph, &input, &weights).expect("proving should succeed");
 
     let gkr = proof.gkr_proof.as_mut().expect("should have GKR proof");
 
@@ -191,8 +186,7 @@ fn security_gate_activation_bypass_allows() {
     let _guard = EnvVarGuard::set("STWO_ALLOW_LOGUP_ACTIVATION", "1");
 
     let (graph, input, weights) = build_mlp_gelu();
-    let mut proof = prove_model_pure_gkr(&graph, &input, &weights)
-        .expect("proving should succeed");
+    let mut proof = prove_model_pure_gkr(&graph, &input, &weights).expect("proving should succeed");
 
     let gkr = proof.gkr_proof.as_mut().expect("should have GKR proof");
 
@@ -233,8 +227,7 @@ fn security_gate_norm_proof_default_rejects() {
     let _guard = EnvVarGuard::remove("STWO_ALLOW_MISSING_NORM_PROOF");
 
     let (graph, input, weights) = build_mlp_layernorm();
-    let mut proof = prove_model_pure_gkr(&graph, &input, &weights)
-        .expect("proving should succeed");
+    let mut proof = prove_model_pure_gkr(&graph, &input, &weights).expect("proving should succeed");
 
     let gkr = proof.gkr_proof.as_mut().expect("should have GKR proof");
 
@@ -289,8 +282,7 @@ fn security_gate_norm_proof_bypass_allows() {
     let _guard = EnvVarGuard::set("STWO_ALLOW_MISSING_NORM_PROOF", "1");
 
     let (graph, input, weights) = build_mlp_layernorm();
-    let mut proof = prove_model_pure_gkr(&graph, &input, &weights)
-        .expect("proving should succeed");
+    let mut proof = prove_model_pure_gkr(&graph, &input, &weights).expect("proving should succeed");
 
     let gkr = proof.gkr_proof.as_mut().expect("should have GKR proof");
 
@@ -344,8 +336,7 @@ fn security_gate_segment_binding_default_rejects() {
     let _guard = EnvVarGuard::remove("STWO_ALLOW_MISSING_SEGMENT_BINDING");
 
     let (graph, input, weights) = build_mlp_gelu();
-    let mut proof = prove_model_pure_gkr(&graph, &input, &weights)
-        .expect("proving should succeed");
+    let mut proof = prove_model_pure_gkr(&graph, &input, &weights).expect("proving should succeed");
 
     let gkr = proof.gkr_proof.as_mut().expect("should have GKR proof");
 
@@ -387,8 +378,7 @@ fn security_gate_segment_binding_bypass_allows() {
     let _guard = EnvVarGuard::set("STWO_ALLOW_MISSING_SEGMENT_BINDING", "1");
 
     let (graph, input, weights) = build_mlp_gelu();
-    let mut proof = prove_model_pure_gkr(&graph, &input, &weights)
-        .expect("proving should succeed");
+    let mut proof = prove_model_pure_gkr(&graph, &input, &weights).expect("proving should succeed");
 
     let gkr = proof.gkr_proof.as_mut().expect("should have GKR proof");
 
@@ -428,8 +418,7 @@ fn security_gate_rlc_only_default_rejects_streaming() {
     let _guard = EnvVarGuard::remove("STWO_AGGREGATED_RLC_ONLY");
 
     let (graph, input, weights) = build_matmul_only();
-    let mut proof = prove_model_pure_gkr(&graph, &input, &weights)
-        .expect("proving should succeed");
+    let mut proof = prove_model_pure_gkr(&graph, &input, &weights).expect("proving should succeed");
 
     let gkr = proof.gkr_proof.as_mut().expect("should have GKR proof");
 
@@ -473,8 +462,7 @@ fn security_gate_rlc_only_bypass_documents_risk() {
     let _guard = EnvVarGuard::set("STWO_AGGREGATED_RLC_ONLY", "1");
 
     let (graph, input, weights) = build_matmul_only();
-    let proof = prove_model_pure_gkr(&graph, &input, &weights)
-        .expect("proving should succeed");
+    let proof = prove_model_pure_gkr(&graph, &input, &weights).expect("proving should succeed");
 
     let gkr = proof.gkr_proof.as_ref().expect("should have GKR proof");
 
@@ -496,8 +484,7 @@ fn security_gate_unified_stark_default_produces() {
     let _guard = EnvVarGuard::remove("STWO_PURE_GKR_SKIP_UNIFIED_STARK");
 
     let (graph, input, weights) = build_matmul_only();
-    let proof = prove_model_pure_gkr(&graph, &input, &weights)
-        .expect("proving should succeed");
+    let proof = prove_model_pure_gkr(&graph, &input, &weights).expect("proving should succeed");
 
     // Default: unified_stark should be produced.
     // Note: pure GKR mode may not produce a unified STARK if GKR covers all layers.
@@ -511,8 +498,7 @@ fn security_gate_unified_stark_bypass_skips() {
     let _guard = EnvVarGuard::set("STWO_PURE_GKR_SKIP_UNIFIED_STARK", "1");
 
     let (graph, input, weights) = build_matmul_only();
-    let proof = prove_model_pure_gkr(&graph, &input, &weights)
-        .expect("proving should succeed");
+    let proof = prove_model_pure_gkr(&graph, &input, &weights).expect("proving should succeed");
 
     assert!(
         proof.unified_stark.is_none(),
@@ -527,8 +513,7 @@ fn security_gate_unified_stark_bypass_skips() {
 #[test]
 fn streaming_calldata_roundtrip_integrity() {
     let (graph, input, weights) = build_mlp_gelu();
-    let proof = prove_model_pure_gkr(&graph, &input, &weights)
-        .expect("proving should succeed");
+    let proof = prove_model_pure_gkr(&graph, &input, &weights).expect("proving should succeed");
     let gkr = proof.gkr_proof.as_ref().expect("should have GKR proof");
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
@@ -560,10 +545,7 @@ fn streaming_calldata_roundtrip_integrity() {
             );
 
             for (i, batch) in cd.stream_batches.iter().enumerate() {
-                assert_eq!(
-                    batch.batch_idx, i as u32,
-                    "batch_idx should be sequential"
-                );
+                assert_eq!(batch.batch_idx, i as u32, "batch_idx should be sequential");
                 assert!(
                     !batch.calldata.is_empty(),
                     "batch {} calldata should be non-empty",
@@ -600,8 +582,7 @@ fn streaming_calldata_roundtrip_integrity() {
 #[test]
 fn streaming_calldata_tampered_batch_audit_finding() {
     let (graph, input, weights) = build_matmul_only();
-    let proof = prove_model_pure_gkr(&graph, &input, &weights)
-        .expect("proving should succeed");
+    let proof = prove_model_pure_gkr(&graph, &input, &weights).expect("proving should succeed");
     let gkr = proof.gkr_proof.as_ref().expect("should have GKR proof");
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
@@ -639,8 +620,7 @@ fn streaming_calldata_tampered_batch_audit_finding() {
 #[test]
 fn streaming_output_mle_chunks_complete() {
     let (graph, input, weights) = build_matmul_only();
-    let proof = prove_model_pure_gkr(&graph, &input, &weights)
-        .expect("proving should succeed");
+    let proof = prove_model_pure_gkr(&graph, &input, &weights).expect("proving should succeed");
     let gkr = proof.gkr_proof.as_ref().expect("should have GKR proof");
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
@@ -663,11 +643,7 @@ fn streaming_output_mle_chunks_complete() {
             let mut _total_len: u32 = 0;
             let mut prev_end: u32 = 0;
             for (i, chunk) in cd.output_mle_chunks.iter().enumerate() {
-                assert_eq!(
-                    chunk.chunk_offset, prev_end,
-                    "chunk {} offset mismatch",
-                    i
-                );
+                assert_eq!(chunk.chunk_offset, prev_end, "chunk {} offset mismatch", i);
                 assert!(chunk.chunk_len > 0, "chunk {} has zero length", i);
                 _total_len += chunk.chunk_len;
                 prev_end = chunk.chunk_offset + chunk.chunk_len;
@@ -685,8 +661,7 @@ fn streaming_output_mle_chunks_complete() {
 #[test]
 fn streaming_session_metadata_consistent() {
     let (graph, input, weights) = build_mlp_gelu();
-    let proof = prove_model_pure_gkr(&graph, &input, &weights)
-        .expect("proving should succeed");
+    let proof = prove_model_pure_gkr(&graph, &input, &weights).expect("proving should succeed");
     let gkr = proof.gkr_proof.as_ref().expect("should have GKR proof");
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
@@ -733,8 +708,7 @@ fn streaming_calldata_kv_fields_present() {
     let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
 
     let (graph, input, weights) = build_matmul_only();
-    let proof = prove_model_pure_gkr(&graph, &input, &weights)
-        .expect("proving should succeed");
+    let proof = prove_model_pure_gkr(&graph, &input, &weights).expect("proving should succeed");
     let gkr = proof.gkr_proof.as_ref().expect("should have GKR proof");
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();
@@ -778,10 +752,7 @@ fn build_decode_transformer(
     d_model: usize,
     num_heads: usize,
     d_ff: usize,
-) -> (
-    obelyzk::compiler::graph::ComputationGraph,
-    GraphWeights,
-) {
+) -> (obelyzk::compiler::graph::ComputationGraph, GraphWeights) {
     let mut builder = GraphBuilder::new((1, d_model));
     builder.transformer_block(num_heads, num_heads, 1, d_ff);
     let graph = builder.build();
@@ -890,7 +861,8 @@ fn decode_chain_valid_sequence_passes() {
         let current_commit = proofs[i].kv_cache_commitment;
         let next_prev = proofs[i + 1].prev_kv_cache_commitment;
         assert_eq!(
-            current_commit, next_prev,
+            current_commit,
+            next_prev,
             "Chain link {}→{} should match: current={:?}, next_prev={:?}",
             i,
             i + 1,
@@ -1021,17 +993,16 @@ fn decode_kv_binding_matches_cache_state() {
     let mut kv_commitment = IncrementalKVCommitment::from_kv_cache(&kv_cache, prefill_len + 1);
 
     let token = random_m31_matrix(1, d_model, 4000);
-    let (proof, new_commit) =
-        obelyzk::aggregation::prove_model_pure_gkr_decode_step_incremental(
-            &graph,
-            &token,
-            &weights,
-            &mut kv_cache,
-            &mut kv_commitment,
-            Some(&weight_cache),
-            None,
-        )
-        .expect("decode step should succeed");
+    let (proof, new_commit) = obelyzk::aggregation::prove_model_pure_gkr_decode_step_incremental(
+        &graph,
+        &token,
+        &weights,
+        &mut kv_cache,
+        &mut kv_commitment,
+        Some(&weight_cache),
+        None,
+    )
+    .expect("decode step should succeed");
 
     // Verify the proof carries a non-None KV commitment.
     assert!(
@@ -1066,9 +1037,7 @@ fn decode_kv_binding_matches_cache_state() {
             msg.contains("binding mismatch"),
             "Expected binding mismatch, got: {msg}"
         );
-        eprintln!(
-            "  [AUDIT NOTE] KV binding mismatch between incremental and full recomputation"
-        );
+        eprintln!("  [AUDIT NOTE] KV binding mismatch between incremental and full recomputation");
     }
 }
 
@@ -1115,8 +1084,7 @@ fn decode_chain_first_proof_nonzero_prev_fails() {
 #[test]
 fn io_commitment_matches_packed_serialization() {
     let (graph, input, weights) = build_matmul_only();
-    let proof = prove_model_pure_gkr(&graph, &input, &weights)
-        .expect("proving should succeed");
+    let proof = prove_model_pure_gkr(&graph, &input, &weights).expect("proving should succeed");
 
     let io_standard = compute_io_commitment(&input, &proof.execution.output);
     let io_packed = compute_io_commitment_packed(&input, &proof.execution.output);
@@ -1145,10 +1113,8 @@ fn io_commitment_matches_packed_serialization() {
 fn weight_commitment_deterministic() {
     let (graph, input, weights) = build_matmul_only();
 
-    let proof1 = prove_model_pure_gkr(&graph, &input, &weights)
-        .expect("proving should succeed");
-    let proof2 = prove_model_pure_gkr(&graph, &input, &weights)
-        .expect("proving should succeed");
+    let proof1 = prove_model_pure_gkr(&graph, &input, &weights).expect("proving should succeed");
+    let proof2 = prove_model_pure_gkr(&graph, &input, &weights).expect("proving should succeed");
 
     let gkr1 = proof1.gkr_proof.as_ref().expect("should have GKR proof");
     let gkr2 = proof2.gkr_proof.as_ref().expect("should have GKR proof");
@@ -1177,8 +1143,7 @@ fn weight_commitment_deterministic() {
 #[test]
 fn streaming_io_commitment_matches_proof() {
     let (graph, input, weights) = build_matmul_only();
-    let proof = prove_model_pure_gkr(&graph, &input, &weights)
-        .expect("proving should succeed");
+    let proof = prove_model_pure_gkr(&graph, &input, &weights).expect("proving should succeed");
     let gkr = proof.gkr_proof.as_ref().expect("should have GKR proof");
 
     let circuit = LayeredCircuit::from_graph(&graph).unwrap();

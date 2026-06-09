@@ -127,7 +127,7 @@ pub fn qm31_mul(x: QM31, y: QM31) -> QM31 {
     // bd × (2 + i): (p + qi)(2 + i) = (2p - q) + (p + 2q)i
     let bd_times_irred = CM31 {
         a: m31_sub(m31_add(bd.a, bd.a), bd.b), // 2·p - q
-        b: m31_add(bd.a, m31_add(bd.b, bd.b)), // p + 2·q
+        b: m31_add(bd.a, m31_add(bd.b, bd.b)) // p + 2·q
     };
 
     // Real part: ac + bd·(2+i)
@@ -160,7 +160,7 @@ pub fn m31_pow(base: u64, exp: u64) -> u64 {
         }
         b = m31_mul(b, b);
         e = e / 2;
-    };
+    }
     result
 }
 
@@ -198,8 +198,7 @@ pub fn qm31_inverse(x: QM31) -> QM31 {
     let b_sq = cm31_mul(x.b, x.b);
     // (2+i) * (p+qi) = (2p - q) + (p + 2q)i
     let b_sq_irred = CM31 {
-        a: m31_sub(m31_add(b_sq.a, b_sq.a), b_sq.b),
-        b: m31_add(b_sq.a, m31_add(b_sq.b, b_sq.b)),
+        a: m31_sub(m31_add(b_sq.a, b_sq.a), b_sq.b), b: m31_add(b_sq.a, m31_add(b_sq.b, b_sq.b)),
     };
     let norm = cm31_sub(a_sq, b_sq_irred);
     let norm_inv = cm31_inverse(norm);
@@ -242,7 +241,7 @@ pub fn batch_inverse(values: Span<QM31>) -> Array<QM31> {
         }
         prefix.append(qm31_mul(*prefix.at(i - 1), *values.at(i)));
         i += 1;
-    };
+    }
 
     // Single inversion of total product
     let mut inv_acc = qm31_inverse(*prefix.at(n - 1));
@@ -261,7 +260,7 @@ pub fn batch_inverse(values: Span<QM31>) -> Array<QM31> {
             rev.append(qm31_mul(*prefix.at(i - 1), inv_acc));
         }
         inv_acc = qm31_mul(inv_acc, *values.at(i));
-    };
+    }
 
     // Reverse to correct order
     let mut result: Array<QM31> = array![];
@@ -272,7 +271,7 @@ pub fn batch_inverse(values: Span<QM31>) -> Array<QM31> {
         }
         j -= 1;
         result.append(*rev.at(j));
-    };
+    }
     result
 }
 
@@ -320,7 +319,7 @@ pub fn eq_eval(x: Span<QM31>, y: Span<QM31>) -> QM31 {
         let term = qm31_add(xi_yi, qm31_mul(one_minus_xi, one_minus_yi));
         result = qm31_mul(result, term);
         i += 1;
-    };
+    }
     result
 }
 
@@ -352,7 +351,7 @@ pub fn evaluate_mle(evals: Span<QM31>, point: Span<QM31>) -> QM31 {
         }
         current.append(*evals.at(i));
         i += 1;
-    };
+    }
 
     let mut size = n;
     let mut var_idx: u32 = 0;
@@ -374,12 +373,12 @@ pub fn evaluate_mle(evals: Span<QM31>, point: Span<QM31>) -> QM31 {
             let hi = *current.at(j + mid);
             next.append(qm31_add(lo, qm31_mul(r, qm31_sub(hi, lo))));
             j += 1;
-        };
+        }
 
         current = next;
         size = mid;
         var_idx += 1;
-    };
+    }
 
     assert!(size == 1, "MLE_FOLD_INCOMPLETE");
     *current.at(0)
@@ -402,11 +401,7 @@ pub fn evaluate_mle(evals: Span<QM31>, point: Span<QM31>) -> QM31 {
 ///
 /// Total: ~16K appends (eq build) vs ~25K appends (old approach)
 pub fn evaluate_mle_from_io_span_1row(
-    io_span: Span<felt252>,
-    data_off: u32,
-    data_len: u32,
-    padded_len: u32,
-    point: Span<QM31>,
+    io_span: Span<felt252>, data_off: u32, data_len: u32, padded_len: u32, point: Span<QM31>,
 ) -> QM31 {
     let n_vars = point.len();
     assert!(padded_len > 0, "EQ_TABLE_EMPTY");
@@ -434,10 +429,10 @@ pub fn evaluate_mle_from_io_span_1row(
             new_table.append(qm31_mul(e, one_minus_r));
             new_table.append(qm31_mul(e, r));
             k += 1;
-        };
+        }
         eq_table = new_table;
         var_idx += 1;
-    };
+    }
 
     // Dot product: sum(data[i] * eq_table[i]) for i in 0..data_len
     // (padding entries are zero, so their eq_table contribution is skipped)
@@ -454,7 +449,7 @@ pub fn evaluate_mle_from_io_span_1row(
             acc = qm31_add(acc, qm31_mul(m31_to_qm31(v_u64), *eq_span.at(i)));
         }
         i += 1;
-    };
+    }
     acc
 }
 
@@ -497,10 +492,10 @@ pub fn evaluate_mle_from_io_span_2d(
             new_table.append(qm31_mul(e, one_minus_r));
             new_table.append(qm31_mul(e, r));
             k += 1;
-        };
+        }
         eq_table = new_table;
         var_idx += 1;
-    };
+    }
 
     // Dot product over non-padded entries only
     let eq_span = eq_table.span();
@@ -523,9 +518,9 @@ pub fn evaluate_mle_from_io_span_2d(
                 acc = qm31_add(acc, qm31_mul(m31_to_qm31(v_u64), *eq_span.at(dst_idx)));
             }
             col += 1;
-        };
+        }
         row += 1;
-    };
+    }
     acc
 }
 
@@ -591,11 +586,7 @@ pub fn extract_m31_from_packed(packed_felts: Span<felt252>, m31_index: u32) -> u
 /// ~2*padded_len for eq_table construction, saving ~60% of Cairo steps for
 /// non-power-of-2 data lengths like Qwen3-14B's 5120-dim output.
 pub fn evaluate_mle_from_packed_1row(
-    packed_felts: Span<felt252>,
-    m31_start: u32,
-    data_len: u32,
-    padded_len: u32,
-    point: Span<QM31>,
+    packed_felts: Span<felt252>, m31_start: u32, data_len: u32, padded_len: u32, point: Span<QM31>,
 ) -> QM31 {
     let n_vars = point.len();
     assert!(padded_len > 0, "MLE_PADDED_EMPTY");
@@ -614,7 +605,11 @@ pub fn evaluate_mle_from_packed_1row(
         let val: u256 = (*packed_felts.at(pi)).into();
         let mut rem_lo: u128 = val.low;
         let mut rem_hi: u128 = val.high;
-        let skip_count = if pi == m31_start / 8 { skip_in_first } else { 0 };
+        let skip_count = if pi == m31_start / 8 {
+            skip_in_first
+        } else {
+            0
+        };
         let mut pos_in_felt: u32 = 0;
 
         // Values 0-3 from lo limb
@@ -633,7 +628,7 @@ pub fn evaluate_mle_from_packed_1row(
             rem_lo = q;
             pos_in_felt += 1;
             vi += 1;
-        };
+        }
 
         // Value 4 straddles lo/hi
         let hi_q4: u128 = rem_hi / 0x8000000;
@@ -664,7 +659,7 @@ pub fn evaluate_mle_from_packed_1row(
             rem_hi = q;
             pos_in_felt += 1;
             vi += 1;
-        };
+        }
 
         // Value 7: remaining bits
         if pos_in_felt >= skip_count && data_idx < data_len {
@@ -675,7 +670,7 @@ pub fn evaluate_mle_from_packed_1row(
         }
 
         pi += 1;
-    };
+    }
 
     // Step 2: Fold — for each variable r_i (from first to last),
     // fold the array in half: new[j] = old[j]*(1-r_i) + old[j+half]*r_i
@@ -713,11 +708,11 @@ pub fn evaluate_mle_from_packed_1row(
                 new_coeffs.append(qm31_add(lo, qm31_mul(r, qm31_sub(hi, lo))));
             }
             j += 1;
-        };
+        }
         coeffs = new_coeffs;
         current_len = half;
         var_idx += 1;
-    };
+    }
 
     assert!(coeffs.len() == 1, "MLE_FOLD_NOT_SCALAR");
     *coeffs.span().at(0)
@@ -776,7 +771,7 @@ pub fn evaluate_mle_eq_dot_partial(
         r_vals.append(r);
         one_minus_r_vals.append(qm31_sub(one, r));
         vi += 1;
-    };
+    }
     let r_span = r_vals.span();
     let omr_span = one_minus_r_vals.span();
 
@@ -800,7 +795,11 @@ pub fn evaluate_mle_eq_dot_partial(
     // the high-bit eq factor.
     //
     // Choose low_bits = log2(next_pow2(chunk_len)) so butterfly covers the chunk.
-    let low_bits = log2_ceil(if chunk_len > 1 { chunk_len } else { 2 });
+    let low_bits = log2_ceil(if chunk_len > 1 {
+        chunk_len
+    } else {
+        2
+    });
     let low_size = pow2(low_bits); // >= chunk_len
     let high_bits = n_vars - low_bits;
 
@@ -825,7 +824,7 @@ pub fn evaluate_mle_eq_dot_partial(
             high_eq = qm31_mul(high_eq, *omr_span.at(hi));
         }
         hi += 1;
-    };
+    }
 
     // Build eq-table for low bits via butterfly (MSB-first within low bits).
     // Low-bit variables are at indices high_bits..n_vars-1 in r_points.
@@ -850,10 +849,10 @@ pub fn evaluate_mle_eq_dot_partial(
             new_table.append(qm31_mul(e, omr));
             new_table.append(qm31_mul(e, r));
             k += 1;
-        };
+        }
         eq_table = new_table;
         li += 1;
-    };
+    }
 
     // Multiply each eq-table entry by high_eq and dot-product with unpacked data.
     // We combine the high_eq multiplication with the dot product to save a pass.
@@ -871,7 +870,7 @@ pub fn evaluate_mle_eq_dot_partial(
             acc = qm31_add(acc, qm31_mul(m31_to_qm31(v.into()), eq_val));
         }
         i += 1;
-    };
+    }
     acc
 }
 
@@ -889,14 +888,14 @@ pub fn pad_and_embed_m31s(vals: Span<u64>, target_len: u32) -> Array<QM31> {
         }
         result.append(m31_to_qm31(*vals.at(i)));
         i += 1;
-    };
+    }
     // Pad with zeros to target_len
     loop {
         if result.len() >= target_len {
             break;
         }
         result.append(qm31_zero());
-    };
+    }
     result
 }
 
@@ -915,7 +914,7 @@ pub fn random_linear_combination(values: Span<QM31>, alpha: QM31) -> QM31 {
         }
         i -= 1;
         acc = qm31_add(qm31_mul(acc, alpha), *values.at(i));
-    };
+    }
     acc
 }
 
@@ -959,7 +958,7 @@ pub fn log2_ceil(n: u32) -> u32 {
         }
         val = val / 2;
         result += 1;
-    };
+    }
     result
 }
 
@@ -978,8 +977,10 @@ pub fn next_power_of_two(n: u32) -> u32 {
 }
 
 /// Pack two QM31 values into a single felt252 (double-pack).
-/// Layout: [a.a.a(31) | a.a.b(31) | a.b.a(31) | a.b.b(31) | b.a.a(31) | b.a.b(31) | b.b.a(31) | b.b.b(31)]
-/// = 248 bits total. No sentinel needed — the format is indicated by context (double_packed flag).
+/// Layout: [a.a.a(31) | a.a.b(31) | a.b.a(31) | a.b.b(31) | b.a.a(31) | b.a.b(31) | b.b.a(31) |
+/// b.b.b(31)]
+/// = 248 bits total. No sentinel needed — the format is indicated by context (double_packed
+/// flag).
 pub fn pack_qm31_pair_to_felt(a: QM31, b: QM31) -> felt252 {
     let shift: felt252 = M31_SHIFT; // 2^31
     let mut result: felt252 = a.a.a.into();
@@ -1031,6 +1032,6 @@ pub fn pow2(n: u32) -> u32 {
         }
         result = result * 2;
         i += 1;
-    };
+    }
     result
 }

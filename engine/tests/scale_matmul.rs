@@ -7,13 +7,13 @@
 
 #![feature(portable_simd)]
 
-use std::time::Instant;
-use stwo::core::fields::m31::M31;
 use obelyzk::components::matmul::{
     estimate_sumcheck_memory, matmul_m31, pad_matrix_pow2, prove_matmul_sumcheck,
     prove_matmul_sumcheck_onchain, verify_matmul_sumcheck, verify_matmul_sumcheck_onchain,
     M31Matrix,
 };
+use std::time::Instant;
+use stwo::core::fields::m31::M31;
 
 /// Build a deterministic test matrix with values in [1, 251].
 fn make_matrix(rows: usize, cols: usize, seed: u64) -> M31Matrix {

@@ -42,7 +42,12 @@ pub struct AuditProver<'a> {
 impl<'a> AuditProver<'a> {
     /// Create a prover for a model.
     pub fn new(graph: &'a ComputationGraph, weights: &'a GraphWeights) -> Self {
-        Self { graph, weights, weight_cache: None, policy: None }
+        Self {
+            graph,
+            weights,
+            weight_cache: None,
+            policy: None,
+        }
     }
 
     /// Create a prover with a pre-warmed weight cache for GPU-accelerated proving.
@@ -51,7 +56,12 @@ impl<'a> AuditProver<'a> {
         weights: &'a GraphWeights,
         cache: &'a crate::weight_cache::SharedWeightCache,
     ) -> Self {
-        Self { graph, weights, weight_cache: Some(cache), policy: None }
+        Self {
+            graph,
+            weights,
+            weight_cache: Some(cache),
+            policy: None,
+        }
     }
 
     /// Set the policy configuration for proof binding.
@@ -140,11 +150,17 @@ impl<'a> AuditProver<'a> {
             } else {
                 entries.len().min(cpu_threads)
             };
-            eprintln!("  [Parallel] Proving {} inferences across {} threads", entries.len(), parallelism);
+            eprintln!(
+                "  [Parallel] Proving {} inferences across {} threads",
+                entries.len(),
+                parallelism
+            );
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(parallelism)
                 .build()
-                .map_err(|e| AuditError::ProvingFailed(format!("Failed to build rayon pool: {e}")))?;
+                .map_err(|e| {
+                    AuditError::ProvingFailed(format!("Failed to build rayon pool: {e}"))
+                })?;
 
             let results: Vec<(usize, Result<InferenceProofResult, AuditError>)> =
                 pool.install(|| {
@@ -154,7 +170,10 @@ impl<'a> AuditProver<'a> {
                         .map(|(idx, entry)| {
                             #[cfg(feature = "multi-gpu")]
                             let _guard = crate::multi_gpu::DeviceGuard::new(idx % gpu_count);
-                            (idx, self.prove_inference(entry, log, &mode, request.verify_on_chain))
+                            (
+                                idx,
+                                self.prove_inference(entry, log, &mode, request.verify_on_chain),
+                            )
                         })
                         .collect()
                 });
@@ -175,7 +194,11 @@ impl<'a> AuditProver<'a> {
                 .map(|p| p.get())
                 .unwrap_or(4);
             let parallelism = entries.len().min(cpu_threads);
-            eprintln!("  [Parallel] Proving {} inferences across {} CPU threads", entries.len(), parallelism);
+            eprintln!(
+                "  [Parallel] Proving {} inferences across {} CPU threads",
+                entries.len(),
+                parallelism
+            );
 
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(parallelism)
@@ -188,7 +211,10 @@ impl<'a> AuditProver<'a> {
                         .par_iter()
                         .enumerate()
                         .map(|(idx, entry)| {
-                            (idx, self.prove_inference(entry, log, &mode, request.verify_on_chain))
+                            (
+                                idx,
+                                self.prove_inference(entry, log, &mode, request.verify_on_chain),
+                            )
                         })
                         .collect()
                 });
@@ -217,12 +243,28 @@ impl<'a> AuditProver<'a> {
 
         // Use actual entry timestamps instead of request bounds (which may be 0).
         let actual_time_start = {
-            let ts = entries.iter().map(|e| e.timestamp_ns).min().unwrap_or(request.start_ns);
-            if ts == 0 { request.start_ns / 1_000_000_000 } else { ts / 1_000_000_000 }
+            let ts = entries
+                .iter()
+                .map(|e| e.timestamp_ns)
+                .min()
+                .unwrap_or(request.start_ns);
+            if ts == 0 {
+                request.start_ns / 1_000_000_000
+            } else {
+                ts / 1_000_000_000
+            }
         };
         let actual_time_end = {
-            let ts = entries.iter().map(|e| e.timestamp_ns).max().unwrap_or(request.end_ns);
-            if ts == u64::MAX { request.end_ns / 1_000_000_000 } else { ts / 1_000_000_000 }
+            let ts = entries
+                .iter()
+                .map(|e| e.timestamp_ns)
+                .max()
+                .unwrap_or(request.end_ns);
+            if ts == u64::MAX {
+                request.end_ns / 1_000_000_000
+            } else {
+                ts / 1_000_000_000
+            }
         };
 
         let weight_binding_mode = if matches!(mode, ProofMode::Gkr) {
@@ -248,7 +290,11 @@ impl<'a> AuditProver<'a> {
             tee_attestation_hash: None,
             policy_name: {
                 let resolved = crate::policy::resolve(policy.or(self.policy));
-                Some(crate::policy::preset_name(&resolved).unwrap_or("custom").to_string())
+                Some(
+                    crate::policy::preset_name(&resolved)
+                        .unwrap_or("custom")
+                        .to_string(),
+                )
             },
             policy_commitment: {
                 let resolved = crate::policy::resolve(policy.or(self.policy));
@@ -311,17 +357,31 @@ impl<'a> AuditProver<'a> {
 
         // When verify_on_chain is requested, we need full aggregated binding for
         // streaming GKR verification. Otherwise use RLC-only (fast path).
+        //
+        // Keep the effective policy explicit and pass it into the prover. Relying
+        // on env-var flips here is not sufficient because prove-model applies the
+        // selected policy through thread-local overrides before audit starts.
+        let mut effective_policy = crate::policy::resolve(self.policy);
         if verify_on_chain {
             std::env::remove_var("STWO_AGGREGATED_RLC_ONLY");
+            std::env::set_var("STWO_AGGREGATED_FULL_BINDING", "1");
+            effective_policy.aggregated_full_binding = true;
+            effective_policy.aggregated_rlc_only = false;
         } else {
+            std::env::remove_var("STWO_AGGREGATED_FULL_BINDING");
             std::env::set_var("STWO_AGGREGATED_RLC_ONLY", "1");
+            effective_policy.aggregated_full_binding = false;
+            effective_policy.aggregated_rlc_only = true;
         }
 
-        let agg_proof =
-            crate::aggregation::prove_model_pure_gkr_auto_with_cache(
-                self.graph, input, self.weights, self.weight_cache, self.policy,
-            )
-                .map_err(|e| AuditError::ProvingFailed(format!("GKR proving failed: {}", e)))?;
+        let agg_proof = crate::aggregation::prove_model_pure_gkr_auto_with_cache(
+            self.graph,
+            input,
+            self.weights,
+            self.weight_cache,
+            Some(&effective_policy),
+        )
+        .map_err(|e| AuditError::ProvingFailed(format!("GKR proving failed: {}", e)))?;
         let gkr_proof = build_gkr_serializable_proof(&agg_proof, model_id, input)
             .map_err(|e| AuditError::ProvingFailed(format!("GKR proving failed: {}", e)))?;
 
@@ -369,7 +429,13 @@ impl<'a> AuditProver<'a> {
         // and the GKR proof is available from the aggregated proof.
         let streaming_steps = if verify_on_chain {
             if let Some(ref gkr) = agg_proof.gkr_proof {
-                match self.build_streaming_steps(gkr, model_id, input, &agg_proof.execution.output, agg_proof.policy_commitment) {
+                match self.build_streaming_steps(
+                    gkr,
+                    model_id,
+                    input,
+                    &agg_proof.execution.output,
+                    agg_proof.policy_commitment,
+                ) {
                     Ok(steps) => {
                         info!(
                             steps = steps.len(),
@@ -434,10 +500,17 @@ impl<'a> AuditProver<'a> {
         let raw_io = crate::cairo_serde::serialize_raw_io(input, output);
 
         let streaming = crate::starknet::build_streaming_gkr_calldata(
-            gkr_proof, &circuit, model_id, &raw_io, None, None,
+            gkr_proof,
+            &circuit,
+            model_id,
+            &raw_io,
+            None,
+            None,
             policy_commitment,
         )
-        .map_err(|e| AuditError::ProvingFailed(format!("Streaming calldata build failed: {}", e)))?;
+        .map_err(|e| {
+            AuditError::ProvingFailed(format!("Streaming calldata build failed: {}", e))
+        })?;
 
         let mut steps = Vec::new();
 
@@ -509,9 +582,12 @@ impl<'a> AuditProver<'a> {
         start: Instant,
     ) -> Result<InferenceProofResult, AuditError> {
         let proof = crate::starknet::prove_for_starknet_onchain_with_policy(
-                self.graph, input, self.weights, self.policy,
-            )
-            .map_err(|e| AuditError::ProvingFailed(format!("Direct proving failed: {}", e)))?;
+            self.graph,
+            input,
+            self.weights,
+            self.policy,
+        )
+        .map_err(|e| AuditError::ProvingFailed(format!("Direct proving failed: {}", e)))?;
 
         let proving_time_ms = start.elapsed().as_millis() as u64;
 
@@ -1011,17 +1087,29 @@ mod tests {
 
     impl EnvVarGuard {
         fn set(key: &'static str, value: &str) -> Self {
-            let lock = crate::test_utils::ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = crate::test_utils::ENV_MUTEX
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let prev = std::env::var(key).ok();
             std::env::set_var(key, value);
-            Self { key, prev, _lock: lock }
+            Self {
+                key,
+                prev,
+                _lock: lock,
+            }
         }
 
         fn remove(key: &'static str) -> Self {
-            let lock = crate::test_utils::ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = crate::test_utils::ENV_MUTEX
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let prev = std::env::var(key).ok();
             std::env::remove_var(key);
-            Self { key, prev, _lock: lock }
+            Self {
+                key,
+                prev,
+                _lock: lock,
+            }
         }
     }
 
@@ -1059,16 +1147,25 @@ mod tests {
         assert_eq!(result.inference_results[0].proof_mode, ProofMode::Gkr);
 
         // verify_on_chain should produce streaming steps
-        let steps = result.inference_results[0].streaming_steps.as_ref()
+        let steps = result.inference_results[0]
+            .streaming_steps
+            .as_ref()
             .expect("verify_on_chain=true should produce streaming_steps");
 
         // Must have at least: init + finalize
-        assert!(steps.len() >= 2, "expected at least 2 streaming steps, got {}", steps.len());
+        assert!(
+            steps.len() >= 2,
+            "expected at least 2 streaming steps, got {}",
+            steps.len()
+        );
 
         // First step must be stream_init
         assert_eq!(steps[0].filename, "stream_init.txt");
         assert_eq!(steps[0].entrypoint, "verify_gkr_stream_init");
-        assert!(!steps[0].calldata.is_empty(), "init calldata must not be empty");
+        assert!(
+            !steps[0].calldata.is_empty(),
+            "init calldata must not be empty"
+        );
 
         // Last step must be stream_finalize
         let last = steps.last().unwrap();
@@ -1077,8 +1174,16 @@ mod tests {
 
         // All steps must have non-empty calldata
         for step in steps {
-            assert!(!step.calldata.is_empty(), "step {} has empty calldata", step.filename);
-            assert!(!step.entrypoint.is_empty(), "step {} has empty entrypoint", step.filename);
+            assert!(
+                !step.calldata.is_empty(),
+                "step {} has empty calldata",
+                step.filename
+            );
+            assert!(
+                !step.entrypoint.is_empty(),
+                "step {} has empty entrypoint",
+                step.filename
+            );
         }
 
         // Verify expected entrypoints appear

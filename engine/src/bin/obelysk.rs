@@ -13,17 +13,16 @@ use std::process::{Command, Stdio};
 #[cfg(feature = "tui")]
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "tui")]
-use std::time::{Duration, Instant};
-#[cfg(feature = "tui")]
 use std::thread;
+#[cfg(feature = "tui")]
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "tui")]
 fn main() {
-
     use crossterm::{
         event::{self, Event, KeyCode, KeyModifiers},
-        terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
         execute,
+        terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     };
     use ratatui::prelude::*;
     use ratatui::widgets::*;
@@ -32,27 +31,29 @@ fn main() {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let model_dir = std::env::var("OBELYSK_MODEL_DIR")
         .unwrap_or_else(|_| format!("{home}/.obelysk/models/qwen2-0.5b"));
-    let gguf_path = std::env::var("OBELYSK_GGUF")
-        .unwrap_or_else(|_| format!("{home}/.obelysk/models/qwen2-0.5b-gguf/qwen2-0_5b-instruct-q4_k_m.gguf"));
-    let prove_bin = std::env::var("OBELYSK_PROVER")
-        .unwrap_or_else(|_| {
-            // Find prove-model relative to this binary
-            let exe = std::env::current_exe().unwrap_or_default();
-            let dir = exe.parent().unwrap_or(std::path::Path::new("."));
-            dir.join("prove-model").to_string_lossy().to_string()
-        });
+    let gguf_path = std::env::var("OBELYSK_GGUF").unwrap_or_else(|_| {
+        format!("{home}/.obelysk/models/qwen2-0.5b-gguf/qwen2-0_5b-instruct-q4_k_m.gguf")
+    });
+    let prove_bin = std::env::var("OBELYSK_PROVER").unwrap_or_else(|_| {
+        // Find prove-model relative to this binary
+        let exe = std::env::current_exe().unwrap_or_default();
+        let dir = exe.parent().unwrap_or(std::path::Path::new("."));
+        dir.join("prove-model").to_string_lossy().to_string()
+    });
     let port: u16 = std::env::var("OBELYSK_PORT")
-        .ok().and_then(|p| p.parse().ok()).unwrap_or(8192);
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8192);
 
     let contract_address = std::env::var("OBELYSK_CONTRACT")
         .or_else(|_| std::env::var("STARKNET_CONTRACT_ADDRESS"))
         .unwrap_or_default();
 
-    let network = std::env::var("OBELYSK_NETWORK")
-        .unwrap_or_else(|_| "Starknet Sepolia".into());
+    let network = std::env::var("OBELYSK_NETWORK").unwrap_or_else(|_| "Starknet Sepolia".into());
 
-    let model_id = std::env::var("OBELYSK_MODEL_ID")
-        .unwrap_or_else(|_| "0x0d5d278a96f12080aea9c13ce8a07bf986ba842ee435afdd30ef9015c8c14a5".into());
+    let model_id = std::env::var("OBELYSK_MODEL_ID").unwrap_or_else(|_| {
+        "0x0d5d278a96f12080aea9c13ce8a07bf986ba842ee435afdd30ef9015c8c14a5".into()
+    });
 
     // Derive model name from directory
     let model_name = std::path::Path::new(&model_dir)
@@ -82,7 +83,8 @@ fn main() {
 
         starknet_private_key: std::env::var("STARKNET_PRIVATE_KEY").ok(),
         starknet_account: std::env::var("STARKNET_ACCOUNT_ADDRESS")
-            .or_else(|_| std::env::var("STARKNET_ACCOUNT")).ok(),
+            .or_else(|_| std::env::var("STARKNET_ACCOUNT"))
+            .ok(),
         contract_address: contract_address.clone(),
         network: network.clone(),
         model_id: model_id.clone(),
@@ -136,8 +138,16 @@ fn main() {
     }
 
     let server = Command::new("llama-server")
-        .args(["--model", &gguf_path, "--port", &port.to_string(),
-               "--ctx-size", "2048", "--n-gpu-layers", "99"])
+        .args([
+            "--model",
+            &gguf_path,
+            "--port",
+            &port.to_string(),
+            "--ctx-size",
+            "2048",
+            "--n-gpu-layers",
+            "99",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
@@ -156,17 +166,28 @@ fn main() {
                             let mut s = state_clone.lock().unwrap();
                             s.mode = Mode::Chat;
                             s.logs.push(format!("Model loaded ({i}s)"));
-                            s.messages.push(("system".into(), "Model loaded. Type a message to chat, 'prove' to verify.".into()));
+                            s.messages.push((
+                                "system".into(),
+                                "Model loaded. Type a message to chat, 'prove' to verify.".into(),
+                            ));
                             return;
                         }
                     }
                     thread::sleep(Duration::from_secs(1));
                 }
-                state_clone.lock().unwrap().logs.push("Server timeout".into());
+                state_clone
+                    .lock()
+                    .unwrap()
+                    .logs
+                    .push("Server timeout".into());
             });
         }
         Err(e) => {
-            state.lock().unwrap().logs.push(format!("Failed to start server: {e}"));
+            state
+                .lock()
+                .unwrap()
+                .logs
+                .push(format!("Failed to start server: {e}"));
             state.lock().unwrap().mode = Mode::Chat; // Allow manual mode
         }
     }
@@ -186,7 +207,9 @@ fn main() {
             s.frame_count = s.frame_count.wrapping_add(1);
             let frame_count = s.frame_count;
             terminal.draw(|frame| render_app(frame, &s)).expect("draw");
-            if s.should_quit { break; }
+            if s.should_quit {
+                break;
+            }
         }
 
         // Handle input (including resize)
@@ -223,10 +246,14 @@ fn main() {
                                     step.done = false;
                                     step.time = None;
                                 }
-                                s.streaming_steps = obelyzk::tui::dashboard::default_streaming_steps();
-                                s.messages.push(("system".into(), "Retrying — ready for input".into()));
+                                s.streaming_steps =
+                                    obelyzk::tui::dashboard::default_streaming_steps();
+                                s.messages
+                                    .push(("system".into(), "Retrying — ready for input".into()));
                             }
-                            KeyCode::Char('q') => { s.should_quit = true; }
+                            KeyCode::Char('q') => {
+                                s.should_quit = true;
+                            }
                             _ => {}
                         }
                         continue;
@@ -243,7 +270,8 @@ fn main() {
                                     step.done = false;
                                     step.time = None;
                                 }
-                                s.streaming_steps = obelyzk::tui::dashboard::default_streaming_steps();
+                                s.streaming_steps =
+                                    obelyzk::tui::dashboard::default_streaming_steps();
                                 s.prove_started_at = None;
                                 s.tamper_io = None;
                                 s.tamper_weight = None;
@@ -251,9 +279,14 @@ fn main() {
                                 s.weight_commit = None;
                                 s.io_root = None;
                                 s.report_hash = None;
-                                s.messages.push(("system".into(), "New session — ready for input".into()));
+                                s.messages.push((
+                                    "system".into(),
+                                    "New session — ready for input".into(),
+                                ));
                             }
-                            KeyCode::Char('q') => { s.should_quit = true; }
+                            KeyCode::Char('q') => {
+                                s.should_quit = true;
+                            }
                             _ => {}
                         }
                         continue;
@@ -270,12 +303,19 @@ fn main() {
                                 s.input.clear();
                                 s.cursor_pos = 0;
 
-                                if input.to_lowercase() == "prove" || input.to_lowercase() == "done" {
+                                if input.to_lowercase() == "prove" || input.to_lowercase() == "done"
+                                {
                                     if s.turns.is_empty() {
-                                        s.messages.push(("system".into(), "Chat first — nothing to prove yet".into()));
+                                        s.messages.push((
+                                            "system".into(),
+                                            "Chat first — nothing to prove yet".into(),
+                                        ));
                                     } else {
                                         s.mode = Mode::Proving;
-                                        s.messages.push(("system".into(), "Starting proof pipeline...".into()));
+                                        s.messages.push((
+                                            "system".into(),
+                                            "Starting proof pipeline...".into(),
+                                        ));
                                         s.logs.push("Prove requested".into());
 
                                         let state_prove = Arc::clone(&state);
@@ -284,10 +324,18 @@ fn main() {
                                         let turns_c = s.turns.clone();
                                         let port_c = s.port;
                                         thread::spawn(move || {
-                                            run_prove_pipeline(state_prove, &model_dir_c, &prove_bin_c, &turns_c, port_c);
+                                            run_prove_pipeline(
+                                                state_prove,
+                                                &model_dir_c,
+                                                &prove_bin_c,
+                                                &turns_c,
+                                                port_c,
+                                            );
                                         });
                                     }
-                                } else if input.to_lowercase() == "quit" || input.to_lowercase() == "exit" {
+                                } else if input.to_lowercase() == "quit"
+                                    || input.to_lowercase() == "exit"
+                                {
                                     s.should_quit = true;
                                 } else {
                                     s.messages.push(("you".into(), input.clone()));
@@ -317,14 +365,22 @@ fn main() {
                             }
                         }
                         KeyCode::Left => {
-                            if s.cursor_pos > 0 { s.cursor_pos -= 1; }
+                            if s.cursor_pos > 0 {
+                                s.cursor_pos -= 1;
+                            }
                         }
                         KeyCode::Right => {
-                            if s.cursor_pos < s.input.len() { s.cursor_pos += 1; }
+                            if s.cursor_pos < s.input.len() {
+                                s.cursor_pos += 1;
+                            }
                         }
                         // Home/End for input navigation
-                        KeyCode::Home => { s.cursor_pos = 0; }
-                        KeyCode::End => { s.cursor_pos = s.input.len(); }
+                        KeyCode::Home => {
+                            s.cursor_pos = 0;
+                        }
+                        KeyCode::End => {
+                            s.cursor_pos = s.input.len();
+                        }
                         // Input history navigation
                         KeyCode::Up => {
                             if s.mode == Mode::Chat && !s.input_history.is_empty() {
@@ -379,7 +435,13 @@ fn main() {
 
 #[cfg(feature = "tui")]
 #[derive(Debug, Clone, PartialEq)]
-enum Mode { Loading, Chat, Proving, Complete, Error(String) }
+enum Mode {
+    Loading,
+    Chat,
+    Proving,
+    Complete,
+    Error(String),
+}
 
 #[cfg(feature = "tui")]
 #[derive(Debug, Clone)]
@@ -394,7 +456,13 @@ struct StepStatus {
 #[cfg(feature = "tui")]
 impl StepStatus {
     fn new(name: &str, desc: &str) -> Self {
-        Self { name: name.into(), desc: desc.into(), progress: 0.0, time: None, done: false }
+        Self {
+            name: name.into(),
+            desc: desc.into(),
+            progress: 0.0,
+            time: None,
+            done: false,
+        }
     }
 }
 
@@ -404,12 +472,12 @@ struct AppState {
     mode: Mode,
     input: String,
     cursor_pos: usize,
-    messages: Vec<(String, String)>,  // (role, content)
+    messages: Vec<(String, String)>,      // (role, content)
     chat_history: Vec<serde_json::Value>, // for llama.cpp
     turns: Vec<serde_json::Value>,
 
     pipeline_step: usize,
-    pipeline_status: Vec<StepStatus>,   // 3 steps
+    pipeline_status: Vec<StepStatus>, // 3 steps
     streaming_steps: Vec<obelyzk::tui::dashboard::StreamingStep>,
 
     // Starknet on-chain config
@@ -498,8 +566,10 @@ fn send_chat(state: std::sync::Arc<std::sync::Mutex<AppState>>, input: &str, por
                         s.tokens_out += reply.split_whitespace().count();
 
                         // Update chat history
-                        s.chat_history.push(serde_json::json!({"role": "user", "content": input}));
-                        s.chat_history.push(serde_json::json!({"role": "assistant", "content": &reply}));
+                        s.chat_history
+                            .push(serde_json::json!({"role": "user", "content": input}));
+                        s.chat_history
+                            .push(serde_json::json!({"role": "assistant", "content": &reply}));
 
                         // Tokenize for turn record
                         let tokens = tokenize(input, port);
@@ -523,10 +593,18 @@ fn send_chat(state: std::sync::Arc<std::sync::Mutex<AppState>>, input: &str, por
                     }
                 }
             }
-            state.lock().unwrap().messages.push(("system".into(), "Failed to parse response".into()));
+            state
+                .lock()
+                .unwrap()
+                .messages
+                .push(("system".into(), "Failed to parse response".into()));
         }
         Err(e) => {
-            state.lock().unwrap().messages.push(("system".into(), format!("Chat error: {e}")));
+            state
+                .lock()
+                .unwrap()
+                .messages
+                .push(("system".into(), format!("Chat error: {e}")));
         }
     }
 }
@@ -542,7 +620,10 @@ fn tokenize(text: &str, port: u16) -> Vec<u32> {
             if let Ok(body) = resp.into_body().read_to_string() {
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
                     if let Some(tokens) = json["tokens"].as_array() {
-                        return tokens.iter().filter_map(|t| t.as_u64().map(|v| v as u32)).collect();
+                        return tokens
+                            .iter()
+                            .filter_map(|t| t.as_u64().map(|v| v as u32))
+                            .collect();
                     }
                 }
             }
@@ -580,8 +661,13 @@ fn run_prove_pipeline(
     // Read config from state
     let (starknet_key, starknet_account, contract_address, network, model_id) = {
         let s = state.lock().unwrap();
-        (s.starknet_private_key.clone(), s.starknet_account.clone(),
-         s.contract_address.clone(), s.network.clone(), s.model_id.clone())
+        (
+            s.starknet_private_key.clone(),
+            s.starknet_account.clone(),
+            s.contract_address.clone(),
+            s.network.clone(),
+            s.model_id.clone(),
+        )
     };
 
     // Resolve script paths relative to binary
@@ -601,9 +687,15 @@ fn run_prove_pipeline(
     }
 
     let capture = Command::new(prove_bin)
-        .args(["capture", "--model-dir", model_dir,
-               "--log-dir", &format!("{tmp_dir}/logs"),
-               "--model-name", "qwen2-0.5b"])
+        .args([
+            "capture",
+            "--model-dir",
+            model_dir,
+            "--log-dir",
+            &format!("{tmp_dir}/logs"),
+            "--model-name",
+            "qwen2-0.5b",
+        ])
         .env("STWO_SKIP_BATCH_TOKENS", "1")
         .stderr(Stdio::piped())
         .stdout(Stdio::null())
@@ -624,14 +716,18 @@ fn run_prove_pipeline(
                     let rest = line.trim_start_matches("Policy: ").trim();
                     if let Some(paren) = rest.find(" (") {
                         s.policy_name = Some(rest[..paren].to_string());
-                        let commit = rest[paren+2..].trim_end_matches(')');
+                        let commit = rest[paren + 2..].trim_end_matches(')');
                         s.policy_commitment = Some(commit.to_string());
                     } else {
                         s.policy_name = Some(rest.to_string());
                     }
                 }
-                if line.contains("turn ") { s.pipeline_status[0].progress += 0.3; }
-                if line.contains("complete") { s.pipeline_status[0].progress = 1.0; }
+                if line.contains("turn ") {
+                    s.pipeline_status[0].progress += 0.3;
+                }
+                if line.contains("complete") {
+                    s.pipeline_status[0].progress = 1.0;
+                }
                 s.logs.push(truncate(&line, 60));
             }
         }
@@ -639,7 +735,10 @@ fn run_prove_pipeline(
         if let Ok(status) = exit_status {
             if !status.success() {
                 let mut s = state.lock().unwrap();
-                s.mode = Mode::Error(format!("Capture failed (exit {})", status.code().unwrap_or(-1)));
+                s.mode = Mode::Error(format!(
+                    "Capture failed (exit {})",
+                    status.code().unwrap_or(-1)
+                ));
                 return;
             }
         }
@@ -654,7 +753,9 @@ fn run_prove_pipeline(
         s.pipeline_status[0].progress = 1.0;
         s.pipeline_status[0].done = true;
         s.pipeline_status[0].time = Some(
-            s.prove_started_at.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.4)
+            s.prove_started_at
+                .map(|t| t.elapsed().as_secs_f64())
+                .unwrap_or(0.4),
         );
     }
 
@@ -670,9 +771,18 @@ fn run_prove_pipeline(
     let proof_file = format!("{tmp_dir}/proof.json");
 
     let gkr_prove = Command::new(prove_bin)
-        .args(["--model-dir", model_dir, "--layers", "1",
-               "--format", "ml_gkr", "--gkr",
-               "--output", &proof_file, "--quiet"])
+        .args([
+            "--model-dir",
+            model_dir,
+            "--layers",
+            "1",
+            "--format",
+            "ml_gkr",
+            "--gkr",
+            "--output",
+            &proof_file,
+            "--quiet",
+        ])
         // On-chain compatibility env vars (from prove_onchain.sh)
         .env("STWO_SKIP_RMS_SQ_PROOF", "1")
         .env("STWO_ALLOW_MISSING_NORM_PROOF", "1")
@@ -692,12 +802,24 @@ fn run_prove_pipeline(
                 let mut s = state.lock().unwrap();
 
                 // Phase tracking
-                if line.contains("Phase 1") { s.pipeline_status[1].progress = 0.05; }
-                if line.contains("Phase 2") { s.pipeline_status[1].progress = 0.1; }
-                if line.contains("Phase 3") { s.pipeline_status[1].progress = 0.85; }
-                if line.contains("GKR proof:") { s.pipeline_status[1].progress = 0.90; }
-                if line.contains("Proof written") { s.pipeline_status[1].progress = 1.0; }
-                if line.contains("Completed") { s.pipeline_status[1].progress = 1.0; }
+                if line.contains("Phase 1") {
+                    s.pipeline_status[1].progress = 0.05;
+                }
+                if line.contains("Phase 2") {
+                    s.pipeline_status[1].progress = 0.1;
+                }
+                if line.contains("Phase 3") {
+                    s.pipeline_status[1].progress = 0.85;
+                }
+                if line.contains("GKR proof:") {
+                    s.pipeline_status[1].progress = 0.90;
+                }
+                if line.contains("Proof written") {
+                    s.pipeline_status[1].progress = 1.0;
+                }
+                if line.contains("Completed") {
+                    s.pipeline_status[1].progress = 1.0;
+                }
 
                 // Per-layer progress: parse "Layer N/M: LayerName"
                 if line.contains("Layer ") && line.contains("/") {
@@ -706,7 +828,10 @@ fn run_prove_pipeline(
                         if parts.len() == 2 {
                             if let Ok(done) = parts[0].trim().parse::<u32>() {
                                 let rest = parts[1];
-                                let total_str = rest.split(|c: char| !c.is_ascii_digit()).next().unwrap_or("0");
+                                let total_str = rest
+                                    .split(|c: char| !c.is_ascii_digit())
+                                    .next()
+                                    .unwrap_or("0");
                                 if let Ok(total) = total_str.parse::<u32>() {
                                     s.layers_done = done;
                                     s.layers_total = total;
@@ -727,7 +852,9 @@ fn run_prove_pipeline(
                         if let Some(idx) = line.find(word) {
                             let before = &line[..idx];
                             if let Some(num_str) = before.split_whitespace().last() {
-                                if let Ok(n) = num_str.parse::<u32>() { s.coverage_matmul = n; }
+                                if let Ok(n) = num_str.parse::<u32>() {
+                                    s.coverage_matmul = n;
+                                }
                             }
                         }
                     }
@@ -735,7 +862,9 @@ fn run_prove_pipeline(
                         if let Some(idx) = line.find(word) {
                             let before = &line[..idx];
                             if let Some(num_str) = before.split_whitespace().last() {
-                                if let Ok(n) = num_str.parse::<u32>() { s.coverage_activation = n; }
+                                if let Ok(n) = num_str.parse::<u32>() {
+                                    s.coverage_activation = n;
+                                }
                             }
                         }
                     }
@@ -743,7 +872,9 @@ fn run_prove_pipeline(
                         if let Some(idx) = line.find(word) {
                             let before = &line[..idx];
                             if let Some(num_str) = before.split_whitespace().last() {
-                                if let Ok(n) = num_str.parse::<u32>() { s.coverage_norm = n; }
+                                if let Ok(n) = num_str.parse::<u32>() {
+                                    s.coverage_norm = n;
+                                }
                             }
                         }
                     }
@@ -753,13 +884,19 @@ fn run_prove_pipeline(
                 if line.contains("params:") || line.contains("Parameters:") {
                     if let Some(p) = line.split(':').nth(1) {
                         let trimmed = p.trim().to_string();
-                        if !trimmed.is_empty() { s.model_params = trimmed; }
+                        if !trimmed.is_empty() {
+                            s.model_params = trimmed;
+                        }
                     }
                 }
                 // Model layers: "layers: 24" or "Layers: 169"
-                if (line.contains("layers:") || line.contains("Layers:")) && !line.contains("Layer ") {
+                if (line.contains("layers:") || line.contains("Layers:"))
+                    && !line.contains("Layer ")
+                {
                     if let Some(p) = line.split(':').nth(1) {
-                        if let Ok(n) = p.trim().parse::<u32>() { s.model_layers = n; }
+                        if let Ok(n) = p.trim().parse::<u32>() {
+                            s.model_layers = n;
+                        }
                     }
                 }
 
@@ -786,7 +923,10 @@ fn run_prove_pipeline(
         if let Ok(status) = exit_status {
             if !status.success() {
                 let mut s = state.lock().unwrap();
-                s.mode = Mode::Error(format!("GKR prover exited with code {}", status.code().unwrap_or(-1)));
+                s.mode = Mode::Error(format!(
+                    "GKR prover exited with code {}",
+                    status.code().unwrap_or(-1)
+                ));
                 s.logs.push("GKR prove failed".into());
                 return;
             }
@@ -815,8 +955,14 @@ fn run_prove_pipeline(
                 }
             }
             s.io_root = proof["io_commitment"].as_str().map(|v| v.to_string());
-            s.report_hash = proof["layer_chain_commitment"].as_str().map(|v| v.to_string())
-                .or_else(|| proof["io_commitment_packed"].as_str().map(|v| v.to_string()));
+            s.report_hash = proof["layer_chain_commitment"]
+                .as_str()
+                .map(|v| v.to_string())
+                .or_else(|| {
+                    proof["io_commitment_packed"]
+                        .as_str()
+                        .map(|v| v.to_string())
+                });
 
             // Persist proof to ~/.obelysk/proofs/
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
@@ -824,7 +970,8 @@ fn run_prove_pipeline(
             std::fs::create_dir_all(&proofs_dir).ok();
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs()).unwrap_or(0);
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
             let persist_path = format!("{proofs_dir}/proof-{ts}.json");
             if std::fs::copy(&proof_file, &persist_path).is_ok() {
                 s.proof_path = Some(persist_path.clone());
@@ -849,17 +996,26 @@ fn run_prove_pipeline(
 
     if !has_creds {
         let mut s = state.lock().unwrap();
-        s.logs.push("No STARKNET_PRIVATE_KEY set, skipping on-chain".into());
-        s.messages.push(("system".into(), "Set STARKNET_PRIVATE_KEY and STARKNET_ACCOUNT_ADDRESS to enable on-chain verification".into()));
+        s.logs
+            .push("No STARKNET_PRIVATE_KEY set, skipping on-chain".into());
+        s.messages.push((
+            "system".into(),
+            "Set STARKNET_PRIVATE_KEY and STARKNET_ACCOUNT_ADDRESS to enable on-chain verification"
+                .into(),
+        ));
         s.pipeline_status[2].progress = 1.0;
         s.pipeline_status[2].done = true;
         s.pipeline_status[2].time = Some(0.0);
         s.mode = Mode::Complete;
         s.logs.push("Proof generated (on-chain skipped)".into());
-        s.messages.push(("system".into(), "━━━━━━━━━━━━━━━━━━━━━━━━━━━━".into()));
-        s.messages.push(("system".into(), format!("  PROOF READY: {proof_file}")));
-        s.messages.push(("system".into(), "  Set env vars to submit on-chain".into()));
-        s.messages.push(("system".into(), "━━━━━━━━━━━━━━━━━━━━━━━━━━━━".into()));
+        s.messages
+            .push(("system".into(), "━━━━━━━━━━━━━━━━━━━━━━━━━━━━".into()));
+        s.messages
+            .push(("system".into(), format!("  PROOF READY: {proof_file}")));
+        s.messages
+            .push(("system".into(), "  Set env vars to submit on-chain".into()));
+        s.messages
+            .push(("system".into(), "━━━━━━━━━━━━━━━━━━━━━━━━━━━━".into()));
         return;
     }
 
@@ -868,7 +1024,8 @@ fn run_prove_pipeline(
 
     {
         let mut s = state.lock().unwrap();
-        s.logs.push("On-chain 6-step streaming verification...".into());
+        s.logs
+            .push("On-chain 6-step streaming verification...".into());
     }
 
     // Step 3a: Submit via paymaster_submit.mjs (handles session, chunks, all 6 streaming steps)
@@ -885,12 +1042,18 @@ fn run_prove_pipeline(
 
     {
         let mut s = state.lock().unwrap();
-        s.logs.push(format!("Submitting to Starknet (model {})...", &model_id[..12.min(model_id.len())]));
+        s.logs.push(format!(
+            "Submitting to Starknet (model {})...",
+            &model_id[..12.min(model_id.len())]
+        ));
         s.pipeline_status[2].progress = 0.05;
     }
 
     // Clear cached session state to force fresh submission
-    let sessions_dir = format!("{}/.obelysk/chunked_sessions", std::env::var("HOME").unwrap_or_default());
+    let sessions_dir = format!(
+        "{}/.obelysk/chunked_sessions",
+        std::env::var("HOME").unwrap_or_default()
+    );
     if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
         for entry in entries.flatten() {
             let _ = std::fs::remove_file(entry.path());
@@ -903,10 +1066,14 @@ fn run_prove_pipeline(
         .args([
             paymaster_script.to_string_lossy().as_ref(),
             "verify",
-            "--proof", &proof_file,
-            "--contract", &contract_address,
-            "--model-id", &model_id,
-            "--network", &network.to_lowercase().replace("starknet ", ""),
+            "--proof",
+            &proof_file,
+            "--contract",
+            &contract_address,
+            "--model-id",
+            &model_id,
+            "--network",
+            &network.to_lowercase().replace("starknet ", ""),
             "--no-paymaster",
         ])
         .env("STARKNET_PRIVATE_KEY", &starknet_key)
@@ -954,7 +1121,8 @@ fn run_prove_pipeline(
                     if line.contains("[E2E]") && line.contains(pattern) {
                         current_stream_step = idx;
                         if idx < s.streaming_steps.len() {
-                            s.streaming_steps[idx].status = obelyzk::tui::dashboard::StepStatus::Submitting;
+                            s.streaming_steps[idx].status =
+                                obelyzk::tui::dashboard::StepStatus::Submitting;
                             s.pipeline_status[2].progress = (idx as f64 + 0.3) / 6.0;
                         }
                     }
@@ -971,8 +1139,10 @@ fn run_prove_pipeline(
                         let tx_hash = line[tx_start..].trim().to_string();
                         if !tx_hash.is_empty() && current_stream_step < s.streaming_steps.len() {
                             s.streaming_steps[current_stream_step].tx_hash = Some(tx_hash);
-                            s.streaming_steps[current_stream_step].status = obelyzk::tui::dashboard::StepStatus::Confirmed;
-                            s.pipeline_status[2].progress = (current_stream_step as f64 + 1.0) / 6.0;
+                            s.streaming_steps[current_stream_step].status =
+                                obelyzk::tui::dashboard::StepStatus::Confirmed;
+                            s.pipeline_status[2].progress =
+                                (current_stream_step as f64 + 1.0) / 6.0;
                             awaiting_tx = false;
                         }
                     }
@@ -995,7 +1165,8 @@ fn run_prove_pipeline(
                         // If we have a TX hash, it was submitted — keep as Confirmed
                         // (the revert happened on-chain, not in submission)
                         if s.streaming_steps[current_stream_step].tx_hash.is_none() {
-                            s.streaming_steps[current_stream_step].status = obelyzk::tui::dashboard::StepStatus::Failed;
+                            s.streaming_steps[current_stream_step].status =
+                                obelyzk::tui::dashboard::StepStatus::Failed;
                         }
                     }
                     awaiting_tx = false;
@@ -1011,8 +1182,14 @@ fn run_prove_pipeline(
         child.wait().ok();
     } else {
         let mut s = state.lock().unwrap();
-        s.logs.push(format!("Failed to spawn node. Check paymaster_submit.mjs at {}", paymaster_script.display()));
-        s.messages.push(("system".into(), "On-chain submission failed to start".into()));
+        s.logs.push(format!(
+            "Failed to spawn node. Check paymaster_submit.mjs at {}",
+            paymaster_script.display()
+        ));
+        s.messages.push((
+            "system".into(),
+            "On-chain submission failed to start".into(),
+        ));
     }
 
     let onchain_time = t_onchain.elapsed().as_secs_f64();
@@ -1021,11 +1198,15 @@ fn run_prove_pipeline(
     {
         let mut s = state.lock().unwrap();
         for step in s.streaming_steps.iter_mut() {
-            if step.status == obelyzk::tui::dashboard::StepStatus::Submitting && step.tx_hash.is_some() {
+            if step.status == obelyzk::tui::dashboard::StepStatus::Submitting
+                && step.tx_hash.is_some()
+            {
                 step.status = obelyzk::tui::dashboard::StepStatus::Confirmed;
             }
         }
-        let confirmed = s.streaming_steps.iter()
+        let confirmed = s
+            .streaming_steps
+            .iter()
             .filter(|st| st.status == obelyzk::tui::dashboard::StepStatus::Confirmed)
             .count();
         if confirmed >= 5 {
@@ -1040,7 +1221,11 @@ fn run_prove_pipeline(
     {
         let mut s = state.lock().unwrap();
         // Count TXs that have hashes (successful submissions)
-        let tx_count = s.streaming_steps.iter().filter(|st| st.tx_hash.is_some()).count();
+        let tx_count = s
+            .streaming_steps
+            .iter()
+            .filter(|st| st.tx_hash.is_some())
+            .count();
         s.gas_used = Some(format!("{tx_count} TXs in {:.0}s", onchain_time));
         s.pipeline_status[2].progress = 1.0;
         s.pipeline_status[2].done = true;
@@ -1049,31 +1234,49 @@ fn run_prove_pipeline(
         s.logs.push("Verification complete".into());
 
         // Count confirmed steps
-        let confirmed = s.streaming_steps.iter()
+        let confirmed = s
+            .streaming_steps
+            .iter()
             .filter(|st| st.status == obelyzk::tui::dashboard::StepStatus::Confirmed)
             .count();
 
-        s.messages.push(("system".into(), "━━━━━━━━━━━━━━━━━━━━━━━━━━━━".into()));
+        s.messages
+            .push(("system".into(), "━━━━━━━━━━━━━━━━━━━━━━━━━━━━".into()));
         if confirmed == 6 {
-            s.messages.push(("system".into(), "  VERIFIED ON-CHAIN".into()));
-            s.messages.push(("system".into(), "  6/6 streaming steps confirmed".into()));
+            s.messages
+                .push(("system".into(), "  VERIFIED ON-CHAIN".into()));
+            s.messages
+                .push(("system".into(), "  6/6 streaming steps confirmed".into()));
         } else {
-            s.messages.push(("system".into(), format!("  {confirmed}/6 steps confirmed")));
+            s.messages
+                .push(("system".into(), format!("  {confirmed}/6 steps confirmed")));
         }
         if !contract_address.is_empty() {
             let ca_start = &contract_address[..contract_address.len().min(10)];
-            let ca_end = if contract_address.len() > 6 { &contract_address[contract_address.len()-6..] } else { "" };
-            s.messages.push(("system".into(), format!("  Contract: {ca_start}...{ca_end}")));
+            let ca_end = if contract_address.len() > 6 {
+                &contract_address[contract_address.len() - 6..]
+            } else {
+                ""
+            };
+            s.messages.push((
+                "system".into(),
+                format!("  Contract: {ca_start}...{ca_end}"),
+            ));
         }
-        s.messages.push(("system".into(), format!("  Network: {network}")));
-        s.messages.push(("system".into(), "━━━━━━━━━━━━━━━━━━━━━━━━━━━━".into()));
+        s.messages
+            .push(("system".into(), format!("  Network: {network}")));
+        s.messages
+            .push(("system".into(), "━━━━━━━━━━━━━━━━━━━━━━━━━━━━".into()));
     }
 }
 
 #[cfg(feature = "tui")]
 fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max { s.to_string() }
-    else { s.chars().take(max).collect::<String>() + "…" }
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        s.chars().take(max).collect::<String>() + "…"
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1082,11 +1285,11 @@ fn truncate(s: &str, max: usize) -> String {
 
 #[cfg(feature = "tui")]
 fn render_app(frame: &mut ratatui::Frame, state: &AppState) {
+    use obelyzk::tui::dashboard::{self, DashboardState, PipelineStep};
     use ratatui::layout::*;
     use ratatui::style::*;
     use ratatui::text::*;
     use ratatui::widgets::*;
-    use obelyzk::tui::dashboard::{self, DashboardState, PipelineStep};
 
     // ── Loading / Welcome screen ─────────────────────────────────
     if state.mode == Mode::Loading {
@@ -1141,7 +1344,8 @@ fn render_app(frame: &mut ratatui::Frame, state: &AppState) {
     }
 
     // Elapsed timer
-    ds.elapsed_secs = state.prove_started_at
+    ds.elapsed_secs = state
+        .prove_started_at
         .map(|t| t.elapsed().as_secs())
         .unwrap_or(0);
 
@@ -1149,14 +1353,12 @@ fn render_app(frame: &mut ratatui::Frame, state: &AppState) {
     ds.step = match state.mode {
         Mode::Loading => PipelineStep::Idle,
         Mode::Chat => PipelineStep::Idle,
-        Mode::Proving => {
-            match state.pipeline_step {
-                0 => PipelineStep::Capture,
-                1 => PipelineStep::GkrProve,
-                2 => PipelineStep::OnChain,
-                _ => PipelineStep::OnChain,
-            }
-        }
+        Mode::Proving => match state.pipeline_step {
+            0 => PipelineStep::Capture,
+            1 => PipelineStep::GkrProve,
+            2 => PipelineStep::OnChain,
+            _ => PipelineStep::OnChain,
+        },
         Mode::Complete => PipelineStep::Complete,
         Mode::Error(_) => PipelineStep::Error,
     };
@@ -1178,10 +1380,10 @@ fn render_app(frame: &mut ratatui::Frame, state: &AppState) {
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6),   // Header (logo + model info)
-            Constraint::Min(10),     // Body (chat + pipeline + crypto)
-            Constraint::Length(3),   // Input field
-            Constraint::Length(1),   // Footer
+            Constraint::Length(6), // Header (logo + model info)
+            Constraint::Min(10),   // Body (chat + pipeline + crypto)
+            Constraint::Length(3), // Input field
+            Constraint::Length(1), // Footer
         ])
         .split(area);
 
@@ -1192,9 +1394,9 @@ fn render_app(frame: &mut ratatui::Frame, state: &AppState) {
     let body_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(40),  // Chat messages
-            Constraint::Percentage(30),  // Pipeline + coverage
-            Constraint::Percentage(30),  // Crypto + integrity
+            Constraint::Percentage(40), // Chat messages
+            Constraint::Percentage(30), // Pipeline + coverage
+            Constraint::Percentage(30), // Crypto + integrity
         ])
         .split(main_layout[1]);
 
@@ -1235,41 +1437,45 @@ fn render_welcome(frame: &mut ratatui::Frame, state: &AppState) {
     let spin_char = spinner[spin_idx];
 
     // Pulsing dot for loading indicator
-    let pulse = if state.frame_count % 6 < 3 { lime } else { lime_dim };
+    let pulse = if state.frame_count % 6 < 3 {
+        lime
+    } else {
+        lime_dim
+    };
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(4),      // Top padding
-            Constraint::Length(3),   // Logo
-            Constraint::Length(2),   // Tagline
-            Constraint::Length(1),   // Divider
-            Constraint::Length(2),   // Spacer
-            Constraint::Length(7),   // System info card
-            Constraint::Length(2),   // Spacer
-            Constraint::Length(3),   // Loading status
-            Constraint::Length(2),   // Spacer
-            Constraint::Length(3),   // Log tail
-            Constraint::Min(2),      // Bottom
+            Constraint::Min(4),    // Top padding
+            Constraint::Length(3), // Logo
+            Constraint::Length(2), // Tagline
+            Constraint::Length(1), // Divider
+            Constraint::Length(2), // Spacer
+            Constraint::Length(7), // System info card
+            Constraint::Length(2), // Spacer
+            Constraint::Length(3), // Loading status
+            Constraint::Length(2), // Spacer
+            Constraint::Length(3), // Log tail
+            Constraint::Min(2),    // Bottom
         ])
         .split(area);
 
     // ── Logo ───────────────────────────────────────────────────────
     let logo = vec![
-        Line::from(vec![
-            Span::styled("    ╔═╗╔╗  ╔═╗╦  ╦ ╦╔═╗╦╔═", Style::default().fg(lime)),
-        ]),
-        Line::from(vec![
-            Span::styled("    ║ ║╠╩╗ ╠═ ║  ╚╦╝╔═╝╠╩╗", Style::default().fg(lime)),
-        ]),
-        Line::from(vec![
-            Span::styled("    ╚═╝╚═╝ ╚═╝╩═╝ ╩ ╚═╝╩ ╩", Style::default().fg(lime_dim)),
-        ]),
+        Line::from(vec![Span::styled(
+            "    ╔═╗╔╗  ╔═╗╦  ╦ ╦╔═╗╦╔═",
+            Style::default().fg(lime),
+        )]),
+        Line::from(vec![Span::styled(
+            "    ║ ║╠╩╗ ╠═ ║  ╚╦╝╔═╝╠╩╗",
+            Style::default().fg(lime),
+        )]),
+        Line::from(vec![Span::styled(
+            "    ╚═╝╚═╝ ╚═╝╩═╝ ╩ ╚═╝╩ ╩",
+            Style::default().fg(lime_dim),
+        )]),
     ];
-    frame.render_widget(
-        Paragraph::new(logo).alignment(Alignment::Center),
-        layout[1],
-    );
+    frame.render_widget(Paragraph::new(logo).alignment(Alignment::Center), layout[1]);
 
     // ── Tagline ────────────────────────────────────────────────────
     let tagline = vec![
@@ -1314,12 +1520,13 @@ fn render_welcome(frame: &mut ratatui::Frame, state: &AppState) {
             Span::styled("    ┌── ", Style::default().fg(ghost)),
             Span::styled("ENVIRONMENT", Style::default().fg(slate)),
         ]),
-        Line::from(vec![
-            Span::styled("    │", Style::default().fg(ghost)),
-        ]),
+        Line::from(vec![Span::styled("    │", Style::default().fg(ghost))]),
         Line::from(vec![
             Span::styled("    │  Model     ", Style::default().fg(ghost)),
-            Span::styled(&model_display, Style::default().fg(white).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                &model_display,
+                Style::default().fg(white).add_modifier(Modifier::BOLD),
+            ),
         ]),
         Line::from(vec![
             Span::styled("    │  Engine    ", Style::default().fg(ghost)),
@@ -1336,13 +1543,13 @@ fn render_welcome(frame: &mut ratatui::Frame, state: &AppState) {
         ]),
         Line::from(vec![
             Span::styled("    └", Style::default().fg(ghost)),
-            Span::styled("──────────────────────────────────", Style::default().fg(ghost)),
+            Span::styled(
+                "──────────────────────────────────",
+                Style::default().fg(ghost),
+            ),
         ]),
     ];
-    frame.render_widget(
-        Paragraph::new(info),
-        layout[5],
-    );
+    frame.render_widget(Paragraph::new(info), layout[5]);
 
     // ── Loading indicator ──────────────────────────────────────────
     let dots = ".".repeat(((state.frame_count / 4) % 4) as usize);
@@ -1352,15 +1559,18 @@ fn render_welcome(frame: &mut ratatui::Frame, state: &AppState) {
             Span::styled(format!("    {spin_char} "), Style::default().fg(pulse)),
             Span::styled(format!("Loading model{dots}"), Style::default().fg(silver)),
         ]),
-        Line::from(vec![
-            Span::styled("      This takes 5-30s depending on model size", Style::default().fg(ghost)),
-        ]),
+        Line::from(vec![Span::styled(
+            "      This takes 5-30s depending on model size",
+            Style::default().fg(ghost),
+        )]),
     ];
     frame.render_widget(Paragraph::new(loading), layout[7]);
 
     // ── Log tail ───────────────────────────────────────────────────
     let log_count = state.logs.len();
-    let log_lines: Vec<Line> = state.logs.iter()
+    let log_lines: Vec<Line> = state
+        .logs
+        .iter()
         .skip(if log_count > 3 { log_count - 3 } else { 0 })
         .map(|l| {
             Line::from(Span::styled(
@@ -1375,18 +1585,37 @@ fn render_welcome(frame: &mut ratatui::Frame, state: &AppState) {
     let footer_area = layout[10];
     if footer_area.height >= 1 {
         let footer = Line::from(vec![
-            Span::styled(" ObelyZK ", Style::default().fg(Color::Black).bg(lime).add_modifier(Modifier::BOLD)),
-            Span::styled("  LOADING", Style::default().fg(pulse).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " ObelyZK ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(lime)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  LOADING",
+                Style::default().fg(pulse).add_modifier(Modifier::BOLD),
+            ),
             Span::styled("    Ctrl+C", Style::default().fg(lime)),
             Span::styled(" exit", Style::default().fg(ghost)),
         ]);
-        let footer_y = Rect::new(footer_area.x, footer_area.y + footer_area.height - 1, footer_area.width, 1);
+        let footer_y = Rect::new(
+            footer_area.x,
+            footer_area.y + footer_area.height - 1,
+            footer_area.width,
+            1,
+        );
         frame.render_widget(Paragraph::new(footer), footer_y);
     }
 }
 
 #[cfg(feature = "tui")]
-fn render_header_section(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &AppState, _ds: &obelyzk::tui::dashboard::DashboardState) {
+fn render_header_section(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    state: &AppState,
+    _ds: &obelyzk::tui::dashboard::DashboardState,
+) {
     use ratatui::style::*;
     use ratatui::text::*;
     use ratatui::widgets::*;
@@ -1404,16 +1633,24 @@ fn render_header_section(frame: &mut ratatui::Frame, area: ratatui::layout::Rect
         ("READY", Color::Indexed(245))
     };
 
-    let elapsed_str = state.prove_started_at
+    let elapsed_str = state
+        .prove_started_at
         .filter(|_| is_proving)
         .map(|t| {
             let secs = t.elapsed().as_secs();
-            if secs < 60 { format!("  {}s", secs) }
-            else { format!("  {}m {:02}s", secs / 60, secs % 60) }
+            if secs < 60 {
+                format!("  {}s", secs)
+            } else {
+                format!("  {}m {:02}s", secs / 60, secs % 60)
+            }
         })
         .unwrap_or_default();
 
-    let model_display = if state.model_name.is_empty() { "no model" } else { &state.model_name };
+    let model_display = if state.model_name.is_empty() {
+        "no model"
+    } else {
+        &state.model_name
+    };
     let params_display = if state.model_params.is_empty() {
         String::new()
     } else {
@@ -1421,22 +1658,52 @@ fn render_header_section(frame: &mut ratatui::Frame, area: ratatui::layout::Rect
     };
 
     let lines = vec![
-        Line::from(Span::styled("  ╔═╗╔╗  ╔═╗╦  ╦ ╦╔═╗╦╔═", Style::default().fg(Color::Indexed(118)))),
+        Line::from(Span::styled(
+            "  ╔═╗╔╗  ╔═╗╦  ╦ ╦╔═╗╦╔═",
+            Style::default().fg(Color::Indexed(118)),
+        )),
         Line::from(vec![
-            Span::styled("  ║ ║╠╩╗ ╠═ ║  ╚╦╝╔═╝╠╩╗", Style::default().fg(Color::Indexed(118))),
+            Span::styled(
+                "  ║ ║╠╩╗ ╠═ ║  ╚╦╝╔═╝╠╩╗",
+                Style::default().fg(Color::Indexed(118)),
+            ),
             Span::raw("  "),
-            Span::styled(model_display, Style::default().fg(Color::Indexed(48)).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                model_display,
+                Style::default()
+                    .fg(Color::Indexed(48))
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(&params_display, Style::default().fg(Color::Indexed(249))),
-            Span::styled(format!("  {} turns  {}→{}", state.turns.len(), state.tokens_in, state.tokens_out), Style::default().fg(Color::Indexed(245))),
+            Span::styled(
+                format!(
+                    "  {} turns  {}→{}",
+                    state.turns.len(),
+                    state.tokens_in,
+                    state.tokens_out
+                ),
+                Style::default().fg(Color::Indexed(245)),
+            ),
         ]),
         Line::from(vec![
-            Span::styled("  ╚═╝╚═╝ ╚═╝╩═╝ ╩ ╚═╝╩ ╩", Style::default().fg(Color::Indexed(70))),
+            Span::styled(
+                "  ╚═╝╚═╝ ╚═╝╩═╝ ╩ ╚═╝╩ ╩",
+                Style::default().fg(Color::Indexed(70)),
+            ),
             Span::raw("  "),
             Span::styled("◆ ", Style::default().fg(status_color)),
-            Span::styled(status, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                status,
+                Style::default()
+                    .fg(status_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(&elapsed_str, Style::default().fg(Color::Indexed(208))),
             Span::raw("  "),
-            Span::styled("STWO Circle STARK + GKR", Style::default().fg(Color::Indexed(240))),
+            Span::styled(
+                "STWO Circle STARK + GKR",
+                Style::default().fg(Color::Indexed(240)),
+            ),
         ]),
     ];
     frame.render_widget(Paragraph::new(lines), area);
@@ -1452,32 +1719,54 @@ fn render_chat_messages(frame: &mut ratatui::Frame, area: ratatui::layout::Rect,
     let mut lines: Vec<Line> = Vec::new();
     for (role, content) in &state.messages {
         let (prefix, color) = match role.as_str() {
-            "you" => ("YOU", Color::Indexed(118)),    // Lime
-            "ai" => ("AI", Color::Indexed(48)),       // Emerald
-            _ => ("SYS", Color::Indexed(245)),        // Gray
+            "you" => ("YOU", Color::Indexed(118)), // Lime
+            "ai" => ("AI", Color::Indexed(48)),    // Emerald
+            _ => ("SYS", Color::Indexed(245)),     // Gray
         };
 
-        lines.push(Line::from(vec![
-            Span::styled(format!(" {prefix} "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
-        ]));
+        lines.push(Line::from(vec![Span::styled(
+            format!(" {prefix} "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )]));
         for chunk in content.chars().collect::<Vec<_>>().chunks(55) {
             let text: String = chunk.iter().collect();
-            let text_color = if role == "system" { Color::Indexed(245) } else { Color::Indexed(252) };
-            lines.push(Line::from(Span::styled(format!("  {text}"), Style::default().fg(text_color))));
+            let text_color = if role == "system" {
+                Color::Indexed(245)
+            } else {
+                Color::Indexed(252)
+            };
+            lines.push(Line::from(Span::styled(
+                format!("  {text}"),
+                Style::default().fg(text_color),
+            )));
         }
         lines.push(Line::from(""));
     }
 
     let block = Block::default()
-        .title(Span::styled(" Chat ", Style::default().fg(Color::Indexed(118)).add_modifier(Modifier::BOLD)))
+        .title(Span::styled(
+            " Chat ",
+            Style::default()
+                .fg(Color::Indexed(118))
+                .add_modifier(Modifier::BOLD),
+        ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Indexed(240)));
 
     let visible = area.height.saturating_sub(2) as usize;
-    let offset = if lines.len() > visible { lines.len() - visible } else { 0 };
+    let offset = if lines.len() > visible {
+        lines.len() - visible
+    } else {
+        0
+    };
     let visible_lines: Vec<Line> = lines.into_iter().skip(offset).collect();
 
-    frame.render_widget(Paragraph::new(visible_lines).block(block).wrap(Wrap { trim: false }), area);
+    frame.render_widget(
+        Paragraph::new(visible_lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 #[cfg(feature = "tui")]
@@ -1487,9 +1776,13 @@ fn render_input(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, state: 
     use ratatui::widgets::*;
 
     let active = state.mode == Mode::Chat;
-    let border_color = if active { Color::Indexed(118) }
-        else if matches!(state.mode, Mode::Error(_)) { Color::Indexed(178) }
-        else { Color::Indexed(240) };
+    let border_color = if active {
+        Color::Indexed(118)
+    } else if matches!(state.mode, Mode::Error(_)) {
+        Color::Indexed(178)
+    } else {
+        Color::Indexed(240)
+    };
     let prompt = if active { " ▸ " } else { " · " };
 
     let title = match state.mode {
@@ -1507,7 +1800,11 @@ fn render_input(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, state: 
 
     let input_text = format!("{prompt}{}", state.input);
     frame.render_widget(
-        Paragraph::new(Span::styled(&input_text, Style::default().fg(Color::Indexed(255)))).block(block),
+        Paragraph::new(Span::styled(
+            &input_text,
+            Style::default().fg(Color::Indexed(255)),
+        ))
+        .block(block),
         area,
     );
 
@@ -1517,7 +1814,12 @@ fn render_input(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, state: 
 }
 
 #[cfg(feature = "tui")]
-fn render_footer_section(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &AppState, _ds: &obelyzk::tui::dashboard::DashboardState) {
+fn render_footer_section(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    state: &AppState,
+    _ds: &obelyzk::tui::dashboard::DashboardState,
+) {
     use ratatui::style::*;
     use ratatui::text::*;
     use ratatui::widgets::*;
@@ -1525,7 +1827,8 @@ fn render_footer_section(frame: &mut ratatui::Frame, area: ratatui::layout::Rect
     let (status_color, status_text) = match state.mode {
         Mode::Complete => (Color::Indexed(48), "VERIFIED".to_string()),
         Mode::Proving => {
-            let elapsed = state.prove_started_at
+            let elapsed = state
+                .prove_started_at
                 .map(|t| t.elapsed().as_secs())
                 .unwrap_or(0);
             let elapsed_fmt = if elapsed < 60 {
@@ -1544,7 +1847,11 @@ fn render_footer_section(frame: &mut ratatui::Frame, area: ratatui::layout::Rect
     let contract_display = if state.contract_address.is_empty() {
         "no contract".to_string()
     } else if state.contract_address.len() > 20 {
-        format!("{}..{}", &state.contract_address[..10], &state.contract_address[state.contract_address.len()-6..])
+        format!(
+            "{}..{}",
+            &state.contract_address[..10],
+            &state.contract_address[state.contract_address.len() - 6..]
+        )
     } else {
         state.contract_address.clone()
     };
@@ -1553,9 +1860,20 @@ fn render_footer_section(frame: &mut ratatui::Frame, area: ratatui::layout::Rect
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" ObelyZK ", Style::default().fg(Color::Black).bg(Color::Indexed(118)).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " ObelyZK ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Indexed(118))
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  "),
-            Span::styled(&status_text, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                &status_text,
+                Style::default()
+                    .fg(status_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  "),
             Span::styled(&contract_display, Style::default().fg(Color::Indexed(73))),
             Span::raw("  "),
@@ -1571,7 +1889,6 @@ fn render_footer_section(frame: &mut ratatui::Frame, area: ratatui::layout::Rect
         area,
     );
 }
-
 
 #[cfg(not(feature = "tui"))]
 fn main() {

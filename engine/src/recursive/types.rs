@@ -168,6 +168,16 @@ pub struct RecursivePublicInputs {
     /// SECURITY: mixed into Fiat-Shamir; cross-checked on-chain by
     /// `verify_decode_step` against the session's stored `last_kv_commitment`.
     pub prev_kv_cache_commitment: FieldElement,
+
+    /// Optional batch-level conversation/action statement hash.
+    ///
+    /// FieldElement::ZERO for legacy single-inference proofs. Non-zero for
+    /// production conversation proofs, where it must equal
+    /// `ConversationBatchStatement::statement_hash()`. Mixing this into the
+    /// recursive Fiat-Shamir channel answers: "what exact transcript,
+    /// generated tokens, actions, KV transitions, model, policy, and security
+    /// level did this proof attest?"
+    pub conversation_statement_hash: FieldElement,
 }
 
 /// The recursive STARK proof — replaces the 112K felt GKR calldata.
@@ -206,13 +216,28 @@ pub struct RecursiveProof {
     /// The AIR's amortized accumulator uses this for the correction term.
     pub n_real_rows: u32,
 
+    /// Number of real primitive verifier arithmetic rows.
+    /// The arithmetic AIR's amortized accumulator uses this for its correction term.
+    pub n_arithmetic_rows: u32,
+
+    /// Number of real recorded sumcheck verifier rows.
+    /// The sumcheck AIR's amortized accumulator uses this for its correction term.
+    pub n_sumcheck_rows: u32,
+
+    /// Number of real channel draw rows recorded for challenge binding.
+    /// The draw AIR's amortized accumulator uses this for its correction term.
+    pub n_draw_rows: u32,
+
     /// Trace log_size (needed for verifier to reconstruct the AIR).
     pub log_size: u32,
 
     /// Hades permutation pairs for two-level recursion.
     /// Each pair is (input[3], output[3]) verified by the prover offline.
     /// Used to generate the Level 1 Hades recursive proof via cairo-prove.
-    pub hades_pairs: Vec<([starknet_ff::FieldElement; 3], [starknet_ff::FieldElement; 3])>,
+    pub hades_pairs: Vec<(
+        [starknet_ff::FieldElement; 3],
+        [starknet_ff::FieldElement; 3],
+    )>,
 
     /// Proof metadata for debugging/display.
     pub metadata: RecursiveProofMetadata,
@@ -233,6 +258,52 @@ pub struct RecursiveProofMetadata {
 
     /// Number of sumcheck rounds verified.
     pub n_sumcheck_rounds: usize,
+
+    /// Number of QM31 arithmetic operations recorded by the instrumented verifier.
+    pub n_qm31_ops: usize,
+
+    /// Number of equality assertions recorded by the instrumented verifier.
+    pub n_equality_checks: usize,
+
+    /// Number of primitive arithmetic/equality rows committed to the recursive AIR.
+    pub n_primitive_arithmetic_rows: usize,
+
+    /// Number of recorded sumcheck rows locally constrained by recursive AIR.
+    pub n_sumcheck_rows_air_constrained: usize,
+
+    /// Number of channel draw rows committed to the recursive AIR.
+    pub n_channel_draw_rows_air_constrained: usize,
+
+    /// True when the recursive AIR constrains the Hades transcript and LogUp
+    /// binds every chain row to an active Hades provider row.
+    pub transcript_air_constrained: bool,
+
+    /// True when recorded QM31 add/mul/equality rows are locally constrained
+    /// by primitive arithmetic AIR columns in the active proof.
+    pub primitive_arithmetic_air_constrained: bool,
+
+    /// True when recorded sumcheck round rows are locally constrained by AIR.
+    pub primitive_sumcheck_air_constrained: bool,
+
+    /// True when LogUp binds sumcheck challenge values to recorded channel draws.
+    pub sumcheck_challenge_draw_logup_bound: bool,
+
+    /// True when draw rows locally constrain felt252-to-QM31 unpacking.
+    pub draw_felt_unpack_air_constrained: bool,
+
+    /// True when LogUp binds draw raw felts to Hades draw output rows.
+    pub draw_felt_hades_logup_bound: bool,
+
+    /// True only when the recursive AIR also constrains the verifier's QM31
+    /// arithmetic checks. This is currently false for the custom Hades-chain
+    /// recursion path; primitive rows can be locally checked before the full
+    /// verifier control-flow/state machine is constrained.
+    pub verifier_arithmetic_air_constrained: bool,
+
+    /// Recorded verifier checks not yet consumed by the full verifier
+    /// control-flow/state-machine AIR. Primitive arithmetic and sumcheck rows
+    /// may still be locally constrained in the active proof.
+    pub unconstrained_verifier_checks: usize,
 
     /// Trace log_size (log2 of number of rows).
     pub trace_log_size: u32,

@@ -6,9 +6,9 @@
 
 #![cfg(feature = "proof-stream")]
 
+use obelyzk::gkr::prover::{set_proof_sink, PROOF_SINK};
 use proof_stream::sink::CollectingSink;
 use proof_stream::{ProofEvent, ProofSink};
-use obelyzk::gkr::prover::{set_proof_sink, PROOF_SINK};
 
 #[test]
 fn test_sink_install_teardown() {

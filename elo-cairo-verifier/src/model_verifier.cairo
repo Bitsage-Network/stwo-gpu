@@ -12,15 +12,20 @@
 //   0=MatMul, 1=Add, 2=Mul, 3=Activation, 4=LayerNorm,
 //   5=Attention, 6=Dequantize, 7=MatMulDualSimd, 8=RMSNorm
 
-use crate::field::{QM31, CM31, qm31_zero, qm31_sub, qm31_add, poly_eval_degree3, log2_ceil, next_power_of_two, unpack_qm31_from_felt, unpack_qm31_pair_from_felt, pack_qm31_to_felt};
-use crate::channel::{PoseidonChannel, channel_mix_secure_field, channel_mix_u64, channel_draw_qm31, channel_mix_poly_coeffs_deg3};
-use crate::types::{GKRClaim, CompressedRoundPoly, CompressedGkrRoundPoly};
-use crate::layer_verifiers::{
-    verify_add_layer, verify_matmul_layer,
-    verify_activation_layer,
-    verify_rmsnorm_layer,
-    clone_point,
+use crate::channel::{
+    PoseidonChannel, channel_draw_qm31, channel_mix_poly_coeffs_deg3, channel_mix_secure_field,
+    channel_mix_u64,
 };
+use crate::field::{
+    CM31, QM31, eq_eval, log2_ceil, next_power_of_two, pack_qm31_to_felt, poly_eval_degree3,
+    qm31_add, qm31_eq, qm31_from_u32, qm31_mul, qm31_one, qm31_sub, qm31_zero,
+    unpack_qm31_from_felt, unpack_qm31_pair_from_felt,
+};
+use crate::layer_verifiers::{
+    clone_point, verify_activation_layer, verify_add_layer, verify_matmul_layer,
+    verify_rmsnorm_layer,
+};
+use crate::types::{CompressedGkrRoundPoly, CompressedRoundPoly, GKRClaim};
 
 /// Weight claim collected during the GKR walk.
 /// Each MatMul layer produces one: the evaluation point and expected value
@@ -134,7 +139,7 @@ fn read_compressed_deg2_polys(ref r: ProofReader, count: u32) -> Array<Compresse
         }
         result.append(read_compressed_deg2_poly(ref r));
         i += 1;
-    };
+    }
     result
 }
 
@@ -147,7 +152,7 @@ fn read_compressed_deg3_polys(ref r: ProofReader, count: u32) -> Array<Compresse
         }
         result.append(read_compressed_deg3_poly(ref r));
         i += 1;
-    };
+    }
     result
 }
 
@@ -179,7 +184,7 @@ fn read_optional_logup(
         }
         let _ = read_u32(ref r);
         i += 1;
-    };
+    }
 
     (true, polys, final_w, final_in, final_out, claimed_sum)
 }
@@ -207,7 +212,7 @@ fn read_optional_multiplicity_sumcheck(
         c0s.append(read_qm31(ref r));
         c1s.append(read_qm31(ref r));
         i += 1;
-    };
+    }
     let final_eval = read_qm31(ref r);
     let claimed_sum = read_qm31(ref r);
 
@@ -241,10 +246,7 @@ pub fn dispatch_matmul(
 
 /// Draw a fresh claim and dispatch a sub-matmul inside an attention block.
 fn dispatch_fresh_sub_matmul(
-    sub_claim_value: QM31,
-    m: u32, k: u32, n: u32,
-    ref reader: ProofReader,
-    ref ch: PoseidonChannel,
+    sub_claim_value: QM31, m: u32, k: u32, n: u32, ref reader: ProofReader, ref ch: PoseidonChannel,
 ) -> GKRClaim {
     panic!("Not supported in lean build")
 }
@@ -254,9 +256,7 @@ fn dispatch_fresh_sub_matmul(
 /// Attention decomposes into 4 + 2*num_heads MatMul sub-proofs:
 ///   0: output projection, then per-head (context + score), then V, K, Q projections.
 pub fn dispatch_attention(
-    current_claim: @GKRClaim,
-    ref reader: ProofReader,
-    ref ch: PoseidonChannel,
+    current_claim: @GKRClaim, ref reader: ProofReader, ref ch: PoseidonChannel,
 ) -> GKRClaim {
     panic!("Not supported in lean build")
 }
@@ -268,18 +268,14 @@ pub fn dispatch_attention(
 /// - Context: (new_tokens, full_seq_len, d_k)
 /// - Projections: (new_tokens, d_model, d_model)
 pub fn dispatch_attention_decode(
-    current_claim: @GKRClaim,
-    ref reader: ProofReader,
-    ref ch: PoseidonChannel,
+    current_claim: @GKRClaim, ref reader: ProofReader, ref ch: PoseidonChannel,
 ) -> GKRClaim {
     panic!("Not supported in lean build")
 }
 
 /// Parse and verify a Tag 1 (Add) layer proof.
 fn dispatch_add(
-    current_claim: @GKRClaim,
-    ref reader: ProofReader,
-    ref ch: PoseidonChannel,
+    current_claim: @GKRClaim, ref reader: ProofReader, ref ch: PoseidonChannel,
 ) -> GKRClaim {
     let lhs = read_qm31(ref reader);
     let rhs = read_qm31(ref reader);
@@ -290,9 +286,7 @@ fn dispatch_add(
 
 /// Parse and verify a Tag 2 (Mul) layer proof.
 fn dispatch_mul(
-    current_claim: @GKRClaim,
-    ref reader: ProofReader,
-    ref ch: PoseidonChannel,
+    current_claim: @GKRClaim, ref reader: ProofReader, ref ch: PoseidonChannel,
 ) -> GKRClaim {
     panic!("Not supported in lean build")
 }
@@ -303,9 +297,7 @@ fn dispatch_mul(
 ///   tag(3), act_type, input_eval, output_eval, table_commitment,
 ///   has_logup + [logup_data], has_ms + [ms_data], has_act_proof + [act_data]
 fn dispatch_activation(
-    current_claim: @GKRClaim,
-    ref reader: ProofReader,
-    ref ch: PoseidonChannel,
+    current_claim: @GKRClaim, ref reader: ProofReader, ref ch: PoseidonChannel,
 ) -> GKRClaim {
     let act_type_tag = read_u64(ref reader);
     let input_eval = read_qm31(ref reader);
@@ -313,15 +305,16 @@ fn dispatch_activation(
     let _table_commitment = read_felt(ref reader);
 
     let (has_logup, logup_polys, w, in_e, out_e, claimed) = read_optional_logup(ref reader);
-    let (ms_has, ms_n, ms_c0s, ms_c1s, ms_final, ms_claimed) =
-        read_optional_multiplicity_sumcheck(ref reader);
+    let (ms_has, ms_n, ms_c0s, ms_c1s, ms_final, ms_claimed) = read_optional_multiplicity_sumcheck(
+        ref reader,
+    );
 
     // Read optional activation product proof (always serialized after multiplicity sumcheck).
     // This flag was previously missing, causing a 1-felt reader offset drift that
     // corrupted all subsequent layer reads (MATMUL_FINAL_MISMATCH).
     let has_act_proof = read_u32(ref reader);
 
-    let result = if has_act_proof == 1 {
+    let mut result = if has_act_proof == 1 {
         // Activation product proof (Phase A soundness, replaces LogUp for ReLU).
         // Channel transcript: mix "ACT" + claim_value, draw eta, deg3 sumcheck,
         // mix final evals, optional bit evals.
@@ -329,63 +322,504 @@ fn dispatch_activation(
     } else if has_logup {
         // has_act_proof == 0: use original LogUp or no-LogUp path
         verify_activation_layer(
-            current_claim, act_type_tag,
-            logup_polys.span(), w, in_e, out_e, claimed,
-            ms_has, ms_n, ms_c0s.span(), ms_c1s.span(), ms_final, ms_claimed,
-            input_eval, output_eval, ref ch,
+            current_claim,
+            act_type_tag,
+            logup_polys.span(),
+            w,
+            in_e,
+            out_e,
+            claimed,
+            ms_has,
+            ms_n,
+            ms_c0s.span(),
+            ms_c1s.span(),
+            ms_final,
+            ms_claimed,
+            input_eval,
+            output_eval,
+            ref ch,
         )
     } else {
         // LogUp skipped (M31 matmul outputs exceed table range).
         channel_mix_secure_field(ref ch, input_eval);
-        GKRClaim {
-            point: clone_point(current_claim.point),
-            value: input_eval,
-        }
+        GKRClaim { point: clone_point(current_claim.point), value: input_eval }
     };
 
-    // Skip optional piecewise-linear proof (serialized by Rust, not yet verified in Cairo).
-    // Format: has_flag(u32), if 1: num_rounds(u32), round_polys(c0,c2,c3 × rounds),
-    //         input_eval(qm31), output_eval(qm31), indicator_evals(16 × qm31),
-    //         optional seg_bit_evals(has_flag + 4 × qm31).
+    // Verify optional piecewise-linear proof (default production path for
+    // GELU/Sigmoid/Softmax/SiLU). This must be active on-chain because LogUp
+    // may be absent for full-M31 activations.
     let has_piecewise = read_u32(ref reader);
     if has_piecewise == 1 {
-        let pw_rounds = read_u32(ref reader);
-        let mut pri: u32 = 0;
-        loop {
-            if pri >= pw_rounds {
-                break;
-            }
-            let _c0 = read_qm31(ref reader);
-            let _c2 = read_qm31(ref reader);
-            let _c3 = read_qm31(ref reader);
-            pri += 1;
-        };
-        let _pw_input = read_qm31(ref reader);
-        let _pw_output = read_qm31(ref reader);
-        // indicator_evals: always 16
-        let mut iei: u32 = 0;
-        loop {
-            if iei >= 16 {
-                break;
-            }
-            let _ie = read_qm31(ref reader);
-            iei += 1;
-        };
-        // Optional segment bit evals
-        let has_seg = read_u32(ref reader);
-        if has_seg == 1 {
-            let mut si: u32 = 0;
-            loop {
-                if si >= 4 {
-                    break;
-                }
-                let _sb = read_qm31(ref reader);
-                si += 1;
-            };
-        }
+        result =
+            dispatch_piecewise_activation_proof(
+                current_claim, act_type_tag, input_eval, ref reader, ref ch,
+            );
     }
 
     result
+}
+
+fn piecewise_coeff(act_type_tag: u64, idx: u32) -> (QM31, QM31) {
+    if act_type_tag == 2 {
+        if idx == 0 {
+            return (qm31_from_u32(493464900), qm31_from_u32(0));
+        }
+        if idx == 1 {
+            return (qm31_from_u32(907732391), qm31_from_u32(1225473846));
+        }
+        if idx == 2 {
+            return (qm31_from_u32(1321999882), qm31_from_u32(1608135299));
+        }
+        if idx == 3 {
+            return (qm31_from_u32(1736267373), qm31_from_u32(1147984359));
+        }
+        if idx == 4 {
+            return (qm31_from_u32(289382371), qm31_from_u32(847180061));
+        }
+        if idx == 5 {
+            return (qm31_from_u32(417318708), qm31_from_u32(1994212593));
+        }
+        if idx == 6 {
+            return (qm31_from_u32(1117917353), qm31_from_u32(1582604850));
+        }
+        if idx == 7 {
+            return (qm31_from_u32(1532184844), qm31_from_u32(1759840478));
+        }
+        if idx == 8 {
+            return (qm31_from_u32(328967650), qm31_from_u32(1903006056));
+        }
+        if idx == 9 {
+            return (qm31_from_u32(1315897449), qm31_from_u32(1153108122));
+        }
+        if idx == 10 {
+            return (qm31_from_u32(1730164940), qm31_from_u32(1994212595));
+        }
+        if idx == 11 {
+            return (qm31_from_u32(2144432431), qm31_from_u32(1992504674));
+        }
+        if idx == 12 {
+            return (qm31_from_u32(411216275), qm31_from_u32(1147984360));
+        }
+        if idx == 13 {
+            return (qm31_from_u32(825483766), qm31_from_u32(1608135300));
+        }
+        if idx == 14 {
+            return (qm31_from_u32(1526082411), qm31_from_u32(1511805000));
+        }
+        if idx == 15 {
+            return (qm31_from_u32(1285247315), qm31_from_u32(1285247315));
+        }
+    }
+    if act_type_tag == 3 {
+        if idx == 0 {
+            return (qm31_from_u32(1825361101), qm31_from_u32(536870911));
+        }
+        if idx == 1 {
+            return (qm31_from_u32(1825361101), qm31_from_u32(858993458));
+        }
+        if idx == 2 {
+            return (qm31_from_u32(1825361101), qm31_from_u32(1181116005));
+        }
+        if idx == 3 {
+            return (qm31_from_u32(1825361101), qm31_from_u32(1503238552));
+        }
+        if idx == 4 {
+            return (qm31_from_u32(1825361101), qm31_from_u32(1825361099));
+        }
+        if idx == 5 {
+            return (qm31_from_u32(1825361101), qm31_from_u32(2147483646));
+        }
+        if idx == 6 {
+            return (qm31_from_u32(1825361101), qm31_from_u32(322122546));
+        }
+        if idx == 7 {
+            return (qm31_from_u32(1825361101), qm31_from_u32(644245093));
+        }
+        if idx == 8 {
+            return (qm31_from_u32(1825361101), qm31_from_u32(429496729));
+        }
+        if idx == 9 {
+            return (qm31_from_u32(1825361101), qm31_from_u32(751619276));
+        }
+        if idx == 10 {
+            return (qm31_from_u32(1825361101), qm31_from_u32(1073741823));
+        }
+        if idx == 11 {
+            return (qm31_from_u32(1825361101), qm31_from_u32(1395864370));
+        }
+        if idx == 12 {
+            return (qm31_from_u32(1825361101), qm31_from_u32(1717986917));
+        }
+        if idx == 13 {
+            return (qm31_from_u32(1825361101), qm31_from_u32(2040109464));
+        }
+        if idx == 14 {
+            return (qm31_from_u32(1825361101), qm31_from_u32(214748364));
+        }
+        if idx == 15 {
+            return (qm31_from_u32(2130165231), qm31_from_u32(519552495));
+        }
+    }
+    if act_type_tag == 4 {
+        if idx == 0 {
+            return (qm31_from_u32(849660839), qm31_from_u32(1073741823));
+        }
+        if idx == 1 {
+            return (qm31_from_u32(1831514974), qm31_from_u32(1370674654));
+        }
+        if idx == 2 {
+            return (qm31_from_u32(1522175356), qm31_from_u32(114698047));
+        }
+        if idx == 3 {
+            return (qm31_from_u32(1496103356), qm31_from_u32(744894842));
+        }
+        if idx == 4 {
+            return (qm31_from_u32(750732055), qm31_from_u32(2119488873));
+        }
+        if idx == 5 {
+            return (qm31_from_u32(1427218), qm31_from_u32(663390487));
+        }
+        if idx == 6 {
+            return (qm31_from_u32(679321127), qm31_from_u32(676188513));
+        }
+        if idx == 7 {
+            return (qm31_from_u32(922668489), qm31_from_u32(158838373));
+        }
+        if idx == 8 {
+            return (qm31_from_u32(516563348), qm31_from_u32(136728555));
+        }
+        if idx == 9 {
+            return (qm31_from_u32(79595521), qm31_from_u32(1342354617));
+        }
+        if idx == 10 {
+            return (qm31_from_u32(1932283198), qm31_from_u32(1983877489));
+        }
+        if idx == 11 {
+            return (qm31_from_u32(2065857279), qm31_from_u32(630850749));
+        }
+        if idx == 12 {
+            return (qm31_from_u32(480167476), qm31_from_u32(291131733));
+        }
+        if idx == 13 {
+            return (qm31_from_u32(1613176540), qm31_from_u32(2111619863));
+        }
+        if idx == 14 {
+            return (qm31_from_u32(883393319), qm31_from_u32(1942310010));
+        }
+        if idx == 15 {
+            return (qm31_from_u32(1181807026), qm31_from_u32(108065201));
+        }
+    }
+    if act_type_tag == 5 {
+        if idx == 0 {
+            return (qm31_from_u32(67108865), qm31_from_u32(0));
+        }
+        if idx == 1 {
+            return (qm31_from_u32(1776147933), qm31_from_u32(362947105));
+        }
+        if idx == 2 {
+            return (qm31_from_u32(1910365662), qm31_from_u32(449070147));
+        }
+        if idx == 3 {
+            return (qm31_from_u32(1758252237), qm31_from_u32(1117362584));
+        }
+        if idx == 4 {
+            return (qm31_from_u32(1606138812), qm31_from_u32(2081493263));
+        }
+        if idx == 5 {
+            return (qm31_from_u32(1454025387), qm31_from_u32(1193978537));
+        }
+        if idx == 6 {
+            return (qm31_from_u32(1301911962), qm31_from_u32(602302053));
+        }
+        if idx == 7 {
+            return (qm31_from_u32(1149798537), qm31_from_u32(306463811));
+        }
+        if idx == 8 {
+            return (qm31_from_u32(711353957), qm31_from_u32(449629389));
+        }
+        if idx == 9 {
+            return (qm31_from_u32(845571686), qm31_from_u32(602302055));
+        }
+        if idx == 10 {
+            return (qm31_from_u32(693458261), qm31_from_u32(1193978539));
+        }
+        if idx == 11 {
+            return (qm31_from_u32(541344836), qm31_from_u32(2081493265));
+        }
+        if idx == 12 {
+            return (qm31_from_u32(389231411), qm31_from_u32(1117362586));
+        }
+        if idx == 13 {
+            return (qm31_from_u32(237117986), qm31_from_u32(449070149));
+        }
+        if idx == 14 {
+            return (qm31_from_u32(85004561), qm31_from_u32(76615954));
+        }
+        if idx == 15 {
+            return (qm31_from_u32(937359294), qm31_from_u32(937359294));
+        }
+    }
+    panic!("UNSUPPORTED_PIECEWISE_ACTIVATION")
+}
+
+fn dispatch_piecewise_activation_proof(
+    current_claim: @GKRClaim,
+    act_type_tag: u64,
+    expected_input_eval: QM31,
+    ref reader: ProofReader,
+    ref ch: PoseidonChannel,
+) -> GKRClaim {
+    let num_rounds = read_u32(ref reader);
+    assert!(num_rounds > 0, "PW_ZERO_ROUNDS");
+    assert!(current_claim.point.len() >= num_rounds, "PW_POINT_TOO_SHORT");
+
+    channel_mix_u64(ref ch, 0x50575F414354); // "PW_ACT"
+    channel_mix_u64(ref ch, act_type_tag);
+    channel_mix_u64(ref ch, num_rounds.into());
+    channel_mix_secure_field(ref ch, *current_claim.value);
+    let eta = channel_draw_qm31(ref ch);
+
+    let mut current_sum = qm31_zero();
+    let mut challenges: Array<QM31> = array![];
+    let mut round: u32 = 0;
+    loop {
+        if round >= num_rounds {
+            break;
+        }
+        let poly = read_compressed_deg3_poly(ref reader);
+        let c0 = poly.c0;
+        let c2 = poly.c2;
+        let c3 = poly.c3;
+        let c1 = qm31_sub(qm31_sub(qm31_sub(current_sum, qm31_add(c0, c0)), c2), c3);
+        channel_mix_poly_coeffs_deg3(ref ch, c0, c1, c2, c3);
+        let challenge = channel_draw_qm31(ref ch);
+        challenges.append(challenge);
+        current_sum = poly_eval_degree3(c0, c1, c2, c3, challenge);
+        round += 1;
+    }
+
+    let pw_input = read_qm31(ref reader);
+    let pw_output = read_qm31(ref reader);
+
+    let mut indicators: Array<QM31> = array![];
+    let mut i: u32 = 0;
+    loop {
+        if i >= 16 {
+            break;
+        }
+        indicators.append(read_qm31(ref reader));
+        i += 1;
+    }
+
+    let has_seg = read_u32(ref reader);
+    assert!(has_seg == 1, "PW_MISSING_SEG_BITS");
+    let mut seg_bits: Array<QM31> = array![];
+    i = 0;
+    loop {
+        if i >= 4 {
+            break;
+        }
+        seg_bits.append(read_qm31(ref reader));
+        i += 1;
+    }
+
+    let has_low = read_u32(ref reader);
+    assert!(has_low == 1, "PW_MISSING_LOW_BITS");
+    let low_len = read_u32(ref reader);
+    assert!(low_len == 27, "PW_LOW_BIT_COUNT");
+    let mut low_bits: Array<QM31> = array![];
+    i = 0;
+    loop {
+        if i >= low_len {
+            break;
+        }
+        low_bits.append(read_qm31(ref reader));
+        i += 1;
+    }
+
+    let has_canonical = read_u32(ref reader);
+    assert!(has_canonical == 1, "PW_MISSING_CANONICAL");
+    let canonical_len = read_u32(ref reader);
+    assert!(canonical_len == 31, "PW_CANONICAL_COUNT");
+    let mut canonical_ands: Array<QM31> = array![];
+    i = 0;
+    loop {
+        if i >= canonical_len {
+            break;
+        }
+        canonical_ands.append(read_qm31(ref reader));
+        i += 1;
+    }
+
+    let one = qm31_one();
+    let mut eta_power = one;
+    let mut piecewise_val = qm31_zero();
+    let mut ind_sum = qm31_zero();
+    i = 0;
+    loop {
+        if i >= 16 {
+            break;
+        }
+        let ind = *indicators.at(i);
+        let (slope, intercept) = piecewise_coeff(act_type_tag, i);
+        ind_sum = qm31_add(ind_sum, ind);
+        piecewise_val =
+            qm31_add(piecewise_val, qm31_mul(ind, qm31_add(qm31_mul(slope, pw_input), intercept)));
+        i += 1;
+    }
+
+    let mut h = qm31_mul(eta_power, qm31_sub(pw_output, piecewise_val));
+    eta_power = qm31_mul(eta_power, eta);
+    h = qm31_add(h, qm31_mul(eta_power, qm31_sub(ind_sum, one)));
+
+    i = 0;
+    loop {
+        if i >= 16 {
+            break;
+        }
+        eta_power = qm31_mul(eta_power, eta);
+        let ind = *indicators.at(i);
+        h = qm31_add(h, qm31_mul(eta_power, qm31_mul(ind, qm31_sub(one, ind))));
+        i += 1;
+    }
+
+    eta_power = qm31_mul(eta_power, eta);
+    let mut bit_sum = qm31_zero();
+    let two = qm31_from_u32(2);
+    let mut seg_pow2 = one;
+    i = 0;
+    loop {
+        if i >= 4 {
+            break;
+        }
+        bit_sum = qm31_add(bit_sum, qm31_mul(seg_pow2, *seg_bits.at(i)));
+        seg_pow2 = qm31_mul(seg_pow2, two);
+        i += 1;
+    }
+    let mut ind_index_sum = qm31_zero();
+    i = 0;
+    loop {
+        if i >= 16 {
+            break;
+        }
+        ind_index_sum = qm31_add(ind_index_sum, qm31_mul(qm31_from_u32(i), *indicators.at(i)));
+        i += 1;
+    }
+    h = qm31_add(h, qm31_mul(eta_power, qm31_sub(bit_sum, ind_index_sum)));
+
+    i = 0;
+    loop {
+        if i >= 4 {
+            break;
+        }
+        eta_power = qm31_mul(eta_power, eta);
+        let bit = *seg_bits.at(i);
+        h = qm31_add(h, qm31_mul(eta_power, qm31_mul(bit, qm31_sub(one, bit))));
+        i += 1;
+    }
+
+    eta_power = qm31_mul(eta_power, eta);
+    let mut low_sum = qm31_zero();
+    let mut pow2 = one;
+    i = 0;
+    loop {
+        if i >= 27 {
+            break;
+        }
+        let bit = *low_bits.at(i);
+        low_sum = qm31_add(low_sum, qm31_mul(pow2, bit));
+        pow2 = qm31_mul(pow2, two);
+        i += 1;
+    }
+    h =
+        qm31_add(
+            h, qm31_mul(eta_power, qm31_sub(qm31_sub(pw_input, low_sum), qm31_mul(pow2, bit_sum))),
+        );
+
+    i = 0;
+    loop {
+        if i >= 27 {
+            break;
+        }
+        eta_power = qm31_mul(eta_power, eta);
+        let bit = *low_bits.at(i);
+        h = qm31_add(h, qm31_mul(eta_power, qm31_mul(bit, qm31_sub(one, bit))));
+        i += 1;
+    }
+
+    i = 0;
+    loop {
+        if i >= 31 {
+            break;
+        }
+        eta_power = qm31_mul(eta_power, eta);
+        let bit = if i < 4 {
+            *seg_bits.at(i)
+        } else {
+            *low_bits.at(i - 4)
+        };
+        let expected = if i == 0 {
+            bit
+        } else {
+            qm31_mul(*canonical_ands.at(i - 1), bit)
+        };
+        h = qm31_add(h, qm31_mul(eta_power, qm31_sub(*canonical_ands.at(i), expected)));
+        i += 1;
+    }
+
+    eta_power = qm31_mul(eta_power, eta);
+    h = qm31_add(h, qm31_mul(eta_power, *canonical_ands.at(30)));
+
+    let mut claim_prefix: Array<QM31> = array![];
+    i = 0;
+    loop {
+        if i >= num_rounds {
+            break;
+        }
+        claim_prefix.append(*current_claim.point.at(i));
+        i += 1;
+    }
+    let expected = qm31_mul(eq_eval(claim_prefix.span(), challenges.span()), h);
+    assert!(qm31_eq(current_sum, expected), "PW_FINAL_MISMATCH");
+    assert!(qm31_eq(pw_input, expected_input_eval), "PW_INPUT_MISMATCH");
+
+    channel_mix_secure_field(ref ch, pw_input);
+    channel_mix_secure_field(ref ch, pw_output);
+    i = 0;
+    loop {
+        if i >= 16 {
+            break;
+        }
+        channel_mix_secure_field(ref ch, *indicators.at(i));
+        i += 1;
+    }
+    i = 0;
+    loop {
+        if i >= 4 {
+            break;
+        }
+        channel_mix_secure_field(ref ch, *seg_bits.at(i));
+        i += 1;
+    }
+    i = 0;
+    loop {
+        if i >= 27 {
+            break;
+        }
+        channel_mix_secure_field(ref ch, *low_bits.at(i));
+        i += 1;
+    }
+    i = 0;
+    loop {
+        if i >= 31 {
+            break;
+        }
+        channel_mix_secure_field(ref ch, *canonical_ands.at(i));
+        i += 1;
+    }
+
+    GKRClaim { point: challenges, value: pw_input }
 }
 
 /// Read and verify an activation product proof (has_act_proof == 1 path).
@@ -399,9 +833,7 @@ fn dispatch_activation(
 ///   6. mix_secure_field(act_indicator_eval)
 ///   7. Optional: for each bit_eval: mix_secure_field(bit_eval)
 fn dispatch_activation_product_proof(
-    current_claim: @GKRClaim,
-    ref reader: ProofReader,
-    ref ch: PoseidonChannel,
+    current_claim: @GKRClaim, ref reader: ProofReader, ref ch: PoseidonChannel,
 ) -> GKRClaim {
     // 1-3: Mix "ACT" tag + current claim value, draw eta
     channel_mix_u64(ref ch, 0x414354); // "ACT"
@@ -424,15 +856,12 @@ fn dispatch_activation_product_proof(
         let c2 = *poly.c2;
         let c3 = *poly.c3;
         // Reconstruct c1 = current_sum - 2*c0 - c2 - c3
-        let c1 = qm31_sub(
-            qm31_sub(qm31_sub(act_sum, qm31_add(c0, c0)), c2),
-            c3,
-        );
+        let c1 = qm31_sub(qm31_sub(qm31_sub(act_sum, qm31_add(c0, c0)), c2), c3);
         channel_mix_poly_coeffs_deg3(ref ch, c0, c1, c2, c3);
         let challenge = channel_draw_qm31(ref ch);
         act_sum = poly_eval_degree3(c0, c1, c2, c3, challenge);
         i += 1;
-    };
+    }
 
     // 5-6: Read and mix final evaluations
     let act_input_eval = read_qm31(ref reader);
@@ -455,27 +884,19 @@ fn dispatch_activation_product_proof(
         };
     }
 
-    GKRClaim {
-        point: clone_point(current_claim.point),
-        value: act_input_eval,
-    }
+    GKRClaim { point: clone_point(current_claim.point), value: act_input_eval }
 }
 
 /// Parse and verify a Tag 4 (LayerNorm) layer proof.
 fn dispatch_layernorm(
-    current_claim: @GKRClaim,
-    ref reader: ProofReader,
-    ref ch: PoseidonChannel,
+    current_claim: @GKRClaim, ref reader: ProofReader, ref ch: PoseidonChannel,
 ) -> GKRClaim {
     panic!("Not supported in lean build")
 }
 
 /// Parse and verify a Tag 6 (Dequantize) layer proof.
 fn dispatch_dequantize(
-    current_claim: @GKRClaim,
-    bits: u64,
-    ref reader: ProofReader,
-    ref ch: PoseidonChannel,
+    current_claim: @GKRClaim, bits: u64, ref reader: ProofReader, ref ch: PoseidonChannel,
 ) -> GKRClaim {
     panic!("Not supported in lean build")
 }
@@ -483,16 +904,15 @@ fn dispatch_dequantize(
 /// Parse and verify a Tag 8 (RMSNorm) layer proof.
 ///
 /// Serialization order (must match Rust cairo_serde.rs):
-///   Part 0: input_eval, output_eval, rms_sq_eval, rsqrt_eval, rsqrt_table_commitment, simd_combined
-///   Part 0b: RMS² verification proof (has_flag + optional: n_active, sq_sum, rounds, final_eval)
+///   Part 0: input_eval, output_eval, rms_sq_eval, rsqrt_eval, rsqrt_table_commitment,
+///   simd_combined Part 0b: RMS² verification proof (has_flag + optional: n_active, sq_sum,
+///   rounds, final_eval)
 ///   Part 1: Linear eq-sumcheck (num_rounds, deg3 polys, input_final, rsqrt_final)
 ///   Part 2: LogUp (optional)
 ///   Part 3: Multiplicity sumcheck
 ///   Part 4: Row RMS² (optional)
 fn dispatch_rmsnorm(
-    current_claim: @GKRClaim,
-    ref reader: ProofReader,
-    ref ch: PoseidonChannel,
+    current_claim: @GKRClaim, ref reader: ProofReader, ref ch: PoseidonChannel,
 ) -> GKRClaim {
     let input_eval = read_qm31(ref reader);
     let output_eval = read_qm31(ref reader);
@@ -523,15 +943,12 @@ fn dispatch_rmsnorm(
             let c2 = read_qm31(ref reader);
             let c3 = read_qm31(ref reader);
             // Reconstruct c1 = current_sum - 2*c0 - c2 - c3
-            let c1 = qm31_sub(
-                qm31_sub(qm31_sub(rms_sum, qm31_add(c0, c0)), c2),
-                c3,
-            );
+            let c1 = qm31_sub(qm31_sub(qm31_sub(rms_sum, qm31_add(c0, c0)), c2), c3);
             channel_mix_poly_coeffs_deg3(ref ch, c0, c1, c2, c3);
             let challenge = channel_draw_qm31(ref ch);
             rms_sum = poly_eval_degree3(c0, c1, c2, c3, challenge);
             ri += 1;
-        };
+        }
         let rms_sq_final = read_qm31(ref reader);
         channel_mix_secure_field(ref ch, rms_sq_final);
     }
@@ -545,8 +962,9 @@ fn dispatch_rmsnorm(
     // Part 2: LogUp
     let (has_logup, logup_polys, w, in_e, out_e, claimed) = read_optional_logup(ref reader);
     // Part 3: Multiplicity sumcheck
-    let (ms_has, ms_n, ms_c0s, ms_c1s, ms_final, ms_claimed) =
-        read_optional_multiplicity_sumcheck(ref reader);
+    let (ms_has, ms_n, ms_c0s, ms_c1s, ms_final, ms_claimed) = read_optional_multiplicity_sumcheck(
+        ref reader,
+    );
 
     // Part 4: Row RMS² binding (optional — skip over it)
     let has_row_rms = read_u32(ref reader);
@@ -564,11 +982,26 @@ fn dispatch_rmsnorm(
 
     verify_rmsnorm_layer(
         current_claim,
-        linear_polys.span(), input_final, rsqrt_final,
-        rms_sq, rsqrt_eval,
-        has_logup, logup_polys.span(), w, in_e, out_e, claimed,
-        ms_has, ms_n, ms_c0s.span(), ms_c1s.span(), ms_final, ms_claimed,
-        input_eval, output_eval, ref ch,
+        linear_polys.span(),
+        input_final,
+        rsqrt_final,
+        rms_sq,
+        rsqrt_eval,
+        has_logup,
+        logup_polys.span(),
+        w,
+        in_e,
+        out_e,
+        claimed,
+        ms_has,
+        ms_n,
+        ms_c0s.span(),
+        ms_c1s.span(),
+        ms_final,
+        ms_claimed,
+        input_eval,
+        output_eval,
+        ref ch,
     )
 }
 
@@ -604,14 +1037,8 @@ pub fn verify_gkr_model(
 ) -> (GKRClaim, Array<WeightClaimData>) {
     let (final_claim, weight_claims, _layer_tags, _deferred_weight_commitments) =
         verify_gkr_model_with_trace(
-            proof_data,
-            num_layers,
-            matmul_dims,
-            dequantize_bits,
-            initial_claim,
-            ref ch,
-            false,
-        );
+        proof_data, num_layers, matmul_dims, dequantize_bits, initial_claim, ref ch, false,
+    );
     (final_claim, weight_claims)
 }
 
@@ -640,8 +1067,7 @@ pub fn verify_gkr_model_with_trace(
     packed: bool,
 ) -> (GKRClaim, Array<WeightClaimData>, Array<u32>, Array<felt252>) {
     verify_gkr_model_with_trace_dp(
-        proof_data, num_layers, matmul_dims, dequantize_bits,
-        initial_claim, ref ch, packed, false,
+        proof_data, num_layers, matmul_dims, dequantize_bits, initial_claim, ref ch, packed, false,
     )
 }
 
@@ -712,7 +1138,7 @@ pub fn verify_gkr_model_with_trace_dp(
                 }
                 eval_point.append(*current_claim.point.at(log_m + j));
                 j += 1;
-            };
+            }
             j = log_m;
             loop {
                 if j >= new_claim.point.len() {
@@ -720,12 +1146,9 @@ pub fn verify_gkr_model_with_trace_dp(
                 }
                 eval_point.append(*new_claim.point.at(j));
                 j += 1;
-            };
+            }
 
-            weight_claims.append(WeightClaimData {
-                eval_point,
-                expected_value: final_b_eval,
-            });
+            weight_claims.append(WeightClaimData { eval_point, expected_value: final_b_eval });
 
             current_claim = new_claim;
         } else if tag == 1 {
@@ -762,7 +1185,7 @@ pub fn verify_gkr_model_with_trace_dp(
         }
 
         layer_idx += 1;
-    };
+    }
 
     assert!(matmul_idx * 3 == matmul_dims.len(), "MATMUL_DIMS_TRAILING");
     assert!(dequantize_idx == dequantize_bits.len(), "DEQUANTIZE_BITS_TRAILING");
@@ -774,10 +1197,7 @@ pub fn verify_gkr_model_with_trace_dp(
     // branches of Add layers. Each Add layer saved its claim point above.
     // Fiat-Shamir order: walk -> deferred proofs -> weight openings.
     let num_deferred = read_u32(ref reader);
-    assert!(
-        num_deferred <= deferred_add_points.len(),
-        "DEFERRED_COUNT_EXCEEDS_ADDS",
-    );
+    assert!(num_deferred <= deferred_add_points.len(), "DEFERRED_COUNT_EXCEEDS_ADDS");
 
     let deferred_points_span = deferred_add_points.span();
     let mut def_idx: u32 = 0;
@@ -823,7 +1243,7 @@ pub fn verify_gkr_model_with_trace_dp(
                 }
                 eval_point.append(*deferred_claim.point.at(log_m + j));
                 j += 1;
-            };
+            }
             j = log_m;
             loop {
                 if j >= new_claim.point.len() {
@@ -831,12 +1251,9 @@ pub fn verify_gkr_model_with_trace_dp(
                 }
                 eval_point.append(*new_claim.point.at(j));
                 j += 1;
-            };
+            }
 
-            weight_claims.append(WeightClaimData {
-                eval_point,
-                expected_value: final_b_eval,
-            });
+            weight_claims.append(WeightClaimData { eval_point, expected_value: final_b_eval });
 
             // Read deferred weight commitment (bound by caller against registration)
             let deferred_weight_commitment = read_felt(ref reader);
@@ -855,7 +1272,7 @@ pub fn verify_gkr_model_with_trace_dp(
         }
 
         def_idx += 1;
-    };
+    }
 
     assert!(reader.offset == reader.data.len(), "PROOF_DATA_TRAILING");
     (current_claim, weight_claims, layer_tags, deferred_weight_commitments)
@@ -944,9 +1361,7 @@ pub fn verify_gkr_layers_batch(
 
         let tag = read_u32(ref reader);
         // Incrementally hash the tag
-        tags_hash = core::poseidon::poseidon_hash_span(
-            array![tags_hash, tag.into()].span(),
-        );
+        tags_hash = core::poseidon::poseidon_hash_span(array![tags_hash, tag.into()].span());
 
         // Diagnostic: track reader offset and channel state per layer
         // assert: offset sanity + which layer we're on
@@ -968,9 +1383,7 @@ pub fn verify_gkr_layers_batch(
 
             // Incrementally hash the packed expected_value
             let packed_ev = pack_qm31_to_felt(final_b_eval);
-            weight_hash = core::poseidon::poseidon_hash_span(
-                array![weight_hash, packed_ev].span(),
-            );
+            weight_hash = core::poseidon::poseidon_hash_span(array![weight_hash, packed_ev].span());
             weight_count += 1;
 
             current_claim = new_claim;
@@ -1008,7 +1421,7 @@ pub fn verify_gkr_layers_batch(
         }
 
         layer_idx += 1;
-    };
+    }
 
     assert!(reader.offset == reader.data.len(), "BATCH_PROOF_DATA_TRAILING");
 

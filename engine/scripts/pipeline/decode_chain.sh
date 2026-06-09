@@ -5,11 +5,11 @@
 # commitment chain links are consistent across steps.
 #
 # Usage:
-#   ./decode_chain.sh --model-dir /path/to/model --layers 5 --gpu \
+#   ./decode_chain.sh --model-dir /path/to/model --layers all --gpu \
 #     --prefill-len 8 --decode-steps 5 [--submit]
 #
 # Environment variables:
-#   LAYERS              Number of transformer layers (default: 1)
+#   LAYERS              Number of transformer layers, or all/full/0 (default: all)
 #   MODEL_DIR           Model directory
 #   PREFILL_LEN         Prefill length (default: 8)
 #   DECODE_STEPS        Number of decode tokens (default: 5)
@@ -21,7 +21,7 @@ BINARY="$REPO_ROOT/target/release/prove-model"
 
 # ─── Defaults ──────────────────────────────────────────────────────────
 MODEL_DIR=""
-LAYERS="1"
+LAYERS="${LAYERS:-all}"
 GPU_FLAG=""
 PREFILL_LEN="8"
 DECODE_STEPS="5"
@@ -34,7 +34,7 @@ usage() {
   echo ""
   echo "Options:"
   echo "  --model-dir PATH    Path to HuggingFace model directory (required)"
-  echo "  --layers N          Number of transformer layers (default: 1)"
+  echo "  --layers N|all      Number of transformer layers (default: all from config.json)"
   echo "  --gpu               Use GPU acceleration"
   echo "  --prefill-len N     Prefill length for KV cache seed (default: 8)"
   echo "  --decode-steps N    Number of decode tokens to prove (default: 5)"
@@ -66,6 +66,17 @@ if [[ -z "$MODEL_DIR" ]]; then
   usage
 fi
 
+case "$LAYERS" in
+  all|full|0|"")
+    LAYERS_LABEL="all"
+    LAYER_ARGS=()
+    ;;
+  *)
+    LAYERS_LABEL="${LAYERS}L"
+    LAYER_ARGS=(--layers "$LAYERS")
+    ;;
+esac
+
 # ─── Check binary ────────────────────────────────────────────────────
 if [[ ! -f "$BINARY" ]]; then
   echo "Binary not found at $BINARY"
@@ -84,11 +95,14 @@ KV_STATE="${KV_STATE:-$OUTPUT_DIR/kv_state.json}"
 echo ""
 echo "=== Decode Chain Pipeline ==="
 echo "  Model:       $MODEL_DIR"
-echo "  Layers:      $LAYERS"
+echo "  Layers:      $LAYERS_LABEL"
 echo "  Prefill:     $PREFILL_LEN tokens"
 echo "  Decode:      $DECODE_STEPS steps"
 echo "  KV state:    $KV_STATE"
 echo "  Output dir:  $OUTPUT_DIR"
+if [[ "$LAYERS" == "1" ]]; then
+  echo "  WARNING:     1-layer mode is diagnostic only; production H100 runs should use all layers."
+fi
 echo ""
 
 # ─── Run decode steps one at a time ─────────────────────────────────
@@ -98,13 +112,13 @@ for step in $(seq 0 $((DECODE_STEPS - 1))); do
 
   STEP_ARGS=(
     --model-dir "$MODEL_DIR"
-    --layers "$LAYERS"
     --format ml_gkr
     --decode
     --kv-cache "$KV_STATE"
     --decode-steps 1
     --output "$OUTPUT_DIR/proof_${step}.json"
   )
+  STEP_ARGS+=("${LAYER_ARGS[@]}")
 
   # Only pass --prefill-len for the first step (when no KV state exists yet)
   if [[ $step -eq 0 ]] && [[ ! -f "$KV_STATE" ]]; then

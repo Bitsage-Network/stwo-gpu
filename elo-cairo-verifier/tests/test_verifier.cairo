@@ -1,4 +1,4 @@
-use elo_cairo_verifier::field::{qm31_new, qm31_mul};
+use elo_cairo_verifier::field::{qm31_mul, qm31_new};
 use elo_cairo_verifier::sumcheck::check_round_sum;
 use elo_cairo_verifier::types::RoundPoly;
 

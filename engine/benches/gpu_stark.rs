@@ -28,7 +28,10 @@ fn make_column<B: ColumnOps<BaseField>>(log_size: u32) -> Col<B, BaseField> {
     let size = 1usize << log_size;
     let mut col = B::Column::zeros(size);
     for i in 0..size {
-        col.set(i, M31::from(((i as u64 * 7 + 13) % ((1u64 << 31) - 1)) as u32));
+        col.set(
+            i,
+            M31::from(((i as u64 * 7 + 13) % ((1u64 << 31) - 1)) as u32),
+        );
     }
     col
 }
@@ -98,9 +101,8 @@ fn bench_ifft(c: &mut Criterion) {
             |bench, &log_size| {
                 let col = make_column::<SimdBackend>(log_size);
                 let domain = CanonicCoset::new(log_size).circle_domain();
-                let eval = CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(
-                    domain, col,
-                );
+                let eval =
+                    CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(domain, col);
                 bench.iter(|| {
                     let _poly = SimdBackend::interpolate(eval.clone(), &twiddles);
                 });
@@ -120,10 +122,9 @@ fn bench_ifft(c: &mut Criterion) {
                     |bench, &log_size| {
                         let col = make_column::<GpuBackend>(log_size);
                         let domain = CanonicCoset::new(log_size).circle_domain();
-                        let eval =
-                            CircleEvaluation::<GpuBackend, BaseField, BitReversedOrder>::new(
-                                domain, col,
-                            );
+                        let eval = CircleEvaluation::<GpuBackend, BaseField, BitReversedOrder>::new(
+                            domain, col,
+                        );
                         bench.iter(|| {
                             let _poly = GpuBackend::interpolate(eval.clone(), &gpu_twiddles);
                         });

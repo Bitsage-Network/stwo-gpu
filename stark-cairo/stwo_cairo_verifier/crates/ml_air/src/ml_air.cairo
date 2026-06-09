@@ -8,14 +8,14 @@
 /// Matmul sumcheck proofs are verified separately (not via STARK).
 
 use core::num::traits::Zero;
-use stwo_verifier_core::verifier::Air;
 use stwo_verifier_core::circle::CirclePoint;
 use stwo_verifier_core::fields::qm31::QM31;
+use stwo_verifier_core::verifier::Air;
 use stwo_verifier_core::{ColumnSpan, TreeSpan};
 use super::claim::MLClaim;
 use super::components::activation::{
-    ActivationClaim, ActivationInteractionClaim, ActivationComponent,
-    ActivationLookupElements, evaluate_activation_constraints_at_point,
+    ActivationClaim, ActivationComponent, ActivationInteractionClaim, ActivationLookupElements,
+    evaluate_activation_constraints_at_point,
 };
 
 /// The ML Air — holds all components for constraint evaluation.
@@ -52,13 +52,9 @@ pub impl MLAirNewImpl of MLAirNewTrait {
                     },
                 );
             i += 1;
-        };
-
-        MLAir {
-            claim: *claim,
-            composition_log_degree_bound,
-            activation_components,
         }
+
+        MLAir { claim: *claim, composition_log_degree_bound, activation_components }
     }
 }
 
@@ -68,10 +64,6 @@ pub impl MLAirNewImpl of MLAirNewTrait {
 /// activation LogUp constraint evaluations weighted by powers of the random
 /// coefficient. This follows the exact pattern from CairoAir.
 pub impl MLAirAirImpl of Air<MLAir> {
-    fn composition_log_degree_bound(self: @MLAir) -> u32 {
-        *self.composition_log_degree_bound
-    }
-
     fn eval_composition_polynomial_at_point(
         self: @MLAir,
         point: CirclePoint<QM31>,
@@ -87,7 +79,10 @@ pub impl MLAirAirImpl of Air<MLAir> {
             mut interaction_trace_mask_values,
             _composition_trace_mask_values,
         ]: [ColumnSpan<Span<QM31>>; 4] =
-            (*mask_values.try_into().unwrap()).unbox();
+            (*mask_values
+            .try_into()
+            .unwrap())
+            .unbox();
 
         // Evaluate activation constraints for each layer.
         // Each call pops its columns from trace_mask_values and
@@ -103,7 +98,7 @@ pub impl MLAirAirImpl of Air<MLAir> {
                 point,
             );
             idx += 1;
-        };
+        }
 
         sum
     }
@@ -111,12 +106,12 @@ pub impl MLAirAirImpl of Air<MLAir> {
 
 #[cfg(test)]
 mod tests {
+    use stwo_constraint_framework::{LookupElements, LookupElementsTrait};
     use stwo_verifier_core::channel::Channel;
     use stwo_verifier_core::fields::qm31::qm31_const;
-    use stwo_constraint_framework::{LookupElements, LookupElementsTrait};
-    use super::{MLAirNewImpl, MLAirAirImpl, Air};
     use super::super::claim::MLClaim;
     use super::super::components::activation::{ActivationClaim, ActivationInteractionClaim};
+    use super::{Air, MLAirAirImpl, MLAirNewImpl};
 
     #[test]
     fn test_ml_air_construction_empty() {
@@ -131,13 +126,7 @@ mod tests {
         let mut channel: Channel = Default::default();
         let lookup_elements: LookupElements<2> = LookupElementsTrait::draw(ref channel);
 
-        let air = MLAirNewImpl::new(
-            @claim,
-            array![].span(),
-            array![].span(),
-            @lookup_elements,
-            10,
-        );
+        let air = MLAirNewImpl::new(@claim, array![].span(), array![].span(), @lookup_elements, 10);
 
         assert!(air.activation_components.len() == 0);
         assert!(air.composition_log_degree_bound == 10);
@@ -155,13 +144,7 @@ mod tests {
         let mut channel: Channel = Default::default();
         let lookup_elements: LookupElements<2> = LookupElementsTrait::draw(ref channel);
 
-        let air = MLAirNewImpl::new(
-            @claim,
-            array![].span(),
-            array![].span(),
-            @lookup_elements,
-            15,
-        );
+        let air = MLAirNewImpl::new(@claim, array![].span(), array![].span(), @lookup_elements, 15);
 
         assert!(Air::composition_log_degree_bound(@air) == 15);
     }

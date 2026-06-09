@@ -235,7 +235,10 @@ pub fn moe_forward(
 ) -> (Vec<TopKSelection>, M31Matrix) {
     let seq_len = input.rows;
     let num_experts = router_weights.cols;
-    assert_eq!(input.cols, router_weights.rows, "input dim must match router input dim");
+    assert_eq!(
+        input.cols, router_weights.rows,
+        "input dim must match router input dim"
+    );
 
     let mut selections = Vec::with_capacity(seq_len);
 
@@ -269,7 +272,9 @@ pub enum TopKError {
     },
     #[error("index {index} out of range (max {max})")]
     IndexOutOfRange { index: usize, max: usize },
-    #[error("value mismatch at {which}[{position}] (index {index}): expected {expected:?}, got {got:?}")]
+    #[error(
+        "value mismatch at {which}[{position}] (index {index}): expected {expected:?}, got {got:?}"
+    )]
     ValueMismatch {
         index: usize,
         expected: M31,
@@ -375,7 +380,12 @@ mod tests {
 
     #[test]
     fn test_verify_detects_missing_index() {
-        let logits = vec![M31::from(10u32), M31::from(50u32), M31::from(30u32), M31::from(40u32)];
+        let logits = vec![
+            M31::from(10u32),
+            M31::from(50u32),
+            M31::from(30u32),
+            M31::from(40u32),
+        ];
         let sel = TopKSelection {
             selected_indices: vec![1],
             selected_values: vec![M31::from(50u32)],
@@ -423,10 +433,10 @@ mod tests {
         // Values > P/2 are negative in signed interpretation
         let half_p = P / 2;
         let logits = vec![
-            M31::from(100u32),           // positive: 100
-            M31::from(P - 100),          // negative: -100
-            M31::from(half_p + 1000),    // negative: -(P - (half_p + 1000))
-            M31::from(50u32),            // positive: 50
+            M31::from(100u32),        // positive: 100
+            M31::from(P - 100),       // negative: -100
+            M31::from(half_p + 1000), // negative: -(P - (half_p + 1000))
+            M31::from(50u32),         // positive: 50
         ];
         let sel = select_top_k(&logits, 2);
         // Top 2 by signed value: 100, 50
@@ -438,9 +448,7 @@ mod tests {
     #[test]
     fn test_mixtral_style_top2() {
         // Mixtral uses 8 experts, top-2 selection
-        let logits: Vec<M31> = (0..8)
-            .map(|i| M31::from((i * 100 + 50) as u32))
-            .collect();
+        let logits: Vec<M31> = (0..8).map(|i| M31::from((i * 100 + 50) as u32)).collect();
         let sel = select_top_k(&logits, 2);
         assert_eq!(sel.selected_indices.len(), 2);
         assert_eq!(sel.rejected_indices.len(), 6);
@@ -464,10 +472,24 @@ mod tests {
         // Verify threshold: min selected ≥ max rejected
         let half_p = P / 2;
         let to_signed = |v: M31| -> i64 {
-            if v.0 <= half_p { v.0 as i64 } else { v.0 as i64 - P as i64 }
+            if v.0 <= half_p {
+                v.0 as i64
+            } else {
+                v.0 as i64 - P as i64
+            }
         };
-        let min_sel = sel.selected_values.iter().map(|&v| to_signed(v)).min().unwrap();
-        let max_rej = sel.rejected_values.iter().map(|&v| to_signed(v)).max().unwrap();
+        let min_sel = sel
+            .selected_values
+            .iter()
+            .map(|&v| to_signed(v))
+            .min()
+            .unwrap();
+        let max_rej = sel
+            .rejected_values
+            .iter()
+            .map(|&v| to_signed(v))
+            .max()
+            .unwrap();
         assert!(min_sel >= max_rej, "threshold: {min_sel} >= {max_rej}");
     }
 }

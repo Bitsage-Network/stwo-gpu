@@ -1,3 +1,6 @@
+use stwo_constraint_framework::{CommonLookupElements, LookupElementsTrait};
+use stwo_verifier_core::ColumnSpan;
+use stwo_verifier_core::circle::CirclePoint;
 /// Activation component for LogUp-based activation function verification.
 ///
 /// Verifies that each (input, output) pair exists in a precomputed activation
@@ -19,11 +22,8 @@
 use stwo_verifier_core::fields::Invertible;
 use stwo_verifier_core::fields::m31::m31;
 use stwo_verifier_core::fields::qm31::{QM31, QM31Serde, QM31Trait};
-use stwo_verifier_core::circle::CirclePoint;
 use stwo_verifier_core::poly::circle::{CanonicCosetImpl, CanonicCosetTrait};
 use stwo_verifier_core::utils::pow2;
-use stwo_verifier_core::ColumnSpan;
-use stwo_constraint_framework::{LookupElements, LookupElementsTrait};
 
 /// Claim about a single activation layer.
 #[derive(Drop, Serde, Copy)]
@@ -60,7 +60,7 @@ pub const N_ACTIVATION_PREPROCESSED_COLUMNS: u32 = 2;
 pub const N_ACTIVATION_INTERACTION_COLUMNS: u32 = 4;
 
 /// Activation lookup elements: combine(input, output) → z + alpha*input + alpha^2*output.
-pub type ActivationLookupElements = LookupElements<2>;
+pub type ActivationLookupElements = CommonLookupElements;
 
 /// Full activation component for constraint evaluation at an OOD point.
 #[derive(Drop)]
@@ -93,19 +93,23 @@ pub fn evaluate_activation_constraints_at_point(
 
     // Pop 3 trace columns: [input, output, multiplicity]
     // Each column has a single mask value at the current row.
-    let [col_input, col_output, col_mult]: [Span<QM31>; 3] =
-        (*trace_mask_values.multi_pop_front().unwrap()).unbox();
+    let [col_input, col_output, col_mult]: [Span<QM31>; 3] = (*trace_mask_values
+        .multi_pop_front()
+        .unwrap())
+        .unbox();
     let [input_val]: [QM31; 1] = (*col_input.try_into().unwrap()).unbox();
     let [output_val]: [QM31; 1] = (*col_output.try_into().unwrap()).unbox();
     let [mult_val]: [QM31; 1] = (*col_mult.try_into().unwrap()).unbox();
 
     // Combine lookup: z - (input + alpha * output)
-    let denom = component.lookup_elements.combine_qm31([input_val, output_val]);
+    let denom = component.lookup_elements.combine_qm31(array![input_val, output_val].span());
 
     // Pop 4 interaction trace columns (LogUp cumulative sum as QM31 partial evals).
     // Each has mask at [prev_row, current_row].
-    let [t2c0, t2c1, t2c2, t2c3]: [Span<QM31>; 4] =
-        (*interaction_trace_mask_values.multi_pop_front().unwrap()).unbox();
+    let [t2c0, t2c1, t2c2, t2c3]: [Span<QM31>; 4] = (*interaction_trace_mask_values
+        .multi_pop_front()
+        .unwrap())
+        .unbox();
     let [t2c0_prev, t2c0_curr]: [QM31; 2] = (*t2c0.try_into().unwrap()).unbox();
     let [t2c1_prev, t2c1_curr]: [QM31; 2] = (*t2c1.try_into().unwrap()).unbox();
     let [t2c2_prev, t2c2_curr]: [QM31; 2] = (*t2c2.try_into().unwrap()).unbox();
@@ -129,10 +133,10 @@ pub fn evaluate_activation_constraints_at_point(
 
 #[cfg(test)]
 mod tests {
+    use stwo_constraint_framework::{CommonLookupElements, LookupElementsTrait};
     use stwo_verifier_core::channel::Channel;
     use stwo_verifier_core::fields::qm31::{QM31, qm31_const};
-    use stwo_constraint_framework::{LookupElements, LookupElementsTrait};
-    use super::{ActivationClaim, ActivationInteractionClaim, ActivationComponent};
+    use super::{ActivationClaim, ActivationComponent, ActivationInteractionClaim};
 
     #[test]
     fn test_activation_component_construction() {
@@ -141,7 +145,7 @@ mod tests {
             claimed_sum: qm31_const::<42, 0, 0, 0>(),
         };
         let mut channel: Channel = Default::default();
-        let lookup_elements: LookupElements<2> = LookupElementsTrait::draw(ref channel);
+        let lookup_elements: CommonLookupElements = LookupElementsTrait::draw(ref channel);
 
         let component = ActivationComponent { claim, interaction_claim, lookup_elements };
         assert!(component.claim.log_size == 4);

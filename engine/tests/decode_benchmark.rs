@@ -15,14 +15,15 @@
 
 use std::time::Instant;
 
-use stwo::core::fields::m31::M31;
-use obelyzk::aggregation::{IncrementalKVCommitment, prove_model_pure_gkr_decode_step_incremental as prove_model_pure_gkr_decode_step};
-use obelyzk::components::attention::{
-    attention_forward_cached, AttentionWeights, ModelKVCache,
+use obelyzk::aggregation::{
+    prove_model_pure_gkr_decode_step_incremental as prove_model_pure_gkr_decode_step,
+    IncrementalKVCommitment,
 };
-use obelyzk::components::matmul::M31Matrix;
 use obelyzk::compiler::graph::GraphBuilder;
 use obelyzk::compiler::onnx::generate_weights_for_graph;
+use obelyzk::components::attention::{attention_forward_cached, AttentionWeights, ModelKVCache};
+use obelyzk::components::matmul::M31Matrix;
+use stwo::core::fields::m31::M31;
 
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
@@ -53,7 +54,10 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 #[ignore]
 fn decode_benchmark() {
     // BENCH_FORCE_CPU=1 forces CPU path for A/B comparison
-    let force_cpu = std::env::var("BENCH_FORCE_CPU").ok().map(|v| v == "1").unwrap_or(false);
+    let force_cpu = std::env::var("BENCH_FORCE_CPU")
+        .ok()
+        .map(|v| v == "1")
+        .unwrap_or(false);
     let _cpu_guard = if force_cpu {
         eprintln!("  [BENCH] BENCH_FORCE_CPU=1 — forcing CPU path");
         std::env::set_var("OBELYSK_FORCE_GPU", "0");
@@ -68,7 +72,11 @@ fn decode_benchmark() {
     let prefill_len = env_usize("BENCH_PREFILL_LEN", 8);
     let decode_steps = env_usize("BENCH_DECODE_STEPS", 10);
 
-    let backend_label = if force_cpu { "CPU (forced)" } else { "auto (GPU if available)" };
+    let backend_label = if force_cpu {
+        "CPU (forced)"
+    } else {
+        "auto (GPU if available)"
+    };
     eprintln!("=== Decode Benchmark [{}] ===", backend_label);
     eprintln!(
         "  d_model={}, heads={}, d_ff={}, prefill={}, steps={}",
@@ -179,7 +187,10 @@ fn decode_benchmark() {
     }
 
     // Report
-    let times_ms: Vec<f64> = decode_times.iter().map(|d| d.as_secs_f64() * 1000.0).collect();
+    let times_ms: Vec<f64> = decode_times
+        .iter()
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .collect();
     let avg = times_ms.iter().sum::<f64>() / times_ms.len() as f64;
     let min = times_ms.iter().cloned().fold(f64::INFINITY, f64::min);
     let max = times_ms.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -209,10 +220,16 @@ fn decode_benchmark() {
         let p50 = percentile(&sorted, 50.0);
         let p95 = percentile(&sorted, 95.0);
         let p99 = percentile(&sorted, 99.0);
-        eprintln!("  Per-token (cached): p50={:.1}ms, p95={:.1}ms, p99={:.1}ms", p50, p95, p99);
+        eprintln!(
+            "  Per-token (cached): p50={:.1}ms, p95={:.1}ms, p99={:.1}ms",
+            p50, p95, p99
+        );
     }
 
-    eprintln!("  Per-step (all): avg={:.1}ms, min={:.1}ms, max={:.1}ms", avg, min, max);
+    eprintln!(
+        "  Per-step (all): avg={:.1}ms, min={:.1}ms, max={:.1}ms",
+        avg, min, max
+    );
     eprintln!("  Throughput: {:.2} tokens/sec (proving)", tokens_per_sec);
     eprintln!("================================");
 
@@ -262,10 +279,26 @@ fn decode_prove_verify_roundtrip() {
     for &node_id in &topo {
         let node = &graph.nodes[node_id];
         if let obelyzk::compiler::graph::GraphOp::Attention { config: _ } = &node.op {
-            weights.add_named_weight(node.id, "w_q", random_m31_matrix(d_model, d_model, 200 + node.id as u64));
-            weights.add_named_weight(node.id, "w_k", random_m31_matrix(d_model, d_model, 300 + node.id as u64));
-            weights.add_named_weight(node.id, "w_v", random_m31_matrix(d_model, d_model, 400 + node.id as u64));
-            weights.add_named_weight(node.id, "w_o", random_m31_matrix(d_model, d_model, 500 + node.id as u64));
+            weights.add_named_weight(
+                node.id,
+                "w_q",
+                random_m31_matrix(d_model, d_model, 200 + node.id as u64),
+            );
+            weights.add_named_weight(
+                node.id,
+                "w_k",
+                random_m31_matrix(d_model, d_model, 300 + node.id as u64),
+            );
+            weights.add_named_weight(
+                node.id,
+                "w_v",
+                random_m31_matrix(d_model, d_model, 400 + node.id as u64),
+            );
+            weights.add_named_weight(
+                node.id,
+                "w_o",
+                random_m31_matrix(d_model, d_model, 500 + node.id as u64),
+            );
         }
     }
 
@@ -282,7 +315,13 @@ fn decode_prove_verify_roundtrip() {
                 w_o: weights.get_named_weight(node.id, "w_o").unwrap().clone(),
             };
             let cache = kv_cache.get_or_create(node.id, config);
-            let _ = attention_forward_cached(&prefill_input, &attn_weights, config, cache, config.causal);
+            let _ = attention_forward_cached(
+                &prefill_input,
+                &attn_weights,
+                config,
+                cache,
+                config.causal,
+            );
         }
     }
 
@@ -290,7 +329,12 @@ fn decode_prove_verify_roundtrip() {
     let token_input = random_m31_matrix(1, d_model, 999);
     let mut kv_commitment = IncrementalKVCommitment::from_kv_cache(&kv_cache, 16);
     let result = prove_model_pure_gkr_decode_step(
-        &graph, &token_input, &weights, &mut kv_cache, &mut kv_commitment, None,
+        &graph,
+        &token_input,
+        &weights,
+        &mut kv_cache,
+        &mut kv_commitment,
+        None,
         None,
     );
     let (proof, kv_commit) = result.expect("decode proving should succeed");
@@ -327,8 +371,7 @@ fn decode_prove_verify_roundtrip() {
                 "full_seq_len should be prefill + 1"
             );
             assert_eq!(
-                *position_offset,
-                prefill_len,
+                *position_offset, prefill_len,
                 "position_offset should equal prefill_len"
             );
             assert_eq!(
@@ -378,10 +421,26 @@ fn decode_kv_commitment_chain() {
     for &node_id in &topo {
         let node = &graph.nodes[node_id];
         if let obelyzk::compiler::graph::GraphOp::Attention { config: _ } = &node.op {
-            weights.add_named_weight(node.id, "w_q", random_m31_matrix(d_model, d_model, 200 + node.id as u64));
-            weights.add_named_weight(node.id, "w_k", random_m31_matrix(d_model, d_model, 300 + node.id as u64));
-            weights.add_named_weight(node.id, "w_v", random_m31_matrix(d_model, d_model, 400 + node.id as u64));
-            weights.add_named_weight(node.id, "w_o", random_m31_matrix(d_model, d_model, 500 + node.id as u64));
+            weights.add_named_weight(
+                node.id,
+                "w_q",
+                random_m31_matrix(d_model, d_model, 200 + node.id as u64),
+            );
+            weights.add_named_weight(
+                node.id,
+                "w_k",
+                random_m31_matrix(d_model, d_model, 300 + node.id as u64),
+            );
+            weights.add_named_weight(
+                node.id,
+                "w_v",
+                random_m31_matrix(d_model, d_model, 400 + node.id as u64),
+            );
+            weights.add_named_weight(
+                node.id,
+                "w_o",
+                random_m31_matrix(d_model, d_model, 500 + node.id as u64),
+            );
         }
     }
 
@@ -398,11 +457,18 @@ fn decode_kv_commitment_chain() {
                 w_o: weights.get_named_weight(node.id, "w_o").unwrap().clone(),
             };
             let cache = kv_cache.get_or_create(node.id, config);
-            let _ = attention_forward_cached(&prefill_input, &attn_weights, config, cache, config.causal);
+            let _ = attention_forward_cached(
+                &prefill_input,
+                &attn_weights,
+                config,
+                cache,
+                config.causal,
+            );
         }
     }
 
-    let mut kv_commitment = IncrementalKVCommitment::from_kv_cache(&kv_cache, prefill_len + decode_steps);
+    let mut kv_commitment =
+        IncrementalKVCommitment::from_kv_cache(&kv_cache, prefill_len + decode_steps);
     let initial_commitment = kv_commitment.commitment();
     let weight_cache = obelyzk::weight_cache::shared_cache("chain-test");
 
@@ -410,13 +476,16 @@ fn decode_kv_commitment_chain() {
     let mut prev_commitment = initial_commitment;
     for step in 0..decode_steps {
         let token_input = random_m31_matrix(1, d_model, 1000 + step as u64);
-        let (proof, new_commitment) =
-            prove_model_pure_gkr_decode_step(
-                &graph, &token_input, &weights, &mut kv_cache, &mut kv_commitment,
-                Some(&weight_cache),
-                None,
-            )
-                .unwrap_or_else(|e| panic!("step {} failed: {:?}", step, e));
+        let (proof, new_commitment) = prove_model_pure_gkr_decode_step(
+            &graph,
+            &token_input,
+            &weights,
+            &mut kv_cache,
+            &mut kv_commitment,
+            Some(&weight_cache),
+            None,
+        )
+        .unwrap_or_else(|e| panic!("step {} failed: {:?}", step, e));
 
         let gkr_proof = proof.gkr_proof.as_ref().unwrap();
 
@@ -452,7 +521,8 @@ fn decode_kv_commitment_chain() {
             } = lp
             {
                 assert_eq!(
-                    *position_offset + *new_tokens, *full_seq_len,
+                    *position_offset + *new_tokens,
+                    *full_seq_len,
                     "Step {}: position_offset + new_tokens != full_seq_len",
                     step
                 );
@@ -475,18 +545,15 @@ fn decode_kv_commitment_chain() {
         );
         prev_commitment = new_commitment;
     }
-    eprintln!(
-        "KV commitment chain ({} steps): PASSED",
-        decode_steps
-    );
+    eprintln!("KV commitment chain ({} steps): PASSED", decode_steps);
 }
 
 /// Basic test: IncrementalPoseidonMerkle root matches full PoseidonMerkleTree::build.
 #[test]
 fn incremental_merkle_basic() {
+    use obelyzk::crypto::poseidon_merkle::{IncrementalPoseidonMerkle, PoseidonMerkleTree};
     use starknet_crypto::poseidon_hash;
     use starknet_ff::FieldElement;
-    use obelyzk::crypto::poseidon_merkle::{IncrementalPoseidonMerkle, PoseidonMerkleTree};
 
     for n in [1usize, 2, 3, 4, 7, 8, 15, 16, 32] {
         let leaves: Vec<FieldElement> = (0..n).map(|i| FieldElement::from(i as u64 + 1)).collect();
@@ -538,8 +605,8 @@ fn incremental_merkle_basic() {
 /// Test that automatic capacity growth preserves root consistency.
 #[test]
 fn incremental_merkle_grow() {
-    use starknet_ff::FieldElement;
     use obelyzk::crypto::poseidon_merkle::{IncrementalPoseidonMerkle, PoseidonMerkleTree};
+    use starknet_ff::FieldElement;
 
     // Start with capacity 4, push 8 leaves (forces one grow)
     let mut inc = IncrementalPoseidonMerkle::new(4);
@@ -557,11 +624,19 @@ fn incremental_merkle_grow() {
     for &leaf in &leaves {
         inc_8.push(leaf);
     }
-    assert_eq!(inc.root(), inc_8.root(), "grown tree root should match pre-sized tree");
+    assert_eq!(
+        inc.root(),
+        inc_8.root(),
+        "grown tree root should match pre-sized tree"
+    );
 
     // Also verify against PoseidonMerkleTree::build
     let full = PoseidonMerkleTree::build(leaves.clone());
-    assert_eq!(inc.root(), full.root(), "grown tree should match full build");
+    assert_eq!(
+        inc.root(),
+        full.root(),
+        "grown tree should match full build"
+    );
 
     // Push more — force a second grow (to capacity 16)
     let extra: Vec<FieldElement> = (8..12).map(|i| FieldElement::from(i as u64 + 1)).collect();
@@ -596,10 +671,26 @@ fn incremental_kv_commitment_matches() {
     for &node_id in &topo {
         let node = &graph.nodes[node_id];
         if let obelyzk::compiler::graph::GraphOp::Attention { config: _ } = &node.op {
-            weights.add_named_weight(node.id, "w_q", random_m31_matrix(d_model, d_model, 200 + node.id as u64));
-            weights.add_named_weight(node.id, "w_k", random_m31_matrix(d_model, d_model, 300 + node.id as u64));
-            weights.add_named_weight(node.id, "w_v", random_m31_matrix(d_model, d_model, 400 + node.id as u64));
-            weights.add_named_weight(node.id, "w_o", random_m31_matrix(d_model, d_model, 500 + node.id as u64));
+            weights.add_named_weight(
+                node.id,
+                "w_q",
+                random_m31_matrix(d_model, d_model, 200 + node.id as u64),
+            );
+            weights.add_named_weight(
+                node.id,
+                "w_k",
+                random_m31_matrix(d_model, d_model, 300 + node.id as u64),
+            );
+            weights.add_named_weight(
+                node.id,
+                "w_v",
+                random_m31_matrix(d_model, d_model, 400 + node.id as u64),
+            );
+            weights.add_named_weight(
+                node.id,
+                "w_o",
+                random_m31_matrix(d_model, d_model, 500 + node.id as u64),
+            );
         }
     }
 
@@ -616,7 +707,13 @@ fn incremental_kv_commitment_matches() {
                 w_o: weights.get_named_weight(node.id, "w_o").unwrap().clone(),
             };
             let cache = kv_cache.get_or_create(node.id, config);
-            let _ = attention_forward_cached(&prefill_input, &attn_weights, config, cache, config.causal);
+            let _ = attention_forward_cached(
+                &prefill_input,
+                &attn_weights,
+                config,
+                cache,
+                config.causal,
+            );
         }
     }
 
@@ -653,7 +750,8 @@ fn incremental_kv_commitment_matches() {
             };
             let cache = kv_cache.get_or_create(node.id, config);
             let step_input = random_m31_matrix(1, d_model, 777);
-            let _ = attention_forward_cached(&step_input, &attn_weights, config, cache, config.causal);
+            let _ =
+                attention_forward_cached(&step_input, &attn_weights, config, cache, config.causal);
         }
     }
     kv_mut.append_step(&kv_cache, 1);
@@ -698,7 +796,11 @@ fn decode_benchmark_prefill_vs_decode() {
     );
     let prefill_elapsed = t_prefill.elapsed();
     match &prefill_result {
-        Ok(_) => eprintln!("  Prefill ({} tokens): {:.1}ms", decode_steps, prefill_elapsed.as_secs_f64() * 1000.0),
+        Ok(_) => eprintln!(
+            "  Prefill ({} tokens): {:.1}ms",
+            decode_steps,
+            prefill_elapsed.as_secs_f64() * 1000.0
+        ),
         Err(e) => eprintln!("  Prefill FAILED: {:?}", e),
     }
 
@@ -712,10 +814,26 @@ fn decode_benchmark_prefill_vs_decode() {
     for &node_id in &topo {
         let node = &decode_graph.nodes[node_id];
         if let obelyzk::compiler::graph::GraphOp::Attention { config: _ } = &node.op {
-            decode_weights.add_named_weight(node.id, "w_q", random_m31_matrix(d_model, d_model, 200 + node.id as u64));
-            decode_weights.add_named_weight(node.id, "w_k", random_m31_matrix(d_model, d_model, 300 + node.id as u64));
-            decode_weights.add_named_weight(node.id, "w_v", random_m31_matrix(d_model, d_model, 400 + node.id as u64));
-            decode_weights.add_named_weight(node.id, "w_o", random_m31_matrix(d_model, d_model, 500 + node.id as u64));
+            decode_weights.add_named_weight(
+                node.id,
+                "w_q",
+                random_m31_matrix(d_model, d_model, 200 + node.id as u64),
+            );
+            decode_weights.add_named_weight(
+                node.id,
+                "w_k",
+                random_m31_matrix(d_model, d_model, 300 + node.id as u64),
+            );
+            decode_weights.add_named_weight(
+                node.id,
+                "w_v",
+                random_m31_matrix(d_model, d_model, 400 + node.id as u64),
+            );
+            decode_weights.add_named_weight(
+                node.id,
+                "w_o",
+                random_m31_matrix(d_model, d_model, 500 + node.id as u64),
+            );
         }
     }
 
@@ -725,25 +843,43 @@ fn decode_benchmark_prefill_vs_decode() {
         let node = &decode_graph.nodes[node_id];
         if let obelyzk::compiler::graph::GraphOp::Attention { config } = &node.op {
             let attn_weights = AttentionWeights {
-                w_q: decode_weights.get_named_weight(node.id, "w_q").unwrap().clone(),
-                w_k: decode_weights.get_named_weight(node.id, "w_k").unwrap().clone(),
-                w_v: decode_weights.get_named_weight(node.id, "w_v").unwrap().clone(),
-                w_o: decode_weights.get_named_weight(node.id, "w_o").unwrap().clone(),
+                w_q: decode_weights
+                    .get_named_weight(node.id, "w_q")
+                    .unwrap()
+                    .clone(),
+                w_k: decode_weights
+                    .get_named_weight(node.id, "w_k")
+                    .unwrap()
+                    .clone(),
+                w_v: decode_weights
+                    .get_named_weight(node.id, "w_v")
+                    .unwrap()
+                    .clone(),
+                w_o: decode_weights
+                    .get_named_weight(node.id, "w_o")
+                    .unwrap()
+                    .clone(),
             };
             let cache = kv_cache.get_or_create(node.id, config);
-            let _ = attention_forward_cached(&seed_input, &attn_weights, config, cache, config.causal);
+            let _ =
+                attention_forward_cached(&seed_input, &attn_weights, config, cache, config.causal);
         }
     }
 
-    let mut kv_commitment = IncrementalKVCommitment::from_kv_cache(&kv_cache, prefill_len + decode_steps);
+    let mut kv_commitment =
+        IncrementalKVCommitment::from_kv_cache(&kv_cache, prefill_len + decode_steps);
     let decode_cache = obelyzk::weight_cache::shared_cache("decode-bench-cmp");
 
     let t_decode_total = Instant::now();
     for step in 0..decode_steps {
         let token_input = random_m31_matrix(1, d_model, 1000 + step as u64);
         let result = prove_model_pure_gkr_decode_step(
-            &decode_graph, &token_input, &decode_weights,
-            &mut kv_cache, &mut kv_commitment, Some(&decode_cache),
+            &decode_graph,
+            &token_input,
+            &decode_weights,
+            &mut kv_cache,
+            &mut kv_commitment,
+            Some(&decode_cache),
             None,
         );
         if let Err(e) = &result {
@@ -805,10 +941,26 @@ fn setup_decode_proof() -> (
     for &node_id in &topo {
         let node = &graph.nodes[node_id];
         if let obelyzk::compiler::graph::GraphOp::Attention { .. } = &node.op {
-            weights.add_named_weight(node.id, "w_q", random_m31_matrix(d_model, d_model, 200 + node.id as u64));
-            weights.add_named_weight(node.id, "w_k", random_m31_matrix(d_model, d_model, 300 + node.id as u64));
-            weights.add_named_weight(node.id, "w_v", random_m31_matrix(d_model, d_model, 400 + node.id as u64));
-            weights.add_named_weight(node.id, "w_o", random_m31_matrix(d_model, d_model, 500 + node.id as u64));
+            weights.add_named_weight(
+                node.id,
+                "w_q",
+                random_m31_matrix(d_model, d_model, 200 + node.id as u64),
+            );
+            weights.add_named_weight(
+                node.id,
+                "w_k",
+                random_m31_matrix(d_model, d_model, 300 + node.id as u64),
+            );
+            weights.add_named_weight(
+                node.id,
+                "w_v",
+                random_m31_matrix(d_model, d_model, 400 + node.id as u64),
+            );
+            weights.add_named_weight(
+                node.id,
+                "w_o",
+                random_m31_matrix(d_model, d_model, 500 + node.id as u64),
+            );
         }
     }
 
@@ -824,7 +976,13 @@ fn setup_decode_proof() -> (
                 w_o: weights.get_named_weight(node.id, "w_o").unwrap().clone(),
             };
             let cache = kv_cache.get_or_create(node.id, config);
-            let _ = attention_forward_cached(&prefill_input, &attn_weights, config, cache, config.causal);
+            let _ = attention_forward_cached(
+                &prefill_input,
+                &attn_weights,
+                config,
+                cache,
+                config.causal,
+            );
         }
     }
 
@@ -832,7 +990,12 @@ fn setup_decode_proof() -> (
     let mut kv_commitment = IncrementalKVCommitment::from_kv_cache(&kv_cache, 16);
 
     let (proof, kv_commit) = prove_model_pure_gkr_decode_step(
-        &graph, &token_input, &weights, &mut kv_cache, &mut kv_commitment, None,
+        &graph,
+        &token_input,
+        &weights,
+        &mut kv_cache,
+        &mut kv_commitment,
+        None,
         None,
     )
     .expect("setup: decode proving should succeed");
@@ -860,7 +1023,10 @@ fn decode_tamper_position_offset_rejected() {
             tampered = true;
         }
     }
-    assert!(tampered, "should have found at least one AttentionDecode layer to tamper");
+    assert!(
+        tampered,
+        "should have found at least one AttentionDecode layer to tamper"
+    );
 
     // Verify should fail
     let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&graph).unwrap();
@@ -873,9 +1039,16 @@ fn decode_tamper_position_offset_rejected() {
     }
 
     let result = obelyzk::gkr::verify_gkr_with_weights(
-        &circuit, gkr_proof, &proof.execution.output, &weights, &mut channel,
+        &circuit,
+        gkr_proof,
+        &proof.execution.output,
+        &weights,
+        &mut channel,
     );
-    assert!(result.is_err(), "tampered position_offset should fail verification");
+    assert!(
+        result.is_err(),
+        "tampered position_offset should fail verification"
+    );
     let err_msg = result.unwrap_err().to_string();
     assert!(
         err_msg.contains("position_offset") || err_msg.contains("verification failed"),
@@ -911,7 +1084,11 @@ fn decode_tamper_kv_commitment_rejected() {
     }
 
     let result = obelyzk::gkr::verify_gkr_with_weights(
-        &circuit, gkr_proof, &proof.execution.output, &weights, &mut channel,
+        &circuit,
+        gkr_proof,
+        &proof.execution.output,
+        &weights,
+        &mut channel,
     );
     // The transcript divergence should cause sumcheck/claim verification to fail
     assert!(
@@ -933,15 +1110,17 @@ fn decode_tamper_new_tokens_rejected() {
     let mut tampered = false;
     for lp in &mut gkr_proof.layer_proofs {
         if let obelyzk::gkr::types::LayerProof::AttentionDecode {
-            ref mut new_tokens,
-            ..
+            ref mut new_tokens, ..
         } = lp
         {
             *new_tokens = 5;
             tampered = true;
         }
     }
-    assert!(tampered, "should have found AttentionDecode layer to tamper");
+    assert!(
+        tampered,
+        "should have found AttentionDecode layer to tamper"
+    );
 
     let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&graph).unwrap();
     let mut channel = obelyzk::crypto::poseidon_channel::PoseidonChannel::new();
@@ -953,12 +1132,22 @@ fn decode_tamper_new_tokens_rejected() {
     }
 
     let result = obelyzk::gkr::verify_gkr_with_weights(
-        &circuit, gkr_proof, &proof.execution.output, &weights, &mut channel,
+        &circuit,
+        gkr_proof,
+        &proof.execution.output,
+        &weights,
+        &mut channel,
     );
-    assert!(result.is_err(), "tampered new_tokens should fail verification");
+    assert!(
+        result.is_err(),
+        "tampered new_tokens should fail verification"
+    );
     let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg.contains("position_offset") || err_msg.contains("new_tokens") || err_msg.contains("full_seq_len") || err_msg.contains("verification failed"),
+        err_msg.contains("position_offset")
+            || err_msg.contains("new_tokens")
+            || err_msg.contains("full_seq_len")
+            || err_msg.contains("verification failed"),
         "error should mention position/token mismatch, got: {err_msg}"
     );
     eprintln!("decode_tamper_new_tokens_rejected: PASSED");
@@ -984,7 +1173,11 @@ fn decode_tamper_prev_kv_commitment_rejected() {
     channel.mix_felt(gkr_proof.prev_kv_cache_commitment.unwrap());
 
     let result = obelyzk::gkr::verify_gkr_with_weights(
-        &circuit, gkr_proof, &proof.execution.output, &weights, &mut channel,
+        &circuit,
+        gkr_proof,
+        &proof.execution.output,
+        &weights,
+        &mut channel,
     );
     assert!(
         result.is_err(),
@@ -1023,9 +1216,16 @@ fn decode_tamper_full_seq_len_rejected() {
     }
 
     let result = obelyzk::gkr::verify_gkr_with_weights(
-        &circuit, gkr_proof, &proof.execution.output, &weights, &mut channel,
+        &circuit,
+        gkr_proof,
+        &proof.execution.output,
+        &weights,
+        &mut channel,
     );
-    assert!(result.is_err(), "tampered full_seq_len should fail verification");
+    assert!(
+        result.is_err(),
+        "tampered full_seq_len should fail verification"
+    );
     eprintln!("decode_tamper_full_seq_len_rejected: PASSED");
 }
 
@@ -1033,8 +1233,8 @@ fn decode_tamper_full_seq_len_rejected() {
 /// should cause sumcheck verification failure.
 #[test]
 fn decode_tamper_sub_claim_value_rejected() {
-    use stwo::core::fields::qm31::SecureField;
     use stwo::core::fields::m31::M31;
+    use stwo::core::fields::qm31::SecureField;
 
     let (graph, weights, mut proof, _input, _kv) = setup_decode_proof();
 
@@ -1066,7 +1266,11 @@ fn decode_tamper_sub_claim_value_rejected() {
     }
 
     let result = obelyzk::gkr::verify_gkr_with_weights(
-        &circuit, gkr_proof, &proof.execution.output, &weights, &mut channel,
+        &circuit,
+        gkr_proof,
+        &proof.execution.output,
+        &weights,
+        &mut channel,
     );
     assert!(
         result.is_err(),
@@ -1099,10 +1303,26 @@ fn decode_multi_token_batch() {
     for &node_id in &topo {
         let node = &graph.nodes[node_id];
         if let obelyzk::compiler::graph::GraphOp::Attention { .. } = &node.op {
-            weights.add_named_weight(node.id, "w_q", random_m31_matrix(d_model, d_model, 200 + node.id as u64));
-            weights.add_named_weight(node.id, "w_k", random_m31_matrix(d_model, d_model, 300 + node.id as u64));
-            weights.add_named_weight(node.id, "w_v", random_m31_matrix(d_model, d_model, 400 + node.id as u64));
-            weights.add_named_weight(node.id, "w_o", random_m31_matrix(d_model, d_model, 500 + node.id as u64));
+            weights.add_named_weight(
+                node.id,
+                "w_q",
+                random_m31_matrix(d_model, d_model, 200 + node.id as u64),
+            );
+            weights.add_named_weight(
+                node.id,
+                "w_k",
+                random_m31_matrix(d_model, d_model, 300 + node.id as u64),
+            );
+            weights.add_named_weight(
+                node.id,
+                "w_v",
+                random_m31_matrix(d_model, d_model, 400 + node.id as u64),
+            );
+            weights.add_named_weight(
+                node.id,
+                "w_o",
+                random_m31_matrix(d_model, d_model, 500 + node.id as u64),
+            );
         }
     }
 
@@ -1119,7 +1339,13 @@ fn decode_multi_token_batch() {
                 w_o: weights.get_named_weight(node.id, "w_o").unwrap().clone(),
             };
             let cache = kv_cache.get_or_create(node.id, config);
-            let _ = attention_forward_cached(&prefill_input, &attn_weights, config, cache, config.causal);
+            let _ = attention_forward_cached(
+                &prefill_input,
+                &attn_weights,
+                config,
+                cache,
+                config.causal,
+            );
         }
     }
 
@@ -1128,14 +1354,22 @@ fn decode_multi_token_batch() {
     let mut kv_commitment = IncrementalKVCommitment::from_kv_cache(&kv_cache, 16);
 
     let result = prove_model_pure_gkr_decode_step(
-        &graph, &batch_input, &weights, &mut kv_cache, &mut kv_commitment, None,
+        &graph,
+        &batch_input,
+        &weights,
+        &mut kv_cache,
+        &mut kv_commitment,
+        None,
         None,
     );
     let (proof, kv_commit) = result.expect("multi-token decode proving should succeed");
 
     // Verify the proof
     let gkr_proof = proof.gkr_proof.as_ref().expect("should have GKR proof");
-    assert!(!gkr_proof.layer_proofs.is_empty(), "should have layer proofs");
+    assert!(
+        !gkr_proof.layer_proofs.is_empty(),
+        "should have layer proofs"
+    );
 
     // Check AttentionDecode metadata
     for lp in &gkr_proof.layer_proofs {
@@ -1153,12 +1387,12 @@ fn decode_multi_token_batch() {
                 "full_seq_len = prefill + new_tokens"
             );
             assert_eq!(
-                *position_offset,
-                prefill_len,
+                *position_offset, prefill_len,
                 "position_offset = prefill_len"
             );
             assert_eq!(
-                *position_offset + *nt, *full_seq_len,
+                *position_offset + *nt,
+                *full_seq_len,
                 "position_offset + new_tokens == full_seq_len"
             );
             eprintln!(
@@ -1175,7 +1409,11 @@ fn decode_multi_token_batch() {
     channel.mix_felt(gkr_proof.prev_kv_cache_commitment.unwrap());
 
     let verify_result = obelyzk::gkr::verify_gkr_with_weights(
-        &circuit, gkr_proof, &proof.execution.output, &weights, &mut channel,
+        &circuit,
+        gkr_proof,
+        &proof.execution.output,
+        &weights,
+        &mut channel,
     );
     assert!(
         verify_result.is_ok(),
@@ -1190,7 +1428,10 @@ fn decode_multi_token_batch() {
         "KV commitment should be non-zero"
     );
 
-    eprintln!("decode_multi_token_batch: PASSED (new_tokens={})", new_tokens);
+    eprintln!(
+        "decode_multi_token_batch: PASSED (new_tokens={})",
+        new_tokens
+    );
 }
 
 /// Multi-token decode followed by single-token decode: chain consistency.
@@ -1211,10 +1452,26 @@ fn decode_multi_then_single_chain() {
     for &node_id in &topo {
         let node = &graph.nodes[node_id];
         if let obelyzk::compiler::graph::GraphOp::Attention { .. } = &node.op {
-            weights.add_named_weight(node.id, "w_q", random_m31_matrix(d_model, d_model, 200 + node.id as u64));
-            weights.add_named_weight(node.id, "w_k", random_m31_matrix(d_model, d_model, 300 + node.id as u64));
-            weights.add_named_weight(node.id, "w_v", random_m31_matrix(d_model, d_model, 400 + node.id as u64));
-            weights.add_named_weight(node.id, "w_o", random_m31_matrix(d_model, d_model, 500 + node.id as u64));
+            weights.add_named_weight(
+                node.id,
+                "w_q",
+                random_m31_matrix(d_model, d_model, 200 + node.id as u64),
+            );
+            weights.add_named_weight(
+                node.id,
+                "w_k",
+                random_m31_matrix(d_model, d_model, 300 + node.id as u64),
+            );
+            weights.add_named_weight(
+                node.id,
+                "w_v",
+                random_m31_matrix(d_model, d_model, 400 + node.id as u64),
+            );
+            weights.add_named_weight(
+                node.id,
+                "w_o",
+                random_m31_matrix(d_model, d_model, 500 + node.id as u64),
+            );
         }
     }
 
@@ -1230,7 +1487,13 @@ fn decode_multi_then_single_chain() {
                 w_o: weights.get_named_weight(node.id, "w_o").unwrap().clone(),
             };
             let cache = kv_cache.get_or_create(node.id, config);
-            let _ = attention_forward_cached(&prefill_input, &attn_weights, config, cache, config.causal);
+            let _ = attention_forward_cached(
+                &prefill_input,
+                &attn_weights,
+                config,
+                cache,
+                config.causal,
+            );
         }
     }
 
@@ -1240,16 +1503,28 @@ fn decode_multi_then_single_chain() {
     // Step 0: first single decode
     let t0_input = random_m31_matrix(1, d_model, 1000);
     let (proof0, commit0) = prove_model_pure_gkr_decode_step(
-        &graph, &t0_input, &weights, &mut kv_cache, &mut kv_commitment, Some(&weight_cache),
+        &graph,
+        &t0_input,
+        &weights,
+        &mut kv_cache,
+        &mut kv_commitment,
+        Some(&weight_cache),
         None,
-    ).expect("step 0 should succeed");
+    )
+    .expect("step 0 should succeed");
 
     // Step 1: second single decode
     let t1_input = random_m31_matrix(1, d_model, 1001);
     let (proof1, commit1) = prove_model_pure_gkr_decode_step(
-        &graph, &t1_input, &weights, &mut kv_cache, &mut kv_commitment, Some(&weight_cache),
+        &graph,
+        &t1_input,
+        &weights,
+        &mut kv_cache,
+        &mut kv_commitment,
+        Some(&weight_cache),
         None,
-    ).expect("step 1 should succeed");
+    )
+    .expect("step 1 should succeed");
 
     // Chain: step1's prev must equal step0's new
     let gkr0 = proof0.gkr_proof.as_ref().unwrap();
@@ -1264,12 +1539,18 @@ fn decode_multi_then_single_chain() {
 
     // Verify position offsets
     for lp in &gkr0.layer_proofs {
-        if let obelyzk::gkr::types::LayerProof::AttentionDecode { position_offset, .. } = lp {
+        if let obelyzk::gkr::types::LayerProof::AttentionDecode {
+            position_offset, ..
+        } = lp
+        {
             assert_eq!(*position_offset, prefill_len, "step 0 offset");
         }
     }
     for lp in &gkr1.layer_proofs {
-        if let obelyzk::gkr::types::LayerProof::AttentionDecode { position_offset, .. } = lp {
+        if let obelyzk::gkr::types::LayerProof::AttentionDecode {
+            position_offset, ..
+        } = lp
+        {
             assert_eq!(*position_offset, prefill_len + 1, "step 1 offset");
         }
     }
@@ -1281,8 +1562,8 @@ fn decode_multi_then_single_chain() {
 #[cfg(feature = "cuda-runtime")]
 #[test]
 fn decode_gpu_cpu_equivalence() {
-    use obelyzk::gkr::circuit::LayeredCircuit;
     use obelyzk::compiler::onnx::generate_weights_for_graph;
+    use obelyzk::gkr::circuit::LayeredCircuit;
 
     let d_model = 64;
     let num_heads = 2;
@@ -1299,10 +1580,26 @@ fn decode_gpu_cpu_equivalence() {
     for &node_id in &topo {
         let node = &graph.nodes[node_id];
         if let obelyzk::compiler::graph::GraphOp::Attention { config: _ } = &node.op {
-            weights.add_named_weight(node.id, "w_q", random_m31_matrix(d_model, d_model, 200 + node.id as u64));
-            weights.add_named_weight(node.id, "w_k", random_m31_matrix(d_model, d_model, 300 + node.id as u64));
-            weights.add_named_weight(node.id, "w_v", random_m31_matrix(d_model, d_model, 400 + node.id as u64));
-            weights.add_named_weight(node.id, "w_o", random_m31_matrix(d_model, d_model, 500 + node.id as u64));
+            weights.add_named_weight(
+                node.id,
+                "w_q",
+                random_m31_matrix(d_model, d_model, 200 + node.id as u64),
+            );
+            weights.add_named_weight(
+                node.id,
+                "w_k",
+                random_m31_matrix(d_model, d_model, 300 + node.id as u64),
+            );
+            weights.add_named_weight(
+                node.id,
+                "w_v",
+                random_m31_matrix(d_model, d_model, 400 + node.id as u64),
+            );
+            weights.add_named_weight(
+                node.id,
+                "w_o",
+                random_m31_matrix(d_model, d_model, 500 + node.id as u64),
+            );
         }
     }
 
@@ -1320,9 +1617,21 @@ fn decode_gpu_cpu_equivalence() {
                 w_o: weights.get_named_weight(node.id, "w_o").unwrap().clone(),
             };
             let cache_cpu = kv_cache_cpu.get_or_create(node.id, config);
-            let _ = attention_forward_cached(&prefill_input, &attn_weights, config, cache_cpu, config.causal);
+            let _ = attention_forward_cached(
+                &prefill_input,
+                &attn_weights,
+                config,
+                cache_cpu,
+                config.causal,
+            );
             let cache_gpu = kv_cache_gpu.get_or_create(node.id, config);
-            let _ = attention_forward_cached(&prefill_input, &attn_weights, config, cache_gpu, config.causal);
+            let _ = attention_forward_cached(
+                &prefill_input,
+                &attn_weights,
+                config,
+                cache_gpu,
+                config.causal,
+            );
         }
     }
 
@@ -1331,18 +1640,36 @@ fn decode_gpu_cpu_equivalence() {
     // Run CPU decode proving
     let mut kv_commitment_cpu = IncrementalKVCommitment::from_kv_cache(&kv_cache_cpu, 16);
     let (proof_cpu, _) = prove_model_pure_gkr_decode_step(
-        &graph, &token_input, &weights, &mut kv_cache_cpu, &mut kv_commitment_cpu, None,
-    ).expect("CPU decode should succeed");
+        &graph,
+        &token_input,
+        &weights,
+        &mut kv_cache_cpu,
+        &mut kv_commitment_cpu,
+        None,
+    )
+    .expect("CPU decode should succeed");
 
     // Run GPU decode proving (same inputs, fresh channel)
     let mut kv_commitment_gpu = IncrementalKVCommitment::from_kv_cache(&kv_cache_gpu, 16);
     let (proof_gpu, _) = prove_model_pure_gkr_decode_step(
-        &graph, &token_input, &weights, &mut kv_cache_gpu, &mut kv_commitment_gpu, None,
-    ).expect("GPU decode should succeed");
+        &graph,
+        &token_input,
+        &weights,
+        &mut kv_cache_gpu,
+        &mut kv_commitment_gpu,
+        None,
+    )
+    .expect("GPU decode should succeed");
 
     // Compare GKR proofs
-    let gkr_cpu = proof_cpu.gkr_proof.as_ref().expect("CPU should have GKR proof");
-    let gkr_gpu = proof_gpu.gkr_proof.as_ref().expect("GPU should have GKR proof");
+    let gkr_cpu = proof_cpu
+        .gkr_proof
+        .as_ref()
+        .expect("CPU should have GKR proof");
+    let gkr_gpu = proof_gpu
+        .gkr_proof
+        .as_ref()
+        .expect("GPU should have GKR proof");
 
     assert_eq!(
         gkr_cpu.layer_proofs.len(),
@@ -1356,7 +1683,12 @@ fn decode_gpu_cpu_equivalence() {
     // Fiat-Shamir channel and the same mathematical reductions.
     // Note: if GPU uses different floating-point rounding for intermediate
     // computations, the proofs may differ — that would indicate a bug.
-    for (i, (cpu_lp, gpu_lp)) in gkr_cpu.layer_proofs.iter().zip(gkr_gpu.layer_proofs.iter()).enumerate() {
+    for (i, (cpu_lp, gpu_lp)) in gkr_cpu
+        .layer_proofs
+        .iter()
+        .zip(gkr_gpu.layer_proofs.iter())
+        .enumerate()
+    {
         assert_eq!(
             std::mem::discriminant(cpu_lp),
             std::mem::discriminant(gpu_lp),
@@ -1366,15 +1698,16 @@ fn decode_gpu_cpu_equivalence() {
     }
 
     assert_eq!(
-        gkr_cpu.output_claim.value,
-        gkr_gpu.output_claim.value,
+        gkr_cpu.output_claim.value, gkr_gpu.output_claim.value,
         "output claim value mismatch"
     );
     assert_eq!(
-        gkr_cpu.input_claim.value,
-        gkr_gpu.input_claim.value,
+        gkr_cpu.input_claim.value, gkr_gpu.input_claim.value,
         "input claim value mismatch"
     );
 
-    eprintln!("decode_gpu_cpu_equivalence: PASSED ({} layer proofs match)", gkr_cpu.layer_proofs.len());
+    eprintln!(
+        "decode_gpu_cpu_equivalence: PASSED ({} layer proofs match)",
+        gkr_cpu.layer_proofs.len()
+    );
 }

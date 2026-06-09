@@ -284,13 +284,11 @@ mod tests {
             },
             weight_commitments: vec![starknet_ff::FieldElement::ONE; 4],
             weight_openings: vec![],
-            weight_claims: vec![
-                WeightClaim {
-                    weight_node_id: 1,
-                    eval_point: vec![v(1), v(2), v(3)],
-                    expected_value: v(42),
-                },
-            ],
+            weight_claims: vec![WeightClaim {
+                weight_node_id: 1,
+                eval_point: vec![v(1), v(2), v(3)],
+                expected_value: v(42),
+            }],
             weight_opening_transcript_mode: WeightOpeningTranscriptMode::AggregatedOracleSumcheck,
             io_commitment: starknet_ff::FieldElement::TWO,
             deferred_proofs: vec![],
@@ -318,7 +316,12 @@ mod tests {
         assert!(recovered.kv_cache_commitment.is_some());
 
         // Verify matmul round polys survived
-        if let LayerProof::MatMul { round_polys, final_a_eval, final_b_eval } = &recovered.layer_proofs[0] {
+        if let LayerProof::MatMul {
+            round_polys,
+            final_a_eval,
+            final_b_eval,
+        } = &recovered.layer_proofs[0]
+        {
             assert_eq!(round_polys.len(), 13);
             assert_eq!(*final_a_eval, v(42));
             assert_eq!(*final_b_eval, v(99));

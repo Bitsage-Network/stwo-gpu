@@ -7,7 +7,9 @@ use crate::vm31_merkle::PackedDigest;
 #[starknet::interface]
 pub trait IMockProofVerifier<TContractState> {
     fn set_verified(ref self: TContractState, proof_hash: felt252, verified: bool);
-    fn bind_vm31_public_hash(ref self: TContractState, proof_hash: felt252, vm31_public_hash: PackedDigest);
+    fn bind_vm31_public_hash(
+        ref self: TContractState, proof_hash: felt252, vm31_public_hash: PackedDigest,
+    );
     fn is_proof_verified(self: @TContractState, proof_hash: felt252) -> bool;
     fn get_vm31_public_hash(self: @TContractState, proof_hash: felt252) -> PackedDigest;
     fn get_owner(self: @TContractState) -> ContractAddress;
@@ -15,9 +17,11 @@ pub trait IMockProofVerifier<TContractState> {
 
 #[starknet::contract]
 pub mod MockProofVerifierContract {
-    use super::{ContractAddress, PackedDigest};
     use starknet::get_caller_address;
-    use starknet::storage::{Map, StoragePathEntry, StoragePointerReadAccess, StoragePointerWriteAccess};
+    use starknet::storage::{
+        Map, StoragePathEntry, StoragePointerReadAccess, StoragePointerWriteAccess,
+    };
+    use super::{ContractAddress, PackedDigest};
 
     #[storage]
     struct Storage {
@@ -52,7 +56,9 @@ pub mod MockProofVerifierContract {
         }
 
         fn get_vm31_public_hash(self: @ContractState, proof_hash: felt252) -> PackedDigest {
-            assert!(self.vm31_public_hash_set.entry(proof_hash).read(), "Mock: VM31 hash not bound");
+            assert!(
+                self.vm31_public_hash_set.entry(proof_hash).read(), "Mock: VM31 hash not bound",
+            );
             self.vm31_public_hash.entry(proof_hash).read()
         }
 

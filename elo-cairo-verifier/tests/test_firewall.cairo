@@ -1,14 +1,12 @@
+use elo_cairo_verifier::firewall::{IAgentFirewallDispatcher, IAgentFirewallDispatcherTrait};
 /// Tests for AgentFirewallZK: on-chain guardrails for AI agent transactions.
 ///
 /// Tests cover agent registration, action submission, proof-based resolution,
 /// EMA trust scoring, strike mechanism, auto-freeze, escalation flow, and access control.
 
-use snforge_std::{declare, DeclareResultTrait, ContractClassTrait};
+use snforge_std::{ContractClassTrait, DeclareResultTrait, declare};
 use snforge_std::{start_cheat_caller_address, stop_cheat_caller_address};
 use starknet::ContractAddress;
-use elo_cairo_verifier::firewall::{
-    IAgentFirewallDispatcher, IAgentFirewallDispatcherTrait,
-};
 
 // ============================================================================
 // Helpers
@@ -28,12 +26,12 @@ fn deploy_firewall() -> IAgentFirewallDispatcher {
     let classifier_model_id: felt252 = 0x42;
     let classifier_weight_root_hash: felt252 = 0xCAFEBABE; // test weight hash
     let (address, _) = contract
-        .deploy(@array![
-            owner().into(),
-            verifier_address.into(),
-            classifier_model_id,
-            classifier_weight_root_hash,
-        ])
+        .deploy(
+            @array![
+                owner().into(), verifier_address.into(), classifier_model_id,
+                classifier_weight_root_hash,
+            ],
+        )
         .unwrap();
     IAgentFirewallDispatcher { contract_address: address }
 }
@@ -288,7 +286,9 @@ fn test_query_action_metadata() {
     let action_id = fw.submit_action(0xA1, 0xDEAD, 0x1000, 0xa9059cbb, 0xCAFE);
 
     assert!(fw.get_action_io_commitment(action_id) == 0xCAFE, "io_commitment should match");
-    assert!(fw.get_action_threat_score(action_id) == 0, "unresolved action threat score should be 0");
+    assert!(
+        fw.get_action_threat_score(action_id) == 0, "unresolved action threat score should be 0",
+    );
 }
 
 // ============================================================================
@@ -515,7 +515,7 @@ fn test_rate_limit_per_agent() {
         }
         fw.submit_action(0xA1, 0xDEAD, i.into(), 0xa9059cbb, (0xCAFE + i.into()));
         i += 1;
-    };
+    }
 
     // 11th should fail
     fw.submit_action(0xA1, 0xDEAD, 0x999, 0xa9059cbb, 0xFFFF);

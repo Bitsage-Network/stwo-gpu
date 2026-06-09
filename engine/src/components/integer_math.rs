@@ -65,7 +65,7 @@ fn build_cos_table() -> [i32; COS_TABLE_SIZE + 1] {
     }
     // Exact endpoints
     table[0] = COS_INTERNAL_SCALE as i32; // cos(0) = 1
-    table[COS_TABLE_SIZE] = 0;            // cos(π/2) = 0
+    table[COS_TABLE_SIZE] = 0; // cos(π/2) = 0
     table
 }
 
@@ -224,7 +224,11 @@ pub fn apply_activation_integer(act_type: u8, val: u32) -> u32 {
     let result = match act_type {
         0 => {
             // ReLU: max(0, x)
-            if signed > 0 { signed } else { 0 }
+            if signed > 0 {
+                signed
+            } else {
+                0
+            }
         }
         1 => {
             // GELU approximation using integer polynomial
@@ -252,6 +256,22 @@ pub fn apply_activation_integer(act_type: u8, val: u32) -> u32 {
             let sig = sigmoid_integer(signed, scale);
             // x × sigmoid(x) / scale (to maintain scale)
             (signed * sig) / scale
+        }
+        5 => {
+            // Softplus: log(1 + exp(x)); coarse integer approximation used
+            // only by piecewise diagnostics, not the production lookup table.
+            if signed > scale * 10 {
+                signed
+            } else if signed < -scale * 10 {
+                0
+            } else {
+                let sig = sigmoid_integer(signed, scale);
+                if signed > 0 {
+                    signed * sig / scale
+                } else {
+                    scale * sig / scale
+                }
+            }
         }
         _ => signed, // identity fallback
     };
@@ -287,8 +307,8 @@ fn gelu_integer(x: i64, scale: i64) -> i64 {
 /// All boundaries and slopes computed in integer arithmetic.
 fn sigmoid_integer(x: i64, scale: i64) -> i64 {
     // Boundaries in terms of scale (scale represents 1.0)
-    let x5 = scale * 5;  // x = 5.0
-    let x25 = scale * 5 / 2;  // x = 2.5
+    let x5 = scale * 5; // x = 5.0
+    let x25 = scale * 5 / 2; // x = 2.5
 
     if x <= -x5 {
         0
@@ -342,18 +362,27 @@ mod tests {
         // cos(0) = 1, sin(0) = 0
         let c = cos_fixed(0);
         let s = sin_fixed(0);
-        assert!((c - COS_INTERNAL_SCALE as i32).unsigned_abs() < 100, "cos(0) should be ~2^30, got {c}");
+        assert!(
+            (c - COS_INTERNAL_SCALE as i32).unsigned_abs() < 100,
+            "cos(0) should be ~2^30, got {c}"
+        );
         assert!(s.unsigned_abs() < 100, "sin(0) should be ~0, got {s}");
 
         // cos(π/2) = 0, sin(π/2) = 1 — π/2 corresponds to angle_fp = 2^30
         let c = cos_fixed(1 << 30);
         let s = sin_fixed(1 << 30);
         assert!(c.unsigned_abs() < 1000, "cos(π/2) should be ~0, got {c}");
-        assert!((s - COS_INTERNAL_SCALE as i32).unsigned_abs() < 1000, "sin(π/2) should be ~2^30, got {s}");
+        assert!(
+            (s - COS_INTERNAL_SCALE as i32).unsigned_abs() < 1000,
+            "sin(π/2) should be ~2^30, got {s}"
+        );
 
         // cos(π) = -1 — π corresponds to angle_fp = 2^31
         let c = cos_fixed(1 << 31);
-        assert!((c + COS_INTERNAL_SCALE as i32).unsigned_abs() < 100, "cos(π) should be ~-2^30, got {c}");
+        assert!(
+            (c + COS_INTERNAL_SCALE as i32).unsigned_abs() < 100,
+            "cos(π) should be ~-2^30, got {c}"
+        );
     }
 
     #[test]
@@ -456,7 +485,10 @@ mod tests {
 
         // sigmoid(-5×scale) ≈ 0
         let s_neg = sigmoid_integer(-5 * scale, scale);
-        assert!(s_neg.unsigned_abs() < (scale as u64 / 100), "sigmoid(-5) should be ~0, got {s_neg}");
+        assert!(
+            s_neg.unsigned_abs() < (scale as u64 / 100),
+            "sigmoid(-5) should be ~0, got {s_neg}"
+        );
 
         // sigmoid(5×scale) ≈ 1
         let s_pos = sigmoid_integer(5 * scale, scale);
@@ -484,7 +516,13 @@ mod tests {
         let thetas = precompute_rope_thetas(64, 10000.0);
         let (cos1, sin1) = build_rope_table_integer(32, 64, &thetas, 0);
         let (cos2, sin2) = build_rope_table_integer(32, 64, &thetas, 0);
-        assert_eq!(cos1, cos2, "RoPE cos tables should be identical across runs");
-        assert_eq!(sin1, sin2, "RoPE sin tables should be identical across runs");
+        assert_eq!(
+            cos1, cos2,
+            "RoPE cos tables should be identical across runs"
+        );
+        assert_eq!(
+            sin1, sin2,
+            "RoPE sin tables should be identical across runs"
+        );
     }
 }

@@ -1,3 +1,7 @@
+use crate::channel::{
+    PoseidonChannel, channel_draw_qm31, channel_mix_felt, channel_mix_felts,
+    channel_mix_poly_coeffs,
+};
 /// Aggregated weight binding verification via unified oracle mismatch sumcheck.
 ///
 /// Verifies M weight claims in one shot: mismatch sumcheck + single MLE opening.
@@ -5,16 +9,12 @@
 
 // use core::poseidon::poseidon_hash_span;  // referenced in comment only
 use crate::field::{
-    QM31, qm31_add, qm31_sub, qm31_mul, qm31_eq, qm31_zero, qm31_one,
-    poly_eval_degree2, eq_eval, pack_qm31_to_felt, unpack_qm31_from_felt,
-};
-use crate::channel::{
-    PoseidonChannel, channel_mix_felt, channel_mix_felts, channel_mix_poly_coeffs,
-    channel_draw_qm31,
+    QM31, eq_eval, pack_qm31_to_felt, poly_eval_degree2, qm31_add, qm31_eq, qm31_mul, qm31_one,
+    qm31_sub, qm31_zero, unpack_qm31_from_felt,
 };
 use crate::mle::verify_mle_opening;
-use crate::types::MleOpeningProof;
 use crate::model_verifier::WeightClaimData;
+use crate::types::MleOpeningProof;
 
 /// Configuration for the aggregated binding protocol.
 #[derive(Drop, Copy, Serde)]
@@ -45,7 +45,8 @@ pub struct AggregatedWeightBindingProof {
 /// Compute the Poseidon hash of (a, b) using 2-to-1 hashing.
 fn poseidon_hash_2(a: felt252, b: felt252) -> felt252 {
     // Must match Rust's starknet_crypto::poseidon_hash(a, b) = hades_permutation(a, b, 2).s0
-    // Do NOT use poseidon_hash_span — that's the sponge construction which gives different results.
+    // Do NOT use poseidon_hash_span — that's the sponge construction which gives different
+    // results.
     let (s0, _, _) = core::poseidon::hades_permutation(a, b, 2);
     s0
 }
@@ -67,7 +68,7 @@ fn merkle_root_from_leaves(leaves: Span<felt252>) -> felt252 {
         }
         current.append(poseidon_hash_2(*leaves.at(i), *leaves.at(i + 1)));
         i += 2;
-    };
+    }
 
     // Reduce until single root
     loop {
@@ -83,11 +84,11 @@ fn merkle_root_from_leaves(leaves: Span<felt252>) -> felt252 {
             }
             next.append(poseidon_hash_2(*current.at(j), *current.at(j + 1)));
             j += 2;
-        };
+        }
         current = next;
-    };
+    }
 
-    *current.at(0)
+    return *current.at(0);
 }
 
 /// Verify the super-root matches the subtree roots.
@@ -95,10 +96,7 @@ fn merkle_root_from_leaves(leaves: Span<felt252>) -> felt252 {
 /// The super-root is the Merkle root of the subtree_roots array.
 /// The verifier reconstructs it from claimed subtree_roots and checks
 /// it matches the claimed super_root.
-fn verify_super_root(
-    claimed_root: felt252,
-    subtree_roots: Span<felt252>,
-) -> bool {
+fn verify_super_root(claimed_root: felt252, subtree_roots: Span<felt252>) -> bool {
     let computed = merkle_root_from_leaves(subtree_roots);
     computed == claimed_root
 }
@@ -122,7 +120,7 @@ fn compute_zero_tree_root(n_vars: u32) -> felt252 {
         }
         h = poseidon_hash_2(h, h);
         level += 1;
-    };
+    }
     h
 }
 
@@ -130,11 +128,7 @@ fn compute_zero_tree_root(n_vars: u32) -> felt252 {
 /// by pairing with zero-tree roots at each level.
 ///
 /// Matches Rust's extension logic in `build_super_root()`.
-fn extend_commitment_to_depth(
-    commitment: felt252,
-    local_n_vars: u32,
-    n_max: u32,
-) -> felt252 {
+fn extend_commitment_to_depth(commitment: felt252, local_n_vars: u32, n_max: u32) -> felt252 {
     if local_n_vars == n_max {
         return commitment;
     }
@@ -149,7 +143,7 @@ fn extend_commitment_to_depth(
         extended = poseidon_hash_2(extended, zero_h);
         zero_h = poseidon_hash_2(zero_h, zero_h);
         lvl += 1;
-    };
+    }
     extended
 }
 
@@ -172,7 +166,7 @@ fn build_zero_tree_cache(n_max: u32) -> Array<felt252> {
         h = poseidon_hash_2(h, h);
         cache.append(h); // level+1
         level += 1;
-    };
+    }
     cache
 }
 
@@ -181,10 +175,7 @@ fn build_zero_tree_cache(n_max: u32) -> Array<felt252> {
 /// cache[i] is the zero-tree root at depth i. At each extension level,
 /// we pair with cache[lvl] (the zero-tree sibling at that level).
 fn extend_commitment_to_depth_cached(
-    commitment: felt252,
-    local_n_vars: u32,
-    n_max: u32,
-    cache: @Array<felt252>,
+    commitment: felt252, local_n_vars: u32, n_max: u32, cache: @Array<felt252>,
 ) -> felt252 {
     if local_n_vars == n_max {
         return commitment;
@@ -197,7 +188,7 @@ fn extend_commitment_to_depth_cached(
         }
         extended = poseidon_hash_2(extended, *cache.at(lvl));
         lvl += 1;
-    };
+    }
     extended
 }
 
@@ -244,7 +235,7 @@ fn verify_subtree_commitments(
             return false;
         }
         i += 1;
-    };
+    }
 
     // Padding slots must be zero-tree root at n_max depth (read from cache)
     let zero_root = *cache.at(n_max);
@@ -256,7 +247,7 @@ fn verify_subtree_commitments(
             return false;
         }
         i += 1;
-    };
+    }
 
     true
 }
@@ -276,19 +267,25 @@ pub fn verify_aggregated_binding(
     let config = proof.config;
 
     // 1. Verify super-root from subtree roots
-    assert!(verify_super_root(*proof.super_root, proof.subtree_roots.span()), "BINDING_SUPER_ROOT_FAILED");
+    assert!(
+        verify_super_root(*proof.super_root, proof.subtree_roots.span()),
+        "BINDING_SUPER_ROOT_FAILED",
+    );
 
     // No diagnostic asserts — direct verification
 
     // 1b. Verify subtree roots match registered weight commitments
-    assert!(verify_subtree_commitments(
-        proof.subtree_roots.span(),
-        weight_commitments,
-        weight_claims,
-        *config.n_claims,
-        *config.n_max,
-        *config.m_padded,
-    ), "BINDING_SUBTREE_COMMITMENTS_FAILED");
+    assert!(
+        verify_subtree_commitments(
+            proof.subtree_roots.span(),
+            weight_commitments,
+            weight_claims,
+            *config.n_claims,
+            *config.n_max,
+            *config.m_padded,
+        ),
+        "BINDING_SUBTREE_COMMITMENTS_FAILED",
+    );
 
     // 2. Mix super-root into channel
     channel_mix_felt(ref ch, *proof.super_root);
@@ -333,7 +330,7 @@ pub fn verify_aggregated_binding(
         current_sum = poly_eval_degree2(c0, c1, c2, r);
 
         round += 1;
-    };
+    }
 
     // 5. Final check: sumcheck output = Σ β_i * eq(g_i, s) * (oracle_eval - v_i)
     let oracle_eval = *proof.oracle_eval_at_s;
@@ -368,7 +365,7 @@ pub fn verify_aggregated_binding(
             } else {
                 g_i.append(qm31_zero());
             }
-        };
+        }
 
         // Local bits: zero-pad to n_max, then eval_point
         let eval_len = claim.eval_point.len();
@@ -380,7 +377,7 @@ pub fn verify_aggregated_binding(
             }
             g_i.append(qm31_zero());
             p += 1;
-        };
+        }
 
         let mut ep: u32 = 0;
         loop {
@@ -389,7 +386,7 @@ pub fn verify_aggregated_binding(
             }
             g_i.append(*claim.eval_point.at(ep));
             ep += 1;
-        };
+        }
 
         // eq(g_i, challenge_point)
         let eq_val = eq_eval(g_i.span(), challenge_span);
@@ -401,7 +398,7 @@ pub fn verify_aggregated_binding(
 
         rho_pow = qm31_mul(rho_pow, rho);
         claim_i += 1;
-    };
+    }
 
     assert!(qm31_eq(current_sum, verifier_sum), "BINDING_FINAL_SUM_MISMATCH");
 
@@ -410,12 +407,7 @@ pub fn verify_aggregated_binding(
     channel_mix_felts(ref ch, oracle_arr.span());
 
     // 7. Verify single MLE opening against super-root
-    let mle_ok = verify_mle_opening(
-        *proof.super_root,
-        proof.opening_proof,
-        challenge_span,
-        ref ch,
-    );
+    let mle_ok = verify_mle_opening(*proof.super_root, proof.opening_proof, challenge_span, ref ch);
     assert!(mle_ok, "BINDING_MLE_OPENING_FAILED");
     true
 }
@@ -450,18 +442,16 @@ fn pow2(n: u32) -> u32 {
             }
             result = result * 2;
             i += 1;
-        };
+        }
         result
     }
 }
-
-use crate::types::{MleQueryRoundData, MleQueryProof};
+use crate::types::{MleQueryProof, MleQueryRoundData};
 
 /// Deserialize an `MleOpeningProof` from packed QM31 format (1 felt per QM31).
 ///
 /// Matches `serialize_mle_opening_proof_packed()` in Rust cairo_serde.rs.
 pub fn deserialize_mle_opening_proof_packed(ref data: Span<felt252>) -> MleOpeningProof {
-
     // intermediate_roots: Array<felt252>
     let num_roots: u32 = Serde::<u32>::deserialize(ref data).unwrap();
     let mut intermediate_roots: Array<felt252> = array![];
@@ -472,7 +462,7 @@ pub fn deserialize_mle_opening_proof_packed(ref data: Span<felt252>) -> MleOpeni
         }
         intermediate_roots.append(*data.pop_front().unwrap());
         i += 1;
-    };
+    }
 
     // queries: Array<MleQueryProof>
     let num_queries: u32 = Serde::<u32>::deserialize(ref data).unwrap();
@@ -502,7 +492,7 @@ pub fn deserialize_mle_opening_proof_packed(ref data: Span<felt252>) -> MleOpeni
                 }
                 left_siblings.append(*data.pop_front().unwrap());
                 ls += 1;
-            };
+            }
             // right_siblings
             let num_right: u32 = Serde::<u32>::deserialize(ref data).unwrap();
             let mut right_siblings: Array<felt252> = array![];
@@ -513,13 +503,16 @@ pub fn deserialize_mle_opening_proof_packed(ref data: Span<felt252>) -> MleOpeni
                 }
                 right_siblings.append(*data.pop_front().unwrap());
                 rs += 1;
-            };
-            rounds.append(MleQueryRoundData { left_value, right_value, left_siblings, right_siblings });
+            }
+            rounds
+                .append(
+                    MleQueryRoundData { left_value, right_value, left_siblings, right_siblings },
+                );
             r += 1;
-        };
+        }
         queries.append(MleQueryProof { initial_pair_index, rounds });
         q += 1;
-    };
+    }
 
     // final_value: QM31
     let final_value = unpack_qm31_from_felt(*data.pop_front().unwrap());
@@ -553,7 +546,7 @@ pub fn deserialize_binding_proof_packed(ref data: Span<felt252>) -> AggregatedWe
         let c2 = unpack_qm31_from_felt(*data.pop_front().unwrap());
         round_polys.append((c0, c1, c2));
         i += 1;
-    };
+    }
 
     // Oracle eval at s: packed QM31
     let oracle_eval_at_s = unpack_qm31_from_felt(*data.pop_front().unwrap());
@@ -571,35 +564,28 @@ pub fn deserialize_binding_proof_packed(ref data: Span<felt252>) -> AggregatedWe
         }
         subtree_roots.append(*data.pop_front().unwrap());
         j += 1;
-    };
+    }
 
     // Opening proof: packed MLE opening
     let opening_proof = deserialize_mle_opening_proof_packed(ref data);
 
     AggregatedWeightBindingProof {
-        config,
-        round_polys,
-        oracle_eval_at_s,
-        super_root,
-        subtree_roots,
-        opening_proof,
+        config, round_polys, oracle_eval_at_s, super_root, subtree_roots, opening_proof,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        verify_aggregated_binding,
-        AggregatedBindingConfig, AggregatedWeightBindingProof,
-        merkle_root_from_leaves, pow2, poseidon_hash_2, verify_super_root,
-        compute_zero_tree_root, extend_commitment_to_depth,
-        build_zero_tree_cache, extend_commitment_to_depth_cached,
-        verify_subtree_commitments,
-    };
-    use crate::field::{QM31, qm31_new, qm31_zero, qm31_eq, pack_qm31_to_felt};
     use crate::channel::channel_default;
-    use crate::types::MleOpeningProof;
+    use crate::field::{QM31, pack_qm31_to_felt, qm31_eq, qm31_new, qm31_zero};
     use crate::model_verifier::WeightClaimData;
+    use crate::types::MleOpeningProof;
+    use super::{
+        AggregatedBindingConfig, AggregatedWeightBindingProof, build_zero_tree_cache,
+        compute_zero_tree_root, extend_commitment_to_depth, extend_commitment_to_depth_cached,
+        merkle_root_from_leaves, poseidon_hash_2, pow2, verify_aggregated_binding,
+        verify_subtree_commitments, verify_super_root,
+    };
 
     #[test]
     fn test_pow2_values() {
@@ -633,10 +619,7 @@ mod tests {
         let subtree_roots: Array<felt252> = array![a, b];
         let expected_root = poseidon_hash_2(a, b);
         assert!(verify_super_root(expected_root, subtree_roots.span()), "super root should verify");
-        assert!(
-            !verify_super_root(0x9999, subtree_roots.span()),
-            "wrong super root should fail",
-        );
+        assert!(!verify_super_root(0x9999, subtree_roots.span()), "wrong super root should fail");
     }
 
     #[test]
@@ -797,10 +780,7 @@ mod tests {
             if d > 4 {
                 break;
             }
-            assert!(
-                *cache.at(d) == compute_zero_tree_root(d),
-                "cache mismatch at depth",
-            );
+            assert!(*cache.at(d) == compute_zero_tree_root(d), "cache mismatch at depth");
             d += 1;
         };
     }
@@ -827,11 +807,7 @@ mod tests {
     #[test]
     fn test_config_serde_roundtrip() {
         let config = AggregatedBindingConfig {
-            selector_bits: 2,
-            n_max: 8,
-            m_padded: 4,
-            n_global: 10,
-            n_claims: 3,
+            selector_bits: 2, n_max: 8, m_padded: 4, n_global: 10, n_claims: 3,
         };
 
         let mut output: Array<felt252> = array![];
@@ -853,11 +829,7 @@ mod tests {
     fn test_proof_serde_roundtrip() {
         // Construct a minimal AggregatedWeightBindingProof and verify Serde roundtrip
         let config = AggregatedBindingConfig {
-            selector_bits: 1,
-            n_max: 2,
-            m_padded: 2,
-            n_global: 3,
-            n_claims: 1,
+            selector_bits: 1, n_max: 2, m_padded: 2, n_global: 3, n_claims: 1,
         };
 
         let q1 = qm31_new(1, 2, 3, 4);
@@ -865,9 +837,7 @@ mod tests {
         let q3 = qm31_new(9, 10, 11, 12);
 
         let round_polys: Array<(QM31, QM31, QM31)> = array![
-            (q1, q2, q3),
-            (q2, q3, q1),
-            (q3, q1, q2),
+            (q1, q2, q3), (q2, q3, q1), (q3, q1, q2),
         ];
 
         let oracle_eval = qm31_new(100, 200, 300, 400);
@@ -932,40 +902,48 @@ mod tests {
         let mut bits_0: Array<u32> = array![];
         let mut bi: u32 = selector_bits;
         loop {
-            if bi == 0 { break; }
+            if bi == 0 {
+                break;
+            }
             bi -= 1;
             bits_0.append((0_u32 / pow2(bi)) % 2);
-        };
+        }
         assert!(*bits_0.at(0) == 0 && *bits_0.at(1) == 0, "claim 0 = [0,0]");
 
         // claim 1: bit1 = (1/2)%2 = 0, bit0 = (1/1)%2 = 1 → [0, 1]
         let mut bits_1: Array<u32> = array![];
         bi = selector_bits;
         loop {
-            if bi == 0 { break; }
+            if bi == 0 {
+                break;
+            }
             bi -= 1;
             bits_1.append((1_u32 / pow2(bi)) % 2);
-        };
+        }
         assert!(*bits_1.at(0) == 0 && *bits_1.at(1) == 1, "claim 1 = [0,1]");
 
         // claim 2: bit1 = (2/2)%2 = 1, bit0 = (2/1)%2 = 0 → [1, 0]
         let mut bits_2: Array<u32> = array![];
         bi = selector_bits;
         loop {
-            if bi == 0 { break; }
+            if bi == 0 {
+                break;
+            }
             bi -= 1;
             bits_2.append((2_u32 / pow2(bi)) % 2);
-        };
+        }
         assert!(*bits_2.at(0) == 1 && *bits_2.at(1) == 0, "claim 2 = [1,0]");
 
         // claim 3: bit1 = (3/2)%2 = 1, bit0 = (3/1)%2 = 1 → [1, 1]
         let mut bits_3: Array<u32> = array![];
         bi = selector_bits;
         loop {
-            if bi == 0 { break; }
+            if bi == 0 {
+                break;
+            }
             bi -= 1;
             bits_3.append((3_u32 / pow2(bi)) % 2);
-        };
+        }
         assert!(*bits_3.at(0) == 1 && *bits_3.at(1) == 1, "claim 3 = [1,1]");
     }
 
@@ -980,43 +958,33 @@ mod tests {
         let wrong_root: felt252 = 0xDEAD;
 
         let config = AggregatedBindingConfig {
-            selector_bits: 1,
-            n_max: 2,
-            m_padded: 2,
-            n_global: 3,
-            n_claims: 1,
+            selector_bits: 1, n_max: 2, m_padded: 2, n_global: 3, n_claims: 1,
         };
 
         let proof = AggregatedWeightBindingProof {
             config,
             round_polys: array![
-                (qm31_zero(), qm31_zero(), qm31_zero()),
-                (qm31_zero(), qm31_zero(), qm31_zero()),
+                (qm31_zero(), qm31_zero(), qm31_zero()), (qm31_zero(), qm31_zero(), qm31_zero()),
                 (qm31_zero(), qm31_zero(), qm31_zero()),
             ],
             oracle_eval_at_s: qm31_zero(),
-            super_root: wrong_root,          // <-- does NOT match subtree_roots
+            super_root: wrong_root, // <-- does NOT match subtree_roots
             subtree_roots: array![a, b],
             opening_proof: MleOpeningProof {
-                intermediate_roots: array![],
-                queries: array![],
-                final_value: qm31_zero(),
+                intermediate_roots: array![], queries: array![], final_value: qm31_zero(),
             },
         };
 
         let claims: Array<WeightClaimData> = array![
             WeightClaimData {
-                eval_point: array![qm31_zero(), qm31_zero()],
-                expected_value: qm31_zero(),
+                eval_point: array![qm31_zero(), qm31_zero()], expected_value: qm31_zero(),
             },
         ];
         let commitments: Array<felt252> = array![a];
 
         let mut ch = channel_default();
         // This will panic with "BINDING_SUPER_ROOT_FAILED"
-        verify_aggregated_binding(
-            @proof, claims.span(), commitments.span(), ref ch,
-        );
+        verify_aggregated_binding(@proof, claims.span(), commitments.span(), ref ch);
     }
 
     #[test]
@@ -1032,43 +1000,35 @@ mod tests {
         let super_root = poseidon_hash_2(fake_subtree, zero_root);
 
         let config = AggregatedBindingConfig {
-            selector_bits: 1,
-            n_max: 2,
-            m_padded: 2,
-            n_global: 3,
-            n_claims: 1,
+            selector_bits: 1, n_max: 2, m_padded: 2, n_global: 3, n_claims: 1,
         };
 
         let proof = AggregatedWeightBindingProof {
             config,
             round_polys: array![
-                (qm31_zero(), qm31_zero(), qm31_zero()),
-                (qm31_zero(), qm31_zero(), qm31_zero()),
+                (qm31_zero(), qm31_zero(), qm31_zero()), (qm31_zero(), qm31_zero(), qm31_zero()),
                 (qm31_zero(), qm31_zero(), qm31_zero()),
             ],
             oracle_eval_at_s: qm31_zero(),
-            super_root,                        // matches subtree_roots...
-            subtree_roots: array![fake_subtree, zero_root],  // ...but doesn't match weight commitment
+            super_root, // matches subtree_roots...
+            subtree_roots: array![
+                fake_subtree, zero_root,
+            ], // ...but doesn't match weight commitment
             opening_proof: MleOpeningProof {
-                intermediate_roots: array![],
-                queries: array![],
-                final_value: qm31_zero(),
+                intermediate_roots: array![], queries: array![], final_value: qm31_zero(),
             },
         };
 
         let claims: Array<WeightClaimData> = array![
             WeightClaimData {
-                eval_point: array![qm31_zero(), qm31_zero()],
-                expected_value: qm31_zero(),
+                eval_point: array![qm31_zero(), qm31_zero()], expected_value: qm31_zero(),
             },
         ];
         let commitments: Array<felt252> = array![real_commitment]; // doesn't match fake_subtree
 
         let mut ch = channel_default();
         // This will panic with "BINDING_SUBTREE_COMMITMENTS_FAILED"
-        verify_aggregated_binding(
-            @proof, claims.span(), commitments.span(), ref ch,
-        );
+        verify_aggregated_binding(@proof, claims.span(), commitments.span(), ref ch);
     }
 
     #[test]
@@ -1082,41 +1042,32 @@ mod tests {
         let super_root = poseidon_hash_2(commitment, zero_root);
 
         let config = AggregatedBindingConfig {
-            selector_bits: 1,
-            n_max: 2,
-            m_padded: 2,
-            n_global: 3,   // expects 3 rounds
+            selector_bits: 1, n_max: 2, m_padded: 2, n_global: 3, // expects 3 rounds
             n_claims: 1,
         };
 
         let proof = AggregatedWeightBindingProof {
             config,
             round_polys: array![
-                (qm31_zero(), qm31_zero(), qm31_zero()),
-                // Only 1 round instead of 3
+                (qm31_zero(), qm31_zero(), qm31_zero()) // Only 1 round instead of 3
             ],
             oracle_eval_at_s: qm31_zero(),
             super_root,
             subtree_roots: array![commitment, zero_root],
             opening_proof: MleOpeningProof {
-                intermediate_roots: array![],
-                queries: array![],
-                final_value: qm31_zero(),
+                intermediate_roots: array![], queries: array![], final_value: qm31_zero(),
             },
         };
 
         let claims: Array<WeightClaimData> = array![
             WeightClaimData {
-                eval_point: array![qm31_zero(), qm31_zero()],
-                expected_value: qm31_zero(),
+                eval_point: array![qm31_zero(), qm31_zero()], expected_value: qm31_zero(),
             },
         ];
         let commitments: Array<felt252> = array![commitment];
 
         let mut ch = channel_default();
         // This will panic due to round count mismatch
-        verify_aggregated_binding(
-            @proof, claims.span(), commitments.span(), ref ch,
-        );
+        verify_aggregated_binding(@proof, claims.span(), commitments.span(), ref ch);
     }
 }

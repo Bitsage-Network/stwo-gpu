@@ -1,11 +1,7 @@
-use elo_cairo_verifier::field::{
-    QM31, CM31, qm31_new, qm31_zero, qm31_add, qm31_sub, qm31_eq,
-};
-use elo_cairo_verifier::channel::{
-    channel_default, channel_mix_secure_field, channel_draw_qm31,
-};
-use elo_cairo_verifier::types::GKRClaim;
+use elo_cairo_verifier::channel::{channel_default, channel_draw_qm31, channel_mix_secure_field};
+use elo_cairo_verifier::field::{CM31, QM31, qm31_add, qm31_eq, qm31_new, qm31_sub, qm31_zero};
 use elo_cairo_verifier::model_verifier::verify_gkr_model;
+use elo_cairo_verifier::types::GKRClaim;
 
 // ============================================================================
 // Helpers
@@ -24,6 +20,51 @@ fn push_qm31(ref data: Array<felt252>, v: QM31) {
     data.append(v.b.b.into());
 }
 
+fn push_zero_qm31s(ref data: Array<felt252>, count: u32) {
+    let mut i: u32 = 0;
+    loop {
+        if i >= count {
+            break;
+        }
+        push_qm31(ref data, qm31_zero());
+        i += 1;
+    }
+}
+
+fn append_zero_silu_piecewise_activation(ref data: Array<felt252>, tamper_canonical_last: bool) {
+    data.append(3); // tag = Activation
+    data.append(5); // SiLU type tag
+    push_qm31(ref data, qm31_zero()); // layer input_eval
+    push_qm31(ref data, qm31_zero()); // layer output_eval
+    data.append(0); // table_commitment
+    data.append(0); // no LogUp proof
+    data.append(0); // no multiplicity sumcheck
+    data.append(0); // no activation product proof
+
+    data.append(1); // has piecewise proof
+    data.append(1); // one sumcheck round
+    push_qm31(ref data, qm31_zero()); // c0
+    push_qm31(ref data, qm31_zero()); // c2
+    push_qm31(ref data, qm31_zero()); // c3
+    push_qm31(ref data, qm31_zero()); // pw_input
+    push_qm31(ref data, qm31_zero()); // pw_output
+    push_qm31(ref data, mk(1)); // indicator[0]
+    push_zero_qm31s(ref data, 15); // indicator[1..15]
+    data.append(1); // has segment bits
+    push_zero_qm31s(ref data, 4);
+    data.append(1); // has low bits
+    data.append(27);
+    push_zero_qm31s(ref data, 27);
+    data.append(1); // has canonical AND chain
+    data.append(31);
+    push_zero_qm31s(ref data, 30);
+    if tamper_canonical_last {
+        push_qm31(ref data, mk(1));
+    } else {
+        push_qm31(ref data, qm31_zero());
+    }
+}
+
 // ============================================================================
 // Test 1: Zero Layers (edge case)
 // ============================================================================
@@ -32,10 +73,7 @@ fn push_qm31(ref data: Array<felt252>, v: QM31) {
 fn test_model_verify_zero_layers() {
     let mut data: Array<felt252> = array![];
     data.append(0); // num_deferred = 0
-    let initial_claim = GKRClaim {
-        point: array![mk(42), mk(7)],
-        value: mk(999),
-    };
+    let initial_claim = GKRClaim { point: array![mk(42), mk(7)], value: mk(999) };
 
     let mut ch = channel_default();
     let (result, _weight_claims) = verify_gkr_model(
@@ -63,10 +101,7 @@ fn test_model_verify_single_add() {
     data.append(0); // trunk_idx = 0 (lhs is trunk)
     data.append(0); // num_deferred = 0
 
-    let initial_claim = GKRClaim {
-        point: array![mk(42)],
-        value: claimed,
-    };
+    let initial_claim = GKRClaim { point: array![mk(42)], value: claimed };
 
     let mut ch = channel_default();
     let (result, _weight_claims) = verify_gkr_model(
@@ -86,10 +121,7 @@ fn test_model_verify_single_add() {
 fn test_model_verify_unknown_tag_panics() {
     let mut data: Array<felt252> = array![99]; // unknown tag
 
-    let initial_claim = GKRClaim {
-        point: array![mk(1)],
-        value: mk(1),
-    };
+    let initial_claim = GKRClaim { point: array![mk(1)], value: mk(1) };
 
     let mut ch = channel_default();
     let (_, _) = verify_gkr_model(
@@ -130,10 +162,7 @@ fn test_model_verify_two_adds() {
     // Deferred section
     data.append(0); // num_deferred = 0
 
-    let initial_claim = GKRClaim {
-        point: array![mk(42)],
-        value: claimed1,
-    };
+    let initial_claim = GKRClaim { point: array![mk(42)], value: claimed1 };
 
     let mut ch = channel_default();
     let (result, _weight_claims) = verify_gkr_model(
@@ -161,10 +190,7 @@ fn test_model_verify_add_bad_sum_panics() {
     data.append(0); // trunk_idx = 0
     data.append(0); // num_deferred = 0
 
-    let initial_claim = GKRClaim {
-        point: array![mk(42)],
-        value: wrong_claimed,
-    };
+    let initial_claim = GKRClaim { point: array![mk(42)], value: wrong_claimed };
 
     let mut ch = channel_default();
     let (_, _) = verify_gkr_model(
@@ -173,7 +199,43 @@ fn test_model_verify_add_bad_sum_panics() {
 }
 
 // ============================================================================
-// Test 6: Single MatMul Layer (v19 compressed: c1 omitted from wire format)
+// Test 6: Single Piecewise Activation
+// ============================================================================
+
+#[test]
+fn test_model_verify_piecewise_silu_zero() {
+    let mut data: Array<felt252> = array![];
+    append_zero_silu_piecewise_activation(ref data, false);
+    data.append(0); // num_deferred = 0
+
+    let initial_claim = GKRClaim { point: array![mk(7)], value: qm31_zero() };
+
+    let mut ch = channel_default();
+    let (result, _weight_claims) = verify_gkr_model(
+        data.span(), 1, array![].span(), array![].span(), initial_claim, ref ch,
+    );
+
+    assert!(result.point.len() == 1, "piecewise returns sumcheck challenge");
+    assert!(qm31_eq(result.value, qm31_zero()), "piecewise returns input eval");
+}
+
+#[test]
+#[should_panic(expected: "PW_FINAL_MISMATCH")]
+fn test_model_verify_piecewise_silu_tampered_canonical_rejected() {
+    let mut data: Array<felt252> = array![];
+    append_zero_silu_piecewise_activation(ref data, true);
+    data.append(0); // num_deferred = 0
+
+    let initial_claim = GKRClaim { point: array![mk(7)], value: qm31_zero() };
+
+    let mut ch = channel_default();
+    let (_, _) = verify_gkr_model(
+        data.span(), 1, array![].span(), array![].span(), initial_claim, ref ch,
+    );
+}
+
+// ============================================================================
+// Test 7: Single MatMul Layer (v19 compressed: c1 omitted from wire format)
 // ============================================================================
 
 /// Uses "constant polynomial" trick: p(x) = 1 for all x.
@@ -204,7 +266,7 @@ fn test_model_verify_single_matmul() {
     data.append(0); // num_deferred = 0
 
     let initial_claim = GKRClaim {
-        point: array![mk(5), mk(7)],  // log_m + log_n = 2 elements for 2x2 output
+        point: array![mk(5), mk(7)], // log_m + log_n = 2 elements for 2x2 output
         value: claimed,
     };
 
@@ -239,26 +301,26 @@ fn test_model_verify_two_matmuls() {
     // Verifier reconstructs c1 = 2 - 2*1 - 0 = 0
     data.append(0); // tag=MatMul
     data.append(1); // num_rounds=1
-    push_qm31(ref data, mk(1));       // c0
+    push_qm31(ref data, mk(1)); // c0
     push_qm31(ref data, qm31_zero()); // c2
-    push_qm31(ref data, mk(1));       // final_a
-    push_qm31(ref data, mk(1));       // final_b
+    push_qm31(ref data, mk(1)); // final_a
+    push_qm31(ref data, mk(1)); // final_b
 
     // MatMul 1: claimed=1 (output of MatMul 0), constant poly c0=inv2, c2=0
     // Verifier reconstructs c1 = 1 - 2*inv2 - 0 = 1 - 1 = 0
     // p(0)+p(1) = 2*inv2 = 1 = claimed
     data.append(0); // tag=MatMul
     data.append(1); // num_rounds=1
-    push_qm31(ref data, inv2);        // c0
+    push_qm31(ref data, inv2); // c0
     push_qm31(ref data, qm31_zero()); // c2
-    push_qm31(ref data, inv2);        // final_a (inv2 * 1 = inv2 = p(r))
-    push_qm31(ref data, mk(1));       // final_b
+    push_qm31(ref data, inv2); // final_a (inv2 * 1 = inv2 = p(r))
+    push_qm31(ref data, mk(1)); // final_b
 
     // Deferred section
     data.append(0); // num_deferred = 0
 
     let initial_claim = GKRClaim {
-        point: array![mk(5), mk(7)],  // log_m + log_n = 2 elements for 2x2 output
+        point: array![mk(5), mk(7)], // log_m + log_n = 2 elements for 2x2 output
         value: mk(2),
     };
 
@@ -285,7 +347,7 @@ fn test_model_verify_two_matmuls() {
 /// Then p(0)+p(1) = V+0 = V, and p(s) = V*(1-s) = eq(0,s)*1*V.
 /// Wire format sends c0, c2, c3; verifier reconstructs c1.
 #[test]
-    #[ignore] // lean build: stripped module
+#[ignore] // lean build: stripped module
 fn test_model_verify_single_mul() {
     let claimed = mk(100);
     let _neg_claimed = qm31_sub(qm31_zero(), claimed); // -100 in M31
@@ -311,10 +373,8 @@ fn test_model_verify_single_mul() {
     push_qm31(ref data, rhs);
     data.append(0); // num_deferred = 0
 
-    let initial_claim = GKRClaim {
-        point: array![mk(0)], // r=0 so eq(0,s)=1-s
-        value: claimed,
-    };
+    let initial_claim = GKRClaim { point: array![mk(0)], // r=0 so eq(0,s)=1-s
+    value: claimed };
 
     let mut ch = channel_default();
     let (result, _weight_claims) = verify_gkr_model(
@@ -365,7 +425,7 @@ fn test_model_verify_add_then_matmul() {
     data.append(0); // num_deferred = 0
 
     let initial_claim = GKRClaim {
-        point: array![mk(42), mk(7)],  // log_m + log_n = 2 elements for 2x2 output
+        point: array![mk(42), mk(7)], // log_m + log_n = 2 elements for 2x2 output
         value: claimed,
     };
 
@@ -399,10 +459,7 @@ fn test_model_verifier_channel_determinism() {
     data.append(0); // trunk_idx = 0
     data.append(0); // num_deferred = 0
 
-    let initial_claim = GKRClaim {
-        point: array![mk(42)],
-        value: claimed,
-    };
+    let initial_claim = GKRClaim { point: array![mk(42)], value: claimed };
 
     let mut ch = channel_default();
     let (_, _) = verify_gkr_model(
@@ -449,7 +506,7 @@ fn test_model_verify_matmul_complex_qm31() {
     data.append(0); // num_deferred = 0
 
     let initial_claim = GKRClaim {
-        point: array![mk(5), mk(7)],  // log_m + log_n = 2 elements for 2x2 output
+        point: array![mk(5), mk(7)], // log_m + log_n = 2 elements for 2x2 output
         value: claimed,
     };
     let matmul_dims: Array<u32> = array![2, 2, 2];
@@ -491,7 +548,7 @@ fn test_model_verify_matmul_bad_round_sum_panics() {
     data.append(0); // num_deferred = 0
 
     let initial_claim = GKRClaim {
-        point: array![mk(5), mk(7)],  // log_m + log_n = 2 elements for 2x2 output
+        point: array![mk(5), mk(7)], // log_m + log_n = 2 elements for 2x2 output
         value: claimed,
     };
     let matmul_dims: Array<u32> = array![2, 2, 2];

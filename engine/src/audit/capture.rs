@@ -340,4 +340,58 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn test_full_context_rows_bind_even_with_same_last_token() {
+        let dir = temp_dir();
+        let hook = CaptureHook::new(&dir, "0x2", "0xabc", "test-model").expect("create hook");
+
+        hook.record(CaptureJob {
+            input_tokens: vec![10, 20, 30],
+            output_tokens: vec![7],
+            input_m31: make_m31_matrix(3, 4, 100),
+            output_m31: make_m31_matrix(1, 2, 900),
+            timestamp_ns: 1_000_000_000_000,
+            latency_ms: 100,
+            gpu_device: "test-gpu".to_string(),
+            tee_report_hash: "0x0".to_string(),
+            task_category: None,
+            input_preview: None,
+            output_preview: None,
+        });
+
+        hook.record(CaptureJob {
+            input_tokens: vec![40, 50, 30],
+            output_tokens: vec![7],
+            input_m31: make_m31_matrix(3, 4, 500),
+            output_m31: make_m31_matrix(1, 2, 900),
+            timestamp_ns: 1_000_000_001_000,
+            latency_ms: 100,
+            gpu_device: "test-gpu".to_string(),
+            tee_report_hash: "0x0".to_string(),
+            task_category: None,
+            input_preview: None,
+            output_preview: None,
+        });
+
+        hook.flush();
+        drop(hook);
+
+        let log = InferenceLog::load(&dir).expect("load");
+        let entries = log.entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0].input_tokens.last(),
+            entries[1].input_tokens.last()
+        );
+        assert_eq!(entries[0].output_tokens, entries[1].output_tokens);
+        assert_eq!(entries[0].input_rows, 3);
+        assert_eq!(entries[1].input_rows, 3);
+        assert_ne!(
+            entries[0].io_commitment, entries[1].io_commitment,
+            "conversation IO commitment must bind the full context matrix, not only the last token"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

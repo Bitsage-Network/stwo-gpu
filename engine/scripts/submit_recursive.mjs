@@ -25,6 +25,10 @@ function packQm31ToFelt252(limbs) {
   return "0x" + r.toString(16);
 }
 
+function hasStatementHash(value) {
+  return BigInt(value || "0x0") !== 0n;
+}
+
 const DEFAULT_RPC = process.env.STARKNET_RPC || "https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_8/demo";
 const DEFAULT_CONTRACT = "0x1c208a5fe731c0d03b098b524f274c537587ea1d43d903838cc4a2bf90c40c7";
 const DEFAULT_ACCOUNT = "0x57a93709bb92879f0f9f2cb81a87f9ca47d2d7e54af87dbde2831b0b7e81c1f";
@@ -55,7 +59,6 @@ async function main() {
 
   // Support both top-level format and nested recursive_proof
   const modelId = raw.model_id || raw.verify_calldata?.model_id || "0x1";
-  const ioCommitment = raw.io_commitment || "0x1";
   const recursive = raw.recursive_proof;
 
   if (!recursive || !recursive.calldata || recursive.calldata.length === 0) {
@@ -64,15 +67,25 @@ async function main() {
   }
 
   const calldata = recursive.calldata;
+  const ioCommitment = calldata[19] || raw.io_commitment || "0x1";
   // Extract real circuit_hash and weight_super_root from proof
   const circuitHash = recursive.circuit_hash || packQm31ToFelt252(calldata.slice(0, 4));
   const weightSuperRoot = recursive.weight_super_root || packQm31ToFelt252(calldata.slice(8, 12));
+  const conversationStatementHash = raw.conversation_statement_hash || recursive.conversation_statement_hash || "0x0";
+  const statementVerifier = raw.statement_verifier || recursive.statement_verifier || process.env.STATEMENT_VERIFIER_CONTRACT || process.env.STWO_STATEMENT_VERIFIER || "0x0";
+  const statementProofHash = raw.statement_proof_hash || recursive.statement_proof_hash || process.env.STATEMENT_PROOF_HASH || "0x0";
+  const bindStatement = hasStatementHash(conversationStatementHash);
+  const bindStatementFact = bindStatement && hasStatementHash(statementVerifier);
+  const verifyEntrypoint = bindStatementFact ? "verify_recursive_with_statement_fact" : (bindStatement ? "verify_recursive_with_statement" : "verify_recursive");
 
   console.log("Contract:      " + CONTRACT);
   console.log("Model ID:      " + modelId);
   console.log("IO Commitment: " + ioCommitment);
   console.log("Circuit Hash:  " + circuitHash);
   console.log("Weight Root:   " + weightSuperRoot);
+  console.log("Statement:     " + conversationStatementHash);
+  console.log("Stmt Verifier: " + statementVerifier);
+  console.log("Entrypoint:    " + verifyEntrypoint);
   console.log("Calldata:      " + calldata.length + " felts");
 
   // Step 1: Register model (or re-register if weight binding changed)
@@ -145,20 +158,33 @@ async function main() {
   // Step 2: Submit verify_recursive with rich on-chain metadata
   const metadata = raw.metadata || {};
   process.stdout.write("Submitting:    ");
+  const verifyFields = {
+    model_id: modelId,
+    io_commitment: ioCommitment,
+    circuit_hash: circuitHash,
+    weight_super_root: weightSuperRoot,
+    n_layers: metadata.n_layers || 337,
+    n_matmuls: metadata.n_matmuls || 192,
+    hidden_size: metadata.hidden_size || 5120,
+    num_transformer_blocks: metadata.num_transformer_blocks || 48,
+    policy_commitment: raw.policy_commitment || recursive.policy_commitment || "0x0",
+    trace_log_size: metadata.trace_log_size || 15,
+  };
   const tx = await account.execute({
     contractAddress: CONTRACT,
-    entrypoint: "verify_recursive",
-    calldata: CallData.compile({
-      model_id: modelId,
-      io_commitment: ioCommitment,
-      circuit_hash: circuitHash,
-      weight_super_root: weightSuperRoot,
-      n_layers: metadata.n_layers || 337,
-      n_matmuls: metadata.n_matmuls || 192,
-      hidden_size: metadata.hidden_size || 5120,
-      num_transformer_blocks: metadata.num_transformer_blocks || 48,
-      policy_commitment: raw.policy_commitment || recursive.policy_commitment || "0x0",
-      trace_log_size: metadata.trace_log_size || 15,
+    entrypoint: verifyEntrypoint,
+    calldata: CallData.compile(bindStatementFact ? {
+      ...verifyFields,
+      expected_conversation_statement_hash: conversationStatementHash,
+      statement_verifier: statementVerifier,
+      expected_statement_proof_hash: statementProofHash,
+      stark_proof_data: calldata,
+    } : bindStatement ? {
+      ...verifyFields,
+      expected_conversation_statement_hash: conversationStatementHash,
+      stark_proof_data: calldata,
+    } : {
+      ...verifyFields,
       stark_proof_data: calldata,
     }),
   });

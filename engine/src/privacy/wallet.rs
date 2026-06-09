@@ -10,9 +10,9 @@ use stwo::core::fields::m31::BaseField as M31;
 use crate::crypto::commitment::{
     derive_pubkey, derive_viewing_key, validate_spending_key, PublicKey, SpendingKey,
 };
-use crate::crypto::encryption::{derive_key, poseidon2_decrypt, poseidon2_encrypt_siv};
 #[cfg(test)]
 use crate::crypto::encryption::poseidon2_encrypt;
+use crate::crypto::encryption::{derive_key, poseidon2_decrypt, poseidon2_encrypt_siv};
 use crate::crypto::poseidon2_m31::{poseidon2_hash, RATE};
 
 /// Legacy Poseidon2 iteration count (v2 wallets only — backward compat).

@@ -39,8 +39,8 @@ pub const MERKLE_DEPTH: u32 = 20;
 // Total: 4 × 31 = 124 bits per felt252 (fits in 252 bits)
 #[derive(Drop, Copy, Serde, starknet::Store, PartialEq, Debug)]
 pub struct PackedDigest {
-    pub lo: felt252,  // M31 values [0..4]
-    pub hi: felt252,  // M31 values [4..8]
+    pub lo: felt252, // M31 values [0..4]
+    pub hi: felt252 // M31 values [4..8]
 }
 
 pub fn packed_digest_zero() -> PackedDigest {
@@ -57,7 +57,7 @@ pub fn pack_m31x8(v: Span<u64>) -> PackedDigest {
         }
         assert!(*v.at(i) < M31_P, "pack_m31x8: value out of M31 range");
         i += 1;
-    };
+    }
     let shift: felt252 = 0x80000000; // 2^31
     let lo: felt252 = (*v.at(0)).into()
         + (*v.at(1)).into() * shift
@@ -98,21 +98,51 @@ pub fn unpack_m31x8(d: PackedDigest) -> Array<u64> {
 
 fn get_internal_diag(i: u32) -> u64 {
     // -2 mod p = 2147483645
-    if i == 0 { return 2147483645; }
-    if i == 1 { return 1; }
-    if i == 2 { return 2; }
-    if i == 3 { return 4; }
-    if i == 4 { return 8; }
-    if i == 5 { return 16; }
-    if i == 6 { return 32; }
-    if i == 7 { return 64; }
-    if i == 8 { return 128; }
-    if i == 9 { return 256; }
-    if i == 10 { return 1024; }
-    if i == 11 { return 4096; }
-    if i == 12 { return 8192; }
-    if i == 13 { return 16384; }
-    if i == 14 { return 32768; }
+    if i == 0 {
+        return 2147483645;
+    }
+    if i == 1 {
+        return 1;
+    }
+    if i == 2 {
+        return 2;
+    }
+    if i == 3 {
+        return 4;
+    }
+    if i == 4 {
+        return 8;
+    }
+    if i == 5 {
+        return 16;
+    }
+    if i == 6 {
+        return 32;
+    }
+    if i == 7 {
+        return 64;
+    }
+    if i == 8 {
+        return 128;
+    }
+    if i == 9 {
+        return 256;
+    }
+    if i == 10 {
+        return 1024;
+    }
+    if i == 11 {
+        return 4096;
+    }
+    if i == 12 {
+        return 8192;
+    }
+    if i == 13 {
+        return 16384;
+    }
+    if i == 14 {
+        return 32768;
+    }
     65536 // i == 15
 }
 
@@ -125,157 +155,437 @@ fn get_external_rc(round: u32, idx: u32) -> u64 {
     // Stored as a flat lookup for gas efficiency
     let flat = round * 16 + idx;
     // Round 0
-    if flat == 0 { return 1904805405; }
-    if flat == 1 { return 1096573395; }
-    if flat == 2 { return 325583922; }
-    if flat == 3 { return 1922497245; }
-    if flat == 4 { return 1238611110; }
-    if flat == 5 { return 1782572124; }
-    if flat == 6 { return 1214633699; }
-    if flat == 7 { return 425244868; }
-    if flat == 8 { return 368977990; }
-    if flat == 9 { return 1938949003; }
-    if flat == 10 { return 857728839; }
-    if flat == 11 { return 657187509; }
-    if flat == 12 { return 1292182440; }
-    if flat == 13 { return 1155991041; }
-    if flat == 14 { return 665120200; }
-    if flat == 15 { return 632342137; }
+    if flat == 0 {
+        return 1904805405;
+    }
+    if flat == 1 {
+        return 1096573395;
+    }
+    if flat == 2 {
+        return 325583922;
+    }
+    if flat == 3 {
+        return 1922497245;
+    }
+    if flat == 4 {
+        return 1238611110;
+    }
+    if flat == 5 {
+        return 1782572124;
+    }
+    if flat == 6 {
+        return 1214633699;
+    }
+    if flat == 7 {
+        return 425244868;
+    }
+    if flat == 8 {
+        return 368977990;
+    }
+    if flat == 9 {
+        return 1938949003;
+    }
+    if flat == 10 {
+        return 857728839;
+    }
+    if flat == 11 {
+        return 657187509;
+    }
+    if flat == 12 {
+        return 1292182440;
+    }
+    if flat == 13 {
+        return 1155991041;
+    }
+    if flat == 14 {
+        return 665120200;
+    }
+    if flat == 15 {
+        return 632342137;
+    }
     // Round 1
-    if flat == 16 { return 67460776; }
-    if flat == 17 { return 1347329608; }
-    if flat == 18 { return 1871055643; }
-    if flat == 19 { return 624516163; }
-    if flat == 20 { return 1103701336; }
-    if flat == 21 { return 1940111874; }
-    if flat == 22 { return 1930359101; }
-    if flat == 23 { return 1396428560; }
-    if flat == 24 { return 1780094021; }
-    if flat == 25 { return 603972502; }
-    if flat == 26 { return 538668740; }
-    if flat == 27 { return 1377983905; }
-    if flat == 28 { return 763555589; }
-    if flat == 29 { return 1484943348; }
-    if flat == 30 { return 123454433; }
-    if flat == 31 { return 248439189; }
+    if flat == 16 {
+        return 67460776;
+    }
+    if flat == 17 {
+        return 1347329608;
+    }
+    if flat == 18 {
+        return 1871055643;
+    }
+    if flat == 19 {
+        return 624516163;
+    }
+    if flat == 20 {
+        return 1103701336;
+    }
+    if flat == 21 {
+        return 1940111874;
+    }
+    if flat == 22 {
+        return 1930359101;
+    }
+    if flat == 23 {
+        return 1396428560;
+    }
+    if flat == 24 {
+        return 1780094021;
+    }
+    if flat == 25 {
+        return 603972502;
+    }
+    if flat == 26 {
+        return 538668740;
+    }
+    if flat == 27 {
+        return 1377983905;
+    }
+    if flat == 28 {
+        return 763555589;
+    }
+    if flat == 29 {
+        return 1484943348;
+    }
+    if flat == 30 {
+        return 123454433;
+    }
+    if flat == 31 {
+        return 248439189;
+    }
     // Round 2
-    if flat == 32 { return 1867417593; }
-    if flat == 33 { return 986287536; }
-    if flat == 34 { return 606008889; }
-    if flat == 35 { return 73979116; }
-    if flat == 36 { return 1322555314; }
-    if flat == 37 { return 1499910744; }
-    if flat == 38 { return 1276293876; }
-    if flat == 39 { return 1430788068; }
-    if flat == 40 { return 542774866; }
-    if flat == 41 { return 471498949; }
-    if flat == 42 { return 1166024235; }
-    if flat == 43 { return 474821153; }
-    if flat == 44 { return 1171382481; }
-    if flat == 45 { return 1425437182; }
-    if flat == 46 { return 711989992; }
-    if flat == 47 { return 1190070539; }
+    if flat == 32 {
+        return 1867417593;
+    }
+    if flat == 33 {
+        return 986287536;
+    }
+    if flat == 34 {
+        return 606008889;
+    }
+    if flat == 35 {
+        return 73979116;
+    }
+    if flat == 36 {
+        return 1322555314;
+    }
+    if flat == 37 {
+        return 1499910744;
+    }
+    if flat == 38 {
+        return 1276293876;
+    }
+    if flat == 39 {
+        return 1430788068;
+    }
+    if flat == 40 {
+        return 542774866;
+    }
+    if flat == 41 {
+        return 471498949;
+    }
+    if flat == 42 {
+        return 1166024235;
+    }
+    if flat == 43 {
+        return 474821153;
+    }
+    if flat == 44 {
+        return 1171382481;
+    }
+    if flat == 45 {
+        return 1425437182;
+    }
+    if flat == 46 {
+        return 711989992;
+    }
+    if flat == 47 {
+        return 1190070539;
+    }
     // Round 3
-    if flat == 48 { return 825883997; }
-    if flat == 49 { return 407968301; }
-    if flat == 50 { return 828103240; }
-    if flat == 51 { return 396959544; }
-    if flat == 52 { return 254805600; }
-    if flat == 53 { return 405629793; }
-    if flat == 54 { return 1736078245; }
-    if flat == 55 { return 161376884; }
-    if flat == 56 { return 1762339952; }
-    if flat == 57 { return 60701464; }
-    if flat == 58 { return 1027360218; }
-    if flat == 59 { return 1528437821; }
-    if flat == 60 { return 1639818656; }
-    if flat == 61 { return 820804151; }
-    if flat == 62 { return 1694124839; }
-    if flat == 63 { return 674178797; }
+    if flat == 48 {
+        return 825883997;
+    }
+    if flat == 49 {
+        return 407968301;
+    }
+    if flat == 50 {
+        return 828103240;
+    }
+    if flat == 51 {
+        return 396959544;
+    }
+    if flat == 52 {
+        return 254805600;
+    }
+    if flat == 53 {
+        return 405629793;
+    }
+    if flat == 54 {
+        return 1736078245;
+    }
+    if flat == 55 {
+        return 161376884;
+    }
+    if flat == 56 {
+        return 1762339952;
+    }
+    if flat == 57 {
+        return 60701464;
+    }
+    if flat == 58 {
+        return 1027360218;
+    }
+    if flat == 59 {
+        return 1528437821;
+    }
+    if flat == 60 {
+        return 1639818656;
+    }
+    if flat == 61 {
+        return 820804151;
+    }
+    if flat == 62 {
+        return 1694124839;
+    }
+    if flat == 63 {
+        return 674178797;
+    }
     // Round 4
-    if flat == 64 { return 1951345086; }
-    if flat == 65 { return 667628229; }
-    if flat == 66 { return 1412910229; }
-    if flat == 67 { return 1526417058; }
-    if flat == 68 { return 1582191717; }
-    if flat == 69 { return 1465503729; }
-    if flat == 70 { return 1514991590; }
-    if flat == 71 { return 723260968; }
-    if flat == 72 { return 1038341032; }
-    if flat == 73 { return 87125145; }
-    if flat == 74 { return 1113380561; }
-    if flat == 75 { return 1916769929; }
-    if flat == 76 { return 883101163; }
-    if flat == 77 { return 500806420; }
-    if flat == 78 { return 441461154; }
-    if flat == 79 { return 624402420; }
+    if flat == 64 {
+        return 1951345086;
+    }
+    if flat == 65 {
+        return 667628229;
+    }
+    if flat == 66 {
+        return 1412910229;
+    }
+    if flat == 67 {
+        return 1526417058;
+    }
+    if flat == 68 {
+        return 1582191717;
+    }
+    if flat == 69 {
+        return 1465503729;
+    }
+    if flat == 70 {
+        return 1514991590;
+    }
+    if flat == 71 {
+        return 723260968;
+    }
+    if flat == 72 {
+        return 1038341032;
+    }
+    if flat == 73 {
+        return 87125145;
+    }
+    if flat == 74 {
+        return 1113380561;
+    }
+    if flat == 75 {
+        return 1916769929;
+    }
+    if flat == 76 {
+        return 883101163;
+    }
+    if flat == 77 {
+        return 500806420;
+    }
+    if flat == 78 {
+        return 441461154;
+    }
+    if flat == 79 {
+        return 624402420;
+    }
     // Round 5
-    if flat == 80 { return 1879880798; }
-    if flat == 81 { return 1427664595; }
-    if flat == 82 { return 1528919036; }
-    if flat == 83 { return 1701115451; }
-    if flat == 84 { return 717907989; }
-    if flat == 85 { return 498367125; }
-    if flat == 86 { return 39443273; }
-    if flat == 87 { return 559133583; }
-    if flat == 88 { return 1693915992; }
-    if flat == 89 { return 1588914461; }
-    if flat == 90 { return 1444895204; }
-    if flat == 91 { return 2002477838; }
-    if flat == 92 { return 929976106; }
-    if flat == 93 { return 685581961; }
-    if flat == 94 { return 1175651740; }
-    if flat == 95 { return 502929573; }
+    if flat == 80 {
+        return 1879880798;
+    }
+    if flat == 81 {
+        return 1427664595;
+    }
+    if flat == 82 {
+        return 1528919036;
+    }
+    if flat == 83 {
+        return 1701115451;
+    }
+    if flat == 84 {
+        return 717907989;
+    }
+    if flat == 85 {
+        return 498367125;
+    }
+    if flat == 86 {
+        return 39443273;
+    }
+    if flat == 87 {
+        return 559133583;
+    }
+    if flat == 88 {
+        return 1693915992;
+    }
+    if flat == 89 {
+        return 1588914461;
+    }
+    if flat == 90 {
+        return 1444895204;
+    }
+    if flat == 91 {
+        return 2002477838;
+    }
+    if flat == 92 {
+        return 929976106;
+    }
+    if flat == 93 {
+        return 685581961;
+    }
+    if flat == 94 {
+        return 1175651740;
+    }
+    if flat == 95 {
+        return 502929573;
+    }
     // Round 6
-    if flat == 96 { return 927043549; }
-    if flat == 97 { return 1495546862; }
-    if flat == 98 { return 919607960; }
-    if flat == 99 { return 1562745368; }
-    if flat == 100 { return 1969008016; }
-    if flat == 101 { return 1653795331; }
-    if flat == 102 { return 2038349847; }
-    if flat == 103 { return 1649824183; }
-    if flat == 104 { return 321040687; }
-    if flat == 105 { return 2060370837; }
-    if flat == 106 { return 996839186; }
-    if flat == 107 { return 652263400; }
-    if flat == 108 { return 565955495; }
-    if flat == 109 { return 653444965; }
-    if flat == 110 { return 2008703010; }
-    if flat == 111 { return 54846370; }
+    if flat == 96 {
+        return 927043549;
+    }
+    if flat == 97 {
+        return 1495546862;
+    }
+    if flat == 98 {
+        return 919607960;
+    }
+    if flat == 99 {
+        return 1562745368;
+    }
+    if flat == 100 {
+        return 1969008016;
+    }
+    if flat == 101 {
+        return 1653795331;
+    }
+    if flat == 102 {
+        return 2038349847;
+    }
+    if flat == 103 {
+        return 1649824183;
+    }
+    if flat == 104 {
+        return 321040687;
+    }
+    if flat == 105 {
+        return 2060370837;
+    }
+    if flat == 106 {
+        return 996839186;
+    }
+    if flat == 107 {
+        return 652263400;
+    }
+    if flat == 108 {
+        return 565955495;
+    }
+    if flat == 109 {
+        return 653444965;
+    }
+    if flat == 110 {
+        return 2008703010;
+    }
+    if flat == 111 {
+        return 54846370;
+    }
     // Round 7
-    if flat == 112 { return 1556376433; }
-    if flat == 113 { return 134987890; }
-    if flat == 114 { return 627602907; }
-    if flat == 115 { return 1808498223; }
-    if flat == 116 { return 604190690; }
-    if flat == 117 { return 2002863080; }
-    if flat == 118 { return 1637851708; }
-    if flat == 119 { return 621652046; }
-    if flat == 120 { return 1980469812; }
-    if flat == 121 { return 1531936506; }
-    if flat == 122 { return 828286260; }
-    if flat == 123 { return 412743697; }
-    if flat == 124 { return 968980913; }
-    if flat == 125 { return 2132095013; }
-    if flat == 126 { return 1743262036; }
+    if flat == 112 {
+        return 1556376433;
+    }
+    if flat == 113 {
+        return 134987890;
+    }
+    if flat == 114 {
+        return 627602907;
+    }
+    if flat == 115 {
+        return 1808498223;
+    }
+    if flat == 116 {
+        return 604190690;
+    }
+    if flat == 117 {
+        return 2002863080;
+    }
+    if flat == 118 {
+        return 1637851708;
+    }
+    if flat == 119 {
+        return 621652046;
+    }
+    if flat == 120 {
+        return 1980469812;
+    }
+    if flat == 121 {
+        return 1531936506;
+    }
+    if flat == 122 {
+        return 828286260;
+    }
+    if flat == 123 {
+        return 412743697;
+    }
+    if flat == 124 {
+        return 968980913;
+    }
+    if flat == 125 {
+        return 2132095013;
+    }
+    if flat == 126 {
+        return 1743262036;
+    }
     1549107277 // flat == 127
 }
 
 fn get_internal_rc(round: u32) -> u64 {
-    if round == 0 { return 861470954; }
-    if round == 1 { return 593081428; }
-    if round == 2 { return 1279665870; }
-    if round == 3 { return 52671424; }
-    if round == 4 { return 1177440899; }
-    if round == 5 { return 2121690958; }
-    if round == 6 { return 1455540962; }
-    if round == 7 { return 438352440; }
-    if round == 8 { return 1523388190; }
-    if round == 9 { return 397307856; }
-    if round == 10 { return 1049387486; }
-    if round == 11 { return 1488926401; }
-    if round == 12 { return 1656484477; }
+    if round == 0 {
+        return 861470954;
+    }
+    if round == 1 {
+        return 593081428;
+    }
+    if round == 2 {
+        return 1279665870;
+    }
+    if round == 3 {
+        return 52671424;
+    }
+    if round == 4 {
+        return 1177440899;
+    }
+    if round == 5 {
+        return 2121690958;
+    }
+    if round == 6 {
+        return 1455540962;
+    }
+    if round == 7 {
+        return 438352440;
+    }
+    if round == 8 {
+        return 1523388190;
+    }
+    if round == 9 {
+        return 397307856;
+    }
+    if round == 10 {
+        return 1049387486;
+    }
+    if round == 11 {
+        return 1488926401;
+    }
+    if round == 12 {
+        return 1656484477;
+    }
     331202396 // round == 13
 }
 
@@ -325,26 +635,34 @@ fn apply_external_round_matrix(ref state: Array<u64>) -> Array<u64> {
         }
         s.append(*state.at(i));
         i += 1;
-    };
+    }
 
     // Block 0
-    let mut a0 = *s.at(0); let mut a1 = *s.at(1);
-    let mut a2 = *s.at(2); let mut a3 = *s.at(3);
+    let mut a0 = *s.at(0);
+    let mut a1 = *s.at(1);
+    let mut a2 = *s.at(2);
+    let mut a3 = *s.at(3);
     apply_m4(ref a0, ref a1, ref a2, ref a3);
 
     // Block 1
-    let mut b0 = *s.at(4); let mut b1 = *s.at(5);
-    let mut b2 = *s.at(6); let mut b3 = *s.at(7);
+    let mut b0 = *s.at(4);
+    let mut b1 = *s.at(5);
+    let mut b2 = *s.at(6);
+    let mut b3 = *s.at(7);
     apply_m4(ref b0, ref b1, ref b2, ref b3);
 
     // Block 2
-    let mut c0 = *s.at(8); let mut c1 = *s.at(9);
-    let mut c2 = *s.at(10); let mut c3 = *s.at(11);
+    let mut c0 = *s.at(8);
+    let mut c1 = *s.at(9);
+    let mut c2 = *s.at(10);
+    let mut c3 = *s.at(11);
     apply_m4(ref c0, ref c1, ref c2, ref c3);
 
     // Block 3
-    let mut d0 = *s.at(12); let mut d1 = *s.at(13);
-    let mut d2 = *s.at(14); let mut d3 = *s.at(15);
+    let mut d0 = *s.at(12);
+    let mut d1 = *s.at(13);
+    let mut d2 = *s.at(14);
+    let mut d3 = *s.at(15);
     apply_m4(ref d0, ref d1, ref d2, ref d3);
 
     // Cross-block column sums
@@ -354,10 +672,10 @@ fn apply_external_round_matrix(ref state: Array<u64>) -> Array<u64> {
     let cs3 = m31_add(m31_add(a3, b3), m31_add(c3, d3));
 
     let mut result: Array<u64> = array![
-        m31_add(a0, cs0), m31_add(a1, cs1), m31_add(a2, cs2), m31_add(a3, cs3),
-        m31_add(b0, cs0), m31_add(b1, cs1), m31_add(b2, cs2), m31_add(b3, cs3),
-        m31_add(c0, cs0), m31_add(c1, cs1), m31_add(c2, cs2), m31_add(c3, cs3),
-        m31_add(d0, cs0), m31_add(d1, cs1), m31_add(d2, cs2), m31_add(d3, cs3),
+        m31_add(a0, cs0), m31_add(a1, cs1), m31_add(a2, cs2), m31_add(a3, cs3), m31_add(b0, cs0),
+        m31_add(b1, cs1), m31_add(b2, cs2), m31_add(b3, cs3), m31_add(c0, cs0), m31_add(c1, cs1),
+        m31_add(c2, cs2), m31_add(c3, cs3), m31_add(d0, cs0), m31_add(d1, cs1), m31_add(d2, cs2),
+        m31_add(d3, cs3),
     ];
     result
 }
@@ -373,7 +691,7 @@ fn apply_internal_round_matrix(ref state: Array<u64>) -> Array<u64> {
         }
         sum = m31_add(sum, *state.at(i));
         i += 1;
-    };
+    }
 
     let mut result: Array<u64> = array![];
     let mut i: u32 = 0;
@@ -383,7 +701,7 @@ fn apply_internal_round_matrix(ref state: Array<u64>) -> Array<u64> {
         }
         result.append(m31_add(m31_mul(*state.at(i), get_internal_diag(i)), sum));
         i += 1;
-    };
+    }
     result
 }
 
@@ -408,7 +726,7 @@ pub fn poseidon2_m31_permutation(input: Span<u64>) -> Array<u64> {
         }
         state.append(*input.at(i));
         i += 1;
-    };
+    }
 
     // First half: 4 full rounds
     let mut round: u32 = 0;
@@ -425,11 +743,11 @@ pub fn poseidon2_m31_permutation(input: Span<u64>) -> Array<u64> {
             }
             next.append(sbox(m31_add(*state.at(i), get_external_rc(round, i))));
             i += 1;
-        };
+        }
         // External linear layer
         state = apply_external_round_matrix(ref next);
         round += 1;
-    };
+    }
 
     // Middle: 14 partial rounds
     let mut round: u32 = 0;
@@ -447,11 +765,11 @@ pub fn poseidon2_m31_permutation(input: Span<u64>) -> Array<u64> {
             }
             next.append(*state.at(i));
             i += 1;
-        };
+        }
         // Internal linear layer
         state = apply_internal_round_matrix(ref next);
         round += 1;
-    };
+    }
 
     // Second half: 4 full rounds
     let mut round: u32 = 0;
@@ -468,10 +786,10 @@ pub fn poseidon2_m31_permutation(input: Span<u64>) -> Array<u64> {
             }
             next.append(sbox(m31_add(*state.at(i), get_external_rc(rc_idx, i))));
             i += 1;
-        };
+        }
         state = apply_external_round_matrix(ref next);
         round += 1;
-    };
+    }
 
     state
 }
@@ -501,11 +819,15 @@ pub fn poseidon2_m31_hash(input: Span<u64>) -> Array<u64> {
             ds_state.append(*state.at(i));
         }
         i += 1;
-    };
+    }
     state = ds_state;
 
     // Absorb phase: process input in chunks of RATE (8)
-    let n_chunks = if input.len() == 0 { 0_u32 } else { (input.len() - 1) / 8 + 1 };
+    let n_chunks = if input.len() == 0 {
+        0_u32
+    } else {
+        (input.len() - 1) / 8 + 1
+    };
     let mut chunk_idx: u32 = 0;
     loop {
         if chunk_idx >= n_chunks {
@@ -530,11 +852,11 @@ pub fn poseidon2_m31_hash(input: Span<u64>) -> Array<u64> {
                 absorbed.append(*state.at(i));
             }
             i += 1;
-        };
+        }
         // Permute
         state = poseidon2_m31_permutation(absorbed.span());
         chunk_idx += 1;
-    };
+    }
 
     // For empty input, still apply one permutation (domain sep is in capacity)
     if input.len() == 0 {
@@ -550,7 +872,7 @@ pub fn poseidon2_m31_hash(input: Span<u64>) -> Array<u64> {
         }
         output.append(*state.at(i));
         i += 1;
-    };
+    }
     output
 }
 
@@ -578,7 +900,7 @@ pub fn poseidon2_m31_compress(left: Span<u64>, right: Span<u64>) -> Array<u64> {
         }
         state.append(*left.at(i));
         i += 1;
-    };
+    }
     let mut i: u32 = 0;
     loop {
         if i >= 8 {
@@ -586,7 +908,7 @@ pub fn poseidon2_m31_compress(left: Span<u64>, right: Span<u64>) -> Array<u64> {
         }
         state.append(*right.at(i));
         i += 1;
-    };
+    }
 
     let permuted = poseidon2_m31_permutation(state.span());
 
@@ -599,7 +921,7 @@ pub fn poseidon2_m31_compress(left: Span<u64>, right: Span<u64>) -> Array<u64> {
         }
         output.append(*permuted.at(i));
         i += 1;
-    };
+    }
     output
 }
 
@@ -627,9 +949,7 @@ pub fn empty_leaf() -> PackedDigest {
 // leaf: the leaf digest.
 // path_indices: bit array indicating left(0) or right(1) at each level.
 pub fn compute_merkle_root(
-    leaf: PackedDigest,
-    path: Span<PackedDigest>,
-    path_indices: Span<u8>,
+    leaf: PackedDigest, path: Span<PackedDigest>, path_indices: Span<u8>,
 ) -> PackedDigest {
     assert!(path.len() == path_indices.len(), "merkle: path/index length mismatch");
 
@@ -650,7 +970,7 @@ pub fn compute_merkle_root(
             current = poseidon2_m31_compress_packed(sibling, current);
         }
         i += 1;
-    };
+    }
     current
 }
 
@@ -668,11 +988,11 @@ pub fn verify_merkle_proof(
 // Compute a note commitment digest for use as a Merkle leaf.
 // Matches Rust's Note: Poseidon2(pk[4] || asset || amt_lo || amt_hi || blinding[4])
 pub fn compute_note_commitment(
-    pk: Span<u64>,         // 4 M31 elements: public key
-    asset_id: u64,         // asset identifier
-    amount_lo: u64,        // amount low limb
-    amount_hi: u64,        // amount high limb
-    blinding: Span<u64>,   // 4 M31 elements: blinding factor
+    pk: Span<u64>, // 4 M31 elements: public key
+    asset_id: u64, // asset identifier
+    amount_lo: u64, // amount low limb
+    amount_hi: u64, // amount high limb
+    blinding: Span<u64> // 4 M31 elements: blinding factor
 ) -> PackedDigest {
     assert!(pk.len() == 4, "note: pk must be 4 elements");
     assert!(blinding.len() == 4, "note: blinding must be 4 elements");
@@ -698,8 +1018,8 @@ pub fn compute_note_commitment(
 
 // Compute a nullifier: Poseidon2(sk[4] || commitment[8])
 pub fn compute_nullifier(
-    sk: Span<u64>,              // 4 M31 elements: secret key
-    commitment: PackedDigest,   // note commitment
+    sk: Span<u64>, // 4 M31 elements: secret key
+    commitment: PackedDigest // note commitment
 ) -> PackedDigest {
     assert!(sk.len() == 4, "nullifier: sk must be 4 elements");
 
@@ -718,7 +1038,7 @@ pub fn compute_nullifier(
         }
         input.append(*commitment_vals.at(i));
         i += 1;
-    };
+    }
 
     poseidon2_m31_hash_packed(input.span())
 }

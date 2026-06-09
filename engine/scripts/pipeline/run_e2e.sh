@@ -83,6 +83,10 @@ done
 # ─── Resolve preset ─────────────────────────────────────────────────
 if [[ -n "$PRESET" ]]; then
   case "$PRESET" in
+    qwen3.5-35b-a3b|qwen35b)
+      MODEL_DIR="${MODEL_DIR:-$HOME/.obelysk/models/qwen3.5-35b-a3b}"
+      LAYERS="${LAYERS:-all}"
+      ;;
     qwen3-14b)
       MODEL_DIR="${MODEL_DIR:-$HOME/.obelysk/models/qwen3-14b}"
       LAYERS="${LAYERS:-5}"
@@ -97,7 +101,7 @@ if [[ -n "$PRESET" ]]; then
       ;;
     *)
       echo "Error: unknown preset '$PRESET'"
-      echo "Available: qwen3-14b, phi3-mini, llama3-8b"
+      echo "Available: qwen3.5-35b-a3b, qwen3-14b, phi3-mini, llama3-8b"
       exit 1
       ;;
   esac
@@ -109,9 +113,20 @@ if [[ -z "$MODEL_DIR" ]]; then
 fi
 
 if [[ -z "$LAYERS" ]]; then
-  echo "Error: specify --layers N"
+  echo "Error: specify --layers N|all"
   exit 1
 fi
+
+case "$LAYERS" in
+  all|full|0|"")
+    LAYER_ARGS=()
+    LAYERS_LABEL="all"
+    ;;
+  *)
+    LAYER_ARGS=(--layers "$LAYERS")
+    LAYERS_LABEL="$LAYERS"
+    ;;
+esac
 
 # ─── Check binary ───────────────────────────────────────────────────
 if [[ ! -f "$BINARY" ]]; then
@@ -168,7 +183,7 @@ echo "║         Obelysk E2E Pipeline                 ║"
 echo "╚══════════════════════════════════════════════╝"
 echo ""
 echo "  Model:      $MODEL_DIR"
-echo "  Layers:     $LAYERS"
+echo "  Layers:     $LAYERS_LABEL"
 echo "  Inferences: $COUNT"
 echo "  GPU:        ${GPU_FLAG:-off}"
 echo "  Submit:     ${SUBMIT:-off}"
@@ -181,7 +196,7 @@ echo ""
 echo "━━━ Step 1/2: Capturing $COUNT inference logs ━━━"
 "$BINARY" capture \
   --model-dir "$MODEL_DIR" \
-  --layers "$LAYERS" \
+  "${LAYER_ARGS[@]}" \
   --log-dir "$LOG_DIR" \
   --count "$COUNT"
 
@@ -193,10 +208,10 @@ echo "━━━ Step 2/2: Running audit (prove + report) ━━━"
 AUDIT_ARGS=(
   --log-dir "$LOG_DIR"
   --model-dir "$MODEL_DIR"
-  --layers "$LAYERS"
   --evaluate
   --output "$REPORT"
 )
+AUDIT_ARGS+=("${LAYER_ARGS[@]}")
 
 [[ -n "$GPU_FLAG" ]] && AUDIT_ARGS+=($GPU_FLAG)
 [[ -n "$DRY_RUN" ]] && AUDIT_ARGS+=($DRY_RUN)

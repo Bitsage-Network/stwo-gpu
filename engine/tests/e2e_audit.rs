@@ -656,9 +656,14 @@ fn test_e2e_audit_anchor_tamper_detection() {
     let meta: serde_json::Value = serde_json::from_str(&meta_str).unwrap();
 
     let mut corrupted = meta.clone();
-    corrupted["last_entry_hash"] =
-        serde_json::Value::String("0x00000000deadbeef00000000deadbeef00000000deadbeef00000000deadbeef".to_string());
-    std::fs::write(&meta_path, serde_json::to_string_pretty(&corrupted).unwrap()).unwrap();
+    corrupted["last_entry_hash"] = serde_json::Value::String(
+        "0x00000000deadbeef00000000deadbeef00000000deadbeef00000000deadbeef".to_string(),
+    );
+    std::fs::write(
+        &meta_path,
+        serde_json::to_string_pretty(&corrupted).unwrap(),
+    )
+    .unwrap();
 
     // Reload should fail with anchor mismatch
     let result = InferenceLog::load(&dir);
@@ -668,7 +673,9 @@ fn test_e2e_audit_anchor_tamper_detection() {
         Ok(_) => panic!("expected error"),
     };
     assert!(
-        err_msg.contains("last_entry_hash") || err_msg.contains("don't match") || err_msg.contains("doesn't match"),
+        err_msg.contains("last_entry_hash")
+            || err_msg.contains("don't match")
+            || err_msg.contains("doesn't match"),
         "error should mention last_entry_hash mismatch, got: {}",
         err_msg,
     );
@@ -854,20 +861,20 @@ fn test_e2e_multi_session_tamper_detection() {
     let meta_path = s1.join("meta.json");
     let meta_str = std::fs::read_to_string(&meta_path).unwrap();
     let mut meta: serde_json::Value = serde_json::from_str(&meta_str).unwrap();
-    meta["merkle_root"] =
-        serde_json::Value::String("0x00000000deadbeef00000000deadbeef00000000deadbeef00000000deadbeef".to_string());
+    meta["merkle_root"] = serde_json::Value::String(
+        "0x00000000deadbeef00000000deadbeef00000000deadbeef00000000deadbeef".to_string(),
+    );
     std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
 
     // Re-aggregate should fail on session 1
     let mut agg2 = MultiSessionAuditAggregator::new();
     let result = agg2.add_session(&s1);
-    assert!(
-        result.is_err(),
-        "aggregating tampered session should fail"
-    );
+    assert!(result.is_err(), "aggregating tampered session should fail");
     let err_msg = format!("{}", result.unwrap_err());
     assert!(
-        err_msg.contains("anchor") || err_msg.contains("mismatch") || err_msg.contains("merkle_root"),
+        err_msg.contains("anchor")
+            || err_msg.contains("mismatch")
+            || err_msg.contains("merkle_root"),
         "error should mention anchor/mismatch, got: {}",
         err_msg,
     );

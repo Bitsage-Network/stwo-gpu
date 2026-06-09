@@ -346,10 +346,11 @@ pub fn prove_full_attestation_with_policy(
     info!("Pure GKR proof in {:.2}s", t_prove.as_secs_f64());
 
     // 2. Extract the GKR proof
-    let gkr_proof = aggregated.gkr_proof.as_ref()
-        .ok_or_else(|| StarknetModelError::SerializationError(
-            "GKR proof not populated — check STWO_AGGREGATED_FULL_BINDING=1".to_string()
-        ))?;
+    let gkr_proof = aggregated.gkr_proof.as_ref().ok_or_else(|| {
+        StarknetModelError::SerializationError(
+            "GKR proof not populated — check STWO_AGGREGATED_FULL_BINDING=1".to_string(),
+        )
+    })?;
 
     // Debug: check binding state
     info!(
@@ -372,8 +373,11 @@ pub fn prove_full_attestation_with_policy(
         use crate::crypto::poseidon_channel::PoseidonChannel;
         let mut verify_channel = PoseidonChannel::new();
         match crate::gkr::verify_gkr_with_weights(
-            &circuit, gkr_proof, &aggregated.execution.output,
-            weights, &mut verify_channel,
+            &circuit,
+            gkr_proof,
+            &aggregated.execution.output,
+            weights,
+            &mut verify_channel,
         ) {
             Ok(_) => {
                 info!("GKR self-verification: passed");
@@ -394,7 +398,12 @@ pub fn prove_full_attestation_with_policy(
 
     // 6. Build streaming calldata (6 steps for on-chain verification)
     let streaming = build_streaming_gkr_calldata(
-        gkr_proof, &circuit, model_id, &raw_io, None, None,
+        gkr_proof,
+        &circuit,
+        model_id,
+        &raw_io,
+        None,
+        None,
         aggregated.policy_commitment,
     )?;
     let t_total = t_start.elapsed();
@@ -407,7 +416,8 @@ pub fn prove_full_attestation_with_policy(
 
     // Extract metadata directly from GKR proof + execution (no build_starknet_proof_onchain)
     let io_commitment = format!("0x{:x}", gkr_proof.io_commitment);
-    let weight_commitments: Vec<String> = gkr_proof.weight_commitments
+    let weight_commitments: Vec<String> = gkr_proof
+        .weight_commitments
         .iter()
         .map(|w| format!("0x{:x}", w))
         .collect();
@@ -426,7 +436,9 @@ pub fn prove_full_attestation_with_policy(
             let mut hasher = crate::crypto::poseidon_channel::PoseidonChannel::new();
             hasher.mix_u64(gkr_proof.weight_claims.len() as u64);
             for wc in &gkr_proof.weight_claims {
-                hasher.mix_felt(crate::crypto::poseidon_channel::securefield_to_felt(wc.expected_value));
+                hasher.mix_felt(crate::crypto::poseidon_channel::securefield_to_felt(
+                    wc.expected_value,
+                ));
             }
             // draw_qm31 = draw a QM31 from the channel after mixing weight claims
             hasher.draw_qm31()
@@ -447,7 +459,8 @@ pub fn prove_full_attestation_with_policy(
                 let cd = crate::cairo_serde::serialize_recursive_proof_calldata(&rp);
                 info!(
                     "Recursive STARK: {:.2}s, {} felts",
-                    rp.metadata.recursive_prove_time_secs, cd.len()
+                    rp.metadata.recursive_prove_time_secs,
+                    cd.len()
                 );
                 Some(cd.iter().map(|f| format!("0x{:x}", f)).collect::<Vec<_>>())
             }
@@ -774,8 +787,7 @@ pub fn build_starknet_proof_onchain(
     };
 
     // KV-cache commitment (optional — for autoregressive models with KV-cache)
-    if let (Some(kv), Some(prev_kv)) = (proof.kv_cache_commitment, proof.prev_kv_cache_commitment)
-    {
+    if let (Some(kv), Some(prev_kv)) = (proof.kv_cache_commitment, proof.prev_kv_cache_commitment) {
         combined.push(FieldElement::from(1u64)); // has_kv = true
         combined.push(kv);
         combined.push(prev_kv);
@@ -814,9 +826,8 @@ pub fn build_starknet_proof_onchain(
         gkr_calldata,
         kv_cache_commitment: proof.kv_cache_commitment,
         prev_kv_cache_commitment: proof.prev_kv_cache_commitment,
-        policy_name: crate::policy::preset_name(
-            &crate::policy::PolicyConfig::from_env()
-        ).map(|s| s.to_string()),
+        policy_name: crate::policy::preset_name(&crate::policy::PolicyConfig::from_env())
+            .map(|s| s.to_string()),
         policy_commitment: Some(proof.policy_commitment),
     }
 }
@@ -1374,7 +1385,13 @@ pub fn build_gkr_serializable_proof_parallel(
 
     // Parallel serialization of 4 independent components via nested rayon::join.
     // GKR calldata and weight openings are the heaviest — run on separate threads.
-    let (gkr_calldata, io_calldata, weight_opening_calldata, weight_claim_calldata, weight_binding_data_calldata) = {
+    let (
+        gkr_calldata,
+        io_calldata,
+        weight_opening_calldata,
+        weight_claim_calldata,
+        weight_binding_data_calldata,
+    ) = {
         let ((gkr_cd, io_cd), (wo_cd, (wc_cd, wbd_cd))) = rayon::join(
             || {
                 rayon::join(
@@ -1394,7 +1411,8 @@ pub fn build_gkr_serializable_proof_parallel(
                             .iter()
                             .filter(|d| d.has_weights())
                             .count();
-                        let total_openings = gkr_proof.weight_openings.len() + deferred_opening_count;
+                        let total_openings =
+                            gkr_proof.weight_openings.len() + deferred_opening_count;
                         let mut buf = Vec::new();
                         crate::cairo_serde::serialize_u32(total_openings as u32, &mut buf);
                         for opening in &gkr_proof.weight_openings {
@@ -1489,7 +1507,11 @@ pub fn prove_for_starknet_ml_gkr_with_cache(
     policy: Option<&crate::policy::PolicyConfig>,
 ) -> Result<GkrStarknetProof, StarknetModelError> {
     let proof = crate::aggregation::prove_model_pure_gkr_auto_with_cache(
-        graph, input, weights, weight_cache, policy,
+        graph,
+        input,
+        weights,
+        weight_cache,
+        policy,
     )?;
     build_gkr_starknet_proof(&proof, model_id, input)
 }
@@ -1737,7 +1759,7 @@ pub fn build_chunked_gkr_calldata(
     if use_io_packing {
         let packed = pack_m31_io_data(raw_io_data);
         flat.push(format!("{}", raw_io_data.len())); // original_len
-        flat.push(format!("{}", packed.len()));       // packed_count
+        flat.push(format!("{}", packed.len())); // packed_count
         for f in &packed {
             flat.push(format!("0x{:x}", f));
         }
@@ -1794,9 +1816,11 @@ pub fn build_chunked_gkr_calldata(
             Err(e) if skip_fatal_selfverify => {
                 eprintln!("[chunked] double-packed self-verification: WARNING — {e}");
             }
-            Err(e) => return Err(StarknetModelError::SoundnessGate(
-                format!("chunked double-packed self-verification failed: {e}")
-            )),
+            Err(e) => {
+                return Err(StarknetModelError::SoundnessGate(format!(
+                    "chunked double-packed self-verification failed: {e}"
+                )))
+            }
         }
     } else {
         match replay_verify_serialized_proof(
@@ -1815,9 +1839,11 @@ pub fn build_chunked_gkr_calldata(
             Err(e) if skip_fatal_selfverify => {
                 eprintln!("[chunked] packed self-verification: WARNING — {e}");
             }
-            Err(e) => return Err(StarknetModelError::SoundnessGate(
-                format!("self-verification failed: {e}")
-            )),
+            Err(e) => {
+                return Err(StarknetModelError::SoundnessGate(format!(
+                    "self-verification failed: {e}"
+                )))
+            }
         }
     }
 
@@ -2035,7 +2061,11 @@ fn extract_decode_metadata(layer_proofs: &[crate::gkr::types::LayerProof]) -> (u
             ..
         } = proof
         {
-            return (*position_offset as u32, *full_seq_len as u32, *new_tokens as u32);
+            return (
+                *position_offset as u32,
+                *full_seq_len as u32,
+                *new_tokens as u32,
+            );
         }
     }
     (0, 0, 0)
@@ -2068,7 +2098,7 @@ pub fn build_streaming_gkr_calldata(
 
     let packed_io = pack_m31_io_data(raw_io_data);
     init_calldata.push(format!("{}", raw_io_data.len())); // original_io_len
-    // packed_raw_io: Array<felt252> [len, data...]
+                                                          // packed_raw_io: Array<felt252> [len, data...]
     init_calldata.push(format!("{}", packed_io.len()));
     for f in &packed_io {
         init_calldata.push(format!("0x{:x}", f));
@@ -2094,8 +2124,8 @@ pub fn build_streaming_gkr_calldata(
         let be = raw_io_data[3 + io_in_len + 2].to_bytes_be();
         u32::from_be_bytes([be[28], be[29], be[30], be[31]])
     };
-    init_calldata.push(format!("{}", io_in_cols));  // in_cols
-    init_calldata.push(format!("{}", io_out_cols));  // out_cols
+    init_calldata.push(format!("{}", io_in_cols)); // in_cols
+    init_calldata.push(format!("{}", io_out_cols)); // out_cols
 
     // KV-cache commitment fields (always 7 felts — Cairo function requires these positional params)
     if let (Some(kv), Some(prev_kv)) = (kv_cache_commitment, prev_kv_cache_commitment) {
@@ -2114,10 +2144,14 @@ pub fn build_streaming_gkr_calldata(
         init_calldata.push("0".to_string()); // position_offset
         init_calldata.push("0".to_string()); // full_seq_len
         init_calldata.push("0".to_string()); // new_tokens
-        // When STWO_SKIP_POLICY_COMMITMENT is set, send 0 so the Cairo verifier
-        // also skips the policy mix (matching the prover's channel).
+                                             // When STWO_SKIP_POLICY_COMMITMENT is set, send 0 so the Cairo verifier
+                                             // also skips the policy mix (matching the prover's channel).
         let skip_policy = crate::policy::policy_commitment_skipped();
-        let effective_policy = if skip_policy { FieldElement::ZERO } else { policy_commitment };
+        let effective_policy = if skip_policy {
+            FieldElement::ZERO
+        } else {
+            policy_commitment
+        };
         init_calldata.push(format!("0x{:x}", effective_policy)); // policy_hash
     }
 
@@ -2152,7 +2186,11 @@ pub fn build_streaming_gkr_calldata(
         // chunk_offset, chunk_len, is_last_chunk
         calldata.push(format!("{}", chunk_offset));
         calldata.push(format!("{}", chunk_len));
-        calldata.push(if is_last { "1".to_string() } else { "0".to_string() });
+        calldata.push(if is_last {
+            "1".to_string()
+        } else {
+            "0".to_string()
+        });
 
         output_mle_chunks.push(OutputMleChunk {
             chunk_offset,
@@ -2215,8 +2253,9 @@ pub fn build_streaming_gkr_calldata(
                 layer_is_dequantize.push(true);
                 6
             }
-            crate::gkr::circuit::LayerType::Input
-            | crate::gkr::circuit::LayerType::Identity => continue,
+            crate::gkr::circuit::LayerType::Input | crate::gkr::circuit::LayerType::Identity => {
+                continue
+            }
             crate::gkr::circuit::LayerType::Add { .. } => {
                 layer_is_matmul.push(false);
                 layer_is_dequantize.push(false);
@@ -2294,7 +2333,10 @@ pub fn build_streaming_gkr_calldata(
         // dequantize_bits for this batch: Array<u64> [len, bits0, ...]
         calldata.push(format!("{}", batch_dequantize_count));
         for i in 0..batch_dequantize_count {
-            calldata.push(format!("{}", all_dequantize_bits[dequantize_bit_offset + i]));
+            calldata.push(format!(
+                "{}",
+                all_dequantize_bits[dequantize_bit_offset + i]
+            ));
         }
         dequantize_bit_offset += batch_dequantize_count;
 
@@ -2388,7 +2430,9 @@ pub fn build_streaming_gkr_calldata(
         for deferred in &proof.deferred_proofs {
             crate::cairo_serde::serialize_qm31_packed(deferred.claim.value, &mut deferred_felts);
             match &deferred.kind {
-                crate::gkr::types::DeferredProofKind::MatMul { weight_commitment, .. } => {
+                crate::gkr::types::DeferredProofKind::MatMul {
+                    weight_commitment, ..
+                } => {
                     crate::cairo_serde::serialize_u32(0, &mut deferred_felts);
                     if let crate::gkr::types::LayerProof::MatMul {
                         round_polys,
@@ -2396,19 +2440,33 @@ pub fn build_streaming_gkr_calldata(
                         final_b_eval,
                     } = &deferred.layer_proof
                     {
-                        crate::cairo_serde::serialize_u32(round_polys.len() as u32, &mut deferred_felts);
+                        crate::cairo_serde::serialize_u32(
+                            round_polys.len() as u32,
+                            &mut deferred_felts,
+                        );
                         for rp in round_polys {
                             crate::cairo_serde::serialize_qm31_packed(rp.c0, &mut deferred_felts);
                             crate::cairo_serde::serialize_qm31_packed(rp.c2, &mut deferred_felts);
                         }
-                        crate::cairo_serde::serialize_qm31_packed(*final_a_eval, &mut deferred_felts);
-                        crate::cairo_serde::serialize_qm31_packed(*final_b_eval, &mut deferred_felts);
+                        crate::cairo_serde::serialize_qm31_packed(
+                            *final_a_eval,
+                            &mut deferred_felts,
+                        );
+                        crate::cairo_serde::serialize_qm31_packed(
+                            *final_b_eval,
+                            &mut deferred_felts,
+                        );
                     }
                     deferred_felts.push(*weight_commitment);
                 }
                 crate::gkr::types::DeferredProofKind::Weightless => {
                     crate::cairo_serde::serialize_u32(1, &mut deferred_felts);
-                    if let crate::gkr::types::LayerProof::Add { lhs_eval, rhs_eval, trunk_idx } = &deferred.layer_proof {
+                    if let crate::gkr::types::LayerProof::Add {
+                        lhs_eval,
+                        rhs_eval,
+                        trunk_idx,
+                    } = &deferred.layer_proof
+                    {
                         crate::cairo_serde::serialize_qm31_packed(*lhs_eval, &mut deferred_felts);
                         crate::cairo_serde::serialize_qm31_packed(*rhs_eval, &mut deferred_felts);
                         crate::cairo_serde::serialize_u32(*trunk_idx as u32, &mut deferred_felts);
@@ -2464,7 +2522,12 @@ pub fn build_streaming_gkr_calldata(
         weight_binding_chunks.len(),
         weight_binding_chunks
             .iter()
-            .map(|c| format!("chunk_{}: {} felts ({})", c.chunk_idx, c.calldata.len(), c.entrypoint))
+            .map(|c| format!(
+                "chunk_{}: {} felts ({})",
+                c.chunk_idx,
+                c.calldata.len(),
+                c.entrypoint
+            ))
             .collect::<Vec<_>>()
             .join(", "),
     );
@@ -2487,16 +2550,30 @@ pub fn build_streaming_gkr_calldata(
             };
             eprintln!(
                 "[streaming]   weight_claim[{}]: eval_pt={}, expected_value=0x{:x}",
-                i, eval_pt_hash,
+                i,
+                eval_pt_hash,
                 crate::crypto::poseidon_channel::securefield_to_felt(wc.expected_value),
             );
         }
-        eprintln!("[streaming]   config: selector_bits={}, n_max={}, n_global={}, n_claims={}",
-            binding.config.selector_bits, binding.config.n_max,
-            binding.config.n_global, binding.config.n_claims);
-        eprintln!("[streaming]   sumcheck rounds: {}", binding.sumcheck_round_polys.len());
-        eprintln!("[streaming]   opening queries: {}", binding.opening_proof.queries.len());
-        eprintln!("[streaming]   opening intermediate roots: {}", binding.opening_proof.intermediate_roots.len());
+        eprintln!(
+            "[streaming]   config: selector_bits={}, n_max={}, n_global={}, n_claims={}",
+            binding.config.selector_bits,
+            binding.config.n_max,
+            binding.config.n_global,
+            binding.config.n_claims
+        );
+        eprintln!(
+            "[streaming]   sumcheck rounds: {}",
+            binding.sumcheck_round_polys.len()
+        );
+        eprintln!(
+            "[streaming]   opening queries: {}",
+            binding.opening_proof.queries.len()
+        );
+        eprintln!(
+            "[streaming]   opening intermediate roots: {}",
+            binding.opening_proof.intermediate_roots.len()
+        );
         eprintln!("[streaming] === END BINDING DIAGNOSTICS ===");
     }
 
@@ -2531,7 +2608,11 @@ pub fn build_streaming_gkr_calldata(
         // chunk_offset, chunk_len, is_last_chunk
         calldata.push(format!("{}", chunk_offset));
         calldata.push(format!("{}", chunk_len));
-        calldata.push(if is_last { "1".to_string() } else { "0".to_string() });
+        calldata.push(if is_last {
+            "1".to_string()
+        } else {
+            "0".to_string()
+        });
 
         input_mle_chunks.push(InputMleChunk {
             chunk_offset,
@@ -2546,7 +2627,8 @@ pub fn build_streaming_gkr_calldata(
 
     // ── Build upload chunks for data integrity ──
     // Reuse existing chunked session format for hash commitment
-    let chunked = build_chunked_gkr_calldata(proof, circuit, model_id, raw_io_data, kv_cache_commitment)?;
+    let chunked =
+        build_chunked_gkr_calldata(proof, circuit, model_id, raw_io_data, kv_cache_commitment)?;
 
     // ── Total felts for session metadata ──
     let total_felts = chunked.total_felts;
@@ -2710,7 +2792,10 @@ fn starknet_weight_binding_data(
                 // RLC-only: marker tag (0x524C43 = "RLC") + claim count.
                 Ok(vec![
                     format!("0x{:x}", FieldElement::from(0x524C43u64)),
-                    format!("0x{:x}", FieldElement::from(proof.weight_claims.len() as u64)),
+                    format!(
+                        "0x{:x}",
+                        FieldElement::from(proof.weight_claims.len() as u64)
+                    ),
                 ])
             }
         }
@@ -2735,7 +2820,8 @@ fn starknet_weight_binding_data_packed(
             if let Some(binding) = proof.aggregated_binding.as_ref() {
                 let mut payload = Vec::new();
                 crate::cairo_serde::serialize_aggregated_binding_proof_packed(
-                    binding, &mut payload,
+                    binding,
+                    &mut payload,
                 );
                 // Roundtrip check: deserialize and compare key fields
                 {
@@ -2744,26 +2830,66 @@ fn starknet_weight_binding_data_packed(
                         &payload, &mut pos,
                     );
                     assert_eq!(
-                        pos, payload.len(),
+                        pos,
+                        payload.len(),
                         "binding proof roundtrip: consumed {} of {} felts",
-                        pos, payload.len()
+                        pos,
+                        payload.len()
                     );
-                    assert_eq!(rt.config.selector_bits, binding.config.selector_bits, "selector_bits mismatch");
+                    assert_eq!(
+                        rt.config.selector_bits, binding.config.selector_bits,
+                        "selector_bits mismatch"
+                    );
                     assert_eq!(rt.config.n_max, binding.config.n_max, "n_max mismatch");
-                    assert_eq!(rt.config.n_global, binding.config.n_global, "n_global mismatch");
-                    assert_eq!(rt.config.n_claims, binding.config.n_claims, "n_claims mismatch");
-                    assert_eq!(rt.sumcheck_round_polys.len(), binding.sumcheck_round_polys.len(), "round polys len");
-                    for (i, ((a0, a1, a2), (b0, b1, b2))) in rt.sumcheck_round_polys.iter().zip(&binding.sumcheck_round_polys).enumerate() {
+                    assert_eq!(
+                        rt.config.n_global, binding.config.n_global,
+                        "n_global mismatch"
+                    );
+                    assert_eq!(
+                        rt.config.n_claims, binding.config.n_claims,
+                        "n_claims mismatch"
+                    );
+                    assert_eq!(
+                        rt.sumcheck_round_polys.len(),
+                        binding.sumcheck_round_polys.len(),
+                        "round polys len"
+                    );
+                    for (i, ((a0, a1, a2), (b0, b1, b2))) in rt
+                        .sumcheck_round_polys
+                        .iter()
+                        .zip(&binding.sumcheck_round_polys)
+                        .enumerate()
+                    {
                         assert_eq!(a0, b0, "round {i} c0 mismatch");
                         assert_eq!(a1, b1, "round {i} c1 mismatch");
                         assert_eq!(a2, b2, "round {i} c2 mismatch");
                     }
-                    assert_eq!(rt.oracle_eval_at_s, binding.oracle_eval_at_s, "oracle_eval mismatch");
-                    assert_eq!(rt.super_root.root, binding.super_root.root, "super_root mismatch");
-                    assert_eq!(rt.super_root.subtree_roots, binding.super_root.subtree_roots, "subtree_roots mismatch");
-                    assert_eq!(rt.opening_proof.intermediate_roots, binding.opening_proof.intermediate_roots, "intermediate_roots mismatch");
-                    assert_eq!(rt.opening_proof.queries.len(), binding.opening_proof.queries.len(), "queries len mismatch");
-                    assert_eq!(rt.opening_proof.final_value, binding.opening_proof.final_value, "final_value mismatch");
+                    assert_eq!(
+                        rt.oracle_eval_at_s, binding.oracle_eval_at_s,
+                        "oracle_eval mismatch"
+                    );
+                    assert_eq!(
+                        rt.super_root.root, binding.super_root.root,
+                        "super_root mismatch"
+                    );
+                    assert_eq!(
+                        rt.super_root.subtree_roots, binding.super_root.subtree_roots,
+                        "subtree_roots mismatch"
+                    );
+                    assert_eq!(
+                        rt.opening_proof.intermediate_roots,
+                        binding.opening_proof.intermediate_roots,
+                        "intermediate_roots mismatch"
+                    );
+                    assert_eq!(
+                        rt.opening_proof.queries.len(),
+                        binding.opening_proof.queries.len(),
+                        "queries len mismatch"
+                    );
+                    assert_eq!(
+                        rt.opening_proof.final_value, binding.opening_proof.final_value,
+                        "final_value mismatch"
+                    );
                     eprintln!(
                         "[streaming] binding proof roundtrip: PASSED ({} felts, {} rounds, {} queries)",
                         payload.len(),
@@ -2779,7 +2905,8 @@ fn starknet_weight_binding_data_packed(
                 payload.push(FieldElement::from(proof.binding_groups.len() as u64));
                 for group in &proof.binding_groups {
                     crate::cairo_serde::serialize_aggregated_binding_proof_packed(
-                        group, &mut payload,
+                        group,
+                        &mut payload,
                     );
                 }
                 eprintln!(
@@ -2797,8 +2924,7 @@ fn starknet_weight_binding_data_packed(
             }
         }
         _ => Err(StarknetModelError::SoundnessGate(
-            "Streaming GKR only supports AggregatedOracleSumcheck (mode 4) binding."
-                .to_string(),
+            "Streaming GKR only supports AggregatedOracleSumcheck (mode 4) binding.".to_string(),
         )),
     }
 }
@@ -3064,12 +3190,14 @@ pub fn build_verify_model_gkr_v4_double_packed_io_calldata(
 
     // matmul_dims array
     let md_len_idx = rest_start + 2;
-    let md_len: usize = base.calldata_parts[md_len_idx].parse::<usize>().map_err(|_| {
-        StarknetModelError::SoundnessGate(format!(
-            "bad calldata at index {} (expected matmul_dims length): {:?}",
-            md_len_idx, base.calldata_parts[md_len_idx]
-        ))
-    })?;
+    let md_len: usize = base.calldata_parts[md_len_idx]
+        .parse::<usize>()
+        .map_err(|_| {
+            StarknetModelError::SoundnessGate(format!(
+                "bad calldata at index {} (expected matmul_dims length): {:?}",
+                md_len_idx, base.calldata_parts[md_len_idx]
+            ))
+        })?;
     parts.push(base.calldata_parts[md_len_idx].clone()); // array length
     for i in 0..md_len {
         parts.push(base.calldata_parts[md_len_idx + 1 + i].clone());
@@ -3077,12 +3205,14 @@ pub fn build_verify_model_gkr_v4_double_packed_io_calldata(
 
     // dequantize_bits array
     let dq_len_idx = md_len_idx + 1 + md_len;
-    let dq_len: usize = base.calldata_parts[dq_len_idx].parse::<usize>().map_err(|_| {
-        StarknetModelError::SoundnessGate(format!(
-            "bad calldata at index {} (expected dequantize_bits length): {:?}",
-            dq_len_idx, base.calldata_parts[dq_len_idx]
-        ))
-    })?;
+    let dq_len: usize = base.calldata_parts[dq_len_idx]
+        .parse::<usize>()
+        .map_err(|_| {
+            StarknetModelError::SoundnessGate(format!(
+                "bad calldata at index {} (expected dequantize_bits length): {:?}",
+                dq_len_idx, base.calldata_parts[dq_len_idx]
+            ))
+        })?;
     parts.push(base.calldata_parts[dq_len_idx].clone()); // array length
     for i in 0..dq_len {
         parts.push(base.calldata_parts[dq_len_idx + 1 + i].clone());
@@ -3097,12 +3227,14 @@ pub fn build_verify_model_gkr_v4_double_packed_io_calldata(
     // Rest: weight_commitments, weight_binding_mode, weight_binding_data, weight_opening_proofs
     // Find where proof_data ends in base
     let base_pd_len_idx = dq_len_idx + 1 + dq_len;
-    let base_pd_len: usize = base.calldata_parts[base_pd_len_idx].parse::<usize>().map_err(|_| {
-        StarknetModelError::SoundnessGate(format!(
-            "bad calldata at index {} (expected proof_data length): {:?}",
-            base_pd_len_idx, base.calldata_parts[base_pd_len_idx]
-        ))
-    })?;
+    let base_pd_len: usize = base.calldata_parts[base_pd_len_idx]
+        .parse::<usize>()
+        .map_err(|_| {
+            StarknetModelError::SoundnessGate(format!(
+                "bad calldata at index {} (expected proof_data length): {:?}",
+                base_pd_len_idx, base.calldata_parts[base_pd_len_idx]
+            ))
+        })?;
     let after_pd_idx = base_pd_len_idx + 1 + base_pd_len;
     for i in after_pd_idx..base.calldata_parts.len() {
         parts.push(base.calldata_parts[i].clone());
@@ -3112,11 +3244,18 @@ pub fn build_verify_model_gkr_v4_double_packed_io_calldata(
     // circuit_depth(1) + num_layers(1) + matmul_dims(1+len) + dequantize_bits(1+len) +
     // dp_proof_data(1+len) + rest_from_base
     let rest_from_base = base.calldata_parts.len() - after_pd_idx;
-    let expected = 1 + 1 + 1 + packed_io.len()
-        + 1 + 1
-        + 1 + md_len
-        + 1 + dq_len
-        + 1 + dp_proof_data.len()
+    let expected = 1
+        + 1
+        + 1
+        + packed_io.len()
+        + 1
+        + 1
+        + 1
+        + md_len
+        + 1
+        + dq_len
+        + 1
+        + dp_proof_data.len()
         + rest_from_base;
     let total_felts = parts.len();
     if total_felts != expected {
@@ -3228,21 +3367,19 @@ fn build_verify_model_gkr_calldata_inner(
             if crate::policy::policy_commitment_skipped() {
                 eprintln!("  [v4] replay self-verification: WARNING — {e} (non-fatal with SKIP_POLICY_COMMITMENT)");
             } else {
-                return Err(StarknetModelError::SoundnessGate(
-                    format!("self-verification failed: {e}")
-                ));
+                return Err(StarknetModelError::SoundnessGate(format!(
+                    "self-verification failed: {e}"
+                )));
             }
         }
     }
     let _self_verify_elapsed = _t_self_verify.elapsed();
 
     // Emit serialization profiling if enabled
-    crate::gkr::profiler::print_serialization_timing(
-        &crate::gkr::profiler::SerializationTimings {
-            serialize: _serialize_elapsed,
-            self_verify: _self_verify_elapsed,
-        },
-    );
+    crate::gkr::profiler::print_serialization_timing(&crate::gkr::profiler::SerializationTimings {
+        serialize: _serialize_elapsed,
+        self_verify: _self_verify_elapsed,
+    });
 
     parts.push(format!("{}", proof_data.len()));
     for f in &proof_data {
@@ -3473,7 +3610,7 @@ pub fn replay_verify_double_packed_proof(
     proof: &crate::gkr::GKRProof,
 ) -> Result<(), String> {
     use crate::cairo_serde::{
-        deserialize_qm31_pair_packed, serialize_qm31_pair_packed, serialize_qm31_packed,
+        deserialize_qm31_pair_packed, serialize_qm31_packed, serialize_qm31_pair_packed,
     };
     use crate::crypto::poseidon_channel::felt_to_securefield;
     use crate::gkr::types::LayerProof;
@@ -3539,10 +3676,7 @@ pub fn replay_verify_double_packed_proof(
                         rp.c2,
                         &format!("layer[{}].Mul.round[{}].(c0,c2)", li, ri),
                     )?;
-                    verify_single(
-                        rp.c3,
-                        &format!("layer[{}].Mul.round[{}].c3", li, ri),
-                    )?;
+                    verify_single(rp.c3, &format!("layer[{}].Mul.round[{}].c3", li, ri))?;
                 }
                 verify_single(*lhs_eval, &format!("layer[{}].Mul.lhs", li))?;
                 verify_single(*rhs_eval, &format!("layer[{}].Mul.rhs", li))?;
@@ -3568,10 +3702,7 @@ pub fn replay_verify_double_packed_proof(
                         rp.c2,
                         &format!("layer[{}].{}.round[{}].(c0,c2)", li, tag, ri),
                     )?;
-                    verify_single(
-                        rp.c3,
-                        &format!("layer[{}].{}.round[{}].c3", li, tag, ri),
-                    )?;
+                    verify_single(rp.c3, &format!("layer[{}].{}.round[{}].c3", li, tag, ri))?;
                 }
                 let (a, b) = *linear_final_evals;
                 verify_single(a, &format!("layer[{}].{}.final_eval_0", li, tag))?;
@@ -3641,7 +3772,11 @@ pub fn replay_verify_double_packed_proof(
     // This ensures double-packed proofs get the same cryptographic verification
     // as regular packed proofs (sumcheck arithmetic, deferred proofs, trailing data).
     replay_verify_serialized_proof(
-        &packed_data, raw_io, matmul_dims, circuit_depth, num_layers,
+        &packed_data,
+        raw_io,
+        matmul_dims,
+        circuit_depth,
+        num_layers,
         true, // packed
         Some(proof.io_commitment),
         proof.aggregated_binding.as_ref(),
@@ -3664,13 +3799,13 @@ pub fn replay_verify_serialized_proof(
     kv_cache_commitment: Option<FieldElement>,
     prev_kv_cache_commitment: Option<FieldElement>,
 ) -> Result<(), String> {
+    use crate::crypto::poseidon_channel::felt_to_securefield;
     use crate::crypto::poseidon_channel::PoseidonChannel;
     use crate::gkr::prover::mix_secure_field;
-    use crate::crypto::poseidon_channel::felt_to_securefield;
-    use stwo::core::fields::qm31::{QM31, SecureField};
+    use num_traits::Zero;
     use stwo::core::fields::cm31::CM31;
     use stwo::core::fields::m31::M31;
-    use num_traits::Zero;
+    use stwo::core::fields::qm31::{SecureField, QM31};
 
     fn felt_to_u64(f: &FieldElement) -> u64 {
         let b = f.to_bytes_be();
@@ -3687,9 +3822,9 @@ pub fn replay_verify_serialized_proof(
     let input_rows = felt_to_u64(&raw_io[0]);
     let input_cols = felt_to_u64(&raw_io[1]);
     let input_len = felt_to_u64(&raw_io[2]) as usize;
-    let out_start = 3usize.checked_add(input_len).ok_or_else(|| {
-        format!("integer overflow computing out_start: 3 + {input_len}")
-    })?;
+    let out_start = 3usize
+        .checked_add(input_len)
+        .ok_or_else(|| format!("integer overflow computing out_start: 3 + {input_len}"))?;
 
     if raw_io.len() < out_start + 3 {
         return Err(format!(
@@ -3703,7 +3838,9 @@ pub fn replay_verify_serialized_proof(
     let output_cols = felt_to_u64(&raw_io[out_start + 1]) as usize;
     let output_len = felt_to_u64(&raw_io[out_start + 2]) as usize;
 
-    let output_data_end = out_start.checked_add(3).and_then(|s| s.checked_add(output_len))
+    let output_data_end = out_start
+        .checked_add(3)
+        .and_then(|s| s.checked_add(output_len))
         .ok_or_else(|| format!("integer overflow computing output data end"))?;
     if raw_io.len() < output_data_end {
         return Err(format!(
@@ -3758,8 +3895,14 @@ pub fn replay_verify_serialized_proof(
     }
     let trace = std::env::var("STWO_CHANNEL_TRACE").is_ok();
     if trace {
-        eprintln!("[VERIFIER] seeding: depth={}, input_rows={}, input_cols={}", circuit_depth, input_rows, input_cols);
-        eprintln!("[VERIFIER] output: {}x{} padded to {}x{}", output_rows, output_cols, padded_rows, padded_cols);
+        eprintln!(
+            "[VERIFIER] seeding: depth={}, input_rows={}, input_cols={}",
+            circuit_depth, input_rows, input_cols
+        );
+        eprintln!(
+            "[VERIFIER] output: {}x{} padded to {}x{}",
+            output_rows, output_cols, padded_rows, padded_cols
+        );
     }
     ch.mix_u64(circuit_depth as u64);
     ch.mix_u64(input_rows as u64);
@@ -3774,7 +3917,10 @@ pub fn replay_verify_serialized_proof(
     }
     if trace {
         eprintln!("[VERIFIER] ch after seeding+policy: {:?}", ch.digest());
-        eprintln!("[VERIFIER] policy_commitment: {:?}, skip={}", policy_commitment, skip_policy);
+        eprintln!(
+            "[VERIFIER] policy_commitment: {:?}, skip={}",
+            policy_commitment, skip_policy
+        );
     }
 
     let log_out = (padded_rows * padded_cols).ilog2() as usize;
@@ -3799,12 +3945,18 @@ pub fn replay_verify_serialized_proof(
             *off += 1;
             felt_to_securefield(fe)
         } else {
-            let aa = felt_to_u64(&data[*off]) as u32; *off += 1;
-            let ab = felt_to_u64(&data[*off]) as u32; *off += 1;
-            let ba = felt_to_u64(&data[*off]) as u32; *off += 1;
-            let bb = felt_to_u64(&data[*off]) as u32; *off += 1;
-            QM31(CM31(M31::from(aa), M31::from(ab)),
-                 CM31(M31::from(ba), M31::from(bb)))
+            let aa = felt_to_u64(&data[*off]) as u32;
+            *off += 1;
+            let ab = felt_to_u64(&data[*off]) as u32;
+            *off += 1;
+            let ba = felt_to_u64(&data[*off]) as u32;
+            *off += 1;
+            let bb = felt_to_u64(&data[*off]) as u32;
+            *off += 1;
+            QM31(
+                CM31(M31::from(aa), M31::from(ab)),
+                CM31(M31::from(ba), M31::from(bb)),
+            )
         }
     };
 
@@ -3820,7 +3972,13 @@ pub fn replay_verify_serialized_proof(
     for layer in 0..num_layers as usize {
         let tag = read_u32_from(proof_data, &mut off);
         if trace {
-            eprintln!("[VERIFIER] layer {} tag={} off={} ch={:?}", layer, tag, off, ch.digest());
+            eprintln!(
+                "[VERIFIER] layer {} tag={} off={} ch={:?}",
+                layer,
+                tag,
+                off,
+                ch.digest()
+            );
         }
 
         match tag {
@@ -3832,7 +3990,10 @@ pub fn replay_verify_serialized_proof(
                 matmul_idx += 1;
 
                 if trace {
-                    eprintln!("[VERIFIER MatMul] m={} k={} n={} claim={:?}", m, k, n, current_claim_value);
+                    eprintln!(
+                        "[VERIFIER MatMul] m={} k={} n={} claim={:?}",
+                        m, k, n, current_claim_value
+                    );
                 }
                 ch.mix_u64(m as u64);
                 ch.mix_u64(k as u64);
@@ -3855,8 +4016,14 @@ pub fn replay_verify_serialized_proof(
                     let challenge = ch.draw_qm31();
                     current_sum = c0 + c1 * challenge + c2 * challenge * challenge;
                     if trace && round < 3 {
-                        eprintln!("[VERIFIER MatMul] round {} c0={:?} c1={:?} c2={:?}", round, c0, c1, c2);
-                        eprintln!("[VERIFIER MatMul] round {} challenge={:?} new_sum={:?}", round, challenge, current_sum);
+                        eprintln!(
+                            "[VERIFIER MatMul] round {} c0={:?} c1={:?} c2={:?}",
+                            round, c0, c1, c2
+                        );
+                        eprintln!(
+                            "[VERIFIER MatMul] round {} challenge={:?} new_sum={:?}",
+                            round, challenge, current_sum
+                        );
                         eprintln!("[VERIFIER MatMul] round {} ch={:?}", round, ch.digest());
                     }
                 }
@@ -3865,7 +4032,9 @@ pub fn replay_verify_serialized_proof(
                 if current_sum != final_a * final_b {
                     return Err(format!(
                         "MATMUL_FINAL_MISMATCH at layer {}: sum={:?} != a*b={:?}",
-                        layer, current_sum, final_a * final_b
+                        layer,
+                        current_sum,
+                        final_a * final_b
                     ));
                 }
                 mix_secure_field(&mut ch, final_a);
@@ -3888,10 +4057,16 @@ pub fn replay_verify_serialized_proof(
                 // Exception: STWO_SKIP_RMS_SQ_PROOF bypasses Part 0 for on-chain streaming
                 let skip_p0 = crate::policy::skip_rms_sq_proof();
                 if !skip_p0 && simd_combined == 0 && has_p0 != 1 {
-                    return Err(format!("layer {}: non-SIMD RMSNorm requires Part 0 (has_p0={})", layer, has_p0));
+                    return Err(format!(
+                        "layer {}: non-SIMD RMSNorm requires Part 0 (has_p0={})",
+                        layer, has_p0
+                    ));
                 }
                 if simd_combined == 1 && has_p0 != 0 {
-                    return Err(format!("layer {}: SIMD RMSNorm must not have Part 0 (has_p0={})", layer, has_p0));
+                    return Err(format!(
+                        "layer {}: SIMD RMSNorm must not have Part 0 (has_p0={})",
+                        layer, has_p0
+                    ));
                 }
                 if has_p0 == 1 {
                     let two_p0 = SecureField::from(M31::from(2u32));
@@ -3915,7 +4090,10 @@ pub fn replay_verify_serialized_proof(
                     let p0_input_final = read_qm31_from(proof_data, &mut off);
                     mix_secure_field(&mut ch, p0_input_final);
                     if trace {
-                        eprintln!("[VERIFIER RMSNorm] ch after Part 0 (RMS² sumcheck): {:?}", ch.digest());
+                        eprintln!(
+                            "[VERIFIER RMSNorm] ch after Part 0 (RMS² sumcheck): {:?}",
+                            ch.digest()
+                        );
                     }
                 }
 
@@ -3948,21 +4126,38 @@ pub fn replay_verify_serialized_proof(
                     let c3 = read_qm31_from(proof_data, &mut off);
                     let c1 = rms_sum - two * c0 - c2 - c3;
                     if trace && _round < 3 {
-                        eprintln!("[VERIFIER RMSNorm] round {} c0={:?} c2={:?} c3={:?}", _round, c0, c2, c3);
-                        eprintln!("[VERIFIER RMSNorm] round {} c1={:?} sum={:?}", _round, c1, rms_sum);
+                        eprintln!(
+                            "[VERIFIER RMSNorm] round {} c0={:?} c2={:?} c3={:?}",
+                            _round, c0, c2, c3
+                        );
+                        eprintln!(
+                            "[VERIFIER RMSNorm] round {} c1={:?} sum={:?}",
+                            _round, c1, rms_sum
+                        );
                     }
                     ch.mix_poly_coeffs_deg3(c0, c1, c2, c3);
                     let challenge = ch.draw_qm31();
                     if trace && _round < 3 {
-                        eprintln!("[VERIFIER RMSNorm] round {} challenge={:?} ch={:?}", _round, challenge, ch.digest());
+                        eprintln!(
+                            "[VERIFIER RMSNorm] round {} challenge={:?} ch={:?}",
+                            _round,
+                            challenge,
+                            ch.digest()
+                        );
                     }
-                    rms_sum = c0 + c1 * challenge + c2 * challenge * challenge
+                    rms_sum = c0
+                        + c1 * challenge
+                        + c2 * challenge * challenge
                         + c3 * challenge * challenge * challenge;
                 }
                 let input_final = read_qm31_from(proof_data, &mut off);
                 let rsqrt_final = read_qm31_from(proof_data, &mut off);
                 if trace {
-                    eprintln!("[VERIFIER RMSNorm] ch after {} eq-rounds: {:?}", nrounds, ch.digest());
+                    eprintln!(
+                        "[VERIFIER RMSNorm] ch after {} eq-rounds: {:?}",
+                        nrounds,
+                        ch.digest()
+                    );
                     eprintln!("[VERIFIER RMSNorm] input_final={:?}", input_final);
                     eprintln!("[VERIFIER RMSNorm] rsqrt_final={:?}", rsqrt_final);
                 }
@@ -3988,7 +4183,10 @@ pub fn replay_verify_serialized_proof(
                     }
                     mix_secure_field(&mut ch, claimed_sum);
                     if trace {
-                        eprintln!("[VERIFIER RMSNorm] ch after mix claimed_sum: {:?}", ch.digest());
+                        eprintln!(
+                            "[VERIFIER RMSNorm] ch after mix claimed_sum: {:?}",
+                            ch.digest()
+                        );
                     }
                     let eq_rounds = read_u32_from(proof_data, &mut off) as usize;
                     if trace {
@@ -4004,7 +4202,9 @@ pub fn replay_verify_serialized_proof(
                         let c1 = logup_sum - two_logup * c0 - c2 - c3;
                         ch.mix_poly_coeffs_deg3(c0, c1, c2, c3);
                         let challenge = ch.draw_qm31();
-                        logup_sum = c0 + c1 * challenge + c2 * challenge * challenge
+                        logup_sum = c0
+                            + c1 * challenge
+                            + c2 * challenge * challenge
                             + c3 * challenge * challenge * challenge;
                     }
                     let _w = read_qm31_from(proof_data, &mut off);
@@ -4033,7 +4233,10 @@ pub fn replay_verify_serialized_proof(
                     let _claimed_sum = read_qm31_from(proof_data, &mut off);
                 }
                 if trace {
-                    eprintln!("[VERIFIER RMSNorm] ch after mult sumcheck: {:?}", ch.digest());
+                    eprintln!(
+                        "[VERIFIER RMSNorm] ch after mult sumcheck: {:?}",
+                        ch.digest()
+                    );
                 }
 
                 // Per-row rms_sq for multi-row binding (not channel-mixed, just consume)
@@ -4080,7 +4283,9 @@ pub fn replay_verify_serialized_proof(
                         let c1 = logup_sum - two_act * c0 - c2 - c3;
                         ch.mix_poly_coeffs_deg3(c0, c1, c2, c3);
                         let challenge = ch.draw_qm31();
-                        logup_sum = c0 + c1 * challenge + c2 * challenge * challenge
+                        logup_sum = c0
+                            + c1 * challenge
+                            + c2 * challenge * challenge
                             + c3 * challenge * challenge * challenge;
                     }
                     let _w = read_qm31_from(proof_data, &mut off);
@@ -4123,7 +4328,9 @@ pub fn replay_verify_serialized_proof(
                         let c1 = act_sum - two_act * c0 - c2 - c3;
                         ch.mix_poly_coeffs_deg3(c0, c1, c2, c3);
                         let challenge = ch.draw_qm31();
-                        act_sum = c0 + c1 * challenge + c2 * challenge * challenge
+                        act_sum = c0
+                            + c1 * challenge
+                            + c2 * challenge * challenge
                             + c3 * challenge * challenge * challenge;
                     }
                     let act_input_eval = read_qm31_from(proof_data, &mut off);
@@ -4163,7 +4370,9 @@ pub fn replay_verify_serialized_proof(
                         let c1 = pw_sum - two_pw * c0 - c2 - c3;
                         ch.mix_poly_coeffs_deg3(c0, c1, c2, c3);
                         let challenge = ch.draw_qm31();
-                        pw_sum = c0 + c1 * challenge + c2 * challenge * challenge
+                        pw_sum = c0
+                            + c1 * challenge
+                            + c2 * challenge * challenge
                             + c3 * challenge * challenge * challenge;
                     }
                     let pw_input_eval = read_qm31_from(proof_data, &mut off);
@@ -4179,6 +4388,34 @@ pub fn replay_verify_serialized_proof(
                         for _ in 0..4usize {
                             let sb = read_qm31_from(proof_data, &mut off);
                             mix_secure_field(&mut ch, sb);
+                        }
+                    }
+                    let has_lbe = read_u32_from(proof_data, &mut off);
+                    if has_lbe == 1 {
+                        let num_low_bits = read_u32_from(proof_data, &mut off) as usize;
+                        if num_low_bits != 27 {
+                            return Err(format!(
+                                "layer {}: piecewise low-bit eval count mismatch: got {}, expected 27",
+                                layer, num_low_bits
+                            ));
+                        }
+                        for _ in 0..num_low_bits {
+                            let lb = read_qm31_from(proof_data, &mut off);
+                            mix_secure_field(&mut ch, lb);
+                        }
+                    }
+                    let has_cae = read_u32_from(proof_data, &mut off);
+                    if has_cae == 1 {
+                        let num_canonical_ands = read_u32_from(proof_data, &mut off) as usize;
+                        if num_canonical_ands != 31 {
+                            return Err(format!(
+                                "layer {}: piecewise canonicality eval count mismatch: got {}, expected 31",
+                                layer, num_canonical_ands
+                            ));
+                        }
+                        for _ in 0..num_canonical_ands {
+                            let ca = read_qm31_from(proof_data, &mut off);
+                            mix_secure_field(&mut ch, ca);
                         }
                     }
                     current_claim_value = pw_input_eval;
@@ -4216,10 +4453,16 @@ pub fn replay_verify_serialized_proof(
                 let has_mv = read_u32_from(proof_data, &mut off);
                 // SIMD consistency gate: non-SIMD must have Part 0, SIMD must not
                 if simd_combined == 0 && has_mv != 1 {
-                    return Err(format!("layer {}: non-SIMD LayerNorm requires Part 0 (has_mv={})", layer, has_mv));
+                    return Err(format!(
+                        "layer {}: non-SIMD LayerNorm requires Part 0 (has_mv={})",
+                        layer, has_mv
+                    ));
                 }
                 if simd_combined == 1 && has_mv != 0 {
-                    return Err(format!("layer {}: SIMD LayerNorm must not have Part 0 (has_mv={})", layer, has_mv));
+                    return Err(format!(
+                        "layer {}: SIMD LayerNorm must not have Part 0 (has_mv={})",
+                        layer, has_mv
+                    ));
                 }
                 if has_mv == 1 {
                     let mv_n_active = read_u32_from(proof_data, &mut off) as u64;
@@ -4264,7 +4507,9 @@ pub fn replay_verify_serialized_proof(
                     let c1 = ln_sum - two_ln * c0 - c2 - c3;
                     ch.mix_poly_coeffs_deg3(c0, c1, c2, c3);
                     let challenge = ch.draw_qm31();
-                    ln_sum = c0 + c1 * challenge + c2 * challenge * challenge
+                    ln_sum = c0
+                        + c1 * challenge
+                        + c2 * challenge * challenge
                         + c3 * challenge * challenge * challenge;
                 }
                 let centered_final = read_qm31_from(proof_data, &mut off);
@@ -4283,7 +4528,7 @@ pub fn replay_verify_serialized_proof(
                 let has_logup = read_u32_from(proof_data, &mut off);
                 if has_logup == 1 {
                     ch.mix_u64(0x4C4F47); // "LOG"
-                    ch.mix_u64(0x5253);   // "RS"
+                    ch.mix_u64(0x5253); // "RS"
                     let _gamma = ch.draw_qm31();
                     let _beta = ch.draw_qm31();
                     let claimed_sum = read_qm31_from(proof_data, &mut off);
@@ -4298,7 +4543,9 @@ pub fn replay_verify_serialized_proof(
                         let c1 = logup_sum - two_logup * c0 - c2 - c3;
                         ch.mix_poly_coeffs_deg3(c0, c1, c2, c3);
                         let challenge = ch.draw_qm31();
-                        logup_sum = c0 + c1 * challenge + c2 * challenge * challenge
+                        logup_sum = c0
+                            + c1 * challenge
+                            + c2 * challenge * challenge
                             + c3 * challenge * challenge * challenge;
                     }
                     let _w = read_qm31_from(proof_data, &mut off);
@@ -4376,7 +4623,9 @@ pub fn replay_verify_serialized_proof(
                         let c1 = logup_sum - two_deq * c0 - c2 - c3;
                         ch.mix_poly_coeffs_deg3(c0, c1, c2, c3);
                         let challenge = ch.draw_qm31();
-                        logup_sum = c0 + c1 * challenge + c2 * challenge * challenge
+                        logup_sum = c0
+                            + c1 * challenge
+                            + c2 * challenge * challenge
                             + c3 * challenge * challenge * challenge;
                     }
                     // Final evals: w, in, out
@@ -4406,7 +4655,12 @@ pub fn replay_verify_serialized_proof(
                 mix_secure_field(&mut ch, output_eval);
                 current_claim_value = input_eval;
                 if trace {
-                    eprintln!("[VERIFIER Dequantize] layer {} bits={} ch={:?}", layer, bits, ch.digest());
+                    eprintln!(
+                        "[VERIFIER Dequantize] layer {} bits={} ch={:?}",
+                        layer,
+                        bits,
+                        ch.digest()
+                    );
                 }
             }
             9 => {
@@ -4441,7 +4695,9 @@ pub fn replay_verify_serialized_proof(
                         let c1 = logup_sum - two_q * c0 - c2 - c3;
                         ch.mix_poly_coeffs_deg3(c0, c1, c2, c3);
                         let challenge = ch.draw_qm31();
-                        logup_sum = c0 + c1 * challenge + c2 * challenge * challenge
+                        logup_sum = c0
+                            + c1 * challenge
+                            + c2 * challenge * challenge
                             + c3 * challenge * challenge * challenge;
                     }
                     // Final evals: w, in, out
@@ -4463,7 +4719,12 @@ pub fn replay_verify_serialized_proof(
                 mix_secure_field(&mut ch, output_eval);
                 current_claim_value = input_eval;
                 if trace {
-                    eprintln!("[VERIFIER Quantize] layer {} bits={} ch={:?}", layer, bits, ch.digest());
+                    eprintln!(
+                        "[VERIFIER Quantize] layer {} bits={} ch={:?}",
+                        layer,
+                        bits,
+                        ch.digest()
+                    );
                 }
             }
             2 => {
@@ -4481,7 +4742,9 @@ pub fn replay_verify_serialized_proof(
                     let c1 = current_sum - two * c0 - c2 - c3;
                     ch.mix_poly_coeffs_deg3(c0, c1, c2, c3);
                     let _challenge = ch.draw_qm31();
-                    current_sum = c0 + c1 * _challenge + c2 * _challenge * _challenge
+                    current_sum = c0
+                        + c1 * _challenge
+                        + c2 * _challenge * _challenge
                         + c3 * _challenge * _challenge * _challenge;
                 }
                 let lhs_eval = read_qm31_from(proof_data, &mut off);
@@ -4489,8 +4752,8 @@ pub fn replay_verify_serialized_proof(
                 mix_secure_field(&mut ch, lhs_eval);
                 mix_secure_field(&mut ch, rhs_eval);
                 let alpha = ch.draw_qm31();
-                current_claim_value = alpha * lhs_eval
-                    + (SecureField::from(M31::from(1u32)) - alpha) * rhs_eval;
+                current_claim_value =
+                    alpha * lhs_eval + (SecureField::from(M31::from(1u32)) - alpha) * rhs_eval;
                 if trace {
                     eprintln!("[VERIFIER Mul] layer {} ch={:?}", layer, ch.digest());
                 }
@@ -4531,7 +4794,9 @@ pub fn replay_verify_serialized_proof(
                     };
                     ch.mix_poly_coeffs_deg3(c0, c1, c2, c3);
                     let challenge = ch.draw_qm31();
-                    current_sum = c0 + c1 * challenge + c2 * challenge * challenge
+                    current_sum = c0
+                        + c1 * challenge
+                        + c2 * challenge * challenge
                         + c3 * challenge * challenge * challenge;
                 }
                 let final_a = read_qm31_from(proof_data, &mut off);
@@ -4540,8 +4805,15 @@ pub fn replay_verify_serialized_proof(
                 mix_secure_field(&mut ch, final_b);
                 current_claim_value = final_a;
                 if trace {
-                    eprintln!("[VERIFIER MatMulDualSimd] layer {} m={} k={} n={} nb={} ch={:?}",
-                        layer, m, k, n, n_blocks, ch.digest());
+                    eprintln!(
+                        "[VERIFIER MatMulDualSimd] layer {} m={} k={} n={} nb={} ch={:?}",
+                        layer,
+                        m,
+                        k,
+                        n,
+                        n_blocks,
+                        ch.digest()
+                    );
                 }
             }
             5 => {
@@ -4579,12 +4851,18 @@ pub fn replay_verify_serialized_proof(
                     let two = SecureField::from(M31::from(2u32));
                     // Sub-proof QM31 reader (always unpacked: 4 felts per QM31)
                     let read_sub_qm31 = |data: &[FieldElement], off: &mut usize| -> SecureField {
-                        let aa = felt_to_u64(&data[*off]) as u32; *off += 1;
-                        let ab = felt_to_u64(&data[*off]) as u32; *off += 1;
-                        let ba = felt_to_u64(&data[*off]) as u32; *off += 1;
-                        let bb = felt_to_u64(&data[*off]) as u32; *off += 1;
-                        QM31(CM31(M31::from(aa), M31::from(ab)),
-                             CM31(M31::from(ba), M31::from(bb)))
+                        let aa = felt_to_u64(&data[*off]) as u32;
+                        *off += 1;
+                        let ab = felt_to_u64(&data[*off]) as u32;
+                        *off += 1;
+                        let ba = felt_to_u64(&data[*off]) as u32;
+                        *off += 1;
+                        let bb = felt_to_u64(&data[*off]) as u32;
+                        *off += 1;
+                        QM31(
+                            CM31(M31::from(aa), M31::from(ab)),
+                            CM31(M31::from(ba), M31::from(bb)),
+                        )
                     };
 
                     if fresh {
@@ -4596,7 +4874,8 @@ pub fn replay_verify_serialized_proof(
                         mix_secure_field(ch, claim_value);
                     }
 
-                    let sub_tag = felt_to_u64(&data[*off]) as u32; *off += 1;
+                    let sub_tag = felt_to_u64(&data[*off]) as u32;
+                    *off += 1;
                     if sub_tag == 0 {
                         // MatMul sub-proof (degree-2, c1 omitted)
                         ch.mix_u64(m as u64);
@@ -4604,7 +4883,8 @@ pub fn replay_verify_serialized_proof(
                         ch.mix_u64(n as u64);
                         mix_secure_field(ch, claim_value);
 
-                        let nr = felt_to_u64(&data[*off]) as usize; *off += 1;
+                        let nr = felt_to_u64(&data[*off]) as usize;
+                        *off += 1;
                         let mut cs = claim_value;
                         for _ in 0..nr {
                             let c0 = read_sub_qm31(data, off);
@@ -4621,7 +4901,8 @@ pub fn replay_verify_serialized_proof(
                         Ok(fa)
                     } else if sub_tag == 7 {
                         // MatMulDualSimd sub-proof (degree-3, c1 omitted in unpacked)
-                        let nbv = felt_to_u64(&data[*off]) as usize; *off += 1;
+                        let nbv = felt_to_u64(&data[*off]) as usize;
+                        *off += 1;
                         let nb = 1usize << nbv;
                         ch.mix_u64(m as u64);
                         ch.mix_u64(k as u64);
@@ -4629,7 +4910,8 @@ pub fn replay_verify_serialized_proof(
                         ch.mix_u64(nb as u64);
                         mix_secure_field(ch, claim_value);
 
-                        let nr = felt_to_u64(&data[*off]) as usize; *off += 1;
+                        let nr = felt_to_u64(&data[*off]) as usize;
+                        *off += 1;
                         let mut cs = claim_value;
                         for _ in 0..nr {
                             let c0 = read_sub_qm31(data, off);
@@ -4653,9 +4935,13 @@ pub fn replay_verify_serialized_proof(
                 // Sub-proof 0: Output projection (uses current claim, not fresh)
                 let mut sub_idx = 0;
                 let _output_proj = replay_sub_matmul(
-                    proof_data, &mut off, &mut ch,
+                    proof_data,
+                    &mut off,
+                    &mut ch,
                     current_claim_value,
-                    att_seq_len, att_d_model, att_d_model,
+                    att_seq_len,
+                    att_d_model,
+                    att_d_model,
                     false, // not fresh — uses existing claim
                 )?;
                 sub_idx += 1;
@@ -4664,18 +4950,26 @@ pub fn replay_verify_serialized_proof(
                 for _h in (0..att_num_heads).rev() {
                     // Context matmul: seq_len × seq_len → d_k
                     let _ctx = replay_sub_matmul(
-                        proof_data, &mut off, &mut ch,
+                        proof_data,
+                        &mut off,
+                        &mut ch,
                         sub_claim_values[sub_idx],
-                        att_seq_len, att_seq_len, att_d_k,
+                        att_seq_len,
+                        att_seq_len,
+                        att_d_k,
                         true,
                     )?;
                     sub_idx += 1;
 
                     // Score matmul: seq_len × d_k → seq_len
                     let _score = replay_sub_matmul(
-                        proof_data, &mut off, &mut ch,
+                        proof_data,
+                        &mut off,
+                        &mut ch,
                         sub_claim_values[sub_idx],
-                        att_seq_len, att_d_k, att_seq_len,
+                        att_seq_len,
+                        att_d_k,
+                        att_seq_len,
                         true,
                     )?;
                     sub_idx += 1;
@@ -4683,17 +4977,25 @@ pub fn replay_verify_serialized_proof(
 
                 // V, K projections (fresh)
                 let _v = replay_sub_matmul(
-                    proof_data, &mut off, &mut ch,
+                    proof_data,
+                    &mut off,
+                    &mut ch,
                     sub_claim_values[sub_idx],
-                    att_seq_len, att_d_model, att_d_model,
+                    att_seq_len,
+                    att_d_model,
+                    att_d_model,
                     true,
                 )?;
                 sub_idx += 1;
 
                 let _k = replay_sub_matmul(
-                    proof_data, &mut off, &mut ch,
+                    proof_data,
+                    &mut off,
+                    &mut ch,
                     sub_claim_values[sub_idx],
-                    att_seq_len, att_d_model, att_d_model,
+                    att_seq_len,
+                    att_d_model,
+                    att_d_model,
                     true,
                 )?;
                 sub_idx += 1;
@@ -4710,22 +5012,33 @@ pub fn replay_verify_serialized_proof(
                 // Q sub-proof (uses q_value claim, not a fresh draw — the draw was done above)
                 let two = SecureField::from(M31::from(2u32));
                 let read_sub_qm31_q = |data: &[FieldElement], off: &mut usize| -> SecureField {
-                    let aa = felt_to_u64(&data[*off]) as u32; *off += 1;
-                    let ab = felt_to_u64(&data[*off]) as u32; *off += 1;
-                    let ba = felt_to_u64(&data[*off]) as u32; *off += 1;
-                    let bb = felt_to_u64(&data[*off]) as u32; *off += 1;
-                    QM31(CM31(M31::from(aa), M31::from(ab)),
-                         CM31(M31::from(ba), M31::from(bb)))
+                    let aa = felt_to_u64(&data[*off]) as u32;
+                    *off += 1;
+                    let ab = felt_to_u64(&data[*off]) as u32;
+                    *off += 1;
+                    let ba = felt_to_u64(&data[*off]) as u32;
+                    *off += 1;
+                    let bb = felt_to_u64(&data[*off]) as u32;
+                    *off += 1;
+                    QM31(
+                        CM31(M31::from(aa), M31::from(ab)),
+                        CM31(M31::from(ba), M31::from(bb)),
+                    )
                 };
-                let q_sub_tag = felt_to_u64(&proof_data[off]) as u32; off += 1;
+                let q_sub_tag = felt_to_u64(&proof_data[off]) as u32;
+                off += 1;
                 if q_sub_tag != 0 {
-                    return Err(format!("Attention Q projection: expected tag 0, got {}", q_sub_tag));
+                    return Err(format!(
+                        "Attention Q projection: expected tag 0, got {}",
+                        q_sub_tag
+                    ));
                 }
                 ch.mix_u64(att_seq_len as u64);
                 ch.mix_u64(att_d_model as u64);
                 ch.mix_u64(att_d_model as u64);
                 mix_secure_field(&mut ch, q_value);
-                let q_nr = felt_to_u64(&proof_data[off]) as usize; off += 1;
+                let q_nr = felt_to_u64(&proof_data[off]) as usize;
+                off += 1;
                 let mut q_sum = q_value;
                 for _ in 0..q_nr {
                     let c0 = read_sub_qm31_q(proof_data, &mut off);
@@ -4742,8 +5055,14 @@ pub fn replay_verify_serialized_proof(
 
                 current_claim_value = q_fa;
                 if trace {
-                    eprintln!("[VERIFIER Attention] layer {} heads={} seq={} d_model={} ch={:?}",
-                        layer, att_num_heads, att_seq_len, att_d_model, ch.digest());
+                    eprintln!(
+                        "[VERIFIER Attention] layer {} heads={} seq={} d_model={} ch={:?}",
+                        layer,
+                        att_num_heads,
+                        att_seq_len,
+                        att_d_model,
+                        ch.digest()
+                    );
                 }
             }
             10 => {
@@ -4782,7 +5101,9 @@ pub fn replay_verify_serialized_proof(
                     for &(c0, c1, c2, c3) in &round_coeffs {
                         ch.mix_poly_coeffs_deg3(c0, c1, c2, c3);
                         let challenge = ch.draw_qm31();
-                        _emb_sum = c0 + c1 * challenge + c2 * challenge * challenge
+                        _emb_sum = c0
+                            + c1 * challenge
+                            + c2 * challenge * challenge
                             + c3 * challenge * challenge * challenge;
                     }
 
@@ -4803,8 +5124,13 @@ pub fn replay_verify_serialized_proof(
                 mix_secure_field(&mut ch, output_eval);
                 current_claim_value = input_eval;
                 if trace {
-                    eprintln!("[VERIFIER Embedding] layer {} vocab={} dim={} ch={:?}",
-                        layer, emb_vocab_size, emb_embed_dim, ch.digest());
+                    eprintln!(
+                        "[VERIFIER Embedding] layer {} vocab={} dim={} ch={:?}",
+                        layer,
+                        emb_vocab_size,
+                        emb_embed_dim,
+                        ch.digest()
+                    );
                 }
             }
             11 => {
@@ -4876,7 +5202,9 @@ pub fn replay_verify_serialized_proof(
                         if csum != fa * fb {
                             return Err(format!(
                                 "DCOD_MATMUL_FINAL_MISMATCH at layer {}: sum={:?} != a*b={:?}",
-                                layer, csum, fa * fb
+                                layer,
+                                csum,
+                                fa * fb
                             ));
                         }
                         mix_secure_field(&mut ch, fa);
@@ -4890,9 +5218,8 @@ pub fn replay_verify_serialized_proof(
                 if sub_tag_0 != 0 {
                     return Err(format!("DCOD_SUB0_NOT_MATMUL: tag={}", sub_tag_0));
                 }
-                let _output_proj_a = replay_matmul_decode!(
-                    current_claim_value, new_tokens, d_model, d_model
-                );
+                let _output_proj_a =
+                    replay_matmul_decode!(current_claim_value, new_tokens, d_model, d_model);
                 proof_idx += 1;
 
                 // Per-head sub-proofs (h = H-1..0): context + score
@@ -4909,7 +5236,10 @@ pub fn replay_verify_serialized_proof(
                         return Err(format!("DCOD_CTX_NOT_MATMUL: tag={}", sub_tag));
                     }
                     let _ctx_a = replay_matmul_decode!(
-                        sub_claim_values[proof_idx], new_tokens, full_seq_len, d_k
+                        sub_claim_values[proof_idx],
+                        new_tokens,
+                        full_seq_len,
+                        d_k
                     );
                     proof_idx += 1;
 
@@ -4925,7 +5255,10 @@ pub fn replay_verify_serialized_proof(
                         return Err(format!("DCOD_SCORE_NOT_MATMUL: tag={}", sub_tag2));
                     }
                     let _score_a = replay_matmul_decode!(
-                        sub_claim_values[proof_idx], new_tokens, d_k, full_seq_len
+                        sub_claim_values[proof_idx],
+                        new_tokens,
+                        d_k,
+                        full_seq_len
                     );
                     proof_idx += 1;
                 }
@@ -4944,7 +5277,10 @@ pub fn replay_verify_serialized_proof(
                         return Err(format!("DCOD_{}_NOT_MATMUL: tag={}", proj_label, sub_tag));
                     }
                     last_final_a = replay_matmul_decode!(
-                        sub_claim_values[proof_idx], new_tokens, d_model, d_model
+                        sub_claim_values[proof_idx],
+                        new_tokens,
+                        d_model,
+                        d_model
                     );
                     proof_idx += 1;
                 }
@@ -4997,8 +5333,10 @@ pub fn replay_verify_serialized_proof(
                     let challenge = ch.draw_qm31();
                     current_sum = c0 + c1 * challenge + c2 * challenge * challenge;
                     if trace && round < 3 {
-                        eprintln!("[VERIFIER DEFERRED {}] round {} c0={:?} c2={:?} challenge={:?}",
-                            di, round, c0, c2, challenge);
+                        eprintln!(
+                            "[VERIFIER DEFERRED {}] round {} c0={:?} c2={:?} challenge={:?}",
+                            di, round, c0, c2, challenge
+                        );
                     }
                 }
                 let final_a = read_qm31_from(proof_data, &mut off);
@@ -5006,7 +5344,9 @@ pub fn replay_verify_serialized_proof(
                 if current_sum != final_a * final_b {
                     return Err(format!(
                         "DEFERRED_MATMUL_FINAL_MISMATCH at deferred[{}]: sum={:?} != a*b={:?}",
-                        di, current_sum, final_a * final_b
+                        di,
+                        current_sum,
+                        final_a * final_b
                     ));
                 }
                 mix_secure_field(&mut ch, final_a);
@@ -5020,7 +5360,9 @@ pub fn replay_verify_serialized_proof(
                 if off + data_len > proof_data.len() {
                     return Err(format!(
                         "Weightless deferred[{}]: data_len={} exceeds remaining {} felts",
-                        di, data_len, proof_data.len() - off
+                        di,
+                        data_len,
+                        proof_data.len() - off
                     ));
                 }
                 off += data_len;
@@ -5037,7 +5379,9 @@ pub fn replay_verify_serialized_proof(
     if off < proof_data.len() {
         return Err(format!(
             "trailing data: consumed {} of {} felts ({} unconsumed)",
-            off, proof_data.len(), proof_data.len() - off,
+            off,
+            proof_data.len(),
+            proof_data.len() - off,
         ));
     }
 
@@ -5221,7 +5565,10 @@ pub fn verify_proof_fast(calldata: &[FieldElement]) -> ProofHealthReport {
             detail: if range_ok {
                 format!("{} samples within range", sample_count)
             } else {
-                format!("{}/{} samples exceed felt252 range", range_failures, sample_count)
+                format!(
+                    "{}/{} samples exceed felt252 range",
+                    range_failures, sample_count
+                )
             },
         });
     }
@@ -5240,13 +5587,17 @@ pub fn verify_proof_fast(calldata: &[FieldElement]) -> ProofHealthReport {
             detail: if tail_ok {
                 "tail is non-zero".to_string()
             } else {
-                format!("last {} felts are all zero (possible truncation)", tail_count)
+                format!(
+                    "last {} felts are all zero (possible truncation)",
+                    tail_count
+                )
             },
         });
     }
 
     // 6. Step estimation
-    let estimated_steps = estimate_gkr_steps(num_layers as usize, original_io_len, num_weight_commits);
+    let estimated_steps =
+        estimate_gkr_steps(num_layers as usize, original_io_len, num_weight_commits);
     let within_limit = estimated_steps < 9_000_000;
     checks.push(HealthCheck {
         name: "step_estimate",
@@ -5283,13 +5634,21 @@ pub fn verify_proof_fast_ml_gkr(
 
     // 1. GKR calldata length — must be non-empty and plausible for the layer count.
     //    Each layer proof has at least a tag + a few sumcheck round values (~3 felts minimum).
-    let min_gkr_felts = if num_layer_proofs > 0 { num_layer_proofs * 3 } else { 1 };
+    let min_gkr_felts = if num_layer_proofs > 0 {
+        num_layer_proofs * 3
+    } else {
+        1
+    };
     let gkr_len_ok = gkr_calldata.len() >= min_gkr_felts;
     checks.push(HealthCheck {
         name: "gkr_calldata",
         passed: gkr_len_ok,
         detail: if gkr_len_ok {
-            format!("{} felts ({} layer proofs)", gkr_calldata.len(), num_layer_proofs)
+            format!(
+                "{} felts ({} layer proofs)",
+                gkr_calldata.len(),
+                num_layer_proofs
+            )
         } else {
             format!(
                 "{} felts too small for {} layer proofs (need >= {})",
@@ -5333,7 +5692,10 @@ pub fn verify_proof_fast_ml_gkr(
                 passed: false,
                 detail: format!(
                     "input dims {}x{} vs len={}, io_calldata.len()={}",
-                    in_rows, in_cols, in_len, io_calldata.len(),
+                    in_rows,
+                    in_cols,
+                    in_len,
+                    io_calldata.len(),
                 ),
             });
             false
@@ -5375,7 +5737,10 @@ pub fn verify_proof_fast_ml_gkr(
             detail: if range_ok {
                 format!("{} samples valid", sample_count)
             } else {
-                format!("{}/{} samples exceed felt252 range", range_failures, sample_count)
+                format!(
+                    "{}/{} samples exceed felt252 range",
+                    range_failures, sample_count
+                )
             },
         });
     }
@@ -5427,7 +5792,12 @@ pub fn dry_run_onchain_ml_gkr(
     rpc_url: Option<&str>,
     _contract_address: Option<&str>,
 ) -> DryRunResult {
-    let health = verify_proof_fast_ml_gkr(gkr_calldata, io_calldata, weight_commitments, num_layer_proofs);
+    let health = verify_proof_fast_ml_gkr(
+        gkr_calldata,
+        io_calldata,
+        weight_commitments,
+        num_layer_proofs,
+    );
 
     let estimated_steps = health.estimated_steps;
     let within_step_limit = estimated_steps < 10_000_000;
@@ -5435,19 +5805,17 @@ pub fn dry_run_onchain_ml_gkr(
     let total_felts = gkr_calldata.len() + io_calldata.len() + weight_commitments.len();
 
     // Optional RPC simulation — use gkr_calldata as the representative payload
-    let rpc_simulation = rpc_url.map(|url| {
-        match simulate_via_rpc(url, gkr_calldata) {
-            Ok((steps, _)) => RpcSimResult {
-                success: true,
-                actual_steps: steps,
-                error: None,
-            },
-            Err(e) => RpcSimResult {
-                success: false,
-                actual_steps: 0,
-                error: Some(e),
-            },
-        }
+    let rpc_simulation = rpc_url.map(|url| match simulate_via_rpc(url, gkr_calldata) {
+        Ok((steps, _)) => RpcSimResult {
+            success: true,
+            actual_steps: steps,
+            error: None,
+        },
+        Err(e) => RpcSimResult {
+            success: false,
+            actual_steps: 0,
+            error: Some(e),
+        },
     });
 
     DryRunResult {
@@ -5576,8 +5944,8 @@ fn simulate_via_rpc(rpc_url: &str, calldata: &[FieldElement]) -> Result<(u64, u6
         .into_body()
         .read_to_string()
         .map_err(|e| format!("RPC response read: {e}"))?;
-    let resp_body: serde_json::Value = serde_json::from_str(&resp_str)
-        .map_err(|e| format!("RPC response parse: {e}"))?;
+    let resp_body: serde_json::Value =
+        serde_json::from_str(&resp_str).map_err(|e| format!("RPC response parse: {e}"))?;
 
     // Parse result
     if let Some(error) = resp_body.get("error") {
@@ -5626,7 +5994,9 @@ fn simulate_via_rpc(_rpc_url: &str, _calldata: &[FieldElement]) -> Result<(u64, 
 /// Extract a u64 from a FieldElement (takes bottom 8 bytes).
 fn felt_to_u64(f: &FieldElement) -> u64 {
     let be = f.to_bytes_be();
-    u64::from_be_bytes([be[24], be[25], be[26], be[27], be[28], be[29], be[30], be[31]])
+    u64::from_be_bytes([
+        be[24], be[25], be[26], be[27], be[28], be[29], be[30], be[31],
+    ])
 }
 
 #[cfg(test)]
@@ -5645,17 +6015,29 @@ mod tests {
 
     impl EnvVarGuard {
         fn set(key: &'static str, value: &str) -> Self {
-            let lock = crate::test_utils::ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = crate::test_utils::ENV_MUTEX
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let prev = std::env::var(key).ok();
             std::env::set_var(key, value);
-            Self { key, prev, _lock: lock }
+            Self {
+                key,
+                prev,
+                _lock: lock,
+            }
         }
 
         fn unset(key: &'static str) -> Self {
-            let lock = crate::test_utils::ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = crate::test_utils::ENV_MUTEX
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let prev = std::env::var(key).ok();
             std::env::remove_var(key);
-            Self { key, prev, _lock: lock }
+            Self {
+                key,
+                prev,
+                _lock: lock,
+            }
         }
     }
 
@@ -6642,13 +7024,26 @@ mod tests {
 
         // Verify activation layers have logup_proof: None
         let has_activation_without_logup = gkr.layer_proofs.iter().any(|lp| {
-            matches!(lp, LayerProof::Activation { logup_proof: None, .. })
+            matches!(
+                lp,
+                LayerProof::Activation {
+                    logup_proof: None,
+                    ..
+                }
+            )
         });
-        assert!(has_activation_without_logup, "activation should have logup_proof: None in GKR mode");
+        assert!(
+            has_activation_without_logup,
+            "activation should have logup_proof: None in GKR mode"
+        );
 
         // Build starknet proof should succeed even with logup_proof: None
         let result = build_gkr_starknet_proof(&agg_proof, FieldElement::from(7u64), &input);
-        assert!(result.is_ok(), "starknet proof with activation logup_proof: None should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "starknet proof with activation logup_proof: None should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -7462,10 +7857,7 @@ mod tests {
             .expect("mode4 with RLC-only binding should succeed");
         assert!(calldata.total_felts > 0, "calldata should be non-empty");
         // Verify RLC marker (0x524c43) appears in calldata after binding mode
-        let has_rlc_marker = calldata
-            .calldata_parts
-            .iter()
-            .any(|p| p == "0x524c43");
+        let has_rlc_marker = calldata.calldata_parts.iter().any(|p| p == "0x524c43");
         assert!(has_rlc_marker, "calldata should contain RLC marker");
     }
 
@@ -7661,8 +8053,9 @@ mod tests {
         let model_id = FieldElement::from(0xBEEFu64);
 
         // Build IO-packed calldata
-        let io_packed = build_verify_model_gkr_v4_packed_io_calldata(gkr, &circuit, model_id, &raw_io)
-            .expect("io_packed calldata should build");
+        let io_packed =
+            build_verify_model_gkr_v4_packed_io_calldata(gkr, &circuit, model_id, &raw_io)
+                .expect("io_packed calldata should build");
         let regular = build_verify_model_gkr_v4_calldata(gkr, &circuit, model_id, &raw_io)
             .expect("regular calldata should build");
 
@@ -7718,11 +8111,13 @@ mod tests {
 
         // Build register calldata
         let circuit_desc = build_circuit_descriptor(&circuit);
-        let register_cd = build_register_gkr_calldata(model_id, &gkr.weight_commitments, &circuit_desc);
+        let register_cd =
+            build_register_gkr_calldata(model_id, &gkr.weight_commitments, &circuit_desc);
 
         // Build IO-packed verify calldata
-        let io_packed = build_verify_model_gkr_v4_packed_io_calldata(gkr, &circuit, model_id, &raw_io)
-            .expect("io_packed calldata should build");
+        let io_packed =
+            build_verify_model_gkr_v4_packed_io_calldata(gkr, &circuit, model_id, &raw_io)
+                .expect("io_packed calldata should build");
 
         // Export as JSON
         let json = serde_json::json!({
@@ -7800,12 +8195,12 @@ mod tests {
     #[test]
     fn test_replay_cairo_verification_from_serialized_proof_data() {
         use crate::aggregation::prove_model_pure_gkr;
+        use crate::cairo_serde::{serialize_gkr_proof_data_only, serialize_raw_io};
         use crate::crypto::poseidon_channel::PoseidonChannel;
         use crate::gkr::prover::mix_secure_field;
-        use crate::cairo_serde::{serialize_gkr_proof_data_only, serialize_raw_io};
-        use stwo::core::fields::qm31::{QM31, SecureField};
-        use stwo::core::fields::cm31::CM31;
         use num_traits::Zero;
+        use stwo::core::fields::cm31::CM31;
+        use stwo::core::fields::qm31::{SecureField, QM31};
         let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
 
         // Build: 1×4 → rms_norm → linear(2) → linear(2)
@@ -7849,8 +8244,12 @@ mod tests {
         // Serialize proof_data (unpacked)
         let mut proof_data_felts = Vec::new();
         serialize_gkr_proof_data_only(gkr, &mut proof_data_felts);
-        println!("proof_data_felts: {} felts, circuit_depth={}, proof_layers={}",
-            proof_data_felts.len(), d, num_proof_layers);
+        println!(
+            "proof_data_felts: {} felts, circuit_depth={}, proof_layers={}",
+            proof_data_felts.len(),
+            d,
+            num_proof_layers
+        );
 
         // Extract matmul dims
         let matmul_dims = extract_matmul_dims(&circuit);
@@ -7872,7 +8271,10 @@ mod tests {
         let output_rows = felt_to_u64(&raw_io[out_start]) as usize;
         let output_cols = felt_to_u64(&raw_io[out_start + 1]) as usize;
 
-        println!("input: {}x{}, output: {}x{}", input_rows, input_cols, output_rows, output_cols);
+        println!(
+            "input: {}x{}, output: {}x{}",
+            input_rows, input_cols, output_rows, output_cols
+        );
 
         // 2. Build output MLE
         let padded_rows = output_rows.next_power_of_two();
@@ -7922,12 +8324,18 @@ mod tests {
             v
         };
         let read_qm31_from = |off: &mut usize| -> SecureField {
-            let aa = felt_to_u64(&proof_felts[*off]) as u32; *off += 1;
-            let ab = felt_to_u64(&proof_felts[*off]) as u32; *off += 1;
-            let ba = felt_to_u64(&proof_felts[*off]) as u32; *off += 1;
-            let bb = felt_to_u64(&proof_felts[*off]) as u32; *off += 1;
-            QM31(CM31(M31::from(aa), M31::from(ab)),
-                 CM31(M31::from(ba), M31::from(bb)))
+            let aa = felt_to_u64(&proof_felts[*off]) as u32;
+            *off += 1;
+            let ab = felt_to_u64(&proof_felts[*off]) as u32;
+            *off += 1;
+            let ba = felt_to_u64(&proof_felts[*off]) as u32;
+            *off += 1;
+            let bb = felt_to_u64(&proof_felts[*off]) as u32;
+            *off += 1;
+            QM31(
+                CM31(M31::from(aa), M31::from(ab)),
+                CM31(M31::from(ba), M31::from(bb)),
+            )
         };
 
         let mut current_claim_value = output_value;
@@ -7968,8 +8376,10 @@ mod tests {
                         let c2 = read_qm31_from(&mut off);
                         let c1 = current_sum - two * c0 - c2;
 
-                        println!("  round {}: c0={:?}, c1(reconstructed), c2={:?}, sum={:?}",
-                            round, c0, c2, current_sum);
+                        println!(
+                            "  round {}: c0={:?}, c1(reconstructed), c2={:?}, sum={:?}",
+                            round, c0, c2, current_sum
+                        );
 
                         ch.mix_poly_coeffs(c0, c1, c2);
                         let challenge = ch.draw_qm31();
@@ -7980,8 +8390,10 @@ mod tests {
                     let final_a = read_qm31_from(&mut off);
                     let final_b = read_qm31_from(&mut off);
                     assert_eq!(
-                        current_sum, final_a * final_b,
-                        "MATMUL_FINAL_MISMATCH at layer {}", layer,
+                        current_sum,
+                        final_a * final_b,
+                        "MATMUL_FINAL_MISMATCH at layer {}",
+                        layer,
                     );
 
                     // Mix final evals (matching Rust verifier lines 2108-2109)
@@ -7999,7 +8411,10 @@ mod tests {
                     current_claim_point = new_point;
                     current_claim_value = final_a;
 
-                    println!("  OK: final_a*final_b check passed, new claim value = {:?}", final_a);
+                    println!(
+                        "  OK: final_a*final_b check passed, new claim value = {:?}",
+                        final_a
+                    );
                 }
 
                 8 => {
@@ -8008,7 +8423,9 @@ mod tests {
                     let output_eval = read_qm31_from(&mut off);
                     let rms_sq = read_qm31_from(&mut off);
                     let rsqrt_eval = read_qm31_from(&mut off);
-                    let _rsqrt_commitment = { off += 1; }; // felt252
+                    let _rsqrt_commitment = {
+                        off += 1;
+                    }; // felt252
                     let _simd_combined = read_u32_from(&mut off); // u32
 
                     // === Part 0: RMS² verification plain sumcheck ===
@@ -8034,7 +8451,10 @@ mod tests {
                         }
                         let p0_input_final = read_qm31_from(&mut off);
                         mix_secure_field(&mut ch, p0_input_final);
-                        println!("  Part 0 (RMS² sumcheck) replayed, n_active={}", p0_n_active);
+                        println!(
+                            "  Part 0 (RMS² sumcheck) replayed, n_active={}",
+                            p0_n_active
+                        );
                     }
 
                     // "RN" tag
@@ -8058,7 +8478,9 @@ mod tests {
 
                         ch.mix_poly_coeffs_deg3(c0, c1, c2, c3);
                         let challenge = ch.draw_qm31();
-                        rms_sum = c0 + c1 * challenge + c2 * challenge * challenge
+                        rms_sum = c0
+                            + c1 * challenge
+                            + c2 * challenge * challenge
                             + c3 * challenge * challenge * challenge;
                     }
 
@@ -8070,7 +8492,7 @@ mod tests {
                     let has_logup = read_u32_from(&mut off);
                     if has_logup == 1 {
                         ch.mix_u64(0x4C4F47); // "LOG"
-                        ch.mix_u64(0x524E);   // "RN"
+                        ch.mix_u64(0x524E); // "RN"
                         let _gamma = ch.draw_qm31();
                         let _beta = ch.draw_qm31();
                         let _claimed_sum = read_qm31_from(&mut off);
@@ -8085,7 +8507,9 @@ mod tests {
                             let c1 = logup_sum - two * c0 - c2 - c3;
                             ch.mix_poly_coeffs_deg3(c0, c1, c2, c3);
                             let challenge = ch.draw_qm31();
-                            logup_sum = c0 + c1 * challenge + c2 * challenge * challenge
+                            logup_sum = c0
+                                + c1 * challenge
+                                + c2 * challenge * challenge
                                 + c3 * challenge * challenge * challenge;
                         }
                         // final evals
@@ -8137,7 +8561,10 @@ mod tests {
                     let act_type = read_u32_from(&mut off);
                     let input_eval = read_qm31_from(&mut off);
                     let output_eval = read_qm31_from(&mut off);
-                    let _table_commitment = { let _f = &proof_felts[off]; off += 1; };
+                    let _table_commitment = {
+                        let _f = &proof_felts[off];
+                        off += 1;
+                    };
 
                     // "LOG" tag
                     ch.mix_u64(0x4C4F47); // 'L'=0x4C, 'O'=0x4F, 'G'=0x47
@@ -8161,7 +8588,9 @@ mod tests {
                             let c1 = act_logup_sum - two * c0 - c2 - c3;
                             ch.mix_poly_coeffs_deg3(c0, c1, c2, c3);
                             let challenge = ch.draw_qm31();
-                            act_logup_sum = c0 + c1 * challenge + c2 * challenge * challenge
+                            act_logup_sum = c0
+                                + c1 * challenge
+                                + c2 * challenge * challenge
                                 + c3 * challenge * challenge * challenge;
                         }
                         let _e1 = read_qm31_from(&mut off);
@@ -8215,7 +8644,10 @@ mod tests {
                     // New claim: same point, value = input_eval
                     current_claim_value = input_eval;
 
-                    println!("  Activation(type={}) OK: new claim value = {:?}", act_type, input_eval);
+                    println!(
+                        "  Activation(type={}) OK: new claim value = {:?}",
+                        act_type, input_eval
+                    );
                 }
 
                 1 => {
@@ -8231,7 +8663,10 @@ mod tests {
                     let trunk_eval = if trunk_idx == 0 { lhs } else { rhs };
                     current_claim_value = trunk_eval;
 
-                    println!("  Add OK: trunk_idx={}, new claim value = {:?}", trunk_idx, trunk_eval);
+                    println!(
+                        "  Add OK: trunk_idx={}, new claim value = {:?}",
+                        trunk_idx, trunk_eval
+                    );
                 }
 
                 _ => panic!("Unknown tag {} at layer {}", tag, layer),
@@ -8242,7 +8677,10 @@ mod tests {
         let num_deferred = read_u32_from(&mut off);
         println!("\nDeferred proofs: {}", num_deferred);
         println!("Remaining felts: {}", proof_data_felts.len() - off);
-        println!("SUCCESS: all {} proof layers pass Cairo-compatible verification replay", num_proof_layers);
+        println!(
+            "SUCCESS: all {} proof layers pass Cairo-compatible verification replay",
+            num_proof_layers
+        );
     }
 
     /// Test replay_verify_serialized_proof with RMSNorm → MatMul order
@@ -8288,7 +8726,10 @@ mod tests {
         let circuit_depth = circuit.layers.len() as u32;
         let num_layers = gkr.layer_proofs.len() as u32;
 
-        println!("circuit_depth={} num_layers={} matmul_dims={:?}", circuit_depth, num_layers, matmul_dims);
+        println!(
+            "circuit_depth={} num_layers={} matmul_dims={:?}",
+            circuit_depth, num_layers, matmul_dims
+        );
         for (i, lp) in gkr.layer_proofs.iter().enumerate() {
             let tag = match lp {
                 crate::gkr::types::LayerProof::MatMul { .. } => 0,
@@ -8325,13 +8766,13 @@ mod tests {
     /// Run manually: `PROOF_JSON=/tmp/packed_proof_40.json cargo test test_replay_from_proof_json -- --ignored --nocapture`
     #[ignore]
     fn test_replay_from_proof_json() {
+        use crate::crypto::poseidon_channel::felt_to_securefield;
         use crate::crypto::poseidon_channel::PoseidonChannel;
         use crate::gkr::prover::mix_secure_field;
-        use crate::crypto::poseidon_channel::felt_to_securefield;
-        use stwo::core::fields::qm31::{QM31, SecureField};
-        use stwo::core::fields::cm31::CM31;
         use num_traits::Zero;
         use std::path::Path;
+        use stwo::core::fields::cm31::CM31;
+        use stwo::core::fields::qm31::{SecureField, QM31};
 
         let proof_path_str = std::env::var("PROOF_JSON")
             .unwrap_or_else(|_| "/tmp/unpacked_proof_2.json".to_string());
@@ -8364,15 +8805,28 @@ mod tests {
                 all_felts.push(fe);
             }
         }
-        println!("Loaded {} felts, circuit_depth={}, num_layers={}", all_felts.len(), circuit_depth, num_layers);
+        println!(
+            "Loaded {} felts, circuit_depth={}, num_layers={}",
+            all_felts.len(),
+            circuit_depth,
+            num_layers
+        );
 
         // Parse sections
         let mut sec_off = 0usize;
         let read_section = |off: &mut usize| -> Vec<FieldElement> {
             let len_bytes = all_felts[*off].to_bytes_be();
-            let len = u64::from_be_bytes([len_bytes[24], len_bytes[25], len_bytes[26], len_bytes[27],
-                                          len_bytes[28], len_bytes[29], len_bytes[30], len_bytes[31]]) as usize;
-            let data = all_felts[*off + 1 .. *off + 1 + len].to_vec();
+            let len = u64::from_be_bytes([
+                len_bytes[24],
+                len_bytes[25],
+                len_bytes[26],
+                len_bytes[27],
+                len_bytes[28],
+                len_bytes[29],
+                len_bytes[30],
+                len_bytes[31],
+            ]) as usize;
+            let data = all_felts[*off + 1..*off + 1 + len].to_vec();
             *off += 1 + len;
             data
         };
@@ -8385,8 +8839,12 @@ mod tests {
         let _weight_binding = read_section(&mut sec_off);
         let _weight_openings = read_section(&mut sec_off);
 
-        println!("raw_io: {}, matmul_dims: {}, proof_data: {} felts",
-            raw_io.len(), matmul_dims_felts.len(), proof_data.len());
+        println!(
+            "raw_io: {}, matmul_dims: {}, proof_data: {} felts",
+            raw_io.len(),
+            matmul_dims_felts.len(),
+            proof_data.len()
+        );
 
         fn felt_to_u64(f: &FieldElement) -> u64 {
             let b = f.to_bytes_be();
@@ -8401,10 +8859,16 @@ mod tests {
         let output_rows = felt_to_u64(&raw_io[out_start]) as usize;
         let output_cols = felt_to_u64(&raw_io[out_start + 1]) as usize;
 
-        println!("input: {}x{}, output: {}x{}", input_rows, input_cols, output_rows, output_cols);
+        println!(
+            "input: {}x{}, output: {}x{}",
+            input_rows, input_cols, output_rows, output_cols
+        );
 
         // Parse matmul_dims
-        let matmul_dims: Vec<u32> = matmul_dims_felts.iter().map(|f| felt_to_u64(f) as u32).collect();
+        let matmul_dims: Vec<u32> = matmul_dims_felts
+            .iter()
+            .map(|f| felt_to_u64(f) as u32)
+            .collect();
 
         // Build output MLE
         let padded_rows = output_rows.next_power_of_two();
@@ -8449,12 +8913,18 @@ mod tests {
                 *off += 1;
                 felt_to_securefield(fe)
             } else {
-                let aa = felt_to_u64(&proof_data[*off]) as u32; *off += 1;
-                let ab = felt_to_u64(&proof_data[*off]) as u32; *off += 1;
-                let ba = felt_to_u64(&proof_data[*off]) as u32; *off += 1;
-                let bb = felt_to_u64(&proof_data[*off]) as u32; *off += 1;
-                QM31(CM31(M31::from(aa), M31::from(ab)),
-                     CM31(M31::from(ba), M31::from(bb)))
+                let aa = felt_to_u64(&proof_data[*off]) as u32;
+                *off += 1;
+                let ab = felt_to_u64(&proof_data[*off]) as u32;
+                *off += 1;
+                let ba = felt_to_u64(&proof_data[*off]) as u32;
+                *off += 1;
+                let bb = felt_to_u64(&proof_data[*off]) as u32;
+                *off += 1;
+                QM31(
+                    CM31(M31::from(aa), M31::from(ab)),
+                    CM31(M31::from(ba), M31::from(bb)),
+                )
             }
         };
 
@@ -8497,15 +8967,23 @@ mod tests {
                         let round_sum = p0 + p1;
 
                         if round < 3 || round_sum != current_sum {
-                            println!("  round {}: p(0)+p(1)={:?}, sum={:?}, match={}",
-                                round, round_sum, current_sum, round_sum == current_sum);
+                            println!(
+                                "  round {}: p(0)+p(1)={:?}, sum={:?}, match={}",
+                                round,
+                                round_sum,
+                                current_sum,
+                                round_sum == current_sum
+                            );
                         }
 
                         if round_sum != current_sum {
                             println!("  c0={:?}", c0);
                             println!("  c1={:?}", c1);
                             println!("  c2={:?}", c2);
-                            panic!("MATMUL_ROUND_SUM_MISMATCH at layer {} round {}", layer, round);
+                            panic!(
+                                "MATMUL_ROUND_SUM_MISMATCH at layer {} round {}",
+                                layer, round
+                            );
                         }
 
                         ch.mix_poly_coeffs(c0, c1, c2);
@@ -8519,7 +8997,12 @@ mod tests {
 
                     let final_a = read_qm31_from(&mut off);
                     let final_b = read_qm31_from(&mut off);
-                    assert_eq!(current_sum, final_a * final_b, "MATMUL_FINAL layer {}", layer);
+                    assert_eq!(
+                        current_sum,
+                        final_a * final_b,
+                        "MATMUL_FINAL layer {}",
+                        layer
+                    );
 
                     mix_secure_field(&mut ch, final_a);
                     mix_secure_field(&mut ch, final_b);
@@ -8602,7 +9085,9 @@ mod tests {
 
                         ch.mix_poly_coeffs_deg3(c0, c1, c2, c3);
                         let challenge = ch.draw_qm31();
-                        rms_sum = c0 + c1 * challenge + c2 * challenge * challenge
+                        rms_sum = c0
+                            + c1 * challenge
+                            + c2 * challenge * challenge
                             + c3 * challenge * challenge * challenge;
                     }
 
@@ -8645,13 +9130,20 @@ mod tests {
                             let p0 = c0;
                             let p1 = c0 + c1 + c2 + c3;
                             if p0 + p1 != logup_sum {
-                                println!("  LOGUP_ROUND_SUM at round {}: p(0)+p(1)={:?} != sum={:?}", round, p0+p1, logup_sum);
+                                println!(
+                                    "  LOGUP_ROUND_SUM at round {}: p(0)+p(1)={:?} != sum={:?}",
+                                    round,
+                                    p0 + p1,
+                                    logup_sum
+                                );
                                 panic!("LOGUP_ROUND_SUM at layer {} round {}", layer, round);
                             }
 
                             ch.mix_poly_coeffs_deg3(c0, c1, c2, c3);
                             let challenge = ch.draw_qm31();
-                            logup_sum = c0 + c1 * challenge + c2 * challenge * challenge
+                            logup_sum = c0
+                                + c1 * challenge
+                                + c2 * challenge * challenge
                                 + c3 * challenge * challenge * challenge;
                             if round < 2 || round == eq_rounds - 1 {
                                 println!("  logup round {}: ch={:?}", round, ch.digest());
@@ -8667,7 +9159,10 @@ mod tests {
                         for _ in 0..num_mults {
                             let _ = read_u32_from(&mut off); // multiplicities are u32, NOT QM31!
                         }
-                        println!("  ch after logup (before input/output mix): {:?}", ch.digest());
+                        println!(
+                            "  ch after logup (before input/output mix): {:?}",
+                            ch.digest()
+                        );
                     }
                     // Read multiplicity sumcheck (always serialized after logup)
                     let has_ms = read_u32_from(&mut off);
@@ -8731,7 +9226,9 @@ mod tests {
 
                             ch.mix_poly_coeffs_deg3(c0, c1, c2, c3);
                             let challenge = ch.draw_qm31();
-                            logup_sum = c0 + c1 * challenge + c2 * challenge * challenge
+                            logup_sum = c0
+                                + c1 * challenge
+                                + c2 * challenge * challenge
                                 + c3 * challenge * challenge * challenge;
                         }
                         let _w = read_qm31_from(&mut off);
@@ -8802,8 +9299,15 @@ mod tests {
         }
 
         let num_deferred = read_u32_from(&mut off);
-        println!("\nDeferred: {}, remaining: {}", num_deferred, proof_data.len() - off);
-        println!("SUCCESS: all {} layers of actual proof pass Rust channel replay", num_layers);
+        println!(
+            "\nDeferred: {}, remaining: {}",
+            num_deferred,
+            proof_data.len() - off
+        );
+        println!(
+            "SUCCESS: all {} layers of actual proof pass Rust channel replay",
+            num_layers
+        );
     }
 
     /// Test that exercises the full prove → serialize → replay pipeline.
@@ -8812,12 +9316,12 @@ mod tests {
     #[test]
     fn test_fresh_prove_serialize_replay_roundtrip() {
         use crate::aggregation::prove_model_pure_gkr;
+        use crate::cairo_serde::{serialize_gkr_proof_data_only, serialize_raw_io};
         use crate::crypto::poseidon_channel::PoseidonChannel;
         use crate::gkr::prover::mix_secure_field;
-        use crate::cairo_serde::{serialize_gkr_proof_data_only, serialize_raw_io};
-        use stwo::core::fields::qm31::{QM31, SecureField};
-        use stwo::core::fields::cm31::CM31;
         use num_traits::Zero;
+        use stwo::core::fields::cm31::CM31;
+        use stwo::core::fields::qm31::{SecureField, QM31};
         let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
 
         // Build a model matching the on-chain Qwen3 pattern:
@@ -8826,13 +9330,13 @@ mod tests {
         let dim = 16;
         let hidden = 32;
         let mut builder = GraphBuilder::new((1, dim));
-        builder.rms_norm();           // layer 0
-        builder.linear(hidden);       // layer 1: up-project
-        builder.linear(dim);          // layer 2: down-project
-        builder.rms_norm();           // layer 3
-        builder.linear(hidden);       // layer 4: up-project
-        builder.linear(dim);          // layer 5: down-project
-        builder.rms_norm();           // layer 6
+        builder.rms_norm(); // layer 0
+        builder.linear(hidden); // layer 1: up-project
+        builder.linear(dim); // layer 2: down-project
+        builder.rms_norm(); // layer 3
+        builder.linear(hidden); // layer 4: up-project
+        builder.linear(dim); // layer 5: down-project
+        builder.rms_norm(); // layer 6
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, dim);
@@ -8844,19 +9348,33 @@ mod tests {
         // Node IDs: 0=rms, 1=linear(hidden), 2=linear(dim), 3=rms, 4=linear(hidden), 5=linear(dim), 6=rms
         // linear(hidden) nodes: weight is dim × hidden
         // linear(dim) nodes: weight is hidden × dim
-        let linear_nodes = [(1usize, dim, hidden), (2, hidden, dim), (4, dim, hidden), (5, hidden, dim)];
+        let linear_nodes = [
+            (1usize, dim, hidden),
+            (2, hidden, dim),
+            (4, dim, hidden),
+            (5, hidden, dim),
+        ];
         for &(node_id, wr, wc) in &linear_nodes {
             let mut w = M31Matrix::new(wr, wc);
             for r in 0..wr {
                 for c in 0..wc {
-                    w.set(r, c, M31::from(((r * wc + c + node_id * 37) * 13 + 5) as u32 % 251));
+                    w.set(
+                        r,
+                        c,
+                        M31::from(((r * wc + c + node_id * 37) * 13 + 5) as u32 % 251),
+                    );
                 }
             }
             weights.add_weight(node_id, w);
         }
 
         let circuit = crate::gkr::LayeredCircuit::from_graph(&graph).expect("circuit");
-        println!("Proving model: {} layers, dim={}, hidden={}", circuit.layers.len(), dim, hidden);
+        println!(
+            "Proving model: {} layers, dim={}, hidden={}",
+            circuit.layers.len(),
+            dim,
+            hidden
+        );
         let agg_proof =
             prove_model_pure_gkr(&graph, &input, &weights).expect("GKR proving should succeed");
         let gkr = agg_proof.gkr_proof.as_ref().expect("GKR proof");
@@ -8868,8 +9386,13 @@ mod tests {
         let mut proof_data_felts = Vec::new();
         serialize_gkr_proof_data_only(gkr, &mut proof_data_felts);
         let matmul_dims = extract_matmul_dims(&circuit);
-        println!("proof_data: {} felts, circuit_depth={}, proof_layers={}, matmul_dims={:?}",
-            proof_data_felts.len(), d, num_proof_layers, matmul_dims);
+        println!(
+            "proof_data: {} felts, circuit_depth={}, proof_layers={}, matmul_dims={:?}",
+            proof_data_felts.len(),
+            d,
+            num_proof_layers,
+            matmul_dims
+        );
 
         // === Replay with IDENTICAL logic to the JSON-based replay ===
         fn felt_to_u64(f: &FieldElement) -> u64 {
@@ -8925,12 +9448,18 @@ mod tests {
             v
         };
         let read_qm31_from = |off: &mut usize| -> SecureField {
-            let aa = felt_to_u64(&proof_felts[*off]) as u32; *off += 1;
-            let ab = felt_to_u64(&proof_felts[*off]) as u32; *off += 1;
-            let ba = felt_to_u64(&proof_felts[*off]) as u32; *off += 1;
-            let bb = felt_to_u64(&proof_felts[*off]) as u32; *off += 1;
-            QM31(CM31(M31::from(aa), M31::from(ab)),
-                 CM31(M31::from(ba), M31::from(bb)))
+            let aa = felt_to_u64(&proof_felts[*off]) as u32;
+            *off += 1;
+            let ab = felt_to_u64(&proof_felts[*off]) as u32;
+            *off += 1;
+            let ba = felt_to_u64(&proof_felts[*off]) as u32;
+            *off += 1;
+            let bb = felt_to_u64(&proof_felts[*off]) as u32;
+            *off += 1;
+            QM31(
+                CM31(M31::from(aa), M31::from(ab)),
+                CM31(M31::from(ba), M31::from(bb)),
+            )
         };
 
         let mut current_claim_value = output_value;
@@ -8967,8 +9496,12 @@ mod tests {
                     }
                     let final_a = read_qm31_from(&mut off);
                     let final_b = read_qm31_from(&mut off);
-                    assert_eq!(current_sum, final_a * final_b,
-                        "MATMUL_FINAL at layer {}", layer);
+                    assert_eq!(
+                        current_sum,
+                        final_a * final_b,
+                        "MATMUL_FINAL at layer {}",
+                        layer
+                    );
                     mix_secure_field(&mut ch, final_a);
                     mix_secure_field(&mut ch, final_b);
                     current_claim_value = final_a;
@@ -8986,11 +9519,17 @@ mod tests {
                     // Must be replayed BEFORE "RN" tag to match prover's channel mixing order.
                     let has_p0 = read_u32_from(&mut off);
                     // SIMD consistency gate (relaxed when STWO_SKIP_RMS_SQ_PROOF is set)
-                    assert!(simd_combined == 0 || has_p0 == 0,
-                        "layer {}: SIMD RMSNorm must not have Part 0", layer);
+                    assert!(
+                        simd_combined == 0 || has_p0 == 0,
+                        "layer {}: SIMD RMSNorm must not have Part 0",
+                        layer
+                    );
                     if !crate::policy::skip_rms_sq_proof() {
-                        assert!(simd_combined == 1 || has_p0 == 1,
-                            "layer {}: non-SIMD RMSNorm requires Part 0", layer);
+                        assert!(
+                            simd_combined == 1 || has_p0 == 1,
+                            "layer {}: non-SIMD RMSNorm requires Part 0",
+                            layer
+                        );
                     }
                     if has_p0 == 1 {
                         let p0_n_active = read_u32_from(&mut off) as u64;
@@ -9029,7 +9568,9 @@ mod tests {
                         let c1 = rms_sum - two * c0 - c2 - c3;
                         ch.mix_poly_coeffs_deg3(c0, c1, c2, c3);
                         let challenge = ch.draw_qm31();
-                        rms_sum = c0 + c1 * challenge + c2 * challenge * challenge
+                        rms_sum = c0
+                            + c1 * challenge
+                            + c2 * challenge * challenge
                             + c3 * challenge * challenge * challenge;
                     }
                     let input_final = read_qm31_from(&mut off);
@@ -9055,7 +9596,9 @@ mod tests {
                             let c1 = logup_sum - two * c0 - c2 - c3;
                             ch.mix_poly_coeffs_deg3(c0, c1, c2, c3);
                             let challenge = ch.draw_qm31();
-                            logup_sum = c0 + c1 * challenge + c2 * challenge * challenge
+                            logup_sum = c0
+                                + c1 * challenge
+                                + c2 * challenge * challenge
                                 + c3 * challenge * challenge * challenge;
                         }
                         let _w = read_qm31_from(&mut off);
@@ -9115,7 +9658,9 @@ mod tests {
                             let c1 = logup_sum - two * c0 - c2 - c3;
                             ch.mix_poly_coeffs_deg3(c0, c1, c2, c3);
                             let challenge = ch.draw_qm31();
-                            logup_sum = c0 + c1 * challenge + c2 * challenge * challenge
+                            logup_sum = c0
+                                + c1 * challenge
+                                + c2 * challenge * challenge
                                 + c3 * challenge * challenge * challenge;
                         }
                         let _w = read_qm31_from(&mut off);
@@ -9180,9 +9725,16 @@ mod tests {
         }
 
         let num_deferred = read_u32_from(&mut off);
-        assert_eq!(proof_data_felts.len() - off, 0,
-            "Expected 0 remaining felts, got {}", proof_data_felts.len() - off);
-        println!("\nSUCCESS: all {} layers pass unpacked roundtrip verify (deferred={})", num_proof_layers, num_deferred);
+        assert_eq!(
+            proof_data_felts.len() - off,
+            0,
+            "Expected 0 remaining felts, got {}",
+            proof_data_felts.len() - off
+        );
+        println!(
+            "\nSUCCESS: all {} layers pass unpacked roundtrip verify (deferred={})",
+            num_proof_layers, num_deferred
+        );
 
         // === Also verify packed format ===
         // For packed output, we must re-prove with STWO_SKIP_RMS_SQ_PROOF=1 because
@@ -9191,14 +9743,24 @@ mod tests {
         std::env::set_var("STWO_SKIP_RMS_SQ_PROOF", "1");
         // Capture the policy BEFORE removing the env var — replay needs the same policy.
         let packed_mode_policy = crate::policy::PolicyConfig::from_env();
-        let agg_proof_packed =
-            prove_model_pure_gkr(&graph, &input, &weights).expect("GKR proving (packed mode) should succeed");
+        let agg_proof_packed = prove_model_pure_gkr(&graph, &input, &weights)
+            .expect("GKR proving (packed mode) should succeed");
         std::env::remove_var("STWO_SKIP_RMS_SQ_PROOF");
-        let gkr_packed = agg_proof_packed.gkr_proof.as_ref().expect("GKR proof (packed)");
+        let gkr_packed = agg_proof_packed
+            .gkr_proof
+            .as_ref()
+            .expect("GKR proof (packed)");
 
         let mut packed_proof_felts = Vec::new();
-        crate::cairo_serde::serialize_gkr_proof_data_only_packed(gkr_packed, &mut packed_proof_felts);
-        println!("packed: {} felts (vs unpacked: {})", packed_proof_felts.len(), proof_data_felts.len());
+        crate::cairo_serde::serialize_gkr_proof_data_only_packed(
+            gkr_packed,
+            &mut packed_proof_felts,
+        );
+        println!(
+            "packed: {} felts (vs unpacked: {})",
+            packed_proof_felts.len(),
+            proof_data_felts.len()
+        );
 
         fn unpack_qm31(f: &FieldElement) -> SecureField {
             let val = f.to_bytes_be();
@@ -9212,8 +9774,10 @@ mod tests {
             let ba = ((val_u128 >> 31) & 0x7FFFFFFF) as u32;
             let ab = ((val_u128 >> 62) & 0x7FFFFFFF) as u32;
             let aa = ((val_u128 >> 93) & 0x7FFFFFFF) as u32;
-            QM31(CM31(M31::from(aa), M31::from(ab)),
-                 CM31(M31::from(ba), M31::from(bb)))
+            QM31(
+                CM31(M31::from(aa), M31::from(ab)),
+                CM31(M31::from(ba), M31::from(bb)),
+            )
         }
 
         let pf = &packed_proof_felts;
@@ -9254,7 +9818,9 @@ mod tests {
                     let k = matmul_dims[mi2 * 3 + 1] as usize;
                     let n = matmul_dims[mi2 * 3 + 2] as usize;
                     mi2 += 1;
-                    ch2.mix_u64(m as u64); ch2.mix_u64(k as u64); ch2.mix_u64(n as u64);
+                    ch2.mix_u64(m as u64);
+                    ch2.mix_u64(k as u64);
+                    ch2.mix_u64(n as u64);
                     mix_secure_field(&mut ch2, claim2);
                     let nr = p_read_u32(&mut poff) as usize;
                     let mut s = claim2;
@@ -9269,7 +9835,8 @@ mod tests {
                     let fa = p_read_qm31(&mut poff);
                     let fb = p_read_qm31(&mut poff);
                     assert_eq!(s, fa * fb, "PACKED_MATMUL_FINAL at L{}", layer);
-                    mix_secure_field(&mut ch2, fa); mix_secure_field(&mut ch2, fb);
+                    mix_secure_field(&mut ch2, fa);
+                    mix_secure_field(&mut ch2, fb);
                     claim2 = fa;
                 }
                 8 => {
@@ -9283,8 +9850,11 @@ mod tests {
                     // Must be replayed BEFORE "RN" tag to match prover's channel mixing order.
                     let has_p0 = p_read_u32(&mut poff);
                     // SIMD consistency gate
-                    assert!(simd_combined == 0 || has_p0 == 0,
-                        "packed layer {}: SIMD RMSNorm must not have Part 0", layer);
+                    assert!(
+                        simd_combined == 0 || has_p0 == 0,
+                        "packed layer {}: SIMD RMSNorm must not have Part 0",
+                        layer
+                    );
                     // Note: packed format intentionally omits Part 0 (RMS² sumcheck)
                     // for on-chain use — it's verified locally by the Rust self-verifier.
                     // So has_p0 == 0 is valid in packed mode for non-SIMD RMSNorm.
@@ -9322,67 +9892,87 @@ mod tests {
                     let mut s = claim2;
                     for _round in 0..nr {
                         let c0 = p_read_qm31(&mut poff);
-                        let c2 = p_read_qm31(&mut poff); let c3 = p_read_qm31(&mut poff);
+                        let c2 = p_read_qm31(&mut poff);
+                        let c3 = p_read_qm31(&mut poff);
                         let c1 = s - c0 - c0 - c2 - c3; // reconstruct from current_sum
                         ch2.mix_poly_coeffs_deg3(c0, c1, c2, c3);
                         let ch_v = ch2.draw_qm31();
                         s = c0 + c1 * ch_v + c2 * ch_v * ch_v + c3 * ch_v * ch_v * ch_v;
                     }
-                    let inf = p_read_qm31(&mut poff); let rsf = p_read_qm31(&mut poff);
-                    mix_secure_field(&mut ch2, inf); mix_secure_field(&mut ch2, rsf);
+                    let inf = p_read_qm31(&mut poff);
+                    let rsf = p_read_qm31(&mut poff);
+                    mix_secure_field(&mut ch2, inf);
+                    mix_secure_field(&mut ch2, rsf);
                     let hl = p_read_u32(&mut poff);
                     if hl == 1 {
-                        ch2.mix_u64(0x4C4F47); ch2.mix_u64(0x524E);
-                        let _ = ch2.draw_qm31(); let _ = ch2.draw_qm31();
+                        ch2.mix_u64(0x4C4F47);
+                        ch2.mix_u64(0x524E);
+                        let _ = ch2.draw_qm31();
+                        let _ = ch2.draw_qm31();
                         let cs = p_read_qm31(&mut poff);
                         mix_secure_field(&mut ch2, cs);
                         let er = p_read_u32(&mut poff) as usize;
                         let mut ls = SecureField::from(M31::from(1u32));
                         for _round in 0..er {
                             let c0 = p_read_qm31(&mut poff);
-                            let c2 = p_read_qm31(&mut poff); let c3 = p_read_qm31(&mut poff);
+                            let c2 = p_read_qm31(&mut poff);
+                            let c3 = p_read_qm31(&mut poff);
                             let c1 = ls - c0 - c0 - c2 - c3; // reconstruct from current_sum
                             ch2.mix_poly_coeffs_deg3(c0, c1, c2, c3);
                             let ch_v = ch2.draw_qm31();
                             ls = c0 + c1 * ch_v + c2 * ch_v * ch_v + c3 * ch_v * ch_v * ch_v;
                         }
-                        let _ = p_read_qm31(&mut poff); let _ = p_read_qm31(&mut poff); let _ = p_read_qm31(&mut poff);
+                        let _ = p_read_qm31(&mut poff);
+                        let _ = p_read_qm31(&mut poff);
+                        let _ = p_read_qm31(&mut poff);
                         let nm = p_read_u32(&mut poff) as usize;
-                        for _ in 0..nm { let _ = p_read_u32(&mut poff); }
+                        for _ in 0..nm {
+                            let _ = p_read_u32(&mut poff);
+                        }
                     }
                     // Read multiplicity sumcheck (always serialized after logup)
                     let hms = p_read_u32(&mut poff);
                     if hms == 1 {
                         let msr = p_read_u32(&mut poff) as usize;
                         for _ in 0..msr {
-                            let c0 = p_read_qm31(&mut poff); let c1 = p_read_qm31(&mut poff);
-                            mix_secure_field(&mut ch2, c0); mix_secure_field(&mut ch2, c1);
+                            let c0 = p_read_qm31(&mut poff);
+                            let c1 = p_read_qm31(&mut poff);
+                            mix_secure_field(&mut ch2, c0);
+                            mix_secure_field(&mut ch2, c1);
                             let _ = ch2.draw_qm31();
                         }
-                        let _ = p_read_qm31(&mut poff); let _ = p_read_qm31(&mut poff);
+                        let _ = p_read_qm31(&mut poff);
+                        let _ = p_read_qm31(&mut poff);
                     }
                     // Per-row rms_sq for multi-row binding (consume)
                     let hrr = p_read_u32(&mut poff);
                     if hrr == 1 {
                         let nr = p_read_u32(&mut poff) as usize;
-                        for _ in 0..nr { let _ = p_read_u32(&mut poff); }
+                        for _ in 0..nr {
+                            let _ = p_read_u32(&mut poff);
+                        }
                     }
-                    mix_secure_field(&mut ch2, ie); mix_secure_field(&mut ch2, oe);
+                    mix_secure_field(&mut ch2, ie);
+                    mix_secure_field(&mut ch2, oe);
                     claim2 = ie;
                 }
                 1 => {
-                    let lhs = p_read_qm31(&mut poff); let rhs = p_read_qm31(&mut poff);
+                    let lhs = p_read_qm31(&mut poff);
+                    let rhs = p_read_qm31(&mut poff);
                     let ti = p_read_u32(&mut poff);
-                    mix_secure_field(&mut ch2, lhs); mix_secure_field(&mut ch2, rhs);
+                    mix_secure_field(&mut ch2, lhs);
+                    mix_secure_field(&mut ch2, rhs);
                     let _ = ch2.draw_qm31();
                     claim2 = if ti == 0 { lhs } else { rhs };
                 }
                 3 => {
                     let _ = p_read_u32(&mut poff);
-                    let ie = p_read_qm31(&mut poff); let oe = p_read_qm31(&mut poff);
+                    let ie = p_read_qm31(&mut poff);
+                    let oe = p_read_qm31(&mut poff);
                     poff += 1;
                     ch2.mix_u64(0x4C4F47);
-                    let _ = ch2.draw_qm31(); let _ = ch2.draw_qm31();
+                    let _ = ch2.draw_qm31();
+                    let _ = ch2.draw_qm31();
                     let hl = p_read_u32(&mut poff);
                     if hl == 1 {
                         let cs = p_read_qm31(&mut poff);
@@ -9390,27 +9980,42 @@ mod tests {
                         let er = p_read_u32(&mut poff) as usize;
                         let mut ls = SecureField::from(M31::from(1u32));
                         for round in 0..er {
-                            let c0 = p_read_qm31(&mut poff); let c1 = p_read_qm31(&mut poff);
-                            let c2 = p_read_qm31(&mut poff); let c3 = p_read_qm31(&mut poff);
-                            assert_eq!(c0 + c0 + c1 + c2 + c3, ls, "PACKED_ACT_LOGUP at L{} R{}", layer, round);
+                            let c0 = p_read_qm31(&mut poff);
+                            let c1 = p_read_qm31(&mut poff);
+                            let c2 = p_read_qm31(&mut poff);
+                            let c3 = p_read_qm31(&mut poff);
+                            assert_eq!(
+                                c0 + c0 + c1 + c2 + c3,
+                                ls,
+                                "PACKED_ACT_LOGUP at L{} R{}",
+                                layer,
+                                round
+                            );
                             ch2.mix_poly_coeffs_deg3(c0, c1, c2, c3);
                             let ch_v = ch2.draw_qm31();
                             ls = c0 + c1 * ch_v + c2 * ch_v * ch_v + c3 * ch_v * ch_v * ch_v;
                         }
-                        let _ = p_read_qm31(&mut poff); let _ = p_read_qm31(&mut poff); let _ = p_read_qm31(&mut poff);
+                        let _ = p_read_qm31(&mut poff);
+                        let _ = p_read_qm31(&mut poff);
+                        let _ = p_read_qm31(&mut poff);
                         let nm = p_read_u32(&mut poff) as usize;
-                        for _ in 0..nm { let _ = p_read_qm31(&mut poff); }
+                        for _ in 0..nm {
+                            let _ = p_read_qm31(&mut poff);
+                        }
                     }
                     // Read multiplicity sumcheck (always serialized after logup)
                     let hms = p_read_u32(&mut poff);
                     if hms == 1 {
                         let msr = p_read_u32(&mut poff) as usize;
                         for _ in 0..msr {
-                            let c0 = p_read_qm31(&mut poff); let c1 = p_read_qm31(&mut poff);
-                            mix_secure_field(&mut ch2, c0); mix_secure_field(&mut ch2, c1);
+                            let c0 = p_read_qm31(&mut poff);
+                            let c1 = p_read_qm31(&mut poff);
+                            mix_secure_field(&mut ch2, c0);
+                            mix_secure_field(&mut ch2, c1);
                             let _ = ch2.draw_qm31();
                         }
-                        let _ = p_read_qm31(&mut poff); let _ = p_read_qm31(&mut poff);
+                        let _ = p_read_qm31(&mut poff);
+                        let _ = p_read_qm31(&mut poff);
                     }
                     // Read activation product proof (Phase A soundness)
                     let hap = p_read_u32(&mut poff);
@@ -9423,7 +10028,7 @@ mod tests {
                         }
                         let _ = p_read_qm31(&mut poff); // input_eval
                         let _ = p_read_qm31(&mut poff); // indicator_eval
-                        // Phase B: skip bit_evals if present
+                                                        // Phase B: skip bit_evals if present
                         let hbe = p_read_u32(&mut poff);
                         if hbe == 1 {
                             let nb = p_read_u32(&mut poff) as usize;
@@ -9432,14 +10037,19 @@ mod tests {
                             }
                         }
                     }
-                    mix_secure_field(&mut ch2, ie); mix_secure_field(&mut ch2, oe);
+                    mix_secure_field(&mut ch2, ie);
+                    mix_secure_field(&mut ch2, oe);
                     claim2 = ie;
                 }
                 _ => panic!("Unknown packed tag {} at layer {}", tag, layer),
             }
         }
         let pd2 = p_read_u32(&mut poff);
-        assert_eq!(packed_proof_felts.len() - poff, 0, "Packed: remaining felts");
+        assert_eq!(
+            packed_proof_felts.len() - poff,
+            0,
+            "Packed: remaining felts"
+        );
         println!("PACKED roundtrip also passes! (deferred={})", pd2);
     }
 
@@ -9448,17 +10058,17 @@ mod tests {
         // Exercises Tag 4 (LayerNorm) and piecewise activation (GELU) in
         // replay_verify_serialized_proof to verify Round 4 fixes.
         use crate::aggregation::prove_model_pure_gkr;
-        use crate::components::activation::ActivationType;
         use crate::cairo_serde::{serialize_gkr_proof_data_only, serialize_raw_io};
+        use crate::components::activation::ActivationType;
         let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
 
         let dim = 16;
         let hidden = 32;
         let mut builder = GraphBuilder::new((1, dim));
-        builder.layer_norm();                        // Tag 4 (LayerNorm)
-        builder.linear(hidden);                      // Tag 0 (MatMul)
-        builder.activation(ActivationType::GELU);    // Tag 3 (piecewise)
-        builder.linear(dim);                         // Tag 0 (MatMul)
+        builder.layer_norm(); // Tag 4 (LayerNorm)
+        builder.linear(hidden); // Tag 0 (MatMul)
+        builder.activation(ActivationType::GELU); // Tag 3 (piecewise)
+        builder.linear(dim); // Tag 0 (MatMul)
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, dim);
@@ -9473,7 +10083,11 @@ mod tests {
             let mut w = M31Matrix::new(wr, wc);
             for r in 0..wr {
                 for c in 0..wc {
-                    w.set(r, c, M31::from(((r * wc + c + node_id * 37) * 13 + 5) as u32 % 251));
+                    w.set(
+                        r,
+                        c,
+                        M31::from(((r * wc + c + node_id * 37) * 13 + 5) as u32 % 251),
+                    );
                 }
             }
             weights.add_weight(node_id, w);
@@ -9502,7 +10116,10 @@ mod tests {
             None,
         );
         assert!(result.is_ok(), "Unpacked replay failed: {:?}", result.err());
-        println!("LayerNorm+Piecewise unpacked replay OK ({} felts)", proof_data.len());
+        println!(
+            "LayerNorm+Piecewise unpacked replay OK ({} felts)",
+            proof_data.len()
+        );
 
         // Packed replay
         let mut packed_data = Vec::new();
@@ -9520,7 +10137,10 @@ mod tests {
             None,
         );
         assert!(result2.is_ok(), "Packed replay failed: {:?}", result2.err());
-        println!("LayerNorm+Piecewise packed replay OK ({} felts)", packed_data.len());
+        println!(
+            "LayerNorm+Piecewise packed replay OK ({} felts)",
+            packed_data.len()
+        );
     }
 
     #[test]
@@ -9549,8 +10169,8 @@ mod tests {
         }
         weights.add_weight(0, w);
 
-        let proof = prove_model_pure_gkr(&graph, &input, &weights)
-            .expect("GKR proving should succeed");
+        let proof =
+            prove_model_pure_gkr(&graph, &input, &weights).expect("GKR proving should succeed");
         let gkr = proof.gkr_proof.as_ref().expect("GKR proof expected");
 
         // With default settings, full binding proof should be present
@@ -9563,11 +10183,23 @@ mod tests {
         let raw_io = crate::cairo_serde::serialize_raw_io(&input, &proof.execution.output);
         let model_id = FieldElement::from(0xBEEFu64);
 
-        let streaming = build_streaming_gkr_calldata(gkr, &circuit, model_id, &raw_io, None, None, FieldElement::ZERO)
-            .expect("streaming calldata should build with full binding");
+        let streaming = build_streaming_gkr_calldata(
+            gkr,
+            &circuit,
+            model_id,
+            &raw_io,
+            None,
+            None,
+            FieldElement::ZERO,
+        )
+        .expect("streaming calldata should build with full binding");
 
         // Weight binding chunks should contain packed binding proof data
-        let wb_total_felts: usize = streaming.weight_binding_chunks.iter().map(|c| c.calldata.len()).sum();
+        let wb_total_felts: usize = streaming
+            .weight_binding_chunks
+            .iter()
+            .map(|c| c.calldata.len())
+            .sum();
         assert!(
             wb_total_felts > 20,
             "weight_binding_chunks should contain substantial packed binding proof, got {} total felts",
@@ -9578,7 +10210,8 @@ mod tests {
             assert!(
                 chunk.calldata.len() <= 4500,
                 "weight_binding chunk {} has {} felts, exceeds 4500 limit",
-                chunk.chunk_idx, chunk.calldata.len(),
+                chunk.chunk_idx,
+                chunk.calldata.len(),
             );
         }
 
@@ -9713,8 +10346,8 @@ mod tests {
         }
         weights.add_weight(0, w);
 
-        let mut proof = prove_model_pure_gkr(&graph, &input, &weights)
-            .expect("GKR proving should succeed");
+        let mut proof =
+            prove_model_pure_gkr(&graph, &input, &weights).expect("GKR proving should succeed");
         let gkr = proof.gkr_proof.as_mut().expect("GKR proof expected");
 
         // Force RLC-only mode
@@ -9725,8 +10358,16 @@ mod tests {
         let raw_io = crate::cairo_serde::serialize_raw_io(&input, &proof.execution.output);
         let model_id = FieldElement::from(0xBEEFu64);
 
-        let err = build_streaming_gkr_calldata(gkr, &circuit, model_id, &raw_io, None, None, FieldElement::ZERO)
-            .expect_err("streaming calldata should reject RLC-only binding");
+        let err = build_streaming_gkr_calldata(
+            gkr,
+            &circuit,
+            model_id,
+            &raw_io,
+            None,
+            None,
+            FieldElement::ZERO,
+        )
+        .expect_err("streaming calldata should reject RLC-only binding");
 
         let msg = format!("{err}");
         assert!(
@@ -9768,15 +10409,12 @@ mod tests {
         }
         weights.add_weight(2, w2);
 
-        let proof = prove_model_pure_gkr(&graph, &input, &weights)
-            .expect("GKR proving should succeed");
+        let proof =
+            prove_model_pure_gkr(&graph, &input, &weights).expect("GKR proving should succeed");
         let gkr = proof.gkr_proof.as_ref().expect("GKR proof expected");
 
         // Should have weight claims with eval points
-        assert!(
-            !gkr.weight_claims.is_empty(),
-            "should have weight claims"
-        );
+        assert!(!gkr.weight_claims.is_empty(), "should have weight claims");
         for wc in &gkr.weight_claims {
             assert!(
                 !wc.eval_point.is_empty(),
@@ -9788,11 +10426,23 @@ mod tests {
         let raw_io = crate::cairo_serde::serialize_raw_io(&input, &proof.execution.output);
         let model_id = FieldElement::from(0xBEEFu64);
 
-        let streaming = build_streaming_gkr_calldata(gkr, &circuit, model_id, &raw_io, None, None, FieldElement::ZERO)
-            .expect("streaming calldata should build");
+        let streaming = build_streaming_gkr_calldata(
+            gkr,
+            &circuit,
+            model_id,
+            &raw_io,
+            None,
+            None,
+            FieldElement::ZERO,
+        )
+        .expect("streaming calldata should build");
 
         // Weight binding chunks should contain eval points + binding proof
-        let wb_total_felts: usize = streaming.weight_binding_chunks.iter().map(|c| c.calldata.len()).sum();
+        let wb_total_felts: usize = streaming
+            .weight_binding_chunks
+            .iter()
+            .map(|c| c.calldata.len())
+            .sum();
         assert!(
             wb_total_felts > 30,
             "weight_binding_chunks should contain eval points + binding proof, got {} total felts",
@@ -9828,8 +10478,8 @@ mod tests {
         }
         weights.add_weight(0, w);
 
-        let proof = prove_model_pure_gkr(&graph, &input, &weights)
-            .expect("GKR proving should succeed");
+        let proof =
+            prove_model_pure_gkr(&graph, &input, &weights).expect("GKR proving should succeed");
         let gkr = proof.gkr_proof.as_ref().expect("GKR proof expected");
 
         let circuit = crate::gkr::LayeredCircuit::from_graph(&graph).expect("circuit compile");
@@ -9838,7 +10488,12 @@ mod tests {
         // Build without KV to get baseline init_calldata
         let model_id = FieldElement::from(0xBEEFu64);
         let streaming_no_kv = build_streaming_gkr_calldata(
-            gkr, &circuit, model_id, &raw_io, None, None,
+            gkr,
+            &circuit,
+            model_id,
+            &raw_io,
+            None,
+            None,
             FieldElement::ZERO,
         )
         .expect("streaming calldata should build without KV");
@@ -9848,9 +10503,17 @@ mod tests {
         let no_kv_len = init_no_kv.len();
         assert!(no_kv_len >= 8, "init_calldata too short: {no_kv_len}");
         // policy_hash is the last entry (was validate_decode_chain, now hex felt252)
-        assert_eq!(&init_no_kv[no_kv_len - 1], "0x0", "policy_hash should be 0x0 when ZERO");
+        assert_eq!(
+            &init_no_kv[no_kv_len - 1],
+            "0x0",
+            "policy_hash should be 0x0 when ZERO"
+        );
         // has_kv is 7 entries from the end: has_kv, kv, prev_kv, pos, seq, tok, policy_hash
-        assert_eq!(&init_no_kv[no_kv_len - 7], "0", "has_kv should be 0 when None");
+        assert_eq!(
+            &init_no_kv[no_kv_len - 7],
+            "0",
+            "has_kv should be 0 when None"
+        );
 
         // Verify KV serialization format with actual KV commitments.
         let kvc = FieldElement::from(0xCAFEu64);
@@ -9901,8 +10564,8 @@ mod tests {
         }
         weights.add_weight(0, w);
 
-        let proof = prove_model_pure_gkr(&graph, &input, &weights)
-            .expect("GKR proving should succeed");
+        let proof =
+            prove_model_pure_gkr(&graph, &input, &weights).expect("GKR proving should succeed");
         let gkr = proof.gkr_proof.as_ref().expect("GKR proof expected");
         // No KV cache → last 3 init felts should be [0, 0x0, 0x0]
         assert!(gkr.kv_cache_commitment.is_none());
@@ -9912,7 +10575,12 @@ mod tests {
         let model_id = FieldElement::from(0xBEEFu64);
 
         let streaming = build_streaming_gkr_calldata(
-            gkr, &circuit, model_id, &raw_io, None, None,
+            gkr,
+            &circuit,
+            model_id,
+            &raw_io,
+            None,
+            None,
             FieldElement::ZERO,
         )
         .expect("streaming calldata should build without KV commitment");
@@ -9920,7 +10588,11 @@ mod tests {
         let init = &streaming.init_calldata;
         let len = init.len();
         // Last entry is policy_hash (0x0 for ZERO)
-        assert_eq!(&init[len - 1], "0x0", "policy_hash should be 0x0 for ZERO policy");
+        assert_eq!(
+            &init[len - 1],
+            "0x0",
+            "policy_hash should be 0x0 for ZERO policy"
+        );
         // has_kv is 7 entries from end: has_kv, kv, prev_kv, pos, seq, tok, policy_hash
         assert_eq!(&init[len - 7], "0", "has_kv should be 0 for non-KV proof");
 
@@ -9936,44 +10608,51 @@ mod tests {
     fn test_verify_proof_fast_ml_gkr_valid() {
         // Construct a minimal valid ml_gkr proof:
         // gkr_calldata: 30 felts (enough for 8 layer proofs * 3 = 24 minimum)
-        let gkr_calldata: Vec<FieldElement> = (0..30)
-            .map(|i| FieldElement::from(i as u64 + 1))
-            .collect();
+        let gkr_calldata: Vec<FieldElement> =
+            (0..30).map(|i| FieldElement::from(i as u64 + 1)).collect();
 
         // io_calldata: 1x4 input, 1x4 output = [1, 4, 4, d0..d3, 1, 4, 4, d0..d3]
         let mut io_calldata = vec![
-            FieldElement::from(1u64),  // in_rows
-            FieldElement::from(4u64),  // in_cols
-            FieldElement::from(4u64),  // in_len
+            FieldElement::from(1u64), // in_rows
+            FieldElement::from(4u64), // in_cols
+            FieldElement::from(4u64), // in_len
         ];
-        for i in 0..4 { io_calldata.push(FieldElement::from(100u64 + i)); }
-        io_calldata.push(FieldElement::from(1u64));  // out_rows
-        io_calldata.push(FieldElement::from(4u64));  // out_cols
-        io_calldata.push(FieldElement::from(4u64));  // out_len
-        for i in 0..4 { io_calldata.push(FieldElement::from(200u64 + i)); }
+        for i in 0..4 {
+            io_calldata.push(FieldElement::from(100u64 + i));
+        }
+        io_calldata.push(FieldElement::from(1u64)); // out_rows
+        io_calldata.push(FieldElement::from(4u64)); // out_cols
+        io_calldata.push(FieldElement::from(4u64)); // out_len
+        for i in 0..4 {
+            io_calldata.push(FieldElement::from(200u64 + i));
+        }
 
-        let weight_commitments = vec![
-            FieldElement::from(0xABCDu64),
-            FieldElement::from(0xDEF0u64),
-        ];
+        let weight_commitments = vec![FieldElement::from(0xABCDu64), FieldElement::from(0xDEF0u64)];
 
         let report = verify_proof_fast_ml_gkr(&gkr_calldata, &io_calldata, &weight_commitments, 8);
-        assert!(report.passed, "all checks should pass, failures: {:?}",
-            report.checks.iter().filter(|c| !c.passed).map(|c| &c.name).collect::<Vec<_>>());
+        assert!(
+            report.passed,
+            "all checks should pass, failures: {:?}",
+            report
+                .checks
+                .iter()
+                .filter(|c| !c.passed)
+                .map(|c| &c.name)
+                .collect::<Vec<_>>()
+        );
         assert_eq!(report.total_felts, 30 + 14 + 2);
     }
 
     #[test]
     fn test_verify_proof_fast_ml_gkr_io_mismatch() {
-        let gkr_calldata: Vec<FieldElement> = (0..10)
-            .map(|i| FieldElement::from(i as u64 + 1))
-            .collect();
+        let gkr_calldata: Vec<FieldElement> =
+            (0..10).map(|i| FieldElement::from(i as u64 + 1)).collect();
 
         // Bad IO: rows*cols != len (2*3 != 5)
         let io_calldata = vec![
-            FieldElement::from(2u64),  // in_rows
-            FieldElement::from(3u64),  // in_cols
-            FieldElement::from(5u64),  // in_len (should be 6)
+            FieldElement::from(2u64), // in_rows
+            FieldElement::from(3u64), // in_cols
+            FieldElement::from(5u64), // in_len (should be 6)
             FieldElement::from(1u64),
             FieldElement::from(2u64),
             FieldElement::from(3u64),
@@ -9984,14 +10663,21 @@ mod tests {
         let report = verify_proof_fast_ml_gkr(&gkr_calldata, &io_calldata, &[FieldElement::ONE], 2);
         // io_data check should fail
         let io_check = report.checks.iter().find(|c| c.name == "io_data").unwrap();
-        assert!(!io_check.passed, "io_data should fail on dimension mismatch");
+        assert!(
+            !io_check.passed,
+            "io_data should fail on dimension mismatch"
+        );
     }
 
     #[test]
     fn test_verify_proof_fast_ml_gkr_empty_weights() {
         let gkr_calldata = vec![FieldElement::from(1u64); 10];
         let report = verify_proof_fast_ml_gkr(&gkr_calldata, &[], &[], 2);
-        let wc_check = report.checks.iter().find(|c| c.name == "weight_commitments").unwrap();
+        let wc_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "weight_commitments")
+            .unwrap();
         assert!(!wc_check.passed, "empty weights should fail");
     }
 
@@ -10003,17 +10689,19 @@ mod tests {
     fn test_replay_deferred_proof_roundtrip() {
         // Build a model with a residual Add (skip connection) → produces deferred proofs.
         use crate::aggregation::prove_model_pure_gkr;
-        use crate::cairo_serde::{serialize_gkr_proof_data_only, serialize_gkr_proof_data_only_packed, serialize_raw_io};
+        use crate::cairo_serde::{
+            serialize_gkr_proof_data_only, serialize_gkr_proof_data_only_packed, serialize_raw_io,
+        };
         use crate::components::activation::ActivationType;
         let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
 
         let mut builder = GraphBuilder::new((1, 8));
-        builder.linear(8);             // node 0 (MatMul)
+        builder.linear(8); // node 0 (MatMul)
         let branch = builder.fork();
         builder.activation(ActivationType::ReLU); // node 1 (activation)
-        builder.linear(8);             // node 2 (MatMul)
-        builder.add_from(branch);      // node 3 (Add — produces deferred proof for skip branch)
-        builder.linear(4);             // node 4 (MatMul)
+        builder.linear(8); // node 2 (MatMul)
+        builder.add_from(branch); // node 3 (Add — produces deferred proof for skip branch)
+        builder.linear(4); // node 4 (MatMul)
         let graph = builder.build();
 
         let mut input = M31Matrix::new(1, 8);
@@ -10026,7 +10714,11 @@ mod tests {
             let mut w = M31Matrix::new(wr, wc);
             for r in 0..wr {
                 for c in 0..wc {
-                    w.set(r, c, M31::from(((r * wc + c + node_id * 37) * 13 + 5) as u32 % 251));
+                    w.set(
+                        r,
+                        c,
+                        M31::from(((r * wc + c + node_id * 37) * 13 + 5) as u32 % 251),
+                    );
                 }
             }
             weights.add_weight(node_id, w);
@@ -10047,23 +10739,49 @@ mod tests {
         let mut proof_data = Vec::new();
         serialize_gkr_proof_data_only(gkr, &mut proof_data);
         let result = super::replay_verify_serialized_proof(
-            &proof_data, &raw_io, &matmul_dims,
-            circuit.layers.len() as u32, gkr.layer_proofs.len() as u32,
-            false, Some(gkr.io_commitment), None, None, None,
+            &proof_data,
+            &raw_io,
+            &matmul_dims,
+            circuit.layers.len() as u32,
+            gkr.layer_proofs.len() as u32,
+            false,
+            Some(gkr.io_commitment),
+            None,
+            None,
+            None,
         );
-        assert!(result.is_ok(), "Unpacked deferred replay failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Unpacked deferred replay failed: {:?}",
+            result.err()
+        );
 
         // Packed replay
         let mut packed_data = Vec::new();
         serialize_gkr_proof_data_only_packed(gkr, &mut packed_data);
         let result2 = super::replay_verify_serialized_proof(
-            &packed_data, &raw_io, &matmul_dims,
-            circuit.layers.len() as u32, gkr.layer_proofs.len() as u32,
-            true, Some(gkr.io_commitment), None, None, None,
+            &packed_data,
+            &raw_io,
+            &matmul_dims,
+            circuit.layers.len() as u32,
+            gkr.layer_proofs.len() as u32,
+            true,
+            Some(gkr.io_commitment),
+            None,
+            None,
+            None,
         );
-        assert!(result2.is_ok(), "Packed deferred replay failed: {:?}", result2.err());
-        println!("Deferred proof replay roundtrip OK (unpacked={}, packed={} felts, {} deferred)",
-            proof_data.len(), packed_data.len(), gkr.deferred_proofs.len());
+        assert!(
+            result2.is_ok(),
+            "Packed deferred replay failed: {:?}",
+            result2.err()
+        );
+        println!(
+            "Deferred proof replay roundtrip OK (unpacked={}, packed={} felts, {} deferred)",
+            proof_data.len(),
+            packed_data.len(),
+            gkr.deferred_proofs.len()
+        );
     }
 
     #[test]
@@ -10093,7 +10811,11 @@ mod tests {
             let mut w = M31Matrix::new(wr, wc);
             for r in 0..wr {
                 for c in 0..wc {
-                    w.set(r, c, M31::from(((r * wc + c + node_id * 37) * 13 + 5) as u32 % 251));
+                    w.set(
+                        r,
+                        c,
+                        M31::from(((r * wc + c + node_id * 37) * 13 + 5) as u32 % 251),
+                    );
                 }
             }
             weights.add_weight(node_id, w);
@@ -10115,11 +10837,21 @@ mod tests {
         packed_data[tamper_idx] = packed_data[tamper_idx] + FieldElement::ONE;
 
         let result = super::replay_verify_serialized_proof(
-            &packed_data, &raw_io, &matmul_dims,
-            circuit.layers.len() as u32, gkr.layer_proofs.len() as u32,
-            true, Some(gkr.io_commitment), None, None, None,
+            &packed_data,
+            &raw_io,
+            &matmul_dims,
+            circuit.layers.len() as u32,
+            gkr.layer_proofs.len() as u32,
+            true,
+            Some(gkr.io_commitment),
+            None,
+            None,
+            None,
         );
-        assert!(result.is_err(), "Tampered deferred proof should be rejected");
+        assert!(
+            result.is_err(),
+            "Tampered deferred proof should be rejected"
+        );
         let err = result.unwrap_err();
         assert!(
             err.contains("DEFERRED_MATMUL_FINAL_MISMATCH"),
@@ -10165,9 +10897,16 @@ mod tests {
 
         // Valid data should pass first
         let result = super::replay_verify_serialized_proof(
-            &packed_data, &raw_io, &matmul_dims,
-            circuit.layers.len() as u32, gkr.layer_proofs.len() as u32,
-            true, Some(gkr.io_commitment), None, None, None,
+            &packed_data,
+            &raw_io,
+            &matmul_dims,
+            circuit.layers.len() as u32,
+            gkr.layer_proofs.len() as u32,
+            true,
+            Some(gkr.io_commitment),
+            None,
+            None,
+            None,
         );
         assert!(result.is_ok(), "Clean data should pass: {:?}", result.err());
 
@@ -10176,9 +10915,16 @@ mod tests {
         with_trailing.push(FieldElement::from(42u64));
 
         let result2 = super::replay_verify_serialized_proof(
-            &with_trailing, &raw_io, &matmul_dims,
-            circuit.layers.len() as u32, gkr.layer_proofs.len() as u32,
-            true, Some(gkr.io_commitment), None, None, None,
+            &with_trailing,
+            &raw_io,
+            &matmul_dims,
+            circuit.layers.len() as u32,
+            gkr.layer_proofs.len() as u32,
+            true,
+            Some(gkr.io_commitment),
+            None,
+            None,
+            None,
         );
         assert!(result2.is_err(), "Trailing data should be rejected");
         let err = result2.unwrap_err();
@@ -10195,9 +10941,7 @@ mod tests {
         // Serialize as double-packed and verify replay_verify_double_packed_proof
         // exercises the Fiat-Shamir channel replay (not just packing round-trips).
         use crate::aggregation::prove_model_pure_gkr;
-        use crate::cairo_serde::{
-            serialize_gkr_proof_data_only_double_packed, serialize_raw_io,
-        };
+        use crate::cairo_serde::{serialize_gkr_proof_data_only_double_packed, serialize_raw_io};
         let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
 
         let mut builder = GraphBuilder::new((1, 8));
@@ -10219,7 +10963,11 @@ mod tests {
             let mut w = M31Matrix::new(wr, wc);
             for r in 0..wr {
                 for c in 0..wc {
-                    w.set(r, c, M31::from(((r * wc + c + node_id * 37) * 13 + 5) as u32 % 251));
+                    w.set(
+                        r,
+                        c,
+                        M31::from(((r * wc + c + node_id * 37) * 13 + 5) as u32 % 251),
+                    );
                 }
             }
             weights.add_weight(node_id, w);
@@ -10264,9 +11012,7 @@ mod tests {
         // Tamper with a double-packed proof's round poly and verify
         // the channel replay (not just the round-trip check) rejects it.
         use crate::aggregation::prove_model_pure_gkr;
-        use crate::cairo_serde::{
-            serialize_gkr_proof_data_only_double_packed, serialize_raw_io,
-        };
+        use crate::cairo_serde::{serialize_gkr_proof_data_only_double_packed, serialize_raw_io};
         let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
 
         let mut builder = GraphBuilder::new((1, 4));
@@ -10296,8 +11042,10 @@ mod tests {
 
         // Tamper: flip a bit in the GKR proof's first round poly, then re-serialize
         let mut tampered = gkr.clone();
-        if let crate::gkr::types::LayerProof::MatMul { ref mut round_polys, .. } =
-            tampered.layer_proofs[0]
+        if let crate::gkr::types::LayerProof::MatMul {
+            ref mut round_polys,
+            ..
+        } = tampered.layer_proofs[0]
         {
             let old = round_polys[0].c0;
             round_polys[0].c0 = old + stwo::core::fields::qm31::QM31::from(1u32);
@@ -10328,8 +11076,8 @@ mod tests {
         // Verifies serialization and replay verification (tag 6 Dequantize handler).
         use crate::aggregation::prove_model_pure_gkr;
         use crate::cairo_serde::{
-            serialize_gkr_proof_data_only, serialize_gkr_proof_data_only_packed,
-            serialize_gkr_proof_data_only_double_packed, serialize_raw_io,
+            serialize_gkr_proof_data_only, serialize_gkr_proof_data_only_double_packed,
+            serialize_gkr_proof_data_only_packed, serialize_raw_io,
         };
         use crate::gadgets::quantize::{QuantParams, QuantStrategy};
         let _guard = EnvVarGuard::unset("STWO_WEIGHT_BINDING");
@@ -10367,7 +11115,11 @@ mod tests {
         let agg_proof =
             prove_model_pure_gkr(&graph, &input, &weights).expect("GKR proving should succeed");
         let gkr = agg_proof.gkr_proof.as_ref().expect("GKR proof");
-        let n_weightless = gkr.deferred_proofs.iter().filter(|d| !d.has_weights()).count();
+        let n_weightless = gkr
+            .deferred_proofs
+            .iter()
+            .filter(|d| !d.has_weights())
+            .count();
         assert!(n_weightless > 0, "should have Weightless deferred proof");
 
         // All 3 serialization variants must not panic (was dims().unwrap())
@@ -10441,7 +11193,11 @@ mod tests {
             let mut w = M31Matrix::new(wr, wc);
             for r in 0..wr {
                 for c in 0..wc {
-                    w.set(r, c, M31::from(((r * wc + c + node_id * 37) * 13 + 5) as u32 % 251));
+                    w.set(
+                        r,
+                        c,
+                        M31::from(((r * wc + c + node_id * 37) * 13 + 5) as u32 % 251),
+                    );
                 }
             }
             weights.add_weight(node_id, w);
@@ -10451,7 +11207,10 @@ mod tests {
         let agg_proof =
             prove_model_pure_gkr(&graph, &input, &weights).expect("GKR proving should succeed");
         let gkr = agg_proof.gkr_proof.as_ref().expect("GKR proof");
-        assert!(!gkr.deferred_proofs.is_empty(), "should have deferred proofs");
+        assert!(
+            !gkr.deferred_proofs.is_empty(),
+            "should have deferred proofs"
+        );
 
         let raw_io = serialize_raw_io(&input, &agg_proof.execution.output);
         let matmul_dims = extract_matmul_dims(&circuit);
@@ -10461,11 +11220,26 @@ mod tests {
 
         // The new kind-tag format should be accepted by the replay verifier
         let result = super::replay_verify_serialized_proof(
-            &packed, &raw_io, &matmul_dims,
-            circuit.layers.len() as u32, gkr.layer_proofs.len() as u32,
-            true, Some(gkr.io_commitment), None, None, None,
+            &packed,
+            &raw_io,
+            &matmul_dims,
+            circuit.layers.len() as u32,
+            gkr.layer_proofs.len() as u32,
+            true,
+            Some(gkr.io_commitment),
+            None,
+            None,
+            None,
         );
-        assert!(result.is_ok(), "Replay with kind-tagged deferred proofs failed: {:?}", result.err());
-        println!("Kind-tagged deferred replay OK ({} packed felts, {} deferred)", packed.len(), gkr.deferred_proofs.len());
+        assert!(
+            result.is_ok(),
+            "Replay with kind-tagged deferred proofs failed: {:?}",
+            result.err()
+        );
+        println!(
+            "Kind-tagged deferred replay OK ({} packed felts, {} deferred)",
+            packed.len(),
+            gkr.deferred_proofs.len()
+        );
     }
 }

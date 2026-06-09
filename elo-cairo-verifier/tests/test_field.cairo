@@ -1,9 +1,7 @@
 use elo_cairo_verifier::field::{
-    M31_P, m31_add, m31_sub, m31_mul, m31_reduce,
-    CM31, cm31_add, cm31_sub, cm31_mul,
-    qm31_new, qm31_zero, qm31_one, qm31_add, qm31_sub, qm31_mul,
-    poly_eval_degree2, pack_qm31_to_felt,
-    log2_ceil, next_power_of_two, pow2,
+    CM31, M31_P, cm31_add, cm31_mul, cm31_sub, log2_ceil, m31_add, m31_mul, m31_reduce, m31_sub,
+    next_power_of_two, pack_qm31_to_felt, poly_eval_degree2, pow2, qm31_add, qm31_mul, qm31_new,
+    qm31_one, qm31_sub, qm31_zero,
 };
 
 // ============================================================================

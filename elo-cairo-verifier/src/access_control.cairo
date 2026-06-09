@@ -13,7 +13,8 @@
 
 use starknet::ContractAddress;
 
-// ─── Types ──────────────────────────────────────────────────────────────────
+// ─── Types
+// ──────────────────────────────────────────────────────────────────
 
 #[derive(Drop, Copy, Serde, starknet::Store)]
 pub struct AuditAccess {
@@ -27,7 +28,8 @@ pub struct AuditAccess {
     pub is_active: bool,
 }
 
-// ─── Events ─────────────────────────────────────────────────────────────────
+// ─── Events
+// ─────────────────────────────────────────────────────────────────
 
 #[derive(Drop, starknet::Event)]
 pub struct AccessGranted {
@@ -48,7 +50,8 @@ pub struct AccessRevoked {
     pub revoked_by: ContractAddress,
 }
 
-// ─── Interface ──────────────────────────────────────────────────────────────
+// ─── Interface
+// ──────────────────────────────────────────────────────────────
 
 #[starknet::interface]
 pub trait IAuditAccessControl<TContractState> {
@@ -69,11 +72,7 @@ pub trait IAuditAccessControl<TContractState> {
     /// Only the owner can revoke. Zeroes the wrapped key on-chain.
     /// Off-chain: the owner should re-encrypt the report with a new
     /// data key and re-wrap for remaining parties.
-    fn revoke_audit_access(
-        ref self: TContractState,
-        audit_id: felt252,
-        revokee: ContractAddress,
-    );
+    fn revoke_audit_access(ref self: TContractState, audit_id: felt252, revokee: ContractAddress);
 
     /// Batch grant access to multiple parties.
     fn grant_audit_access_batch(
@@ -85,31 +84,19 @@ pub trait IAuditAccessControl<TContractState> {
     );
 
     /// Check if an address has active access to an audit.
-    fn has_audit_access(
-        self: @TContractState,
-        audit_id: felt252,
-        address: ContractAddress,
-    ) -> bool;
+    fn has_audit_access(self: @TContractState, audit_id: felt252, address: ContractAddress) -> bool;
 
     /// Get the wrapped key for a specific grantee.
     ///
     /// The grantee calls this to retrieve their encrypted data key,
     /// then decrypts it with their Starknet private key.
     fn get_wrapped_key(
-        self: @TContractState,
-        audit_id: felt252,
-        grantee: ContractAddress,
+        self: @TContractState, audit_id: felt252, grantee: ContractAddress,
     ) -> felt252;
 
     /// Get the owner of an audit (whoever called submit_audit).
-    fn get_audit_owner(
-        self: @TContractState,
-        audit_id: felt252,
-    ) -> ContractAddress;
+    fn get_audit_owner(self: @TContractState, audit_id: felt252) -> ContractAddress;
 
     /// Get the number of active access grants for an audit.
-    fn get_access_count(
-        self: @TContractState,
-        audit_id: felt252,
-    ) -> u32;
+    fn get_access_count(self: @TContractState, audit_id: felt252) -> u32;
 }

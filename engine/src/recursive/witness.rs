@@ -1,34 +1,41 @@
 //! GKR verifier witness generator for recursive STARK composition.
 //!
 //! This module re-executes the GKR verifier with an instrumented channel that
-//! records every Poseidon2 permutation and QM31 arithmetic operation. The
+//! records transcript permutations and selected QM31 verifier checks. The
 //! recorded operations become the execution trace for the recursive STARK.
 //!
 //! # Design Principle
 //!
-//! The witness generator must execute the **exact same code path** as the
-//! production verifier (`verify_gkr_inner`). We achieve this by:
+//! The witness generator executes the **exact same verifier code path** as the
+//! production verifier (`verify_gkr_inner`) by running it over
+//! `InstrumentedChannel`. Pass 1 still runs the concrete `PoseidonChannel`
+//! verifier first as an independent preflight and to capture the production
+//! digest/count.
+//!
+//! The intended end-state is:
 //!
 //! 1. Wrapping `PoseidonChannel` in `InstrumentedChannel` that records ops
 //! 2. Using `InstrumentedChannel` as a drop-in replacement during verification
 //! 3. Running differential tests to confirm both paths produce identical transcripts
 //!
-//! # Future: Generic Verifier
+//! # Generic Verifier
 //!
-//! The end-state is a generic verifier function:
+//! The verifier is generic over the channel:
 //! ```ignore
 //! fn verify_gkr_generic<C: VerifierChannel>(channel: &mut C, ...) -> Result<...>
 //! ```
 //! Both `PoseidonChannel` and `InstrumentedChannel` implement `VerifierChannel`.
-//! This guarantees transcript consistency by construction. For now, we replay
-//! the same logic with the instrumented channel.
+//! This guarantees transcript consistency by construction. Arithmetic hooks are
+//! recorded for the core MatMul/Add/Mul checks today; broader AIR constraints
+//! are still required before calling the custom recursive AIR a complete
+//! STARK-in-STARK verifier.
 
 use starknet_ff::FieldElement;
 use stwo::core::fields::m31::M31;
 use stwo::core::fields::qm31::QM31;
 
 use crate::crypto::poseidon_channel::{
-    felt_to_securefield, pack_m31s, securefield_to_felt, PoseidonChannel,
+    felt_to_securefield, pack_m31s, securefield_to_felt, PoseidonChannel, VerifierChannel,
 };
 use crate::gkr::types::SecureField;
 
@@ -244,6 +251,87 @@ impl InstrumentedChannel {
         );
     }
 
+    /// Mix a variable-length array of QM31 values into the channel.
+    ///
+    /// This records the exact `poseidon_hash_many([digest, packed_chunks...])`
+    /// permutation sequence used by `PoseidonChannel::mix_felts`.
+    pub fn mix_felts(&mut self, felts: &[SecureField]) {
+        if felts.is_empty() {
+            return;
+        }
+
+        let mut hash_inputs = vec![self.inner.digest()];
+        let mut i = 0;
+        while i < felts.len() {
+            let remaining = felts.len() - i;
+            if remaining >= 2 {
+                let m31s: Vec<M31> = vec![
+                    felts[i].0 .0,
+                    felts[i].0 .1,
+                    felts[i].1 .0,
+                    felts[i].1 .1,
+                    felts[i + 1].0 .0,
+                    felts[i + 1].0 .1,
+                    felts[i + 1].1 .0,
+                    felts[i + 1].1 .1,
+                ];
+                hash_inputs.push(pack_m31s(&m31s));
+                i += 2;
+            } else {
+                let m31s: Vec<M31> =
+                    vec![felts[i].0 .0, felts[i].0 .1, felts[i].1 .0, felts[i].1 .1];
+                hash_inputs.push(pack_m31s(&m31s));
+                i += 1;
+            }
+        }
+
+        let digest_before = self.inner.digest();
+        let digest_after = self.record_poseidon_hash_many(&hash_inputs);
+        self.ops.push(WitnessOp::ChannelOp {
+            digest_before,
+            digest_after,
+        });
+
+        self.inner.mix_felts(felts);
+        debug_assert_eq!(
+            self.inner.digest(),
+            digest_after,
+            "mix_felts decomposition mismatch"
+        );
+    }
+
+    fn record_poseidon_hash_many(&mut self, inputs: &[FieldElement]) -> FieldElement {
+        let mut state = [FieldElement::ZERO, FieldElement::ZERO, FieldElement::ZERO];
+        let mut chunks = inputs.chunks_exact(2);
+
+        for chunk in chunks.by_ref() {
+            state[0] += chunk[0];
+            state[1] += chunk[1];
+            let input = state;
+            crate::crypto::hades::hades_permutation(&mut state);
+            self.ops.push(WitnessOp::HadesPerm {
+                input,
+                output: state,
+            });
+            self.n_poseidon_perms += 1;
+        }
+
+        let remainder = chunks.remainder();
+        if remainder.len() == 1 {
+            state[0] += remainder[0];
+        }
+        state[remainder.len()] += FieldElement::ONE;
+        let input = state;
+        crate::crypto::hades::hades_permutation(&mut state);
+        self.ops.push(WitnessOp::HadesPerm {
+            input,
+            output: state,
+        });
+        self.n_poseidon_perms += 1;
+
+        state[0]
+    }
+
     /// Mix degree-3 polynomial coefficients (4 QM31s).
     ///
     /// Same sponge construction for `poseidon_hash_many([digest, felt1, felt2])`.
@@ -377,6 +465,98 @@ impl Default for InstrumentedChannel {
     }
 }
 
+impl VerifierChannel for InstrumentedChannel {
+    fn mix_u64(&mut self, value: u64) {
+        InstrumentedChannel::mix_u64(self, value);
+    }
+
+    fn mix_felt(&mut self, value: FieldElement) {
+        InstrumentedChannel::mix_felt(self, value);
+    }
+
+    fn mix_felts(&mut self, felts: &[SecureField]) {
+        InstrumentedChannel::mix_felts(self, felts);
+    }
+
+    fn mix_poly_coeffs(&mut self, c0: SecureField, c1: SecureField, c2: SecureField) {
+        InstrumentedChannel::mix_poly_coeffs(self, c0, c1, c2);
+    }
+
+    fn mix_poly_coeffs_deg3(
+        &mut self,
+        c0: SecureField,
+        c1: SecureField,
+        c2: SecureField,
+        c3: SecureField,
+    ) {
+        InstrumentedChannel::mix_poly_coeffs_deg3(self, c0, c1, c2, c3);
+    }
+
+    fn draw_felt252(&mut self) -> FieldElement {
+        InstrumentedChannel::draw_felt252(self)
+    }
+
+    fn draw_qm31(&mut self) -> SecureField {
+        InstrumentedChannel::draw_qm31(self)
+    }
+
+    fn draw_qm31s(&mut self, count: usize) -> Vec<SecureField> {
+        InstrumentedChannel::draw_qm31s(self, count)
+    }
+
+    fn mix_securefield(&mut self, value: SecureField) {
+        InstrumentedChannel::mix_securefield(self, value);
+    }
+
+    fn record_qm31_mul(&mut self, a: SecureField, b: SecureField, result: SecureField) {
+        InstrumentedChannel::record_mul(self, a, b, result);
+    }
+
+    fn record_qm31_add(&mut self, a: SecureField, b: SecureField, result: SecureField) {
+        InstrumentedChannel::record_add(self, a, b, result);
+    }
+
+    fn record_equality_check(&mut self, lhs: SecureField, rhs: SecureField) {
+        InstrumentedChannel::record_equality_check(self, lhs, rhs);
+    }
+
+    fn record_sumcheck_round_deg2(
+        &mut self,
+        round_poly: crate::components::matmul::RoundPoly,
+        claim: SecureField,
+        challenge: SecureField,
+        next_claim: SecureField,
+    ) {
+        InstrumentedChannel::record_sumcheck_round_deg2(
+            self, round_poly, claim, challenge, next_claim,
+        );
+    }
+
+    fn record_sumcheck_round_deg3(
+        &mut self,
+        round_poly: crate::gkr::types::RoundPolyDeg3,
+        claim: SecureField,
+        challenge: SecureField,
+        next_claim: SecureField,
+    ) {
+        InstrumentedChannel::record_sumcheck_round_deg3(
+            self, round_poly, claim, challenge, next_claim,
+        );
+    }
+
+    fn digest(&self) -> FieldElement {
+        self.inner.digest()
+    }
+
+    fn n_draws(&self) -> u32 {
+        self.inner.n_draws()
+    }
+
+    fn hash_count(&self) -> u64 {
+        self.inner.hash_count()
+    }
+}
+
 // =========================================================================
 // Witness generation
 // =========================================================================
@@ -389,15 +569,13 @@ impl Default for InstrumentedChannel {
 /// `PoseidonChannel` to confirm the proof is valid and measure the exact
 /// number of Poseidon calls (via `hash_count()`).
 ///
-/// **Pass 2 (instrumented replay)**: Replays the core layers (MatMul, Add, Mul)
-/// with an `InstrumentedChannel` to record detailed witness operations. Non-core
-/// layers (Activation, LayerNorm, RMSNorm) are accounted for via the hash_count
-/// delta from Pass 1.
+/// **Pass 2 (instrumented verification)**: Runs the same verifier over an
+/// `InstrumentedChannel`, recording every transcript permutation plus the core
+/// MatMul/Add/Mul arithmetic hooks that the recursive AIR currently consumes.
 ///
-/// This guarantees:
-/// - Correctness: Pass 1 proves the GKR proof is valid using production code
-/// - Completeness: hash_count captures ALL Poseidon calls from ALL layer types
-/// - Detail: Pass 2 records fine-grained ops for the dominant cost (MatMul sumchecks)
+/// Matching the Pass 1 digest proves transcript coverage. It is still not a
+/// complete custom-AIR verifier for every non-core arithmetic relation until
+/// those verifier hooks/constraints are added.
 pub fn generate_witness(
     circuit: &crate::gkr::circuit::LayeredCircuit,
     proof: &crate::gkr::types::GKRProof,
@@ -430,11 +608,6 @@ pub fn generate_witness_with_policy(
     io_commitment: QM31,
     policy: Option<&crate::policy::PolicyConfig>,
 ) -> Result<GkrVerifierWitness, crate::gkr::types::GKRError> {
-    use crate::components::matmul::{
-        evaluate_mle_pub as evaluate_mle, matrix_to_mle_pub as matrix_to_mle, pad_matrix_pow2,
-    };
-    use crate::gkr::circuit::LayerType;
-
     // ── Pass 1: production verification ──────────────────────────────
     // Run the real verifier to (a) confirm validity, (b) measure hash_count,
     // and (c) capture the final channel digest.
@@ -478,161 +651,43 @@ pub fn generate_witness_with_policy(
     let total_poseidon_calls = prod_channel.hash_count() as usize;
     let final_digest = prod_channel.digest();
 
-    // ── Pass 2: instrumented replay ──────────────────────────────────
-    // Replay with InstrumentedChannel for detailed witness.
+    // ── Pass 2: instrumented verifier replay ─────────────────────────
+    // Run the same verifier code path over InstrumentedChannel so every
+    // transcript operation is captured for the recursive trace.
     let mut channel = InstrumentedChannel::new();
     let d = circuit.layers.len();
 
-    // No outer seeding needed — the pure GKR path starts fresh.
-
-    // Seed channel identically to GKR prover internal
-    channel.mix_u64(d as u64);
-    channel.mix_u64(circuit.input_shape.0 as u64);
-    channel.mix_u64(circuit.input_shape.1 as u64);
+    if let Some(kv) = proof.kv_cache_commitment {
+        channel.mix_felt(kv);
+        if let Some(prev_kv) = proof.prev_kv_cache_commitment {
+            channel.mix_felt(prev_kv);
+        }
+    }
 
     // SECURITY: Capture the seed digest — deterministic given the model.
     // This becomes a public input and AIR checkpoint constraint.
-    let seed_digest = felt_to_securefield(channel.inner().digest());
-
-    // Reconstruct output claim
-    let output_padded = pad_matrix_pow2(output);
-    let output_mle = matrix_to_mle(&output_padded);
-    let log_out_rows = output_padded.rows.ilog2() as usize;
-    let log_out_cols = output_padded.cols.ilog2() as usize;
-    let r_out = channel.draw_qm31s(log_out_rows + log_out_cols);
-    let output_value = evaluate_mle(&output_mle, &r_out);
-    channel.mix_securefield(output_value);
-
-    let mut current_claim = crate::gkr::types::GKRClaim {
-        point: r_out,
-        value: output_value,
+    let seed_digest = {
+        let mut seed_channel = PoseidonChannel::new();
+        if let Some(kv) = proof.kv_cache_commitment {
+            seed_channel.mix_felt(kv);
+            if let Some(prev_kv) = proof.prev_kv_cache_commitment {
+                seed_channel.mix_felt(prev_kv);
+            }
+        }
+        seed_channel.mix_u64(d as u64);
+        seed_channel.mix_u64(circuit.input_shape.0 as u64);
+        seed_channel.mix_u64(circuit.input_shape.1 as u64);
+        felt_to_securefield(seed_channel.digest())
     };
 
-    // Walk layers from output → input
-    let mut proof_idx = 0;
-
-    for layer_idx in (0..d).rev() {
-        let layer = &circuit.layers[layer_idx];
-
-        match &layer.layer_type {
-            LayerType::Identity => continue,
-            LayerType::Input => break,
-            _ => {}
-        }
-
-        if proof_idx >= proof.layer_proofs.len() {
-            return Err(crate::gkr::types::GKRError::VerificationError {
-                layer_idx,
-                reason: "ran out of layer proofs".to_string(),
-            });
-        }
-
-        let layer_proof = &proof.layer_proofs[proof_idx];
-        proof_idx += 1;
-
-        match (&layer.layer_type, layer_proof) {
-            // ── MatMul: full sumcheck replay ─────────────────────
-            (
-                LayerType::MatMul { .. },
-                crate::gkr::types::LayerProof::MatMul {
-                    round_polys,
-                    final_a_eval,
-                    final_b_eval,
-                },
-            ) => {
-                let mut claim = current_claim.value;
-                let mut challenges = Vec::with_capacity(round_polys.len());
-
-                for rp in round_polys.iter() {
-                    let sum_check = rp.c0 + (rp.c0 + rp.c1 + rp.c2);
-                    channel.record_equality_check(sum_check, claim);
-                    channel.mix_poly_coeffs(rp.c0, rp.c1, rp.c2);
-                    let r = channel.draw_qm31();
-                    challenges.push(r);
-                    let next_claim = rp.c0 + rp.c1 * r + rp.c2 * r * r;
-                    channel.record_sumcheck_round_deg2(*rp, claim, r, next_claim);
-                    claim = next_claim;
-                }
-
-                let product = *final_a_eval * *final_b_eval;
-                channel.record_mul(*final_a_eval, *final_b_eval, product);
-                channel.record_equality_check(claim, product);
-                channel.mix_securefield(*final_a_eval);
-                channel.mix_securefield(*final_b_eval);
-
-                current_claim = crate::gkr::types::GKRClaim {
-                    point: challenges,
-                    value: *final_a_eval,
-                };
-            }
-
-            // ── Add: direct evaluation check ─────────────────────
-            (
-                LayerType::Add { .. },
-                crate::gkr::types::LayerProof::Add {
-                    lhs_eval, rhs_eval, ..
-                },
-            ) => {
-                let sum = *lhs_eval + *rhs_eval;
-                channel.record_add(*lhs_eval, *rhs_eval, sum);
-                channel.record_equality_check(current_claim.value, sum);
-                channel.mix_securefield(*lhs_eval);
-                channel.mix_securefield(*rhs_eval);
-
-                current_claim = crate::gkr::types::GKRClaim {
-                    point: current_claim.point.clone(),
-                    value: *lhs_eval,
-                };
-            }
-
-            // ── Mul: degree-3 eq-sumcheck ────────────────────────
-            (
-                LayerType::Mul { .. },
-                crate::gkr::types::LayerProof::Mul {
-                    eq_round_polys,
-                    lhs_eval,
-                    rhs_eval,
-                },
-            ) => {
-                let mut claim = current_claim.value;
-
-                for rp in eq_round_polys.iter() {
-                    let sum_check = rp.c0 + (rp.c0 + rp.c1 + rp.c2 + rp.c3);
-                    channel.record_equality_check(sum_check, claim);
-                    channel.mix_poly_coeffs_deg3(rp.c0, rp.c1, rp.c2, rp.c3);
-                    let r = channel.draw_qm31();
-                    let next_claim = rp.eval(r);
-                    channel.record_sumcheck_round_deg3(*rp, claim, r, next_claim);
-                    claim = next_claim;
-                }
-
-                let product = *lhs_eval * *rhs_eval;
-                channel.record_mul(*lhs_eval, *rhs_eval, product);
-                channel.mix_securefield(*lhs_eval);
-                channel.mix_securefield(*rhs_eval);
-
-                current_claim = crate::gkr::types::GKRClaim {
-                    point: current_claim.point.clone(),
-                    value: *lhs_eval,
-                };
-            }
-
-            // ── All other layer types ────────────────────────────
-            // Activation, LayerNorm, RMSNorm, Embedding, RoPE, etc.
-            // These are verified in Pass 1 (production verifier).
-            // Pass 2 skips detailed recording — the Poseidon call count
-            // from Pass 1 tells the AIR exactly how many rows to allocate.
-            //
-            // The recursive STARK constrains these layers via the
-            // PoseidonChain component: the hash chain is continuous,
-            // so skipping verification here does NOT break soundness —
-            // the chain constraint ensures the transcript is intact.
-            _ => {
-                // Record that this layer was verified (by Pass 1)
-                // but detailed ops are not captured in this pass.
-            }
-        }
-    }
+    crate::gkr::verifier::verify_gkr_on_channel(
+        circuit,
+        proof,
+        output,
+        weights,
+        &mut channel,
+        policy,
+    )?;
 
     let circuit_hash = compute_circuit_hash(circuit);
     let (_instrumented_poseidon, n_sumcheck_rounds, n_qm31_ops, n_equality_checks) =
@@ -641,21 +696,27 @@ pub fn generate_witness_with_policy(
     // Compute hades_commitment from all HadesPerm pairs in the ops.
     // This matches the Cairo Hades verifier program's output.
     let hades_commitment = {
-        let pairs: Vec<_> = channel.ops().iter().filter_map(|op| {
-            if let WitnessOp::HadesPerm { input, output } = op {
-                Some((*input, *output))
-            } else {
-                None
-            }
-        }).collect();
+        let pairs: Vec<_> = channel
+            .ops()
+            .iter()
+            .filter_map(|op| {
+                if let WitnessOp::HadesPerm { input, output } = op {
+                    Some((*input, *output))
+                } else {
+                    None
+                }
+            })
+            .collect();
         super::prover::compute_hades_commitment(&pairs)
     };
 
     // Pull KV-cache commitments from the GKR proof (set by decode-step prover).
     // FieldElement::ZERO on prefill / single-pass / non-decode proofs.
-    let kv_cache_commitment = proof.kv_cache_commitment
+    let kv_cache_commitment = proof
+        .kv_cache_commitment
         .unwrap_or(starknet_ff::FieldElement::ZERO);
-    let prev_kv_cache_commitment = proof.prev_kv_cache_commitment
+    let prev_kv_cache_commitment = proof
+        .prev_kv_cache_commitment
         .unwrap_or(starknet_ff::FieldElement::ZERO);
 
     let witness = GkrVerifierWitness {
@@ -670,6 +731,7 @@ pub fn generate_witness_with_policy(
             hades_commitment,
             kv_cache_commitment,
             prev_kv_cache_commitment,
+            conversation_statement_hash: starknet_ff::FieldElement::ZERO,
         },
         // Use the production verifier's total count (covers ALL layer types)
         n_poseidon_perms: total_poseidon_calls,

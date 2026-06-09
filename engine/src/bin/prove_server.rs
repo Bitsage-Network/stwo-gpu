@@ -21,7 +21,10 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::Query;
 use axum::{
     extract::{ConnectInfo, Path, State},
-    http::{header::{AUTHORIZATION, CONTENT_TYPE}, Method, StatusCode},
+    http::{
+        header::{AUTHORIZATION, CONTENT_TYPE},
+        Method, StatusCode,
+    },
     middleware,
     response::{Html, IntoResponse},
     routing::{get, post},
@@ -33,8 +36,8 @@ use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use uuid::Uuid;
 
-use stwo::core::fields::m31::M31;
 use obelyzk::circuits::batch::BatchPublicInputs;
+use stwo::core::fields::m31::M31;
 
 use obelyzk::compiler::hf_loader::load_hf_model;
 use obelyzk::compiler::onnx::load_onnx;
@@ -687,7 +690,7 @@ impl RateLimiter {
 /// Hashing both sides ensures equal-length comparison and prevents
 /// timing side-channel attacks on the API key.
 fn constant_time_eq(a: &str, b: &str) -> bool {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let ha = Sha256::digest(a.as_bytes());
     let hb = Sha256::digest(b.as_bytes());
     // Fixed-length (32 byte) comparison — constant time for equal-length slices
@@ -718,8 +721,13 @@ async fn auth_middleware(
         if !auth_ok {
             return (
                 StatusCode::UNAUTHORIZED,
-                Json(ErrorResponse { error: "Unauthorized: invalid or missing API key. Set Authorization: Bearer <key>".into() }),
-            ).into_response();
+                Json(ErrorResponse {
+                    error:
+                        "Unauthorized: invalid or missing API key. Set Authorization: Bearer <key>"
+                            .into(),
+                }),
+            )
+                .into_response();
         }
     }
     next.run(req).await
@@ -765,8 +773,8 @@ fn validate_model_path(
 
     // Check against allowlist if configured
     if let Ok(allowed) = std::env::var("PROVE_SERVER_MODEL_DIR") {
-        let allowed_canonical = std::fs::canonicalize(&allowed)
-            .unwrap_or_else(|_| std::path::PathBuf::from(&allowed));
+        let allowed_canonical =
+            std::fs::canonicalize(&allowed).unwrap_or_else(|_| std::path::PathBuf::from(&allowed));
         if !canonical.starts_with(&allowed_canonical) {
             return Err((
                 StatusCode::FORBIDDEN,
@@ -984,13 +992,8 @@ async fn load_model(
     // Use the canonicalized path for weight cache (not raw user input)
     #[cfg(feature = "multi-query")]
     {
-        let cache =
-            obelyzk::weight_cache::shared_cache_for_model(&canonical_path, &model_id);
-        state
-            .weight_caches
-            .write()
-            .await
-            .insert(model_id, cache);
+        let cache = obelyzk::weight_cache::shared_cache_for_model(&canonical_path, &model_id);
+        state.weight_caches.write().await.insert(model_id, cache);
     }
 
     // Suppress unused variable warning when multi-query is disabled
@@ -1054,28 +1057,25 @@ async fn load_hf_model_handler(
     #[cfg(feature = "multi-query")]
     {
         let cache = obelyzk::weight_cache::shared_cache_for_model(&path, &model_id);
-        state
-            .weight_caches
-            .write()
-            .await
-            .insert(model_id, cache);
+        state.weight_caches.write().await.insert(model_id, cache);
     }
 
     Ok((StatusCode::CREATED, Json(resp)))
 }
 
 /// List all loaded models.
-async fn list_models(
-    State(state): State<Arc<AppState>>,
-) -> Json<Vec<ModelListEntry>> {
+async fn list_models(State(state): State<Arc<AppState>>) -> Json<Vec<ModelListEntry>> {
     let models = state.models.read().await;
-    let entries: Vec<ModelListEntry> = models.values().map(|m| ModelListEntry {
-        model_id: m.model_id.clone(),
-        name: m.name.clone(),
-        weight_commitment: m.weight_commitment.clone(),
-        num_layers: m.num_layers,
-        input_shape: [m.input_shape.0, m.input_shape.1],
-    }).collect();
+    let entries: Vec<ModelListEntry> = models
+        .values()
+        .map(|m| ModelListEntry {
+            model_id: m.model_id.clone(),
+            name: m.name.clone(),
+            weight_commitment: m.weight_commitment.clone(),
+            num_layers: m.num_layers,
+            input_shape: [m.input_shape.0, m.input_shape.1],
+        })
+        .collect();
     Json(entries)
 }
 
@@ -1257,9 +1257,8 @@ async fn submit_prove(
             prove_fn: Box::new(move |_device_id| {
                 // Install proof-stream sink on the blocking thread
                 #[cfg(feature = "proof-stream")]
-                let _sink_guard = obelyzk::gkr::prover::set_proof_sink(
-                    proof_stream::ProofSink::new(ws_clone),
-                );
+                let _sink_guard =
+                    obelyzk::gkr::prover::set_proof_sink(proof_stream::ProofSink::new(ws_clone));
 
                 let prove_start = Instant::now();
                 let proof_result = if let Some(ref cache) = weight_cache {
@@ -1341,7 +1340,11 @@ async fn submit_prove(
 
                     let calldata: Vec<String> = payload_json["calldata"]
                         .as_array()
-                        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
                         .unwrap_or_default();
 
                     let payload = ProveResultPayload {
@@ -1356,12 +1359,10 @@ async fn submit_prove(
                             .unwrap_or("0x0")
                             .to_string(),
                         estimated_gas: payload_json["estimated_gas"].as_u64().unwrap_or(0),
-                        num_matmul_proofs: payload_json["num_matmul_proofs"]
-                            .as_u64()
-                            .unwrap_or(0) as usize,
-                        num_layers: payload_json["num_proven_layers"]
-                            .as_u64()
-                            .unwrap_or(0) as usize,
+                        num_matmul_proofs: payload_json["num_matmul_proofs"].as_u64().unwrap_or(0)
+                            as usize,
+                        num_layers: payload_json["num_proven_layers"].as_u64().unwrap_or(0)
+                            as usize,
                         prove_time_ms: gpu_result.prove_time_ms,
                         tee_attestation_hash: payload_json["tee_attestation_hash"]
                             .as_str()
@@ -1434,199 +1435,203 @@ async fn submit_prove(
     // -------------------------------------------------------------------------
     #[cfg(not(feature = "multi-query"))]
     {
-    let state_clone = state.clone();
-    let jid = job_id.clone();
-    tokio::task::spawn(async move {
-        // Mark as proving
-        {
-            let mut jobs = state_clone.jobs.write().await;
-            if let Some(j) = jobs.get_mut(&jid) {
-                j.status = JobStatus::Proving;
-                j.progress_bps = 100; // 1%
-            }
-        }
-
-        let prove_start = Instant::now();
-
-        // Progress ticker: estimate progress based on elapsed time
-        // SmolLM2-135M takes ~8s, Qwen2-0.5B ~20s. Use 15s as default estimate.
-        let progress_state = state_clone.clone();
-        let progress_jid = jid.clone();
-        let progress_handle = tokio::spawn(async move {
-            let estimated_secs = 15.0_f64;
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                let elapsed = prove_start.elapsed().as_secs_f64();
-                // Asymptotic progress: approaches 95% but never reaches 100%
-                let pct = 1.0 - (-elapsed / estimated_secs).exp();
-                let bps = (pct * 9500.0) as u16 + 100; // 100..9600 range
-                let mut jobs = progress_state.jobs.write().await;
-                match jobs.get_mut(&progress_jid) {
-                    Some(j) if j.status == JobStatus::Proving => {
-                        j.progress_bps = bps;
-                    }
-                    _ => break, // job completed or removed
+        let state_clone = state.clone();
+        let jid = job_id.clone();
+        tokio::task::spawn(async move {
+            // Mark as proving
+            {
+                let mut jobs = state_clone.jobs.write().await;
+                if let Some(j) = jobs.get_mut(&jid) {
+                    j.status = JobStatus::Proving;
+                    j.progress_bps = 100; // 1%
                 }
             }
-        });
 
-        // Run CPU+GPU heavy proving on a blocking thread
-        #[cfg(feature = "proof-stream")]
-        let ws_clone = state_clone.ws_sink.clone();
-        let validator_url_clone = state_clone.validator_url.clone();
-        let jid_for_validator = jid.clone();
+            let prove_start = Instant::now();
 
-        let result = tokio::task::spawn_blocking(move || {
-            // Install proof-stream sink on the blocking thread (thread-local must
-            // live on the same thread that runs the prover).
-            #[cfg(feature = "proof-stream")]
-            let _sink_guard =
-                obelyzk::gkr::prover::set_proof_sink(proof_stream::ProofSink::new(ws_clone));
-            prove_for_starknet_onchain(&*graph, &input_matrix, &*weights)
-        })
-        .await;
-
-        // Stop the progress ticker
-        progress_handle.abort();
-
-        let prove_elapsed = prove_start.elapsed();
-        let mut jobs = state_clone.jobs.write().await;
-
-        match result {
-            Ok(Ok(proof)) => {
-                let calldata: Vec<String> = proof
-                    .combined_calldata
-                    .iter()
-                    .map(|f| format!("0x{:x}", f))
-                    .collect();
-
-                let payload = ProveResultPayload {
-                    calldata,
-                    io_commitment: format!("0x{:x}", proof.io_commitment),
-                    weight_commitment: model_weight_commitment.clone(),
-                    layer_chain_commitment: format!("0x{:x}", proof.layer_chain_commitment),
-                    estimated_gas: proof.estimated_gas,
-                    num_matmul_proofs: proof.num_matmul_proofs,
-                    num_layers: proof.num_proven_layers,
-                    prove_time_ms: prove_elapsed.as_millis() as u64,
-                    tee_attestation_hash: proof.tee_attestation_hash.map(|h| format!("0x{:x}", h)),
-                    policy: request_policy_name.clone(),
-                    policy_commitment: request_policy_commitment_hex.clone(),
-                };
-
-                // Store in proofs map for /api/v1/proofs listing
-                let io_str = format!("0x{:x}", proof.io_commitment);
-                let proof_hash = format!("0x{:x}", proof.layer_chain_commitment);
-                {
-                    let stored = StoredProof {
-                        proof_hash: proof_hash.clone(),
-                        model_id: model_id_for_proofs.clone(),
-                        io_commitment: io_str.clone(),
-                        weight_commitment: model_weight_commitment.clone(),
-                        num_proven_layers: proof.num_proven_layers,
-                        prove_time_ms: prove_elapsed.as_millis() as u64,
-                        calldata_size: payload.calldata.len(),
-                        created_at_epoch_ms: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64,
-                    };
-                    drop(jobs);
-                    state_clone.proofs.write().await.insert(proof_hash, stored);
-                    let mut jobs = state_clone.jobs.write().await;
-                    if let Some(j) = jobs.get_mut(&jid) {
-                        j.status = JobStatus::Completed;
-                        j.progress_bps = 10000;
-                        j.completed_at = Some(Instant::now());
-                        j.result = Some(payload);
-                    }
-                }
-
-                // Forward proof result to validator if configured
-                #[cfg(any(feature = "audit-http", feature = "server-stream"))]
-                if let Some(ref url) = validator_url_clone {
-                    let post_url = format!("{url}/api/v1/workers/job/{jid_for_validator}/result");
-                    let elapsed_ms = prove_elapsed.as_millis() as u64;
-                    let jid_v = jid_for_validator.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        let body = format!(
-                            r#"{{"job_id":"{}","success":true,"generation_time_ms":{}}}"#,
-                            jid_v, elapsed_ms
-                        );
-                        match ureq::post(&post_url)
-                            .header("Content-Type", "application/json")
-                            .send(body.as_bytes())
-                        {
-                            Ok(resp) if resp.status() == 200 || resp.status() == 201 => {}
-                            Ok(resp) => eprintln!(
-                                "[prove-server] validator returned HTTP {} for job {}",
-                                resp.status(),
-                                jid_v
-                            ),
-                            Err(e) => eprintln!(
-                                "[prove-server] validator bridge error for job {}: {}",
-                                jid_v, e
-                            ),
+            // Progress ticker: estimate progress based on elapsed time
+            // SmolLM2-135M takes ~8s, Qwen2-0.5B ~20s. Use 15s as default estimate.
+            let progress_state = state_clone.clone();
+            let progress_jid = jid.clone();
+            let progress_handle = tokio::spawn(async move {
+                let estimated_secs = 15.0_f64;
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let elapsed = prove_start.elapsed().as_secs_f64();
+                    // Asymptotic progress: approaches 95% but never reaches 100%
+                    let pct = 1.0 - (-elapsed / estimated_secs).exp();
+                    let bps = (pct * 9500.0) as u16 + 100; // 100..9600 range
+                    let mut jobs = progress_state.jobs.write().await;
+                    match jobs.get_mut(&progress_jid) {
+                        Some(j) if j.status == JobStatus::Proving => {
+                            j.progress_bps = bps;
                         }
-                    })
-                    .await;
+                        _ => break, // job completed or removed
+                    }
                 }
+            });
 
-                // Record inference for audit log
-                #[cfg(feature = "server-audit")]
-                {
-                    let tee_hash = proof
-                        .tee_attestation_hash
-                        .map(|h| format!("0x{:x}", h))
-                        .unwrap_or_else(|| "0x0".to_string());
-                    drop(jobs);
-                    let models = state_clone.models.read().await;
-                    if let Some(model) = models.get(&jid_model) {
-                        if let Some(ref hook) = model.capture_hook {
-                            // Replay forward pass to get output for audit record
-                            if let Ok(output_m31) = obelyzk::audit::replay::execute_forward_pass(
-                                &audit_graph,
-                                &input_matrix_clone,
-                                &audit_weights,
-                            ) {
-                                hook.record(obelyzk::audit::capture::CaptureJob {
-                                    input_tokens: vec![],
-                                    output_tokens: vec![],
-                                    input_m31: input_matrix_clone,
-                                    output_m31,
-                                    timestamp_ns: std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_nanos()
-                                        as u64,
-                                    latency_ms: prove_elapsed.as_millis() as u64,
-                                    gpu_device: "server".to_string(),
-                                    tee_report_hash: tee_hash,
-                                    task_category: Some("prove".to_string()),
-                                    input_preview: None,
-                                    output_preview: None,
-                                });
+            // Run CPU+GPU heavy proving on a blocking thread
+            #[cfg(feature = "proof-stream")]
+            let ws_clone = state_clone.ws_sink.clone();
+            let validator_url_clone = state_clone.validator_url.clone();
+            let jid_for_validator = jid.clone();
+
+            let result = tokio::task::spawn_blocking(move || {
+                // Install proof-stream sink on the blocking thread (thread-local must
+                // live on the same thread that runs the prover).
+                #[cfg(feature = "proof-stream")]
+                let _sink_guard =
+                    obelyzk::gkr::prover::set_proof_sink(proof_stream::ProofSink::new(ws_clone));
+                prove_for_starknet_onchain(&*graph, &input_matrix, &*weights)
+            })
+            .await;
+
+            // Stop the progress ticker
+            progress_handle.abort();
+
+            let prove_elapsed = prove_start.elapsed();
+            let mut jobs = state_clone.jobs.write().await;
+
+            match result {
+                Ok(Ok(proof)) => {
+                    let calldata: Vec<String> = proof
+                        .combined_calldata
+                        .iter()
+                        .map(|f| format!("0x{:x}", f))
+                        .collect();
+
+                    let payload = ProveResultPayload {
+                        calldata,
+                        io_commitment: format!("0x{:x}", proof.io_commitment),
+                        weight_commitment: model_weight_commitment.clone(),
+                        layer_chain_commitment: format!("0x{:x}", proof.layer_chain_commitment),
+                        estimated_gas: proof.estimated_gas,
+                        num_matmul_proofs: proof.num_matmul_proofs,
+                        num_layers: proof.num_proven_layers,
+                        prove_time_ms: prove_elapsed.as_millis() as u64,
+                        tee_attestation_hash: proof
+                            .tee_attestation_hash
+                            .map(|h| format!("0x{:x}", h)),
+                        policy: request_policy_name.clone(),
+                        policy_commitment: request_policy_commitment_hex.clone(),
+                    };
+
+                    // Store in proofs map for /api/v1/proofs listing
+                    let io_str = format!("0x{:x}", proof.io_commitment);
+                    let proof_hash = format!("0x{:x}", proof.layer_chain_commitment);
+                    {
+                        let stored = StoredProof {
+                            proof_hash: proof_hash.clone(),
+                            model_id: model_id_for_proofs.clone(),
+                            io_commitment: io_str.clone(),
+                            weight_commitment: model_weight_commitment.clone(),
+                            num_proven_layers: proof.num_proven_layers,
+                            prove_time_ms: prove_elapsed.as_millis() as u64,
+                            calldata_size: payload.calldata.len(),
+                            created_at_epoch_ms: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis()
+                                as u64,
+                        };
+                        drop(jobs);
+                        state_clone.proofs.write().await.insert(proof_hash, stored);
+                        let mut jobs = state_clone.jobs.write().await;
+                        if let Some(j) = jobs.get_mut(&jid) {
+                            j.status = JobStatus::Completed;
+                            j.progress_bps = 10000;
+                            j.completed_at = Some(Instant::now());
+                            j.result = Some(payload);
+                        }
+                    }
+
+                    // Forward proof result to validator if configured
+                    #[cfg(any(feature = "audit-http", feature = "server-stream"))]
+                    if let Some(ref url) = validator_url_clone {
+                        let post_url =
+                            format!("{url}/api/v1/workers/job/{jid_for_validator}/result");
+                        let elapsed_ms = prove_elapsed.as_millis() as u64;
+                        let jid_v = jid_for_validator.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let body = format!(
+                                r#"{{"job_id":"{}","success":true,"generation_time_ms":{}}}"#,
+                                jid_v, elapsed_ms
+                            );
+                            match ureq::post(&post_url)
+                                .header("Content-Type", "application/json")
+                                .send(body.as_bytes())
+                            {
+                                Ok(resp) if resp.status() == 200 || resp.status() == 201 => {}
+                                Ok(resp) => eprintln!(
+                                    "[prove-server] validator returned HTTP {} for job {}",
+                                    resp.status(),
+                                    jid_v
+                                ),
+                                Err(e) => eprintln!(
+                                    "[prove-server] validator bridge error for job {}: {}",
+                                    jid_v, e
+                                ),
+                            }
+                        })
+                        .await;
+                    }
+
+                    // Record inference for audit log
+                    #[cfg(feature = "server-audit")]
+                    {
+                        let tee_hash = proof
+                            .tee_attestation_hash
+                            .map(|h| format!("0x{:x}", h))
+                            .unwrap_or_else(|| "0x0".to_string());
+                        drop(jobs);
+                        let models = state_clone.models.read().await;
+                        if let Some(model) = models.get(&jid_model) {
+                            if let Some(ref hook) = model.capture_hook {
+                                // Replay forward pass to get output for audit record
+                                if let Ok(output_m31) = obelyzk::audit::replay::execute_forward_pass(
+                                    &audit_graph,
+                                    &input_matrix_clone,
+                                    &audit_weights,
+                                ) {
+                                    hook.record(obelyzk::audit::capture::CaptureJob {
+                                        input_tokens: vec![],
+                                        output_tokens: vec![],
+                                        input_m31: input_matrix_clone,
+                                        output_m31,
+                                        timestamp_ns: std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_nanos()
+                                            as u64,
+                                        latency_ms: prove_elapsed.as_millis() as u64,
+                                        gpu_device: "server".to_string(),
+                                        tee_report_hash: tee_hash,
+                                        task_category: Some("prove".to_string()),
+                                        input_preview: None,
+                                        output_preview: None,
+                                    });
+                                }
                             }
                         }
                     }
                 }
-            }
-            Ok(Err(e)) => {
-                if let Some(j) = jobs.get_mut(&jid) {
-                    j.status = JobStatus::Failed;
-                    j.error = Some(format!("{e}"));
-                    j.completed_at = Some(Instant::now());
+                Ok(Err(e)) => {
+                    if let Some(j) = jobs.get_mut(&jid) {
+                        j.status = JobStatus::Failed;
+                        j.error = Some(format!("{e}"));
+                        j.completed_at = Some(Instant::now());
+                    }
+                }
+                Err(e) => {
+                    if let Some(j) = jobs.get_mut(&jid) {
+                        j.status = JobStatus::Failed;
+                        j.error = Some(format!("Task panicked: {e}"));
+                        j.completed_at = Some(Instant::now());
+                    }
                 }
             }
-            Err(e) => {
-                if let Some(j) = jobs.get_mut(&jid) {
-                    j.status = JobStatus::Failed;
-                    j.error = Some(format!("Task panicked: {e}"));
-                    j.completed_at = Some(Instant::now());
-                }
-            }
-        }
-    });
+        });
     }
 
     Ok((StatusCode::ACCEPTED, Json(resp)))
@@ -1718,7 +1723,8 @@ async fn infer(
             Json(ErrorResponse {
                 error: format!(
                     "Model '{}' not found. Available: [{}]",
-                    req.model_id, available.join(", ")
+                    req.model_id,
+                    available.join(", ")
                 ),
             }),
         )
@@ -1731,32 +1737,55 @@ async fn infer(
         if req.input.is_some() {
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(ErrorResponse { error: "Cannot provide both 'input' and 'prompt'".into() }),
+                Json(ErrorResponse {
+                    error: "Cannot provide both 'input' and 'prompt'".into(),
+                }),
             ));
         }
-        let tokenizer = model.tokenizer.as_ref().ok_or_else(|| (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse { error: "Model has no tokenizer — use 'input' instead of 'prompt'".into() }),
-        ))?;
-        let model_dir = model.model_dir.as_ref().ok_or_else(|| (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse { error: "Model has no model_dir — cannot embed tokens".into() }),
-        ))?;
-        let encoding = tokenizer.encode(prompt.as_str(), false).map_err(|e| (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse { error: format!("Tokenization failed: {e}") }),
-        ))?;
+        let tokenizer = model.tokenizer.as_ref().ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Model has no tokenizer — use 'input' instead of 'prompt'".into(),
+                }),
+            )
+        })?;
+        let model_dir = model.model_dir.as_ref().ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Model has no model_dir — cannot embed tokens".into(),
+                }),
+            )
+        })?;
+        let encoding = tokenizer.encode(prompt.as_str(), false).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("Tokenization failed: {e}"),
+                }),
+            )
+        })?;
         let token_ids = encoding.get_ids();
         if token_ids.is_empty() {
-            return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse { error: "Prompt produced zero tokens".into() })));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Prompt produced zero tokens".into(),
+                }),
+            ));
         }
         let last_token_id = *token_ids.last().unwrap();
-        let (row, _vocab_size) = obelyzk::compiler::hf_loader::load_embedding_row(
-            model_dir, in_cols, last_token_id,
-        ).map_err(|e| (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: format!("Embedding lookup failed: {e}") }),
-        ))?;
+        let (row, _vocab_size) =
+            obelyzk::compiler::hf_loader::load_embedding_row(model_dir, in_cols, last_token_id)
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!("Embedding lookup failed: {e}"),
+                        }),
+                    )
+                })?;
         row
     } else if let Some(ref input) = req.input {
         let expected = in_rows * in_cols;
@@ -1766,7 +1795,8 @@ async fn infer(
                 Json(ErrorResponse {
                     error: format!(
                         "Input has {} values, model expects {} ({in_rows}×{in_cols})",
-                        input.len(), expected
+                        input.len(),
+                        expected
                     ),
                 }),
             ));
@@ -1780,7 +1810,9 @@ async fn infer(
     } else {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse { error: "Must provide either 'input' (f32 array) or 'prompt' (text)".into() }),
+            Json(ErrorResponse {
+                error: "Must provide either 'input' (f32 array) or 'prompt' (text)".into(),
+            }),
         ));
     };
 
@@ -1813,14 +1845,21 @@ async fn infer(
                 // Extract output
                 let output_matrix = &proof.execution.output;
                 let output_f32 = if include_output {
-                    Some(output_matrix.data.iter().map(|v| v.0 as f32).collect::<Vec<f32>>())
+                    Some(
+                        output_matrix
+                            .data
+                            .iter()
+                            .map(|v| v.0 as f32)
+                            .collect::<Vec<f32>>(),
+                    )
                 } else {
                     None
                 };
 
                 // Compute proof hash (Poseidon of io_commitment + weight_commitment)
                 let io_hex = format!("0x{:x}", proof.io_commitment);
-                let proof_hash = format!("0x{:x}",
+                let proof_hash = format!(
+                    "0x{:x}",
                     starknet_crypto::poseidon_hash_many(&[
                         proof.io_commitment,
                         proof.layer_chain_commitment,
@@ -1839,7 +1878,12 @@ async fn infer(
                 let calldata_size = calldata_felts.len();
 
                 let calldata = if include_calldata {
-                    Some(calldata_felts.iter().map(|f| format!("0x{:x}", f)).collect())
+                    Some(
+                        calldata_felts
+                            .iter()
+                            .map(|f| format!("0x{:x}", f))
+                            .collect(),
+                    )
                 } else {
                     None
                 };
@@ -1891,7 +1935,11 @@ async fn infer(
                     .unwrap_or_default()
                     .as_millis() as u64,
             };
-            state.proofs.write().await.insert(response.proof_hash.clone(), stored);
+            state
+                .proofs
+                .write()
+                .await
+                .insert(response.proof_hash.clone(), stored);
 
             Ok(Json(response))
         }
@@ -1916,7 +1964,12 @@ async fn chat(
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, (StatusCode, Json<ErrorResponse>)> {
     if req.prompt.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse { error: "prompt cannot be empty".into() })));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "prompt cannot be empty".into(),
+            }),
+        ));
     }
 
     let models = state.models.read().await;
@@ -1925,28 +1978,52 @@ async fn chat(
         (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
-                error: format!("Model '{}' not found. Available: [{}]", req.model_id, available.join(", ")),
+                error: format!(
+                    "Model '{}' not found. Available: [{}]",
+                    req.model_id,
+                    available.join(", ")
+                ),
             }),
         )
     })?;
 
-    let tokenizer = model.tokenizer.as_ref().ok_or_else(|| (
-        StatusCode::BAD_REQUEST,
-        Json(ErrorResponse { error: format!("Model '{}' has no tokenizer.json — cannot accept text prompts", req.model_id) }),
-    ))?;
-    let model_dir = model.model_dir.as_ref().ok_or_else(|| (
-        StatusCode::BAD_REQUEST,
-        Json(ErrorResponse { error: "Model has no model_dir — cannot embed tokens".into() }),
-    ))?;
+    let tokenizer = model.tokenizer.as_ref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!(
+                    "Model '{}' has no tokenizer.json — cannot accept text prompts",
+                    req.model_id
+                ),
+            }),
+        )
+    })?;
+    let model_dir = model.model_dir.as_ref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Model has no model_dir — cannot embed tokens".into(),
+            }),
+        )
+    })?;
 
     // Tokenize the prompt
-    let encoding = tokenizer.encode(req.prompt.as_str(), false).map_err(|e| (
-        StatusCode::BAD_REQUEST,
-        Json(ErrorResponse { error: format!("Tokenization failed: {e}") }),
-    ))?;
+    let encoding = tokenizer.encode(req.prompt.as_str(), false).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("Tokenization failed: {e}"),
+            }),
+        )
+    })?;
     let token_ids: Vec<u32> = encoding.get_ids().to_vec();
     if token_ids.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse { error: "Prompt produced zero tokens".into() })));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Prompt produced zero tokens".into(),
+            }),
+        ));
     }
     let num_tokens = token_ids.len();
     let (_in_rows, in_cols) = model.input_shape;
@@ -1963,19 +2040,32 @@ async fn chat(
     // ── Decode path: continue existing session ──────────────────────────
     if let Some(ref session_id) = req.session_id {
         // Take ownership of the session (prevents concurrent mutation)
-        let mut session = state.sessions.write().await.remove(session_id).ok_or_else(|| (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse { error: format!("Session '{}' not found or expired", session_id) }),
-        ))?;
+        let mut session = state
+            .sessions
+            .write()
+            .await
+            .remove(session_id)
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse {
+                        error: format!("Session '{}' not found or expired", session_id),
+                    }),
+                )
+            })?;
 
         // For decode, embed just the last token (single-token input)
         let last_token_id = *token_ids.last().unwrap();
-        let (input_matrix, _) = obelyzk::compiler::hf_loader::load_embedding_row(
-            model_dir, in_cols, last_token_id,
-        ).map_err(|e| (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: format!("Embedding lookup failed: {e}") }),
-        ))?;
+        let (input_matrix, _) =
+            obelyzk::compiler::hf_loader::load_embedding_row(model_dir, in_cols, last_token_id)
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!("Embedding lookup failed: {e}"),
+                        }),
+                    )
+                })?;
 
         let sid = session_id.clone();
         drop(models);
@@ -1996,17 +2086,26 @@ async fn chat(
                 Ok((proof, new_kv_felt)) => {
                     let prove_time_ms = t_start.elapsed().as_millis() as u64;
                     let output_matrix = &proof.execution.output;
-                    let output_f32: Vec<f32> = output_matrix.data.iter().map(|v| v.0 as f32).collect();
+                    let output_f32: Vec<f32> =
+                        output_matrix.data.iter().map(|v| v.0 as f32).collect();
 
                     let (predicted_token_id, predicted_text) =
-                        match obelyzk::compiler::hf_loader::project_to_logits(&model_dir_clone, output_matrix) {
+                        match obelyzk::compiler::hf_loader::project_to_logits(
+                            &model_dir_clone,
+                            output_matrix,
+                        ) {
                             Ok((tid, _)) => (Some(tid), tokenizer_clone.decode(&[tid], true).ok()),
                             Err(_) => (None, None),
                         };
 
                     let io_hex = format!("0x{:x}", proof.io_commitment);
-                    let proof_hash = format!("0x{:x}",
-                        starknet_crypto::poseidon_hash_many(&[proof.io_commitment, proof.layer_chain_commitment]));
+                    let proof_hash = format!(
+                        "0x{:x}",
+                        starknet_crypto::poseidon_hash_many(&[
+                            proof.io_commitment,
+                            proof.layer_chain_commitment
+                        ])
+                    );
                     let kv_hex = format!("0x{:x}", new_kv_felt);
 
                     let gkr_proof = proof.gkr_proof.as_ref();
@@ -2014,11 +2113,20 @@ async fn chat(
                         let mut felts = Vec::new();
                         obelyzk::cairo_serde::serialize_gkr_proof_data_only(gkr, &mut felts);
                         felts
-                    } else { Vec::new() };
+                    } else {
+                        Vec::new()
+                    };
                     let calldata_size = calldata_felts.len();
                     let calldata = if include_calldata {
-                        Some(calldata_felts.iter().map(|f| format!("0x{:x}", f)).collect())
-                    } else { None };
+                        Some(
+                            calldata_felts
+                                .iter()
+                                .map(|f| format!("0x{:x}", f))
+                                .collect(),
+                        )
+                    } else {
+                        None
+                    };
 
                     // Update session
                     session.token_history.extend_from_slice(&token_ids);
@@ -2026,52 +2134,89 @@ async fn chat(
                     session.last_accessed = Instant::now();
                     let cached = session.tokens_proven;
 
-                    Ok((ChatResponse {
-                        proof_id: format!("proof-{}", uuid::Uuid::new_v4()),
-                        token_ids, num_tokens,
-                        output: Some(output_f32),
-                        output_shape: (output_matrix.rows, output_matrix.cols),
-                        predicted_token_id, predicted_text,
-                        io_commitment: io_hex, weight_commitment,
-                        proof_hash: proof_hash.clone(),
-                        prove_time_ms, calldata_size, calldata,
-                        session_id: sid.clone(),
-                        mode: "decode".to_string(),
-                        kv_cache_commitment: Some(kv_hex),
-                        cached_tokens: cached,
-                    }, session))
+                    Ok((
+                        ChatResponse {
+                            proof_id: format!("proof-{}", uuid::Uuid::new_v4()),
+                            token_ids,
+                            num_tokens,
+                            output: Some(output_f32),
+                            output_shape: (output_matrix.rows, output_matrix.cols),
+                            predicted_token_id,
+                            predicted_text,
+                            io_commitment: io_hex,
+                            weight_commitment,
+                            proof_hash: proof_hash.clone(),
+                            prove_time_ms,
+                            calldata_size,
+                            calldata,
+                            session_id: sid.clone(),
+                            mode: "decode".to_string(),
+                            kv_cache_commitment: Some(kv_hex),
+                            cached_tokens: cached,
+                        },
+                        session,
+                    ))
                 }
                 Err(e) => Err(format!("Decode proving failed: {e}")),
             }
         })
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("Task join error: {e}") })))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Task join error: {e}"),
+                }),
+            )
+        })?;
 
         match result {
             Ok((response, session)) => {
                 // Re-insert session
-                state.sessions.write().await.insert(response.session_id.clone(), session);
+                state
+                    .sessions
+                    .write()
+                    .await
+                    .insert(response.session_id.clone(), session);
                 let stored = StoredProof {
-                    proof_hash: response.proof_hash.clone(), model_id: model_id_for_storage,
-                    io_commitment: response.io_commitment.clone(), weight_commitment: response.weight_commitment.clone(),
-                    num_proven_layers: 0, prove_time_ms: response.prove_time_ms, calldata_size: response.calldata_size,
-                    created_at_epoch_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+                    proof_hash: response.proof_hash.clone(),
+                    model_id: model_id_for_storage,
+                    io_commitment: response.io_commitment.clone(),
+                    weight_commitment: response.weight_commitment.clone(),
+                    num_proven_layers: 0,
+                    prove_time_ms: response.prove_time_ms,
+                    calldata_size: response.calldata_size,
+                    created_at_epoch_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
                 };
-                state.proofs.write().await.insert(response.proof_hash.clone(), stored);
+                state
+                    .proofs
+                    .write()
+                    .await
+                    .insert(response.proof_hash.clone(), stored);
                 Ok(Json(response))
             }
-            Err(err) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: err }))),
+            Err(err) => Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: err }),
+            )),
         }
     } else {
         // ── Prefill path: new conversation ──────────────────────────────
         // Embed the last token for the single-row prefill
         let last_token_id = *token_ids.last().unwrap();
-        let (input_matrix, _) = obelyzk::compiler::hf_loader::load_embedding_row(
-            model_dir, in_cols, last_token_id,
-        ).map_err(|e| (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: format!("Embedding lookup failed: {e}") }),
-        ))?;
+        let (input_matrix, _) =
+            obelyzk::compiler::hf_loader::load_embedding_row(model_dir, in_cols, last_token_id)
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!("Embedding lookup failed: {e}"),
+                        }),
+                    )
+                })?;
 
         let new_session_id = format!("ses-{}", Uuid::new_v4());
         let sid = new_session_id.clone();
@@ -2083,28 +2228,45 @@ async fn chat(
             // Create fresh KV-cache and run prefill with caching
             let mut kv_cache = obelyzk::components::attention::ModelKVCache::new();
             let proof_result = obelyzk::aggregation::prove_model_pure_gkr_prefill_with_cache(
-                &graph, &input_matrix, &weights, &mut kv_cache, None, None,
+                &graph,
+                &input_matrix,
+                &weights,
+                &mut kv_cache,
+                None,
+                None,
             );
 
             match proof_result {
                 Ok(proof) => {
                     let prove_time_ms = t_start.elapsed().as_millis() as u64;
                     let output_matrix = &proof.execution.output;
-                    let output_f32: Vec<f32> = output_matrix.data.iter().map(|v| v.0 as f32).collect();
+                    let output_f32: Vec<f32> =
+                        output_matrix.data.iter().map(|v| v.0 as f32).collect();
 
                     let (predicted_token_id, predicted_text) =
-                        match obelyzk::compiler::hf_loader::project_to_logits(&model_dir_clone, output_matrix) {
+                        match obelyzk::compiler::hf_loader::project_to_logits(
+                            &model_dir_clone,
+                            output_matrix,
+                        ) {
                             Ok((tid, _)) => (Some(tid), tokenizer_clone.decode(&[tid], true).ok()),
                             Err(_) => (None, None),
                         };
 
                     let io_hex = format!("0x{:x}", proof.io_commitment);
-                    let proof_hash = format!("0x{:x}",
-                        starknet_crypto::poseidon_hash_many(&[proof.io_commitment, proof.layer_chain_commitment]));
+                    let proof_hash = format!(
+                        "0x{:x}",
+                        starknet_crypto::poseidon_hash_many(&[
+                            proof.io_commitment,
+                            proof.layer_chain_commitment
+                        ])
+                    );
 
                     // Build incremental commitment from the populated KV-cache
                     let capacity = (num_tokens + 64).next_power_of_two();
-                    let kv_commitment = obelyzk::aggregation::IncrementalKVCommitment::from_kv_cache(&kv_cache, capacity);
+                    let kv_commitment =
+                        obelyzk::aggregation::IncrementalKVCommitment::from_kv_cache(
+                            &kv_cache, capacity,
+                        );
                     let kv_hex = format!("0x{:x}", kv_commitment.commitment());
 
                     let gkr_proof = proof.gkr_proof.as_ref();
@@ -2112,11 +2274,20 @@ async fn chat(
                         let mut felts = Vec::new();
                         obelyzk::cairo_serde::serialize_gkr_proof_data_only(gkr, &mut felts);
                         felts
-                    } else { Vec::new() };
+                    } else {
+                        Vec::new()
+                    };
                     let calldata_size = calldata_felts.len();
                     let calldata = if include_calldata {
-                        Some(calldata_felts.iter().map(|f| format!("0x{:x}", f)).collect())
-                    } else { None };
+                        Some(
+                            calldata_felts
+                                .iter()
+                                .map(|f| format!("0x{:x}", f))
+                                .collect(),
+                        )
+                    } else {
+                        None
+                    };
 
                     let session = ChatSession {
                         session_id: sid.clone(),
@@ -2128,40 +2299,73 @@ async fn chat(
                         tokens_proven: num_tokens,
                     };
 
-                    Ok((ChatResponse {
-                        proof_id: format!("proof-{}", uuid::Uuid::new_v4()),
-                        token_ids, num_tokens,
-                        output: Some(output_f32),
-                        output_shape: (output_matrix.rows, output_matrix.cols),
-                        predicted_token_id, predicted_text,
-                        io_commitment: io_hex, weight_commitment,
-                        proof_hash: proof_hash.clone(),
-                        prove_time_ms, calldata_size, calldata,
-                        session_id: sid,
-                        mode: "prefill".to_string(),
-                        kv_cache_commitment: Some(kv_hex),
-                        cached_tokens: num_tokens,
-                    }, session))
+                    Ok((
+                        ChatResponse {
+                            proof_id: format!("proof-{}", uuid::Uuid::new_v4()),
+                            token_ids,
+                            num_tokens,
+                            output: Some(output_f32),
+                            output_shape: (output_matrix.rows, output_matrix.cols),
+                            predicted_token_id,
+                            predicted_text,
+                            io_commitment: io_hex,
+                            weight_commitment,
+                            proof_hash: proof_hash.clone(),
+                            prove_time_ms,
+                            calldata_size,
+                            calldata,
+                            session_id: sid,
+                            mode: "prefill".to_string(),
+                            kv_cache_commitment: Some(kv_hex),
+                            cached_tokens: num_tokens,
+                        },
+                        session,
+                    ))
                 }
                 Err(e) => Err(format!("Prefill proving failed: {e}")),
             }
         })
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("Task join error: {e}") })))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Task join error: {e}"),
+                }),
+            )
+        })?;
 
         match result {
             Ok((response, session)) => {
-                state.sessions.write().await.insert(response.session_id.clone(), session);
+                state
+                    .sessions
+                    .write()
+                    .await
+                    .insert(response.session_id.clone(), session);
                 let stored = StoredProof {
-                    proof_hash: response.proof_hash.clone(), model_id: model_id_for_storage,
-                    io_commitment: response.io_commitment.clone(), weight_commitment: response.weight_commitment.clone(),
-                    num_proven_layers: 0, prove_time_ms: response.prove_time_ms, calldata_size: response.calldata_size,
-                    created_at_epoch_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+                    proof_hash: response.proof_hash.clone(),
+                    model_id: model_id_for_storage,
+                    io_commitment: response.io_commitment.clone(),
+                    weight_commitment: response.weight_commitment.clone(),
+                    num_proven_layers: 0,
+                    prove_time_ms: response.prove_time_ms,
+                    calldata_size: response.calldata_size,
+                    created_at_epoch_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
                 };
-                state.proofs.write().await.insert(response.proof_hash.clone(), stored);
+                state
+                    .proofs
+                    .write()
+                    .await
+                    .insert(response.proof_hash.clone(), stored);
                 Ok(Json(response))
             }
-            Err(err) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: err }))),
+            Err(err) => Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: err }),
+            )),
         }
     }
 }
@@ -2175,7 +2379,12 @@ async fn delete_session(
     if removed {
         Ok(Json(serde_json::json!({"deleted": session_id})))
     } else {
-        Err((StatusCode::NOT_FOUND, Json(ErrorResponse { error: format!("Session '{}' not found", session_id) })))
+        Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("Session '{}' not found", session_id),
+            }),
+        ))
     }
 }
 
@@ -2289,7 +2498,11 @@ async fn attest(
         (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
-                error: format!("Model '{}' not found. Available: [{}]", req.model_id, available.join(", ")),
+                error: format!(
+                    "Model '{}' not found. Available: [{}]",
+                    req.model_id,
+                    available.join(", ")
+                ),
             }),
         )
     })?;
@@ -2300,7 +2513,11 @@ async fn attest(
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: format!("Input has {} values, model expects {} ({in_rows}x{in_cols})", req.input.len(), expected),
+                error: format!(
+                    "Input has {} values, model expects {} ({in_rows}x{in_cols})",
+                    req.input.len(),
+                    expected
+                ),
             }),
         ));
     }
@@ -2330,14 +2547,22 @@ async fn attest(
         obelyzk::starknet::prove_full_attestation(&*graph, &input_matrix, &*weights, model_id_fe)
     })
     .await
-    .map_err(|e| (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrorResponse { error: format!("Proof thread panicked: {e}") }),
-    ))?
-    .map_err(|e| (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrorResponse { error: format!("Attestation failed: {e}") }),
-    ))?;
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Proof thread panicked: {e}"),
+            }),
+        )
+    })?
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Attestation failed: {e}"),
+            }),
+        )
+    })?;
 
     let io_commitment = attestation.io_commitment.clone();
     let proof_hash = io_commitment.clone();
@@ -2363,7 +2588,11 @@ async fn attest(
                 .unwrap_or_default()
                 .as_millis() as u64,
         };
-        state.proofs.write().await.insert(proof_hash.clone(), stored);
+        state
+            .proofs
+            .write()
+            .await
+            .insert(proof_hash.clone(), stored);
     }
 
     // On-chain submission
@@ -2378,8 +2607,9 @@ async fn attest(
 
             if use_recursive {
                 // Recursive path: single TX via submit_recursive.mjs
-                let recursive_contract = std::env::var("RECURSIVE_CONTRACT")
-                    .unwrap_or_else(|_| "0x1c208a5fe731c0d03b098b524f274c537587ea1d43d903838cc4a2bf90c40c7".to_string());
+                let recursive_contract = std::env::var("RECURSIVE_CONTRACT").unwrap_or_else(|_| {
+                    "0x1c208a5fe731c0d03b098b524f274c537587ea1d43d903838cc4a2bf90c40c7".to_string()
+                });
 
                 let recursive_cd = attestation.recursive_calldata.as_ref().unwrap();
                 let artifact = serde_json::json!({
@@ -2395,14 +2625,25 @@ async fn attest(
                 });
 
                 let tmp_path = format!("/tmp/attest-recursive-{}.json", proof_id);
-                if let Err(e) = std::fs::write(&tmp_path, serde_json::to_string(&artifact).unwrap_or_default()) {
+                if let Err(e) = std::fs::write(
+                    &tmp_path,
+                    serde_json::to_string(&artifact).unwrap_or_default(),
+                ) {
                     return Ok(Json(AttestResponse {
-                        proof_id, io_commitment, weight_commitment: model_weight_commitment,
-                        num_proven_layers: num_layers, prove_time_ms: prove_elapsed,
-                        calldata_felts, estimated_gas,
+                        proof_id,
+                        io_commitment,
+                        weight_commitment: model_weight_commitment,
+                        num_proven_layers: num_layers,
+                        prove_time_ms: prove_elapsed,
+                        calldata_felts,
+                        estimated_gas,
                         onchain: OnChainStatus {
-                            submitted: false, tx_hashes: vec![], network: "starknet-sepolia".into(),
-                            contract: recursive_contract, verified: false, explorer_url: None,
+                            submitted: false,
+                            tx_hashes: vec![],
+                            network: "starknet-sepolia".into(),
+                            contract: recursive_contract,
+                            verified: false,
+                            explorer_url: None,
                             error: Some(format!("Failed to write recursive artifact: {e}")),
                         },
                     }));
@@ -2410,7 +2651,9 @@ async fn attest(
 
                 // Locate submit_recursive.mjs
                 let exe = std::env::current_exe().unwrap_or_default();
-                let scripts_dir = exe.parent().unwrap_or(std::path::Path::new("."))
+                let scripts_dir = exe
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
                     .join("../../../scripts");
                 let submit_script = if scripts_dir.join("submit_recursive.mjs").exists() {
                     scripts_dir.join("submit_recursive.mjs")
@@ -2418,18 +2661,24 @@ async fn attest(
                     std::path::PathBuf::from("scripts/submit_recursive.mjs")
                 };
 
-                let rpc_url = std::env::var("STARKNET_RPC")
-                    .unwrap_or_else(|_| "https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_8/demo".into());
+                let rpc_url = std::env::var("STARKNET_RPC").unwrap_or_else(|_| {
+                    "https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_8/demo".into()
+                });
 
-                eprintln!("[attest] Submitting recursive proof on-chain via {}", submit_script.display());
+                eprintln!(
+                    "[attest] Submitting recursive proof on-chain via {}",
+                    submit_script.display()
+                );
 
                 let node_bin = [
                     "/home/ubuntu/.nvm/versions/node/v20.20.2/bin/node",
                     "/usr/local/bin/node",
                     "/usr/bin/node",
                     "node",
-                ].iter().find(|p| std::path::Path::new(p).exists())
-                    .unwrap_or(&"node");
+                ]
+                .iter()
+                .find(|p| std::path::Path::new(p).exists())
+                .unwrap_or(&"node");
 
                 match tokio::process::Command::new(node_bin)
                     .arg(submit_script.to_str().unwrap_or("submit_recursive.mjs"))
@@ -2446,9 +2695,15 @@ async fn attest(
                         let stdout = String::from_utf8_lossy(&output.stdout);
 
                         // Parse structured RESULT_JSON line
-                        let result_json = stdout.lines()
+                        let result_json = stdout
+                            .lines()
                             .find(|l| l.starts_with("RESULT_JSON:"))
-                            .and_then(|l| serde_json::from_str::<serde_json::Value>(&l["RESULT_JSON:".len()..]).ok());
+                            .and_then(|l| {
+                                serde_json::from_str::<serde_json::Value>(
+                                    &l["RESULT_JSON:".len()..],
+                                )
+                                .ok()
+                            });
 
                         if let Some(ref rj) = result_json {
                             let success = rj["success"].as_bool() == Some(true);
@@ -2457,12 +2712,20 @@ async fn attest(
 
                             OnChainStatus {
                                 submitted: success,
-                                tx_hashes: if tx_hash.is_empty() { vec![] } else { vec![tx_hash] },
+                                tx_hashes: if tx_hash.is_empty() {
+                                    vec![]
+                                } else {
+                                    vec![tx_hash]
+                                },
                                 network: "starknet-sepolia".to_string(),
                                 contract: recursive_contract,
                                 verified: success,
                                 explorer_url: explorer,
-                                error: if !success { rj["error"].as_str().map(|s| s.to_string()) } else { None },
+                                error: if !success {
+                                    rj["error"].as_str().map(|s| s.to_string())
+                                } else {
+                                    None
+                                },
                             }
                         } else {
                             let submitted = output.status.success();
@@ -2473,7 +2736,11 @@ async fn attest(
                                 contract: recursive_contract,
                                 verified: submitted,
                                 explorer_url: None,
-                                error: if !submitted { Some(String::from_utf8_lossy(&output.stderr).to_string()) } else { None },
+                                error: if !submitted {
+                                    Some(String::from_utf8_lossy(&output.stderr).to_string())
+                                } else {
+                                    None
+                                },
                             }
                         }
                     }
@@ -2491,32 +2758,47 @@ async fn attest(
                 // Streaming path: multi-TX via register_and_submit.mjs
                 let contract = std::env::var("CONTRACT_ADDRESS")
                     .or_else(|_| std::env::var("OBELYSK_CONTRACT"))
-                    .unwrap_or_else(|_| "0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005".to_string());
+                    .unwrap_or_else(|_| {
+                        "0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005"
+                            .to_string()
+                    });
 
                 let streaming = &attestation.streaming_calldata;
-                let batch_json: Vec<serde_json::Value> = streaming.stream_batches.iter().map(|b| {
-                    serde_json::json!({
-                        "batch_idx": b.batch_idx,
-                        "num_layers": b.num_layers,
-                        "calldata": b.calldata,
+                let batch_json: Vec<serde_json::Value> = streaming
+                    .stream_batches
+                    .iter()
+                    .map(|b| {
+                        serde_json::json!({
+                            "batch_idx": b.batch_idx,
+                            "num_layers": b.num_layers,
+                            "calldata": b.calldata,
+                        })
                     })
-                }).collect();
-                let output_chunks_json: Vec<serde_json::Value> = streaming.output_mle_chunks.iter().map(|c| {
-                    serde_json::json!({
-                        "chunk_offset": c.chunk_offset,
-                        "chunk_len": c.chunk_len,
-                        "is_last": c.is_last,
-                        "calldata": c.calldata,
+                    .collect();
+                let output_chunks_json: Vec<serde_json::Value> = streaming
+                    .output_mle_chunks
+                    .iter()
+                    .map(|c| {
+                        serde_json::json!({
+                            "chunk_offset": c.chunk_offset,
+                            "chunk_len": c.chunk_len,
+                            "is_last": c.is_last,
+                            "calldata": c.calldata,
+                        })
                     })
-                }).collect();
-                let input_chunks_json: Vec<serde_json::Value> = streaming.input_mle_chunks.iter().map(|c| {
-                    serde_json::json!({
-                        "chunk_offset": c.chunk_offset,
-                        "chunk_len": c.chunk_len,
-                        "is_last": c.is_last,
-                        "calldata": c.calldata,
+                    .collect();
+                let input_chunks_json: Vec<serde_json::Value> = streaming
+                    .input_mle_chunks
+                    .iter()
+                    .map(|c| {
+                        serde_json::json!({
+                            "chunk_offset": c.chunk_offset,
+                            "chunk_len": c.chunk_len,
+                            "is_last": c.is_last,
+                            "calldata": c.calldata,
+                        })
                     })
-                }).collect();
+                    .collect();
 
                 let artifact = serde_json::json!({
                     "format": "ml_gkr",
@@ -2550,21 +2832,34 @@ async fn attest(
                 });
 
                 let tmp_path = format!("/tmp/attest-{}.json", proof_id);
-                if let Err(e) = std::fs::write(&tmp_path, serde_json::to_string(&artifact).unwrap_or_default()) {
+                if let Err(e) = std::fs::write(
+                    &tmp_path,
+                    serde_json::to_string(&artifact).unwrap_or_default(),
+                ) {
                     return Ok(Json(AttestResponse {
-                        proof_id, io_commitment, weight_commitment: model_weight_commitment,
-                        num_proven_layers: num_layers, prove_time_ms: prove_elapsed,
-                        calldata_felts, estimated_gas,
+                        proof_id,
+                        io_commitment,
+                        weight_commitment: model_weight_commitment,
+                        num_proven_layers: num_layers,
+                        prove_time_ms: prove_elapsed,
+                        calldata_felts,
+                        estimated_gas,
                         onchain: OnChainStatus {
-                            submitted: false, tx_hashes: vec![], network: "starknet-sepolia".into(),
-                            contract, verified: false, explorer_url: None,
+                            submitted: false,
+                            tx_hashes: vec![],
+                            network: "starknet-sepolia".into(),
+                            contract,
+                            verified: false,
+                            explorer_url: None,
                             error: Some(format!("Failed to write proof artifact: {e}")),
                         },
                     }));
                 }
 
                 let exe = std::env::current_exe().unwrap_or_default();
-                let scripts_dir = exe.parent().unwrap_or(std::path::Path::new("."))
+                let scripts_dir = exe
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
                     .join("../../../scripts/pipeline");
                 let submit_script = if scripts_dir.join("register_and_submit.mjs").exists() {
                     scripts_dir.join("register_and_submit.mjs")
@@ -2572,18 +2867,24 @@ async fn attest(
                     std::path::PathBuf::from("scripts/pipeline/register_and_submit.mjs")
                 };
 
-                let rpc_url = std::env::var("STARKNET_RPC")
-                    .unwrap_or_else(|_| "https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_7/demo".into());
+                let rpc_url = std::env::var("STARKNET_RPC").unwrap_or_else(|_| {
+                    "https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_7/demo".into()
+                });
 
-                eprintln!("[attest] Submitting streaming proof on-chain via {}", submit_script.display());
+                eprintln!(
+                    "[attest] Submitting streaming proof on-chain via {}",
+                    submit_script.display()
+                );
 
                 let node_bin = [
                     "/home/ubuntu/.nvm/versions/node/v20.20.2/bin/node",
                     "/usr/local/bin/node",
                     "/usr/bin/node",
                     "node",
-                ].iter().find(|p| std::path::Path::new(p).exists())
-                    .unwrap_or(&"node");
+                ]
+                .iter()
+                .find(|p| std::path::Path::new(p).exists())
+                .unwrap_or(&"node");
 
                 match tokio::process::Command::new(node_bin)
                     .arg(submit_script.to_str().unwrap_or("register_and_submit.mjs"))
@@ -2602,7 +2903,8 @@ async fn attest(
                         let stdout = String::from_utf8_lossy(&output.stdout);
                         let stderr = String::from_utf8_lossy(&output.stderr);
 
-                        let tx_hashes: Vec<String> = stdout.lines()
+                        let tx_hashes: Vec<String> = stdout
+                            .lines()
                             .chain(stderr.lines())
                             .filter(|l| l.contains("TX:") || l.contains("0x"))
                             .filter_map(|l| {
@@ -2623,8 +2925,13 @@ async fn attest(
                             network: "starknet-sepolia".to_string(),
                             contract: contract.clone(),
                             verified: submitted,
-                            explorer_url: first_tx.map(|h| format!("https://sepolia.starkscan.co/tx/{h}")),
-                            error: if !submitted { Some(stderr.to_string()) } else { None },
+                            explorer_url: first_tx
+                                .map(|h| format!("https://sepolia.starkscan.co/tx/{h}")),
+                            error: if !submitted {
+                                Some(stderr.to_string())
+                            } else {
+                                None
+                            },
                         }
                     }
                     Err(e) => OnChainStatus {
@@ -2707,39 +3014,61 @@ async fn classify(
 
     // Target address (required, must be valid hex)
     if req.target.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse {
-            error: "target address is required".to_string(),
-        })));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "target address is required".to_string(),
+            }),
+        ));
     }
     let target = starknet_ff::FieldElement::from_hex_be(&req.target).map_err(|e| {
-        (StatusCode::BAD_REQUEST, Json(ErrorResponse {
-            error: format!("invalid target address: {e}"),
-        }))
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("invalid target address: {e}"),
+            }),
+        )
     })?;
 
     // Value (u256 as decimal — parse both halves for large values)
-    let value_str = if req.value.is_empty() { "0" } else { &req.value };
+    let value_str = if req.value.is_empty() {
+        "0"
+    } else {
+        &req.value
+    };
     let value_u128: u128 = value_str.parse().map_err(|e| {
-        (StatusCode::BAD_REQUEST, Json(ErrorResponse {
-            error: format!("invalid value (must be decimal u128): {e}"),
-        }))
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("invalid value (must be decimal u128): {e}"),
+            }),
+        )
     })?;
     let value: [u128; 2] = [0, value_u128];
 
     // Selector (hex, 4 bytes)
-    let selector_hex = req.selector.trim_start_matches("0x").trim_start_matches("0X");
+    let selector_hex = req
+        .selector
+        .trim_start_matches("0x")
+        .trim_start_matches("0X");
     let selector: u32 = if selector_hex.is_empty() {
         0
     } else {
         u32::from_str_radix(selector_hex, 16).map_err(|e| {
-            (StatusCode::BAD_REQUEST, Json(ErrorResponse {
-                error: format!("invalid selector (must be hex u32): {e}"),
-            }))
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("invalid selector (must be hex u32): {e}"),
+                }),
+            )
         })?
     };
 
     // Calldata (hex, variable length — parse safely)
-    let calldata_hex = req.calldata.trim_start_matches("0x").trim_start_matches("0X");
+    let calldata_hex = req
+        .calldata
+        .trim_start_matches("0x")
+        .trim_start_matches("0X");
     // Ensure even length for hex pairs
     let safe_hex = if calldata_hex.len() % 2 != 0 {
         format!("0{calldata_hex}")
@@ -2749,7 +3078,8 @@ async fn classify(
     let calldata_bytes: Vec<u8> = (0..safe_hex.len())
         .step_by(2)
         .filter_map(|i| {
-            safe_hex.get(i..i + 2)
+            safe_hex
+                .get(i..i + 2)
                 .and_then(|pair| u8::from_str_radix(pair, 16).ok())
         })
         .collect();
@@ -2766,7 +3096,11 @@ async fn classify(
     // ── Build features ──────────────────────────────────────────────
 
     // Derive value features from the parsed value
-    let log2_value = if value_u128 > 0 { (128 - value_u128.leading_zeros()) } else { 0 };
+    let log2_value = if value_u128 > 0 {
+        (128 - value_u128.leading_zeros())
+    } else {
+        0
+    };
     let is_max_approval = value_u128 == u128::MAX;
 
     let tx = TransactionFeatures {
@@ -2813,20 +3147,24 @@ async fn classify(
     let policy = PolicyConfig::strict();
 
     // Run classifier + prove on a blocking thread (CPU-heavy, ~1s release / ~10s debug)
-    let result = tokio::task::spawn_blocking(move || {
-        evaluate_transaction(&tx, &model, &policy)
-    })
-    .await
-    .map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
-            error: format!("classify task failed: {e}"),
-        }))
-    })?
-    .map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
-            error: format!("classification failed: {e}"),
-        }))
-    })?;
+    let result = tokio::task::spawn_blocking(move || evaluate_transaction(&tx, &model, &policy))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("classify task failed: {e}"),
+                }),
+            )
+        })?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("classification failed: {e}"),
+                }),
+            )
+        })?;
 
     Ok(Json(ClassifyResponse {
         request_id,
@@ -2842,9 +3180,7 @@ async fn classify(
 /// List all proven inferences — GET /api/v1/proofs
 ///
 /// Returns all stored proofs, most recent first.
-async fn list_proofs(
-    State(state): State<Arc<AppState>>,
-) -> Json<Vec<StoredProof>> {
+async fn list_proofs(State(state): State<Arc<AppState>>) -> Json<Vec<StoredProof>> {
     let proofs = state.proofs.read().await;
     let mut list: Vec<StoredProof> = proofs.values().cloned().collect();
     list.sort_by(|a, b| b.created_at_epoch_ms.cmp(&a.created_at_epoch_ms));
@@ -2898,220 +3234,218 @@ async fn submit_privacy_batch(
 
         let prove_start = Instant::now();
 
-        let result =
-            tokio::task::spawn_blocking(move || {
-                use stwo::core::fields::m31::BaseField;
-                use obelyzk::circuits::batch::{prove_privacy_batch, PrivacyBatch};
-                use obelyzk::circuits::deposit::DepositWitness;
-                use obelyzk::circuits::spend::{InputNoteWitness, OutputNoteWitness, SpendWitness};
-                use obelyzk::circuits::withdraw::WithdrawWitness;
-                use obelyzk::crypto::commitment::Note;
-                use obelyzk::crypto::merkle_m31::MerklePath;
-                use obelyzk::crypto::poseidon2_m31::RATE;
+        let result = tokio::task::spawn_blocking(move || {
+            use obelyzk::circuits::batch::{prove_privacy_batch, PrivacyBatch};
+            use obelyzk::circuits::deposit::DepositWitness;
+            use obelyzk::circuits::spend::{InputNoteWitness, OutputNoteWitness, SpendWitness};
+            use obelyzk::circuits::withdraw::WithdrawWitness;
+            use obelyzk::crypto::commitment::Note;
+            use obelyzk::crypto::merkle_m31::MerklePath;
+            use obelyzk::crypto::poseidon2_m31::RATE;
+            use stwo::core::fields::m31::BaseField;
 
-                let m31 = |v: u32| BaseField::from_u32_unchecked(v);
-                let m31_4 = |arr: [u32; 4]| [m31(arr[0]), m31(arr[1]), m31(arr[2]), m31(arr[3])];
-                let m31_8 = |arr: [u32; 8]| -> [BaseField; 8] {
-                    [
-                        m31(arr[0]),
-                        m31(arr[1]),
-                        m31(arr[2]),
-                        m31(arr[3]),
-                        m31(arr[4]),
-                        m31(arr[5]),
-                        m31(arr[6]),
-                        m31(arr[7]),
-                    ]
-                };
+            let m31 = |v: u32| BaseField::from_u32_unchecked(v);
+            let m31_4 = |arr: [u32; 4]| [m31(arr[0]), m31(arr[1]), m31(arr[2]), m31(arr[3])];
+            let m31_8 = |arr: [u32; 8]| -> [BaseField; 8] {
+                [
+                    m31(arr[0]),
+                    m31(arr[1]),
+                    m31(arr[2]),
+                    m31(arr[3]),
+                    m31(arr[4]),
+                    m31(arr[5]),
+                    m31(arr[6]),
+                    m31(arr[7]),
+                ]
+            };
 
-                // Helper: generate random blinding (fallible, rejection-sampled).
-                let random_blinding = || -> Result<[BaseField; 4], String> {
-                    const P: u32 = (1u32 << 31) - 1; // M31 prime
-                    let mut result = [m31(0); 4];
-                    for elem in result.iter_mut() {
-                        loop {
-                            let mut buf = [0u8; 4];
-                            getrandom::getrandom(&mut buf)
-                                .map_err(|e| format!("entropy source unavailable: {e}"))?;
-                            let v = u32::from_le_bytes(buf) >> 1; // 31 bits, uniform in [0, 2^31)
-                            if v < P {
-                                *elem = m31(v);
-                                break;
-                            }
-                            // v == P (2^31 - 1): reject and retry (~0% probability)
+            // Helper: generate random blinding (fallible, rejection-sampled).
+            let random_blinding = || -> Result<[BaseField; 4], String> {
+                const P: u32 = (1u32 << 31) - 1; // M31 prime
+                let mut result = [m31(0); 4];
+                for elem in result.iter_mut() {
+                    loop {
+                        let mut buf = [0u8; 4];
+                        getrandom::getrandom(&mut buf)
+                            .map_err(|e| format!("entropy source unavailable: {e}"))?;
+                        let v = u32::from_le_bytes(buf) >> 1; // 31 bits, uniform in [0, 2^31)
+                        if v < P {
+                            *elem = m31(v);
+                            break;
                         }
+                        // v == P (2^31 - 1): reject and retry (~0% probability)
                     }
-                    Ok(result)
-                };
-
-                // Max amount that fits in two M31 limbs
-                const MAX_AMOUNT: u64 = ((1u64 << 31) - 1) + ((1u64 << 31) - 1) * (1u64 << 31);
-
-                // Build deposit witnesses
-                let deposits: Vec<DepositWitness> = {
-                    let mut v = Vec::with_capacity(req.deposits.len());
-                    for d in &req.deposits {
-                        if d.amount > MAX_AMOUNT {
-                            return Err(format!(
-                                "deposit amount {} exceeds max {}",
-                                d.amount, MAX_AMOUNT
-                            ));
-                        }
-                        let pubkey = m31_4(d.recipient_pubkey);
-                        let amount_lo = m31((d.amount & 0x7FFF_FFFF) as u32);
-                        let amount_hi = m31((d.amount >> 31) as u32);
-                        let blinding = random_blinding()?;
-                        let note = Note {
-                            owner_pubkey: pubkey,
-                            amount_lo,
-                            amount_hi,
-                            asset_id: m31(d.asset_id),
-                            blinding,
-                        };
-                        v.push(DepositWitness {
-                            note,
-                            amount: d.amount,
-                            asset_id: m31(d.asset_id),
-                        });
-                    }
-                    v
-                };
-
-                // Build withdraw witnesses and recipient bindings.
-                let mut payout_recipients: Vec<String> = Vec::with_capacity(req.withdrawals.len());
-                let mut credit_recipients: Vec<String> = Vec::with_capacity(req.withdrawals.len());
-                let mut withdrawals: Vec<WithdrawWitness> =
-                    Vec::with_capacity(req.withdrawals.len());
-                for (idx, w) in req.withdrawals.iter().enumerate() {
-                    let payout = w
-                        .payout_recipient
-                        .clone()
-                        .ok_or_else(|| format!("withdrawals[{idx}] missing payout_recipient"))?;
-                    let credit = w.credit_recipient.clone().unwrap_or_else(|| payout.clone());
-                    let binding = compute_withdrawal_binding_digest(
-                        &payout,
-                        &credit,
-                        w.note.asset_id as u64,
-                        w.note.amount_lo as u64,
-                        w.note.amount_hi as u64,
-                        idx as u32,
-                    )
-                    .map_err(|e| format!("withdrawals[{idx}] invalid binding inputs: {e}"))?;
-
-                    let note = Note {
-                        owner_pubkey: m31_4(w.note.pub_key),
-                        amount_lo: m31(w.note.amount_lo),
-                        amount_hi: m31(w.note.amount_hi),
-                        asset_id: m31(w.note.asset_id),
-                        blinding: m31_4(w.note.blinding),
-                    };
-                    let siblings: Vec<[BaseField; RATE]> =
-                        w.merkle_siblings.iter().map(|s| m31_8(*s)).collect();
-                    withdrawals.push(WithdrawWitness {
-                        note,
-                        spending_key: m31_4(w.spending_key),
-                        merkle_path: MerklePath {
-                            siblings,
-                            index: w.merkle_index,
-                        },
-                        merkle_root: m31_8(w.merkle_root),
-                        withdrawal_binding: binding,
-                    });
-                    payout_recipients.push(payout);
-                    credit_recipients.push(credit);
                 }
+                Ok(result)
+            };
 
-                // Build spend witnesses
-                let spends: Vec<SpendWitness> = req
-                    .spends
-                    .iter()
-                    .map(|s| {
-                        let inputs: [InputNoteWitness; 2] = [
-                            {
-                                let inp = &s.inputs[0];
-                                let note = Note {
-                                    owner_pubkey: m31_4(inp.note.pub_key),
-                                    amount_lo: m31(inp.note.amount_lo),
-                                    amount_hi: m31(inp.note.amount_hi),
-                                    asset_id: m31(inp.note.asset_id),
-                                    blinding: m31_4(inp.note.blinding),
-                                };
-                                let siblings: Vec<[BaseField; RATE]> =
-                                    inp.merkle_siblings.iter().map(|sib| m31_8(*sib)).collect();
-                                InputNoteWitness {
-                                    note,
-                                    spending_key: m31_4(inp.spending_key),
-                                    merkle_path: MerklePath {
-                                        siblings,
-                                        index: inp.merkle_index,
-                                    },
-                                }
-                            },
-                            {
-                                let inp = &s.inputs[1];
-                                let note = Note {
-                                    owner_pubkey: m31_4(inp.note.pub_key),
-                                    amount_lo: m31(inp.note.amount_lo),
-                                    amount_hi: m31(inp.note.amount_hi),
-                                    asset_id: m31(inp.note.asset_id),
-                                    blinding: m31_4(inp.note.blinding),
-                                };
-                                let siblings: Vec<[BaseField; RATE]> =
-                                    inp.merkle_siblings.iter().map(|sib| m31_8(*sib)).collect();
-                                InputNoteWitness {
-                                    note,
-                                    spending_key: m31_4(inp.spending_key),
-                                    merkle_path: MerklePath {
-                                        siblings,
-                                        index: inp.merkle_index,
-                                    },
-                                }
-                            },
-                        ];
-                        let outputs: [OutputNoteWitness; 2] = [
-                            {
-                                let out = &s.outputs[0];
-                                OutputNoteWitness {
-                                    note: Note {
-                                        owner_pubkey: m31_4(out.recipient_pubkey),
-                                        amount_lo: m31(out.amount_lo),
-                                        amount_hi: m31(out.amount_hi),
-                                        asset_id: m31(out.asset_id),
-                                        blinding: m31_4(out.blinding),
-                                    },
-                                }
-                            },
-                            {
-                                let out = &s.outputs[1];
-                                OutputNoteWitness {
-                                    note: Note {
-                                        owner_pubkey: m31_4(out.recipient_pubkey),
-                                        amount_lo: m31(out.amount_lo),
-                                        amount_hi: m31(out.amount_hi),
-                                        asset_id: m31(out.asset_id),
-                                        blinding: m31_4(out.blinding),
-                                    },
-                                }
-                            },
-                        ];
-                        SpendWitness {
-                            inputs,
-                            outputs,
-                            merkle_root: m31_8(s.merkle_root),
-                        }
-                    })
-                    .collect();
+            // Max amount that fits in two M31 limbs
+            const MAX_AMOUNT: u64 = ((1u64 << 31) - 1) + ((1u64 << 31) - 1) * (1u64 << 31);
 
-                let batch = PrivacyBatch {
-                    deposits,
-                    withdrawals,
-                    spends,
+            // Build deposit witnesses
+            let deposits: Vec<DepositWitness> = {
+                let mut v = Vec::with_capacity(req.deposits.len());
+                for d in &req.deposits {
+                    if d.amount > MAX_AMOUNT {
+                        return Err(format!(
+                            "deposit amount {} exceeds max {}",
+                            d.amount, MAX_AMOUNT
+                        ));
+                    }
+                    let pubkey = m31_4(d.recipient_pubkey);
+                    let amount_lo = m31((d.amount & 0x7FFF_FFFF) as u32);
+                    let amount_hi = m31((d.amount >> 31) as u32);
+                    let blinding = random_blinding()?;
+                    let note = Note {
+                        owner_pubkey: pubkey,
+                        amount_lo,
+                        amount_hi,
+                        asset_id: m31(d.asset_id),
+                        blinding,
+                    };
+                    v.push(DepositWitness {
+                        note,
+                        amount: d.amount,
+                        asset_id: m31(d.asset_id),
+                    });
+                }
+                v
+            };
+
+            // Build withdraw witnesses and recipient bindings.
+            let mut payout_recipients: Vec<String> = Vec::with_capacity(req.withdrawals.len());
+            let mut credit_recipients: Vec<String> = Vec::with_capacity(req.withdrawals.len());
+            let mut withdrawals: Vec<WithdrawWitness> = Vec::with_capacity(req.withdrawals.len());
+            for (idx, w) in req.withdrawals.iter().enumerate() {
+                let payout = w
+                    .payout_recipient
+                    .clone()
+                    .ok_or_else(|| format!("withdrawals[{idx}] missing payout_recipient"))?;
+                let credit = w.credit_recipient.clone().unwrap_or_else(|| payout.clone());
+                let binding = compute_withdrawal_binding_digest(
+                    &payout,
+                    &credit,
+                    w.note.asset_id as u64,
+                    w.note.amount_lo as u64,
+                    w.note.amount_hi as u64,
+                    idx as u32,
+                )
+                .map_err(|e| format!("withdrawals[{idx}] invalid binding inputs: {e}"))?;
+
+                let note = Note {
+                    owner_pubkey: m31_4(w.note.pub_key),
+                    amount_lo: m31(w.note.amount_lo),
+                    amount_hi: m31(w.note.amount_hi),
+                    asset_id: m31(w.note.asset_id),
+                    blinding: m31_4(w.note.blinding),
                 };
+                let siblings: Vec<[BaseField; RATE]> =
+                    w.merkle_siblings.iter().map(|s| m31_8(*s)).collect();
+                withdrawals.push(WithdrawWitness {
+                    note,
+                    spending_key: m31_4(w.spending_key),
+                    merkle_path: MerklePath {
+                        siblings,
+                        index: w.merkle_index,
+                    },
+                    merkle_root: m31_8(w.merkle_root),
+                    withdrawal_binding: binding,
+                });
+                payout_recipients.push(payout);
+                credit_recipients.push(credit);
+            }
 
-                let proof = prove_privacy_batch(&batch).map_err(|e| format!("{e}"))?;
-                Ok((proof, payout_recipients, credit_recipients))
-            })
-            .await;
+            // Build spend witnesses
+            let spends: Vec<SpendWitness> = req
+                .spends
+                .iter()
+                .map(|s| {
+                    let inputs: [InputNoteWitness; 2] = [
+                        {
+                            let inp = &s.inputs[0];
+                            let note = Note {
+                                owner_pubkey: m31_4(inp.note.pub_key),
+                                amount_lo: m31(inp.note.amount_lo),
+                                amount_hi: m31(inp.note.amount_hi),
+                                asset_id: m31(inp.note.asset_id),
+                                blinding: m31_4(inp.note.blinding),
+                            };
+                            let siblings: Vec<[BaseField; RATE]> =
+                                inp.merkle_siblings.iter().map(|sib| m31_8(*sib)).collect();
+                            InputNoteWitness {
+                                note,
+                                spending_key: m31_4(inp.spending_key),
+                                merkle_path: MerklePath {
+                                    siblings,
+                                    index: inp.merkle_index,
+                                },
+                            }
+                        },
+                        {
+                            let inp = &s.inputs[1];
+                            let note = Note {
+                                owner_pubkey: m31_4(inp.note.pub_key),
+                                amount_lo: m31(inp.note.amount_lo),
+                                amount_hi: m31(inp.note.amount_hi),
+                                asset_id: m31(inp.note.asset_id),
+                                blinding: m31_4(inp.note.blinding),
+                            };
+                            let siblings: Vec<[BaseField; RATE]> =
+                                inp.merkle_siblings.iter().map(|sib| m31_8(*sib)).collect();
+                            InputNoteWitness {
+                                note,
+                                spending_key: m31_4(inp.spending_key),
+                                merkle_path: MerklePath {
+                                    siblings,
+                                    index: inp.merkle_index,
+                                },
+                            }
+                        },
+                    ];
+                    let outputs: [OutputNoteWitness; 2] = [
+                        {
+                            let out = &s.outputs[0];
+                            OutputNoteWitness {
+                                note: Note {
+                                    owner_pubkey: m31_4(out.recipient_pubkey),
+                                    amount_lo: m31(out.amount_lo),
+                                    amount_hi: m31(out.amount_hi),
+                                    asset_id: m31(out.asset_id),
+                                    blinding: m31_4(out.blinding),
+                                },
+                            }
+                        },
+                        {
+                            let out = &s.outputs[1];
+                            OutputNoteWitness {
+                                note: Note {
+                                    owner_pubkey: m31_4(out.recipient_pubkey),
+                                    amount_lo: m31(out.amount_lo),
+                                    amount_hi: m31(out.amount_hi),
+                                    asset_id: m31(out.asset_id),
+                                    blinding: m31_4(out.blinding),
+                                },
+                            }
+                        },
+                    ];
+                    SpendWitness {
+                        inputs,
+                        outputs,
+                        merkle_root: m31_8(s.merkle_root),
+                    }
+                })
+                .collect();
+
+            let batch = PrivacyBatch {
+                deposits,
+                withdrawals,
+                spends,
+            };
+
+            let proof = prove_privacy_batch(&batch).map_err(|e| format!("{e}"))?;
+            Ok((proof, payout_recipients, credit_recipients))
+        })
+        .await;
 
         let prove_elapsed = prove_start.elapsed();
         let mut jobs = state_clone.privacy_jobs.write().await;
@@ -3476,13 +3810,17 @@ async fn submit_audit(
         )
     })?;
     // Sanitize model_id: only allow alphanumeric, underscore, hyphen, dot
-    let sanitized_model_id: String = req.model_id.chars()
+    let sanitized_model_id: String = req
+        .model_id
+        .chars()
         .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-' || *c == '.')
         .collect();
     if sanitized_model_id.is_empty() || sanitized_model_id.contains("..") {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse { error: "invalid model_id".to_string() }),
+            Json(ErrorResponse {
+                error: "invalid model_id".to_string(),
+            }),
         ));
     }
     let log_dir = std::path::PathBuf::from(&audit_dir).join(&sanitized_model_id);
@@ -3557,9 +3895,10 @@ async fn submit_audit(
                 model_dir: None,
             };
 
-            let pipeline_result =
-                obelyzk::audit::orchestrator::run_audit(&log, &graph, &weights, &config, None, None)
-                    .map_err(|e| format!("Audit pipeline failed: {e}"))?;
+            let pipeline_result = obelyzk::audit::orchestrator::run_audit(
+                &log, &graph, &weights, &config, None, None,
+            )
+            .map_err(|e| format!("Audit pipeline failed: {e}"))?;
 
             serde_json::to_value(&pipeline_result.report)
                 .map_err(|e| format!("Failed to serialize report: {e}"))
@@ -3652,9 +3991,11 @@ async fn ws_job_handler(
         }
     }
     let rx = state.ws_sink.subscribe();
-    Ok(ws.on_upgrade(move |socket| async move {
-        ws_job_client_loop(socket, rx, job_id).await;
-    }).into_response())
+    Ok(ws
+        .on_upgrade(move |socket| async move {
+            ws_job_client_loop(socket, rx, job_id).await;
+        })
+        .into_response())
 }
 
 #[cfg(all(feature = "multi-query", feature = "proof-stream"))]
@@ -3716,9 +4057,11 @@ async fn ws_handler(
         }
     }
     let rx = state.ws_sink.subscribe();
-    Ok(ws.on_upgrade(move |socket| async move {
-        ws_client_loop(socket, rx).await;
-    }).into_response())
+    Ok(ws
+        .on_upgrade(move |socket| async move {
+            ws_client_loop(socket, rx).await;
+        })
+        .into_response())
 }
 
 #[cfg(feature = "proof-stream")]
@@ -3793,17 +4136,68 @@ async fn main() {
     // set vars that aren't already set).
     let server_default_policy = obelyzk::policy::PolicyConfig::standard();
     for (key, val) in [
-        ("STWO_SKIP_RMS_SQ_PROOF", if server_default_policy.skip_rms_sq_proof { "1" } else { "0" }),
-        ("STWO_ALLOW_MISSING_NORM_PROOF", if server_default_policy.allow_missing_norm_proof { "1" } else { "0" }),
-        ("STWO_PIECEWISE_ACTIVATION", if server_default_policy.piecewise_activation { "1" } else { "0" }),
-        ("STWO_ALLOW_LOGUP_ACTIVATION", if server_default_policy.allow_logup_activation { "1" } else { "0" }),
-        ("STWO_AGGREGATED_FULL_BINDING", if server_default_policy.aggregated_full_binding { "1" } else { "0" }),
-        ("STWO_SKIP_BATCH_TOKENS", if server_default_policy.skip_batch_tokens { "1" } else { "0" }),
-        ("STWO_PURE_GKR_SKIP_UNIFIED_STARK", if server_default_policy.skip_unified_stark { "1" } else { "0" }),
+        (
+            "STWO_SKIP_RMS_SQ_PROOF",
+            if server_default_policy.skip_rms_sq_proof {
+                "1"
+            } else {
+                "0"
+            },
+        ),
+        (
+            "STWO_ALLOW_MISSING_NORM_PROOF",
+            if server_default_policy.allow_missing_norm_proof {
+                "1"
+            } else {
+                "0"
+            },
+        ),
+        (
+            "STWO_PIECEWISE_ACTIVATION",
+            if server_default_policy.piecewise_activation {
+                "1"
+            } else {
+                "0"
+            },
+        ),
+        (
+            "STWO_ALLOW_LOGUP_ACTIVATION",
+            if server_default_policy.allow_logup_activation {
+                "1"
+            } else {
+                "0"
+            },
+        ),
+        (
+            "STWO_AGGREGATED_FULL_BINDING",
+            if server_default_policy.aggregated_full_binding {
+                "1"
+            } else {
+                "0"
+            },
+        ),
+        (
+            "STWO_SKIP_BATCH_TOKENS",
+            if server_default_policy.skip_batch_tokens {
+                "1"
+            } else {
+                "0"
+            },
+        ),
+        (
+            "STWO_PURE_GKR_SKIP_UNIFIED_STARK",
+            if server_default_policy.skip_unified_stark {
+                "1"
+            } else {
+                "0"
+            },
+        ),
     ] {
         if std::env::var(key).is_err() {
             // Safety: called once in main() before any threads are spawned.
-            unsafe { std::env::set_var(key, val); }
+            unsafe {
+                std::env::set_var(key, val);
+            }
         }
     }
     eprintln!(
@@ -3822,7 +4216,14 @@ async fn main() {
             Ok(handle) => {
                 eprintln!("  Worker mode: ACTIVE (id: {})", handle.worker_id);
                 eprintln!("  Coordinator: {}", wc.coordinator_url);
-                eprintln!("  Wallet: {}", if wc.wallet_address.is_empty() { "none" } else { &wc.wallet_address });
+                eprintln!(
+                    "  Wallet: {}",
+                    if wc.wallet_address.is_empty() {
+                        "none"
+                    } else {
+                        &wc.wallet_address
+                    }
+                );
                 Some(handle)
             }
             Err(e) => {
@@ -3852,11 +4253,7 @@ async fn main() {
             .unwrap_or(64);
         let device_ordinals: Vec<usize> = std::env::var("GPU_DEVICES")
             .ok()
-            .map(|s| {
-                s.split(',')
-                    .filter_map(|v| v.trim().parse().ok())
-                    .collect()
-            })
+            .map(|s| s.split(',').filter_map(|v| v.trim().parse().ok()).collect())
             .unwrap_or_default();
 
         obelyzk::gpu_scheduler::GpuScheduler::new(obelyzk::gpu_scheduler::GpuSchedulerConfig {
@@ -3885,7 +4282,8 @@ async fn main() {
             eprintln!("  Auto-loading model from {model_dir}...");
             match load_hf_model(&path, None) {
                 Ok(hf) => {
-                    let model_name = path.file_name()
+                    let model_name = path
+                        .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| "default".to_string());
                     // Skip expensive weight commitment computation at startup.
@@ -3898,23 +4296,29 @@ async fn main() {
                     let has_tokenizer = tokenizer.is_some();
                     eprintln!("  Auto-loaded: {} ({} layers, {} weights, tokenizer: {}) — fast startup, commitments deferred",
                         model_name, num_layers, num_weights, has_tokenizer);
-                    initial_models.insert(model_name.clone(), LoadedModel {
-                        model_id: format!("0x{:x}", starknet_crypto::poseidon_hash_many(&[
-                            starknet_ff::FieldElement::ONE,
-                            starknet_ff::FieldElement::from(num_weights as u64),
-                            starknet_ff::FieldElement::from(num_layers as u64),
-                        ])),
-                        name: model_name,
-                        weight_commitment: "deferred".to_string(),
-                        num_layers,
-                        input_shape: hf.input_shape,
-                        graph: Arc::new(hf.graph),
-                        weights: Arc::new(hf.weights),
-                        tokenizer,
-                        model_dir: Some(path.clone()),
-                        #[cfg(feature = "server-audit")]
-                        capture_hook: None,
-                    });
+                    initial_models.insert(
+                        model_name.clone(),
+                        LoadedModel {
+                            model_id: format!(
+                                "0x{:x}",
+                                starknet_crypto::poseidon_hash_many(&[
+                                    starknet_ff::FieldElement::ONE,
+                                    starknet_ff::FieldElement::from(num_weights as u64),
+                                    starknet_ff::FieldElement::from(num_layers as u64),
+                                ])
+                            ),
+                            name: model_name,
+                            weight_commitment: "deferred".to_string(),
+                            num_layers,
+                            input_shape: hf.input_shape,
+                            graph: Arc::new(hf.graph),
+                            weights: Arc::new(hf.weights),
+                            tokenizer,
+                            model_dir: Some(path.clone()),
+                            #[cfg(feature = "server-audit")]
+                            capture_hook: None,
+                        },
+                    );
                 }
                 Err(e) => {
                     eprintln!("  WARNING: Failed to auto-load model from {model_dir}: {e}");
@@ -3952,10 +4356,15 @@ async fn main() {
                 interval.tick().await;
                 let mut sessions = state_evict.sessions.write().await;
                 let before = sessions.len();
-                sessions.retain(|_, s| s.last_accessed.elapsed() < std::time::Duration::from_secs(300));
+                sessions
+                    .retain(|_, s| s.last_accessed.elapsed() < std::time::Duration::from_secs(300));
                 let evicted = before - sessions.len();
                 if evicted > 0 {
-                    eprintln!("  Session eviction: removed {} expired sessions ({} active)", evicted, sessions.len());
+                    eprintln!(
+                        "  Session eviction: removed {} expired sessions ({} active)",
+                        evicted,
+                        sessions.len()
+                    );
                 }
             }
         });
@@ -3971,7 +4380,10 @@ async fn main() {
         .route("/api/v1/prove/:job_id/result", get(get_prove_result))
         .route("/api/v1/infer", post(infer))
         .route("/api/v1/chat", post(chat))
-        .route("/api/v1/chat/:session_id", axum::routing::delete(delete_session))
+        .route(
+            "/api/v1/chat/:session_id",
+            axum::routing::delete(delete_session),
+        )
         .route("/api/v1/verify/:proof_hash", get(verify_proof))
         .route("/api/v1/classify", post(classify))
         .route("/api/v1/proofs", get(list_proofs))
@@ -4012,8 +4424,14 @@ async fn main() {
 
     // Apply auth + rate-limit middleware to API routes
     let api_routes = api_routes
-        .layer(middleware::from_fn_with_state(state.clone(), rate_limit_middleware))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
     // Public routes (no auth required): dashboard, health, WebSocket
     let public_routes = Router::new()
@@ -4057,7 +4475,8 @@ async fn main() {
                     jobs.retain(|_, j| evict(&j.completed_at));
                     // Hard cap: if still over limit, drop oldest completed first
                     if jobs.len() > MAX_JOBS {
-                        let mut to_remove: Vec<_> = jobs.iter()
+                        let mut to_remove: Vec<_> = jobs
+                            .iter()
                             .filter(|(_, j)| j.completed_at.is_some())
                             .map(|(k, j)| (k.clone(), j.started_at))
                             .collect();
@@ -4090,16 +4509,22 @@ async fn main() {
         tokio::spawn(async move {
             eprintln!("  Worker job processor: listening for coordinator assignments");
             while let Some(job) = handle.job_rx.recv().await {
-                eprintln!("  Worker: received job {} (model: {})", job.job_id, job.model_id);
+                eprintln!(
+                    "  Worker: received job {} (model: {})",
+                    job.job_id, job.model_id
+                );
 
                 // Check if model is loaded
                 let model_exists = worker_state.models.read().await.contains_key(&job.model_id);
                 if !model_exists {
                     eprintln!("  Worker: model {} not loaded, rejecting job", job.model_id);
                     obelyzk::worker::submit_job_result(
-                        &worker_cfg, &worker_id, &job.job_id,
+                        &worker_cfg,
+                        &worker_id,
+                        &job.job_id,
                         Err(format!("Model {} not loaded on this worker", job.model_id)),
-                    ).await;
+                    )
+                    .await;
                     continue;
                 }
 
@@ -4121,15 +4546,19 @@ async fn main() {
                             Some(m) => m,
                             None => {
                                 obelyzk::worker::submit_job_result(
-                                    &cfg, &wid, &job_id,
+                                    &cfg,
+                                    &wid,
+                                    &job_id,
                                     Err("Model disappeared during proving".into()),
-                                ).await;
+                                )
+                                .await;
                                 return;
                             }
                         };
 
                         let (rows, cols) = model.input_shape;
-                        let q_input: Vec<M31> = input.iter()
+                        let q_input: Vec<M31> = input
+                            .iter()
                             .map(|&v| M31::from((v.abs() * 1000.0) as u32 % ((1u32 << 31) - 1)))
                             .collect();
 
@@ -4147,7 +4576,9 @@ async fn main() {
 
                         // Run proof
                         match obelyzk::starknet::prove_for_starknet_onchain(
-                            &graph, &input_matrix, &weights,
+                            &graph,
+                            &input_matrix,
+                            &weights,
                         ) {
                             Ok(proof) => {
                                 let elapsed = start.elapsed().as_millis() as u64;
@@ -4156,7 +4587,9 @@ async fn main() {
                                     + proof.matmul_calldata.iter().map(|c| c.len()).sum::<usize>();
 
                                 obelyzk::worker::submit_job_result(
-                                    &cfg, &wid, &job_id,
+                                    &cfg,
+                                    &wid,
+                                    &job_id,
                                     Ok(obelyzk::worker::JobProofResult {
                                         proof_hash: io_str.clone(),
                                         io_commitment: io_str,
@@ -4164,13 +4597,17 @@ async fn main() {
                                         prove_time_ms: elapsed,
                                         calldata_size,
                                     }),
-                                ).await;
+                                )
+                                .await;
                             }
                             Err(e) => {
                                 obelyzk::worker::submit_job_result(
-                                    &cfg, &wid, &job_id,
+                                    &cfg,
+                                    &wid,
+                                    &job_id,
                                     Err(format!("Proof failed: {e}")),
-                                ).await;
+                                )
+                                .await;
                             }
                         }
                     });

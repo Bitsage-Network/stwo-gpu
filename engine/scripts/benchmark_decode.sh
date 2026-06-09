@@ -6,21 +6,38 @@
 #
 # Examples:
 #   bash scripts/benchmark_decode.sh 10
-#   bash scripts/benchmark_decode.sh 20 1 /path/to/qwen3-14b
+#   bash scripts/benchmark_decode.sh 20 all /path/to/qwen3.5-35b-a3b
 #   SKIP_BUILD=1 bash scripts/benchmark_decode.sh 5
 set -euo pipefail
 
 N_STEPS="${1:-10}"
-LAYERS="${2:-${LAYERS:-1}}"
+LAYERS="${2:-${LAYERS:-all}}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SKIP_BUILD="${SKIP_BUILD:-0}"
+
+case "${LAYERS}" in
+    all|full|0|"")
+        LAYERS_LABEL="all"
+        LAYER_FLAGS=()
+        ;;
+    *)
+        LAYERS_LABEL="${LAYERS}L"
+        LAYER_FLAGS=(--layers "${LAYERS}")
+        ;;
+esac
 
 # Auto-detect model directory
 if [[ -n "${3:-}" ]]; then
     MODEL_DIR="$3"
 elif [[ -n "${MODEL_DIR:-}" ]]; then
     : # already set
+elif [[ -d "/home/shadeform/.obelyzk/models/qwen3.5-35b-a3b" ]]; then
+    MODEL_DIR="/home/shadeform/.obelyzk/models/qwen3.5-35b-a3b"
+elif [[ -d "$HOME/.obelyzk/models/qwen3.5-35b-a3b" ]]; then
+    MODEL_DIR="$HOME/.obelyzk/models/qwen3.5-35b-a3b"
+elif [[ -d "$HOME/models/qwen3.5-35b-a3b" ]]; then
+    MODEL_DIR="$HOME/models/qwen3.5-35b-a3b"
 elif [[ -d "/home/shadeform/.obelysk/models/qwen3-14b" ]]; then
     MODEL_DIR="/home/shadeform/.obelysk/models/qwen3-14b"
 elif [[ -d "$HOME/.obelysk/models/qwen3-14b" ]]; then
@@ -41,15 +58,18 @@ fi
 
 KV_CACHE_DIR="/tmp/decode_bench_kv_$$"
 mkdir -p "${KV_CACHE_DIR}"
-OUTPUT="/tmp/decode_bench_${LAYERS}L_${N_STEPS}s_$(date +%s).json"
+OUTPUT="/tmp/decode_bench_${LAYERS_LABEL}_${N_STEPS}s_$(date +%s).json"
 
 echo "=== ZKML Decode-Step Benchmark ==="
 echo "  Model     : ${MODEL_DIR}"
-echo "  Layers    : ${LAYERS}"
+echo "  Layers    : ${LAYERS_LABEL}"
 echo "  Steps     : ${N_STEPS}"
 echo "  GPU       : ${GPU_NAME}"
 echo "  KV-cache  : ${KV_CACHE_DIR}"
 echo "  Output    : ${OUTPUT}"
+if [[ "${LAYERS}" == "1" ]]; then
+    echo "  WARNING   : 1-layer decode mode is diagnostic only; production H100 runs should use all layers."
+fi
 echo ""
 
 if [[ "${SKIP_BUILD}" != "1" ]]; then
@@ -59,13 +79,13 @@ if [[ "${SKIP_BUILD}" != "1" ]]; then
     echo ""
 fi
 
-echo "Running decode benchmark (${N_STEPS} steps, ${LAYERS} layers)..."
+echo "Running decode benchmark (${N_STEPS} steps, ${LAYERS_LABEL} layers)..."
 echo ""
 
 cd "${REPO_ROOT}"
 time target/release/prove-model \
     --model-dir "${MODEL_DIR}" \
-    --layers "${LAYERS}" \
+    "${LAYER_FLAGS[@]}" \
     --gpu \
     --format ml_gkr \
     --output "${OUTPUT}" \

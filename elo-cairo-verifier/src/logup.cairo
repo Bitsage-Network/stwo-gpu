@@ -11,8 +11,7 @@
 // is required (ADR-2 Approach B).
 
 use crate::field::{
-    QM31, qm31_zero, qm31_add, qm31_sub, qm31_mul,
-    m31_to_qm31, qm31_from_u32, batch_inverse,
+    QM31, batch_inverse, m31_to_qm31, qm31_add, qm31_from_u32, qm31_mul, qm31_sub, qm31_zero,
 };
 
 /// Verify the LogUp table-side sum matches the claimed sum.
@@ -59,7 +58,7 @@ pub fn verify_logup_table_sum(
             mults.append(m);
         }
         i += 1;
-    };
+    }
 
     if denoms.len() == 0 {
         // No entries accessed: sum should be zero
@@ -79,7 +78,7 @@ pub fn verify_logup_table_sum(
         let mult_qm31 = qm31_from_u32(*mults.at(i));
         sum = qm31_add(sum, qm31_mul(mult_qm31, *inv_denoms.at(i)));
         i += 1;
-    };
+    }
 
     sum == claimed_sum
 }

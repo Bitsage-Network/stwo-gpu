@@ -126,7 +126,7 @@ pub fn tensor_to_f32(data: &[u8], dtype: safetensors::Dtype) -> Vec<f32> {
 fn fp8_e4m3_to_f32(bits: u8) -> f32 {
     let sign = (bits >> 7) & 1;
     let exp = (bits >> 3) & 0xF; // 4 bits
-    let man = bits & 0x7;         // 3 bits
+    let man = bits & 0x7; // 3 bits
 
     // NaN: exponent=15 and mantissa=7
     if exp == 15 && man == 7 {
@@ -149,11 +149,15 @@ fn fp8_e4m3_to_f32(bits: u8) -> f32 {
 fn fp8_e5m2_to_f32(bits: u8) -> f32 {
     let sign = (bits >> 7) & 1;
     let exp = (bits >> 2) & 0x1F; // 5 bits
-    let man = bits & 0x3;          // 2 bits
+    let man = bits & 0x3; // 2 bits
 
     if exp == 31 {
         return if man == 0 {
-            if sign == 1 { f32::NEG_INFINITY } else { f32::INFINITY }
+            if sign == 1 {
+                f32::NEG_INFINITY
+            } else {
+                f32::INFINITY
+            }
         } else {
             f32::NAN
         };
@@ -217,7 +221,10 @@ pub fn dtype_byte_size(dtype: safetensors::Dtype) -> usize {
         safetensors::Dtype::I32 | safetensors::Dtype::U32 => 4,
         safetensors::Dtype::F64 | safetensors::Dtype::I64 | safetensors::Dtype::U64 => 8,
         other => {
-            eprintln!("  WARNING: unknown dtype {:?}, assuming 4-byte elements", other);
+            eprintln!(
+                "  WARNING: unknown dtype {:?}, assuming 4-byte elements",
+                other
+            );
             4
         }
     }

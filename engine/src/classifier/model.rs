@@ -89,12 +89,8 @@ pub fn build_trained_classifier() -> ClassifierModel {
     use super::trained_weights::*;
 
     let graph = build_classifier_graph();
-    let weights = load_weights_from_arrays(
-        &LAYER0_WEIGHTS,
-        &LAYER2_WEIGHTS,
-        &LAYER4_WEIGHTS,
-    )
-    .expect("trained weight dimensions must match architecture");
+    let weights = load_weights_from_arrays(&LAYER0_WEIGHTS, &LAYER2_WEIGHTS, &LAYER4_WEIGHTS)
+        .expect("trained weight dimensions must match architecture");
 
     ClassifierModel { graph, weights }
 }
@@ -172,9 +168,18 @@ mod tests {
     fn test_build_test_classifier() {
         let model = build_test_classifier();
         assert_eq!(model.graph.nodes.len(), 5);
-        assert!(model.weights.get_weight(0).is_some(), "layer 0 weight should exist");
-        assert!(model.weights.get_weight(2).is_some(), "layer 2 weight should exist");
-        assert!(model.weights.get_weight(4).is_some(), "layer 4 weight should exist");
+        assert!(
+            model.weights.get_weight(0).is_some(),
+            "layer 0 weight should exist"
+        );
+        assert!(
+            model.weights.get_weight(2).is_some(),
+            "layer 2 weight should exist"
+        );
+        assert!(
+            model.weights.get_weight(4).is_some(),
+            "layer 4 weight should exist"
+        );
 
         let w0 = model.weights.get_weight(0).unwrap();
         assert_eq!(w0.rows, 64);

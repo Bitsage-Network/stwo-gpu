@@ -9,7 +9,7 @@ use cairo_lang_runner::Arg;
 use cairo_prove::args::{Cli, Commands, ProgramArguments};
 use cairo_prove::error::{CairoProveError, Result};
 use cairo_prove::execute::execute;
-use cairo_prove::prove::{prove, prove_poseidon, prover_input_from_runner};
+use cairo_prove::prove::{prove, prove_poseidon, prove_recursive_160, prover_input_from_runner};
 use clap::Parser;
 use log::{error, info};
 use stwo_cairo_prover::stwo::core::fri::FriConfig;
@@ -54,6 +54,7 @@ fn handle_prove(
     proof: &Path,
     proof_format: ProofFormat,
     poseidon: bool,
+    recursive_160: bool,
     args: ProgramArguments,
 ) -> Result<()> {
     info!("Generating proof for target: {:?}", target);
@@ -69,7 +70,16 @@ fn handle_prove(
     let runner = execute(executable, args.read_arguments())?;
     let prover_input = prover_input_from_runner(&runner)?;
 
-    if poseidon {
+    if recursive_160 {
+        info!("[recursive-160] On-chain STARK-in-STARK path enabled.");
+        let cairo_proof = prove_recursive_160(prover_input)?;
+        serialize_proof_to_file::<Poseidon252MerkleHasher>(
+            &cairo_proof,
+            proof.into(),
+            proof_format,
+        )
+        .map_err(|e| CairoProveError::ProofSerialization(format!("{:?}", e)))?;
+    } else if poseidon {
         info!("[Poseidon252] On-chain recursive path enabled.");
         let cairo_proof = prove_poseidon(prover_input, secure_pcs_config())?;
         serialize_proof_to_file::<Poseidon252MerkleHasher>(
@@ -268,9 +278,17 @@ fn run() -> Result<()> {
             proof,
             proof_format,
             poseidon,
+            recursive_160,
             program_arguments,
         } => {
-            handle_prove(&target, &proof, proof_format, poseidon, program_arguments)?;
+            handle_prove(
+                &target,
+                &proof,
+                proof_format,
+                poseidon,
+                recursive_160,
+                program_arguments,
+            )?;
         }
         Commands::Verify {
             proof,

@@ -25,39 +25,52 @@ pub struct ProgramInfo {
 #[starknet::interface]
 pub trait IGeneralStwoVerifier<TContractState> {
     /// Register a program for on-chain verification.
-    fn register_program(
-        ref self: TContractState,
-        program_hash: felt252,
-        min_security_bits: u32,
-    );
+    fn register_program(ref self: TContractState, program_hash: felt252, min_security_bits: u32);
 
     /// Single-TX verification (for proofs ≤ 5000 felts).
-    fn verify_stwo(
+    fn verify_stwo(ref self: TContractState, proof: CairoProof) -> VerificationOutput;
+
+    /// Statement-bound verification for ML conversation/action proofs.
+    ///
+    /// The Cairo program being proven must emit the canonical 19 statement felts.
+    /// With `general_stwo_poseidon`, stwo_cairo_air exposes this as
+    /// `VerificationOutput.output_hash = poseidon_hash_span(statement_felts)`.
+    fn verify_conversation_stwo(
         ref self: TContractState,
         proof: CairoProof,
+        expected_program_hash: felt252,
+        expected_output_hash: felt252,
+        statement_hash: felt252,
+        model_id: felt252,
+    ) -> VerificationOutput;
+
+    /// Strict statement-bound verification. Production callers should prefer
+    /// this entrypoint because it recomputes the canonical statement hash from
+    /// the 19 emitted statement felts and rejects caller-side relabeling of
+    /// model/program/security metadata.
+    fn verify_conversation_stwo_with_statement(
+        ref self: TContractState,
+        proof: CairoProof,
+        expected_program_hash: felt252,
+        statement_hash: felt252,
+        model_id: felt252,
+        statement_felts: Array<felt252>,
     ) -> VerificationOutput;
 
     /// Streaming: open a verification session.
-    fn stream_open(
-        ref self: TContractState,
-        expected_total_felts: u32,
-    ) -> u64;
+    fn stream_open(ref self: TContractState, expected_total_felts: u32) -> u64;
 
     /// Streaming: upload a chunk of proof data.
     fn stream_chunk(
-        ref self: TContractState,
-        session_id: u64,
-        chunk_idx: u32,
-        chunk: Array<felt252>,
+        ref self: TContractState, session_id: u64, chunk_idx: u32, chunk: Array<felt252>,
     );
 
     /// Streaming: finalize — reassemble proof, verify, record on-chain.
-    fn stream_verify(
-        ref self: TContractState,
-        session_id: u64,
-    ) -> VerificationOutput;
+    fn stream_verify(ref self: TContractState, session_id: u64) -> VerificationOutput;
 
     fn is_verified(self: @TContractState, proof_hash: felt252) -> bool;
+    fn is_statement_verified(self: @TContractState, statement_hash: felt252) -> bool;
+    fn get_statement_proof_hash(self: @TContractState, statement_hash: felt252) -> felt252;
     fn get_verification_count(self: @TContractState, program_hash: felt252) -> u64;
 
     /// Propose a contract class upgrade (owner only, subject to timelock).
@@ -73,19 +86,22 @@ pub trait IGeneralStwoVerifier<TContractState> {
 #[starknet::contract]
 mod GeneralStwoVerifierContract {
     use core::poseidon::poseidon_hash_span;
-    use starknet::{get_caller_address, get_block_timestamp, ContractAddress};
     use starknet::storage::{
         Map, StorageMapReadAccess, StorageMapWriteAccess, StoragePointerReadAccess,
         StoragePointerWriteAccess,
     };
+    use starknet::{ContractAddress, get_block_timestamp, get_caller_address};
     use stwo_verifier_core::pcs::PcsConfigTrait;
     use super::{
-        CairoProof, IGeneralStwoVerifier, ProgramInfo, VerificationOutput,
-        get_verification_output, verify_cairo,
+        CairoProof, IGeneralStwoVerifier, ProgramInfo, VerificationOutput, get_verification_output,
+        verify_cairo,
     };
 
     const MIN_SECURITY_BITS: u32 = 160;
     const MAX_CHUNK_SIZE: u32 = 4900; // Leave room for TX overhead
+    const DOMAIN_BATCH: felt252 = 0x43424154; // "CBAT"
+    const CONVERSATION_STATEMENT_VERSION: felt252 = 1;
+    const CONVERSATION_STATEMENT_FELTS: u32 = 19;
 
     #[storage]
     struct Storage {
@@ -94,6 +110,8 @@ mod GeneralStwoVerifierContract {
         programs: Map<felt252, ProgramInfo>,
         // Verification results
         verified_proofs: Map<felt252, bool>,
+        verified_statements: Map<felt252, bool>,
+        statement_proof_hash: Map<felt252, felt252>,
         verification_count: Map<felt252, u64>,
         // Last verification per program
         last_proof_hash: Map<felt252, felt252>,
@@ -122,6 +140,7 @@ mod GeneralStwoVerifierContract {
     enum Event {
         ProgramRegistered: ProgramRegistered,
         StwoProofVerified: StwoProofVerified,
+        ConversationStatementVerified: ConversationStatementVerified,
         StreamOpened: StreamOpened,
         StreamChunkReceived: StreamChunkReceived,
         UpgradeProposed: UpgradeProposed,
@@ -144,7 +163,20 @@ mod GeneralStwoVerifierContract {
         verification_count: u64,
         verified_at: u64,
         submitter: ContractAddress,
-        mode: felt252, // 'single' or 'stream'
+        mode: felt252 // 'single' or 'stream'
+    }
+
+    #[derive(Drop, starknet::Event)]
+    struct ConversationStatementVerified {
+        #[key]
+        statement_hash: felt252,
+        #[key]
+        model_id: felt252,
+        program_hash: felt252,
+        output_hash: felt252,
+        proof_hash: felt252,
+        verified_at: u64,
+        submitter: ContractAddress,
     }
 
     #[derive(Drop, starknet::Event)]
@@ -185,9 +217,7 @@ mod GeneralStwoVerifierContract {
     #[abi(embed_v0)]
     impl GeneralStwoVerifierImpl of IGeneralStwoVerifier<ContractState> {
         fn register_program(
-            ref self: ContractState,
-            program_hash: felt252,
-            min_security_bits: u32,
+            ref self: ContractState, program_hash: felt252, min_security_bits: u32,
         ) {
             assert!(min_security_bits >= MIN_SECURITY_BITS, "min_security_bits must be >= 160");
             assert!(program_hash != 0, "program_hash cannot be zero");
@@ -196,17 +226,14 @@ mod GeneralStwoVerifierContract {
             self
                 .programs
                 .write(
-                    program_hash,
-                    ProgramInfo { program_hash, min_security_bits, owner: caller },
+                    program_hash, ProgramInfo { program_hash, min_security_bits, owner: caller },
                 );
             self.emit(ProgramRegistered { program_hash, min_security_bits, registered_by: caller });
         }
 
-        // ─── Single-TX verification ───────────────────────────────────────
-        fn verify_stwo(
-            ref self: ContractState,
-            proof: CairoProof,
-        ) -> VerificationOutput {
+        // ─── Single-TX verification
+        // ───────────────────────────────────────
+        fn verify_stwo(ref self: ContractState, proof: CairoProof) -> VerificationOutput {
             let output = get_verification_output(proof: @proof);
 
             let security = proof.stark_proof.commitment_scheme_proof.config.security_bits();
@@ -215,18 +242,104 @@ mod GeneralStwoVerifierContract {
             // FULL CRYPTOGRAPHIC STARK VERIFICATION
             verify_cairo(proof);
 
-            let proof_hash = poseidon_hash_span(array![output.program_hash].span());
+            let proof_hash = poseidon_hash_span(
+                array![output.program_hash, output.output_hash].span(),
+            );
             assert!(!self.verified_proofs.read(proof_hash), "Already verified");
 
             self._record_verification(output.program_hash, proof_hash, 'single');
             output
         }
 
-        // ─── Streaming: open session ──────────────────────────────────────
-        fn stream_open(
+        // ─── Statement-bound ML conversation/action verification ─────────
+        fn verify_conversation_stwo(
             ref self: ContractState,
-            expected_total_felts: u32,
-        ) -> u64 {
+            proof: CairoProof,
+            expected_program_hash: felt252,
+            expected_output_hash: felt252,
+            statement_hash: felt252,
+            model_id: felt252,
+        ) -> VerificationOutput {
+            assert!(expected_program_hash != 0, "program_hash cannot be zero");
+            assert!(expected_output_hash != 0, "output_hash cannot be zero");
+            assert!(statement_hash != 0, "statement_hash cannot be zero");
+            assert!(model_id != 0, "model_id cannot be zero");
+            assert!(expected_output_hash == statement_hash, "statement/output hash mismatch");
+
+            let registered = self.programs.read(expected_program_hash);
+            assert!(registered.program_hash == expected_program_hash, "program not registered");
+
+            let output = get_verification_output(proof: @proof);
+            assert!(output.program_hash == expected_program_hash, "program_hash mismatch");
+            assert!(output.output_hash == expected_output_hash, "output_hash mismatch");
+
+            let security = proof.stark_proof.commitment_scheme_proof.config.security_bits();
+            assert!(security >= MIN_SECURITY_BITS, "Security {} < 160", security);
+            assert!(security >= registered.min_security_bits, "Security below program minimum");
+
+            // FULL CRYPTOGRAPHIC STARK VERIFICATION of the Cairo verifier run.
+            verify_cairo(proof);
+
+            let proof_hash = poseidon_hash_span(
+                array![output.program_hash, output.output_hash, statement_hash, model_id].span(),
+            );
+            assert!(!self.verified_proofs.read(proof_hash), "Already verified");
+            assert!(!self.verified_statements.read(statement_hash), "Statement already verified");
+
+            self._record_verification(output.program_hash, proof_hash, 'conversation');
+            self
+                ._record_statement_verification(
+                    statement_hash, model_id, output.program_hash, output.output_hash, proof_hash,
+                );
+            output
+        }
+
+        fn verify_conversation_stwo_with_statement(
+            ref self: ContractState,
+            proof: CairoProof,
+            expected_program_hash: felt252,
+            statement_hash: felt252,
+            model_id: felt252,
+            statement_felts: Array<felt252>,
+        ) -> VerificationOutput {
+            assert!(expected_program_hash != 0, "program_hash cannot be zero");
+            assert!(statement_hash != 0, "statement_hash cannot be zero");
+            assert!(model_id != 0, "model_id cannot be zero");
+            assert_conversation_statement(
+                statement_felts.span(), expected_program_hash, statement_hash, model_id,
+            );
+
+            let registered = self.programs.read(expected_program_hash);
+            assert!(registered.program_hash == expected_program_hash, "program not registered");
+
+            let output = get_verification_output(proof: @proof);
+            assert!(output.program_hash == expected_program_hash, "program_hash mismatch");
+            assert!(output.output_hash == statement_hash, "output_hash mismatch");
+
+            let security = proof.stark_proof.commitment_scheme_proof.config.security_bits();
+            assert!(security >= MIN_SECURITY_BITS, "Security {} < 160", security);
+            assert!(security >= registered.min_security_bits, "Security below program minimum");
+
+            // FULL CRYPTOGRAPHIC STARK VERIFICATION of the Cairo verifier run.
+            verify_cairo(proof);
+
+            let proof_hash = poseidon_hash_span(
+                array![output.program_hash, output.output_hash, statement_hash, model_id].span(),
+            );
+            assert!(!self.verified_proofs.read(proof_hash), "Already verified");
+            assert!(!self.verified_statements.read(statement_hash), "Statement already verified");
+
+            self._record_verification(output.program_hash, proof_hash, 'conversation');
+            self
+                ._record_statement_verification(
+                    statement_hash, model_id, output.program_hash, output.output_hash, proof_hash,
+                );
+            output
+        }
+
+        // ─── Streaming: open session
+        // ──────────────────────────────────────
+        fn stream_open(ref self: ContractState, expected_total_felts: u32) -> u64 {
             let session_id = self.next_session_id.read();
             self.next_session_id.write(session_id + 1);
 
@@ -242,12 +355,10 @@ mod GeneralStwoVerifierContract {
             session_id
         }
 
-        // ─── Streaming: upload chunk ──────────────────────────────────────
+        // ─── Streaming: upload chunk
+        // ──────────────────────────────────────
         fn stream_chunk(
-            ref self: ContractState,
-            session_id: u64,
-            chunk_idx: u32,
-            chunk: Array<felt252>,
+            ref self: ContractState, session_id: u64, chunk_idx: u32, chunk: Array<felt252>,
         ) {
             // Validate session
             let caller = get_caller_address();
@@ -270,14 +381,14 @@ mod GeneralStwoVerifierContract {
                 }
                 self.session_data.write((session_id, offset + i), *chunk_span.at(i.into()));
                 i += 1;
-            };
+            }
 
             // Update running hash for integrity
             let prev_hash = self.session_data_hash.read(session_id);
             let mut hash_input = array![prev_hash];
             for felt in chunk_span {
                 hash_input.append(*felt);
-            };
+            }
             self.session_data_hash.write(session_id, poseidon_hash_span(hash_input.span()));
 
             // Update counters
@@ -294,19 +405,14 @@ mod GeneralStwoVerifierContract {
             self
                 .emit(
                     StreamChunkReceived {
-                        session_id,
-                        chunk_idx,
-                        chunk_size: chunk_len,
-                        total_received: new_received,
+                        session_id, chunk_idx, chunk_size: chunk_len, total_received: new_received,
                     },
                 );
         }
 
-        // ─── Streaming: finalize and verify ───────────────────────────────
-        fn stream_verify(
-            ref self: ContractState,
-            session_id: u64,
-        ) -> VerificationOutput {
+        // ─── Streaming: finalize and verify
+        // ───────────────────────────────
+        fn stream_verify(ref self: ContractState, session_id: u64) -> VerificationOutput {
             // Validate session is sealed
             let caller = get_caller_address();
             assert!(self.session_owner.read(session_id) == caller, "Not session owner");
@@ -322,12 +428,11 @@ mod GeneralStwoVerifierContract {
                 }
                 proof_data.append(self.session_data.read((session_id, i)));
                 i += 1;
-            };
+            }
 
             // Deserialize CairoProof from reassembled data
             let mut proof_span = proof_data.span();
-            let proof: CairoProof = Serde::deserialize(ref proof_span)
-                .expect('PROOF_DESER');
+            let proof: CairoProof = Serde::deserialize(ref proof_span).expect('PROOF_DESER');
 
             // Extract output BEFORE verification
             let output = get_verification_output(proof: @proof);
@@ -340,7 +445,9 @@ mod GeneralStwoVerifierContract {
             verify_cairo(proof);
 
             // Record on-chain
-            let proof_hash = poseidon_hash_span(array![output.program_hash].span());
+            let proof_hash = poseidon_hash_span(
+                array![output.program_hash, output.output_hash].span(),
+            );
             assert!(!self.verified_proofs.read(proof_hash), "Already verified");
 
             self._record_verification(output.program_hash, proof_hash, 'stream');
@@ -351,11 +458,20 @@ mod GeneralStwoVerifierContract {
             self.verified_proofs.read(proof_hash)
         }
 
+        fn is_statement_verified(self: @ContractState, statement_hash: felt252) -> bool {
+            self.verified_statements.read(statement_hash)
+        }
+
+        fn get_statement_proof_hash(self: @ContractState, statement_hash: felt252) -> felt252 {
+            self.statement_proof_hash.read(statement_hash)
+        }
+
         fn get_verification_count(self: @ContractState, program_hash: felt252) -> u64 {
             self.verification_count.read(program_hash)
         }
 
-        // ─── Upgradability (timelocked) ───────────────────────────────────
+        // ─── Upgradability (timelocked)
+        // ───────────────────────────────────
         fn propose_upgrade(ref self: ContractState, new_class_hash: starknet::ClassHash) {
             assert!(get_caller_address() == self.owner.read(), "Only owner");
             assert!(new_class_hash.into() != 0_felt252, "Zero class hash");
@@ -400,10 +516,7 @@ mod GeneralStwoVerifierContract {
     #[generate_trait]
     impl InternalImpl of InternalTrait {
         fn _record_verification(
-            ref self: ContractState,
-            program_hash: felt252,
-            proof_hash: felt252,
-            mode: felt252,
+            ref self: ContractState, program_hash: felt252, proof_hash: felt252, mode: felt252,
         ) {
             self.verified_proofs.write(proof_hash, true);
             let count = self.verification_count.read(program_hash);
@@ -424,5 +537,56 @@ mod GeneralStwoVerifierContract {
                     },
                 );
         }
+
+        fn _record_statement_verification(
+            ref self: ContractState,
+            statement_hash: felt252,
+            model_id: felt252,
+            program_hash: felt252,
+            output_hash: felt252,
+            proof_hash: felt252,
+        ) {
+            self.verified_statements.write(statement_hash, true);
+            self.statement_proof_hash.write(statement_hash, proof_hash);
+
+            self
+                .emit(
+                    ConversationStatementVerified {
+                        statement_hash,
+                        model_id,
+                        program_hash,
+                        output_hash,
+                        proof_hash,
+                        verified_at: get_block_timestamp(),
+                        submitter: get_caller_address(),
+                    },
+                );
+        }
+    }
+
+    fn assert_conversation_statement(
+        statement_felts: Span<felt252>,
+        expected_program_hash: felt252,
+        statement_hash: felt252,
+        model_id: felt252,
+    ) {
+        assert!(statement_felts.len() == CONVERSATION_STATEMENT_FELTS, "statement felts len");
+        assert!(*statement_felts.at(0) == DOMAIN_BATCH, "statement domain mismatch");
+        assert!(
+            *statement_felts.at(1) == CONVERSATION_STATEMENT_VERSION, "statement version mismatch",
+        );
+        assert!(*statement_felts.at(2) == model_id, "statement model mismatch");
+        assert!(*statement_felts.at(3) == expected_program_hash, "statement program mismatch");
+        assert!(*statement_felts.at(4) != 0, "statement circuit missing");
+        assert!(*statement_felts.at(5) != 0, "statement weight missing");
+        assert!(*statement_felts.at(6) != 0, "statement policy missing");
+        assert!(*statement_felts.at(14) != 0, "statement conversations missing");
+        assert!(*statement_felts.at(15) != 0, "statement steps missing");
+
+        let statement_security: u32 = (*statement_felts.at(18)).try_into().unwrap();
+        assert!(statement_security >= MIN_SECURITY_BITS, "statement security below 160");
+
+        let computed_hash = poseidon_hash_span(statement_felts);
+        assert!(computed_hash == statement_hash, "statement hash mismatch");
     }
 }

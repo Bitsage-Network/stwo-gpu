@@ -144,19 +144,28 @@ pub fn run_audit(
     // Without the cache, the prover falls back to CPU for Merkle root computation.
     let weight_cache = if let Some(ref model_dir) = config.model_dir {
         let cache = crate::weight_cache::shared_cache_for_model_mmap(
-            model_dir, &config.model_info.model_id, weights,
+            model_dir,
+            &config.model_info.model_id,
+            weights,
         );
-        info!("Audit pipeline: weight cache loaded from {}", model_dir.display());
+        info!(
+            "Audit pipeline: weight cache loaded from {}",
+            model_dir.display()
+        );
 
-        // Pre-warm GPU roots before proving to avoid CPU fallback.
-        #[cfg(feature = "cuda-runtime")]
-        {
-            let newly_computed = crate::weight_cache::prewarm_weight_roots_gpu_exclusive(
-                weights, &cache, Some(model_dir.as_path()),
+        // Pre-warm roots before proving so the GKR path can reuse the same
+        // cache on CUDA and CPU-only machines. The helper falls back to CPU
+        // when CUDA is unavailable and persists partial progress.
+        let newly_computed = crate::weight_cache::prewarm_weight_roots_gpu_exclusive(
+            weights,
+            &cache,
+            Some(model_dir.as_path()),
+        );
+        if newly_computed > 0 {
+            info!(
+                roots = newly_computed,
+                "Audit pipeline: pre-warmed weight roots"
             );
-            if newly_computed > 0 {
-                info!(roots = newly_computed, "Audit pipeline: pre-warmed weight roots on GPU");
-            }
         }
         Some(cache)
     } else {
@@ -177,7 +186,11 @@ pub fn run_audit(
             .iter()
             .filter_map(|r| r.streaming_steps.clone())
             .collect();
-        if steps.is_empty() { None } else { Some(steps) }
+        if steps.is_empty() {
+            None
+        } else {
+            Some(steps)
+        }
     };
 
     info!(
@@ -308,16 +321,25 @@ pub fn run_audit(
             let mut cd = Vec::with_capacity(9);
             cd.push(parse_felt(&audit_result.model_id, "model_id")?);
             // report_hash: use lo part (most significant 124 bits of M31 digest)
-            let (rh_lo, _rh_hi) = cfg.report_hash.unwrap_or((FieldElement::ZERO, FieldElement::ZERO));
+            let (rh_lo, _rh_hi) = cfg
+                .report_hash
+                .unwrap_or((FieldElement::ZERO, FieldElement::ZERO));
             cd.push(rh_lo);
             // merkle_root: use lo part
-            let (mr_lo, _mr_hi) = digest_hex_to_felts(&audit_result.log_merkle_root, "log_merkle_root")?;
+            let (mr_lo, _mr_hi) =
+                digest_hex_to_felts(&audit_result.log_merkle_root, "log_merkle_root")?;
             cd.push(mr_lo);
-            cd.push(parse_felt(&audit_result.weight_commitment, "weight_commitment")?);
+            cd.push(parse_felt(
+                &audit_result.weight_commitment,
+                "weight_commitment",
+            )?);
             cd.push(FieldElement::from(audit_result.time_start));
             cd.push(FieldElement::from(audit_result.time_end));
             cd.push(FieldElement::from(audit_result.inference_count as u64));
-            let tee_hash = audit_result.tee_attestation_hash.as_deref().unwrap_or("0x0");
+            let tee_hash = audit_result
+                .tee_attestation_hash
+                .as_deref()
+                .unwrap_or("0x0");
             cd.push(parse_felt(tee_hash, "tee_attestation_hash")?);
             cd.push(FieldElement::from(cfg.privacy_tier as u64));
             cd

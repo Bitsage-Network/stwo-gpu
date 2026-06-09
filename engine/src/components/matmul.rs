@@ -2254,8 +2254,7 @@ mod tests {
         let n = padded_rows * padded_cols; // 32
 
         let mut limb_buf = vec![0u64; n * 4];
-        let (evals_sf, _evals_u32) =
-            matrix_to_mle_col_major_all_padded(&matrix, &mut limb_buf);
+        let (evals_sf, _evals_u32) = matrix_to_mle_col_major_all_padded(&matrix, &mut limb_buf);
 
         // Root from SecureField path (reference)
         let root_sf = commit_mle_root_only(&evals_sf);

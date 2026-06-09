@@ -24,31 +24,31 @@ use ratatui::{
 // ANSI 256-color palette — universal terminal compatibility.
 // No RGB — works in every terminal, no pink/magenta misinterpretation.
 
-const BG:          Color = Color::Reset;                 // Terminal default
-const BG_ACTIVE:   Color = Color::Indexed(236);          // Gray 8%
+const BG: Color = Color::Reset; // Terminal default
+const BG_ACTIVE: Color = Color::Indexed(236); // Gray 8%
 
-const LIME:        Color = Color::Indexed(118);           // Bright lime #87ff00
-const LIME_DIM:    Color = Color::Indexed(70);            // Medium green #5faf00
+const LIME: Color = Color::Indexed(118); // Bright lime #87ff00
+const LIME_DIM: Color = Color::Indexed(70); // Medium green #5faf00
 
-const EMERALD:     Color = Color::Indexed(48);            // Bright cyan-green #00ff87
-const VIOLET:      Color = Color::Indexed(73);            // Steel blue #5fafaf — for hashes
+const EMERALD: Color = Color::Indexed(48); // Bright cyan-green #00ff87
+const VIOLET: Color = Color::Indexed(73); // Steel blue #5fafaf — for hashes
 
-const WHITE:       Color = Color::Indexed(255);           // Bright white
-const SILVER:      Color = Color::Indexed(249);           // Light gray
-const SLATE:       Color = Color::Indexed(245);           // Medium gray
-const GHOST:       Color = Color::Indexed(240);           // Dark gray — borders
+const WHITE: Color = Color::Indexed(255); // Bright white
+const SILVER: Color = Color::Indexed(249); // Light gray
+const SLATE: Color = Color::Indexed(245); // Medium gray
+const GHOST: Color = Color::Indexed(240); // Dark gray — borders
 
-const RED:         Color = Color::Indexed(178);           // Gold/amber #d7af00
+const RED: Color = Color::Indexed(178); // Gold/amber #d7af00
 
-const ORANGE:      Color = Color::Indexed(208);           // Orange — on-chain TX highlights
-const LILAC:       Color = Color::Indexed(141);           // Light purple — streaming step names
+const ORANGE: Color = Color::Indexed(208); // Orange — on-chain TX highlights
+const LILAC: Color = Color::Indexed(141); // Light purple — streaming step names
 
 // ── Box-drawing characters for custom borders ───────────────────────
 const H_LINE: &str = "─";
 const V_LINE: &str = "│";
 const DOT: &str = "·";
 const BLOCK_FULL: &str = "█";
-const BLOCK_LOW:  &str = "░";
+const BLOCK_LOW: &str = "░";
 const ARROW_R: &str = "▸";
 const CHECK: &str = "✓";
 const CROSS: &str = "✗";
@@ -187,21 +187,30 @@ impl Default for DashboardState {
         let contract = std::env::var("OBELYSK_CONTRACT")
             .or_else(|_| std::env::var("STARKNET_CONTRACT_ADDRESS"))
             .unwrap_or_default();
-        let network = std::env::var("OBELYSK_NETWORK")
-            .unwrap_or_else(|_| "Starknet Sepolia".into());
+        let network =
+            std::env::var("OBELYSK_NETWORK").unwrap_or_else(|_| "Starknet Sepolia".into());
 
         Self {
             model_name: String::new(),
             model_params: String::new(),
             model_layers: 0,
-            num_turns: 0, tokens_in: 0, tokens_out: 0,
+            num_turns: 0,
+            tokens_in: 0,
+            tokens_out: 0,
             step: PipelineStep::Idle,
-            capture_progress: 0.0, prove_progress: 0.0, onchain_progress: 0.0,
-            capture_time: None, prove_time: None, onchain_time: None,
+            capture_progress: 0.0,
+            prove_progress: 0.0,
+            onchain_progress: 0.0,
+            capture_time: None,
+            prove_time: None,
+            onchain_time: None,
             prove_time_secs: 0.0,
             elapsed_secs: 0,
-            policy_name: None, policy_commitment: None,
-            weight_commitment: None, io_root: None, report_hash: None,
+            policy_name: None,
+            policy_commitment: None,
+            weight_commitment: None,
+            io_root: None,
+            report_hash: None,
             contract,
             network,
             verification_count: None,
@@ -210,8 +219,11 @@ impl Default for DashboardState {
             total_felts: 0,
             gas_used: None,
             streaming_steps: default_streaming_steps(),
-            tamper_io: None, tamper_weight: None, tamper_output: None,
-            turns: Vec::new(), logs: Vec::new(),
+            tamper_io: None,
+            tamper_weight: None,
+            tamper_output: None,
+            turns: Vec::new(),
+            logs: Vec::new(),
             frame_count: 0,
             // Dynamic coverage — populated from circuit analysis
             coverage_matmul: 0,
@@ -247,11 +259,11 @@ pub fn render(frame: &mut Frame, state: &DashboardState) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(if narrow { 4 } else { 6 }),  // Header
-            Constraint::Length(1),  // Divider
-            Constraint::Min(10),   // Body
-            Constraint::Length(1),  // Divider
-            Constraint::Length(2),  // Footer
+            Constraint::Length(if narrow { 4 } else { 6 }), // Header
+            Constraint::Length(1),                          // Divider
+            Constraint::Min(10),                            // Body
+            Constraint::Length(1),                          // Divider
+            Constraint::Length(2),                          // Footer
         ])
         .split(area);
 
@@ -313,16 +325,31 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
     // Logo — left side
     let logo = if narrow {
         vec![
-            Line::from(Span::styled(" ObelyZK", Style::default().fg(LIME).add_modifier(Modifier::BOLD))),
+            Line::from(Span::styled(
+                " ObelyZK",
+                Style::default().fg(LIME).add_modifier(Modifier::BOLD),
+            )),
             Line::from(Span::styled(" VERIFIABLE ML", Style::default().fg(SLATE))),
         ]
     } else {
         vec![
             Line::from(Span::styled("", Style::default())),
-            Line::from(Span::styled("  ╔═╗╔╗  ╔═╗╦  ╦ ╦╔═╗╦╔═", Style::default().fg(LIME))),
-            Line::from(Span::styled("  ║ ║╠╩╗ ╠═ ║  ╚╦╝╔═╝╠╩╗", Style::default().fg(LIME))),
-            Line::from(Span::styled("  ╚═╝╚═╝ ╚═╝╩═╝ ╩ ╚═╝╩ ╩", Style::default().fg(LIME_DIM))),
-            Line::from(Span::styled("  VERIFIABLE ML INFERENCE", Style::default().fg(SLATE))),
+            Line::from(Span::styled(
+                "  ╔═╗╔╗  ╔═╗╦  ╦ ╦╔═╗╦╔═",
+                Style::default().fg(LIME),
+            )),
+            Line::from(Span::styled(
+                "  ║ ║╠╩╗ ╠═ ║  ╚╦╝╔═╝╠╩╗",
+                Style::default().fg(LIME),
+            )),
+            Line::from(Span::styled(
+                "  ╚═╝╚═╝ ╚═╝╩═╝ ╩ ╚═╝╩ ╩",
+                Style::default().fg(LIME_DIM),
+            )),
+            Line::from(Span::styled(
+                "  VERIFIABLE ML INFERENCE",
+                Style::default().fg(SLATE),
+            )),
         ]
     };
 
@@ -361,13 +388,19 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
     let arch_display = if state.model_params.is_empty() && state.model_layers == 0 {
         "awaiting model info".to_string()
     } else {
-        format!("{} params  {} layers", state.model_params, state.model_layers)
+        format!(
+            "{} params  {} layers",
+            state.model_params, state.model_layers
+        )
     };
 
     // Per-layer progress indicator during proving
     let layer_str = if state.layers_total > 0 && state.step == PipelineStep::GkrProve {
         let layer_name = state.current_layer.as_deref().unwrap_or("...");
-        format!("  [{}/{} {}]", state.layers_done, state.layers_total, layer_name)
+        format!(
+            "  [{}/{} {}]",
+            state.layers_done, state.layers_total, layer_name
+        )
     } else {
         String::new()
     };
@@ -375,8 +408,14 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
     let info = if narrow {
         vec![
             Line::from(vec![
-                Span::styled(&model_display, Style::default().fg(WHITE).add_modifier(Modifier::BOLD)),
-                Span::styled(format!("  {DIAMOND} {status_text}"), Style::default().fg(status_color)),
+                Span::styled(
+                    &model_display,
+                    Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {DIAMOND} {status_text}"),
+                    Style::default().fg(status_color),
+                ),
             ]),
             Line::from(vec![
                 Span::styled(elapsed_str, Style::default().fg(ORANGE)),
@@ -388,7 +427,10 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
             Line::from(Span::styled("", Style::default())),
             Line::from(vec![
                 Span::styled("  MODEL  ", Style::default().fg(SLATE)),
-                Span::styled(&model_display, Style::default().fg(WHITE).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    &model_display,
+                    Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
+                ),
             ]),
             Line::from(vec![
                 Span::styled("  ARCH   ", Style::default().fg(SLATE)),
@@ -398,19 +440,20 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
                 Span::styled("  STATUS ", Style::default().fg(SLATE)),
                 Span::styled(
                     format!("{DIAMOND} {status_text}"),
-                    Style::default().fg(status_color).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(status_color)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     elapsed_str,
                     Style::default().fg(ORANGE).add_modifier(Modifier::BOLD),
                 ),
+                Span::styled(layer_str, Style::default().fg(LILAC)),
                 Span::styled(
-                    layer_str,
-                    Style::default().fg(LILAC),
-                ),
-                Span::styled(
-                    format!("  {} turns  {}→{} tokens",
-                        state.num_turns, state.tokens_in, state.tokens_out),
+                    format!(
+                        "  {} turns  {}→{} tokens",
+                        state.num_turns, state.tokens_in, state.tokens_out
+                    ),
                     Style::default().fg(SLATE),
                 ),
             ]),
@@ -457,11 +500,11 @@ fn render_body(frame: &mut Frame, area: Rect, state: &DashboardState) {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(40),  // Pipeline
-                Constraint::Length(1),        // Gutter
-                Constraint::Percentage(30),  // Crypto
-                Constraint::Length(1),        // Gutter
-                Constraint::Percentage(30),  // Inference Log
+                Constraint::Percentage(40), // Pipeline
+                Constraint::Length(1),      // Gutter
+                Constraint::Percentage(30), // Crypto
+                Constraint::Length(1),      // Gutter
+                Constraint::Percentage(30), // Inference Log
             ])
             .split(area);
 
@@ -474,9 +517,9 @@ fn render_body(frame: &mut Frame, area: Rect, state: &DashboardState) {
 }
 
 fn render_gutter(frame: &mut Frame, area: Rect) {
-    let lines: Vec<Line> = (0..area.height).map(|_| {
-        Line::from(Span::styled(V_LINE, Style::default().fg(GHOST)))
-    }).collect();
+    let lines: Vec<Line> = (0..area.height)
+        .map(|_| Line::from(Span::styled(V_LINE, Style::default().fg(GHOST))))
+        .collect();
     frame.render_widget(Paragraph::new(lines), area);
 }
 
@@ -486,46 +529,73 @@ pub fn render_pipeline(frame: &mut Frame, area: Rect, state: &DashboardState) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),  // Section header
-            Constraint::Length(1),  // Spacer
-            Constraint::Length(3),  // Step 1: Capture
-            Constraint::Length(3),  // Step 2: GKR Prove
-            Constraint::Length(3),  // Step 3: On-Chain
-            Constraint::Length(1),  // Spacer
+            Constraint::Length(1), // Section header
+            Constraint::Length(1), // Spacer
+            Constraint::Length(3), // Step 1: Capture
+            Constraint::Length(3), // Step 2: GKR Prove
+            Constraint::Length(3), // Step 3: On-Chain
+            Constraint::Length(1), // Spacer
             Constraint::Min(2),    // Coverage
         ])
         .split(area);
 
     // Section header
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("  PROOF PIPELINE", Style::default().fg(LIME).add_modifier(Modifier::BOLD)),
-        ])),
+        Paragraph::new(Line::from(vec![Span::styled(
+            "  PROOF PIPELINE",
+            Style::default().fg(LIME).add_modifier(Modifier::BOLD),
+        )])),
         layout[0],
     );
 
-    let pulse_lime = if state.frame_count % 4 < 2 { LIME } else { LIME_DIM };
+    let pulse_lime = if state.frame_count % 4 < 2 {
+        LIME
+    } else {
+        LIME_DIM
+    };
 
-    render_step(frame, layout[2], 1, "CAPTURE",
+    render_step(
+        frame,
+        layout[2],
+        1,
+        "CAPTURE",
         "M31 forward pass",
-        state.capture_progress, state.capture_time,
+        state.capture_progress,
+        state.capture_time,
         state.step.as_u8() >= PipelineStep::Capture.as_u8(),
-        state.step == PipelineStep::Capture, pulse_lime);
+        state.step == PipelineStep::Capture,
+        pulse_lime,
+    );
 
-    render_step(frame, layout[3], 2, "GKR PROVE",
+    render_step(
+        frame,
+        layout[3],
+        2,
+        "GKR PROVE",
         "Sumcheck + STARK + Binding",
-        state.prove_progress, state.prove_time,
+        state.prove_progress,
+        state.prove_time,
         state.step.as_u8() >= PipelineStep::GkrProve.as_u8(),
-        state.step == PipelineStep::GkrProve, pulse_lime);
+        state.step == PipelineStep::GkrProve,
+        pulse_lime,
+    );
 
-    render_step(frame, layout[4], 3, "ON-CHAIN",
+    render_step(
+        frame,
+        layout[4],
+        3,
+        "ON-CHAIN",
         "6-step Starknet verification",
-        state.onchain_progress, state.onchain_time,
+        state.onchain_progress,
+        state.onchain_time,
         state.step.as_u8() >= PipelineStep::OnChain.as_u8(),
-        state.step == PipelineStep::OnChain, pulse_lime);
+        state.step == PipelineStep::OnChain,
+        pulse_lime,
+    );
 
     // Coverage stats — dynamic from circuit analysis
-    let has_coverage = state.coverage_matmul > 0 || state.coverage_activation > 0 || state.coverage_norm > 0;
+    let has_coverage =
+        state.coverage_matmul > 0 || state.coverage_activation > 0 || state.coverage_norm > 0;
     let coverage = if has_coverage {
         vec![
             Line::from(vec![
@@ -534,35 +604,52 @@ pub fn render_pipeline(frame: &mut Frame, area: Rect, state: &DashboardState) {
                     format!("{}", state.coverage_matmul),
                     Style::default().fg(LIME).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!(" {} ", state.coverage_label.0), Style::default().fg(SLATE)),
+                Span::styled(
+                    format!(" {} ", state.coverage_label.0),
+                    Style::default().fg(SLATE),
+                ),
                 Span::styled(
                     format!("{}", state.coverage_activation),
                     Style::default().fg(LIME).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!(" {} ", state.coverage_label.1), Style::default().fg(SLATE)),
+                Span::styled(
+                    format!(" {} ", state.coverage_label.1),
+                    Style::default().fg(SLATE),
+                ),
                 Span::styled(
                     format!("{}", state.coverage_norm),
                     Style::default().fg(LIME).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!(" {}", state.coverage_label.2), Style::default().fg(SLATE)),
+                Span::styled(
+                    format!(" {}", state.coverage_label.2),
+                    Style::default().fg(SLATE),
+                ),
             ]),
-            Line::from(vec![
-                Span::styled("  per turn · poseidon merkle · io binding", Style::default().fg(GHOST)),
-            ]),
+            Line::from(vec![Span::styled(
+                "  per turn · poseidon merkle · io binding",
+                Style::default().fg(GHOST),
+            )]),
         ]
     } else {
-        vec![
-            Line::from(Span::styled("  awaiting circuit analysis…", Style::default().fg(GHOST))),
-        ]
+        vec![Line::from(Span::styled(
+            "  awaiting circuit analysis…",
+            Style::default().fg(GHOST),
+        ))]
     };
     frame.render_widget(Paragraph::new(coverage), layout[6]);
 }
 
 fn render_step(
-    frame: &mut Frame, area: Rect,
-    num: u8, name: &str, desc: &str,
-    progress: f64, time: Option<f64>, active: bool,
-    is_current: bool, pulse_color: Color,
+    frame: &mut Frame,
+    area: Rect,
+    num: u8,
+    name: &str,
+    desc: &str,
+    progress: f64,
+    time: Option<f64>,
+    active: bool,
+    is_current: bool,
+    pulse_color: Color,
 ) {
     let done = progress >= 1.0;
     let running = active && !done && progress > 0.0;
@@ -577,15 +664,27 @@ fn render_step(
         (GHOST, DOT)
     };
 
-    let name_color = if done { EMERALD } else if active { WHITE } else { SLATE };
+    let name_color = if done {
+        EMERALD
+    } else if active {
+        WHITE
+    } else {
+        SLATE
+    };
     let time_str = time.map(|t| format!(" {:.1}s", t)).unwrap_or_default();
 
     // Line 1: icon + number + name + desc + time
     let line1 = Line::from(vec![
         Span::styled(format!("  {icon} "), Style::default().fg(icon_color)),
-        Span::styled(format!("{num}"), Style::default().fg(if active { LIME } else { GHOST })),
+        Span::styled(
+            format!("{num}"),
+            Style::default().fg(if active { LIME } else { GHOST }),
+        ),
         Span::styled(" ", Style::default()),
-        Span::styled(name, Style::default().fg(name_color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            name,
+            Style::default().fg(name_color).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(format!("  {desc}"), Style::default().fg(GHOST)),
     ]);
 
@@ -594,7 +693,15 @@ fn render_step(
     let filled = ((progress * bar_width as f64) as usize).min(bar_width);
     let empty = bar_width.saturating_sub(filled);
 
-    let bar_color = if done { EMERALD } else if is_current { pulse_color } else if active { LIME } else { GHOST };
+    let bar_color = if done {
+        EMERALD
+    } else if is_current {
+        pulse_color
+    } else if active {
+        LIME
+    } else {
+        GHOST
+    };
 
     // Gradient edge: ██▓▒░ at the frontier
     let (full_chars, edge_chars) = if done || !active || filled == 0 {
@@ -636,28 +743,35 @@ pub fn render_crypto(frame: &mut Frame, area: Rect, state: &DashboardState) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),   // Policy header
-            Constraint::Length(1),   // Policy value
-            Constraint::Length(1),   // Commitments header
-            Constraint::Length(1),   // Spacer
-            Constraint::Length(3),   // Weight hash
-            Constraint::Length(3),   // IO hash
-            Constraint::Length(3),   // Report hash
-            Constraint::Length(1),   // Spacer
-            Constraint::Length(1),   // On-chain verification header
-            Constraint::Length(1),   // Spacer
-            Constraint::Min(4),     // Streaming steps + totals
+            Constraint::Length(1), // Policy header
+            Constraint::Length(1), // Policy value
+            Constraint::Length(1), // Commitments header
+            Constraint::Length(1), // Spacer
+            Constraint::Length(3), // Weight hash
+            Constraint::Length(3), // IO hash
+            Constraint::Length(3), // Report hash
+            Constraint::Length(1), // Spacer
+            Constraint::Length(1), // On-chain verification header
+            Constraint::Length(1), // Spacer
+            Constraint::Min(4),    // Streaming steps + totals
         ])
         .split(area);
 
     // Policy section
     frame.render_widget(
-        Paragraph::new(Span::styled(" POLICY", Style::default().fg(LIME).add_modifier(Modifier::BOLD))),
+        Paragraph::new(Span::styled(
+            " POLICY",
+            Style::default().fg(LIME).add_modifier(Modifier::BOLD),
+        )),
         layout[0],
     );
     let policy_text = match (&state.policy_name, &state.policy_commitment) {
         (Some(name), Some(commit)) => {
-            let short = if commit.len() > 16 { &commit[..16] } else { commit.as_str() };
+            let short = if commit.len() > 16 {
+                &commit[..16]
+            } else {
+                commit.as_str()
+            };
             format!("  {} ({}...)", name, short)
         }
         (Some(name), None) => format!("  {}", name),
@@ -670,7 +784,10 @@ pub fn render_crypto(frame: &mut Frame, area: Rect, state: &DashboardState) {
 
     // Commitments header
     frame.render_widget(
-        Paragraph::new(Span::styled(" COMMITMENTS", Style::default().fg(VIOLET).add_modifier(Modifier::BOLD))),
+        Paragraph::new(Span::styled(
+            " COMMITMENTS",
+            Style::default().fg(VIOLET).add_modifier(Modifier::BOLD),
+        )),
         layout[2],
     );
 
@@ -680,7 +797,10 @@ pub fn render_crypto(frame: &mut Frame, area: Rect, state: &DashboardState) {
 
     // On-chain verification header
     frame.render_widget(
-        Paragraph::new(Span::styled(" ON-CHAIN VERIFICATION", Style::default().fg(EMERALD).add_modifier(Modifier::BOLD))),
+        Paragraph::new(Span::styled(
+            " ON-CHAIN VERIFICATION",
+            Style::default().fg(EMERALD).add_modifier(Modifier::BOLD),
+        )),
         layout[8],
     );
 
@@ -750,7 +870,10 @@ pub fn render_crypto(frame: &mut Frame, area: Rect, state: &DashboardState) {
 
     // Tamper detection section
     lines.push(Line::from(Span::styled("", Style::default())));
-    lines.push(Line::from(Span::styled(" INTEGRITY", Style::default().fg(RED).add_modifier(Modifier::BOLD))));
+    lines.push(Line::from(Span::styled(
+        " INTEGRITY",
+        Style::default().fg(RED).add_modifier(Modifier::BOLD),
+    )));
 
     lines.push(tamper_line("io commitment", state.tamper_io));
     lines.push(tamper_line("weight commitment", state.tamper_weight));
@@ -759,7 +882,10 @@ pub fn render_crypto(frame: &mut Frame, area: Rect, state: &DashboardState) {
     if adv_count > 0 {
         lines.push(Line::from(vec![
             Span::styled(format!(" {SHIELD} "), Style::default().fg(EMERALD)),
-            Span::styled(format!("{adv_count} adversarial tests"), Style::default().fg(EMERALD)),
+            Span::styled(
+                format!("{adv_count} adversarial tests"),
+                Style::default().fg(EMERALD),
+            ),
         ]));
     }
 
@@ -809,11 +935,11 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &DashboardState) {
         .direction(Direction::Vertical)
         .constraints(if has_logs {
             vec![
-                Constraint::Length(1),    // Header
-                Constraint::Length(1),    // Spacer
-                Constraint::Min(4),       // Turns
-                Constraint::Length(1),    // Log header
-                Constraint::Length(6),    // Log tail
+                Constraint::Length(1), // Header
+                Constraint::Length(1), // Spacer
+                Constraint::Min(4),    // Turns
+                Constraint::Length(1), // Log header
+                Constraint::Length(6), // Log tail
             ]
         } else {
             vec![
@@ -827,7 +953,10 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &DashboardState) {
         .split(area);
 
     frame.render_widget(
-        Paragraph::new(Span::styled(" INFERENCE LOG", Style::default().fg(LIME).add_modifier(Modifier::BOLD))),
+        Paragraph::new(Span::styled(
+            " INFERENCE LOG",
+            Style::default().fg(LIME).add_modifier(Modifier::BOLD),
+        )),
         layout[0],
     );
 
@@ -839,7 +968,10 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &DashboardState) {
         let idx = format!("#{:<2}", i);
         lines.push(Line::from(vec![
             Span::styled(format!(" {idx}"), Style::default().fg(GHOST)),
-            Span::styled(" YOU ", Style::default().fg(LIME).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " YOU ",
+                Style::default().fg(LIME).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(truncate_str(user, max_text), Style::default().fg(WHITE)),
         ]));
         lines.push(Line::from(vec![
@@ -851,20 +983,33 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &DashboardState) {
     }
 
     if lines.is_empty() {
-        lines.push(Line::from(Span::styled(" awaiting input…", Style::default().fg(GHOST))));
+        lines.push(Line::from(Span::styled(
+            " awaiting input…",
+            Style::default().fg(GHOST),
+        )));
     }
 
     // Auto-scroll turns to show most recent
     let visible = layout[2].height as usize;
-    let offset = if lines.len() > visible { lines.len() - visible } else { 0 };
+    let offset = if lines.len() > visible {
+        lines.len() - visible
+    } else {
+        0
+    };
     let visible_lines: Vec<Line> = lines.into_iter().skip(offset).collect();
 
-    frame.render_widget(Paragraph::new(visible_lines).wrap(Wrap { trim: false }), layout[2]);
+    frame.render_widget(
+        Paragraph::new(visible_lines).wrap(Wrap { trim: false }),
+        layout[2],
+    );
 
     // Activity log tail
     if has_logs {
         frame.render_widget(
-            Paragraph::new(Span::styled(" ACTIVITY", Style::default().fg(GHOST).add_modifier(Modifier::BOLD))),
+            Paragraph::new(Span::styled(
+                " ACTIVITY",
+                Style::default().fg(GHOST).add_modifier(Modifier::BOLD),
+            )),
             layout[3],
         );
 
@@ -874,12 +1019,16 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &DashboardState) {
         } else {
             0
         };
-        let log_lines: Vec<Line> = state.logs.iter()
+        let log_lines: Vec<Line> = state
+            .logs
+            .iter()
             .skip(log_offset)
-            .map(|l| Line::from(Span::styled(
-                format!(" {}", truncate_str(l, col_width)),
-                Style::default().fg(GHOST),
-            )))
+            .map(|l| {
+                Line::from(Span::styled(
+                    format!(" {}", truncate_str(l, col_width)),
+                    Style::default().fg(GHOST),
+                ))
+            })
             .collect();
         frame.render_widget(Paragraph::new(log_lines), layout[4]);
     }
@@ -889,12 +1038,12 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &DashboardState) {
 
 fn render_footer(frame: &mut Frame, area: Rect, state: &DashboardState) {
     let (status_text, status_color) = match state.step {
-        PipelineStep::Idle =>     ("IDLE",      GHOST),
-        PipelineStep::Capture =>  ("CAPTURING", LIME),
-        PipelineStep::GkrProve => ("PROVING",   LIME),
-        PipelineStep::OnChain =>  ("ON-CHAIN",  ORANGE),
-        PipelineStep::Complete => ("VERIFIED",  EMERALD),
-        PipelineStep::Error =>    ("ERROR",     RED),
+        PipelineStep::Idle => ("IDLE", GHOST),
+        PipelineStep::Capture => ("CAPTURING", LIME),
+        PipelineStep::GkrProve => ("PROVING", LIME),
+        PipelineStep::OnChain => ("ON-CHAIN", ORANGE),
+        PipelineStep::Complete => ("VERIFIED", EMERALD),
+        PipelineStep::Error => ("ERROR", RED),
     };
 
     let elapsed_str = if state.elapsed_secs > 0 {
@@ -912,19 +1061,38 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &DashboardState) {
 
     // Proof path hint on completion
     let proof_hint = if state.step == PipelineStep::Complete {
-        state.proof_path.as_deref().map(|p| {
-            let short = if p.len() > 30 { format!("…{}", &p[p.len()-28..]) } else { p.to_string() };
-            format!("  {short}")
-        }).unwrap_or_default()
+        state
+            .proof_path
+            .as_deref()
+            .map(|p| {
+                let short = if p.len() > 30 {
+                    format!("…{}", &p[p.len() - 28..])
+                } else {
+                    p.to_string()
+                };
+                format!("  {short}")
+            })
+            .unwrap_or_default()
     } else {
         String::new()
     };
 
     let mut spans = vec![
         Span::styled(" ", Style::default()),
-        Span::styled(" ObelyZK ", Style::default().fg(BG).bg(LIME).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " ObelyZK ",
+            Style::default()
+                .fg(BG)
+                .bg(LIME)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("  ", Style::default()),
-        Span::styled(status_text, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            status_text,
+            Style::default()
+                .fg(status_color)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(&elapsed_str, Style::default().fg(ORANGE)),
         Span::styled("  ", Style::default()),
         Span::styled(&contract_display, Style::default().fg(VIOLET)),
@@ -960,12 +1128,18 @@ fn tamper_line(name: &str, result: Option<bool>) -> Line<'static> {
         Some(true) => Line::from(vec![
             Span::styled(format!(" {CHECK} "), Style::default().fg(EMERALD)),
             Span::styled(name.to_string(), Style::default().fg(SILVER)),
-            Span::styled(" REJECTED", Style::default().fg(EMERALD).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " REJECTED",
+                Style::default().fg(EMERALD).add_modifier(Modifier::BOLD),
+            ),
         ]),
         Some(false) => Line::from(vec![
             Span::styled(format!(" {CROSS} "), Style::default().fg(RED)),
             Span::styled(name.to_string(), Style::default().fg(SILVER)),
-            Span::styled(" LEAKED", Style::default().fg(RED).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " LEAKED",
+                Style::default().fg(RED).add_modifier(Modifier::BOLD),
+            ),
         ]),
         None => Line::from(vec![
             Span::styled(format!(" {DOT} "), Style::default().fg(GHOST)),
@@ -975,12 +1149,16 @@ fn tamper_line(name: &str, result: Option<bool>) -> Line<'static> {
 }
 
 fn truncate_hash(s: &str, max: usize) -> String {
-    if s.len() <= max { return s.to_string(); }
-    format!("{}…{}", &s[..max/2], &s[s.len()-6..])
+    if s.len() <= max {
+        return s.to_string();
+    }
+    format!("{}…{}", &s[..max / 2], &s[s.len() - 6..])
 }
 
 fn truncate_str(s: &str, max: usize) -> String {
-    if s.chars().count() <= max { return s.to_string(); }
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
     s.chars().take(max).collect::<String>() + "…"
 }
 
@@ -998,9 +1176,19 @@ fn format_elapsed(secs: u64) -> String {
 /// Update adversarial test count dynamically
 fn adversarial_count(state: &DashboardState) -> u32 {
     let mut count = 0;
-    if state.tamper_io.is_some() { count += 1; }
-    if state.tamper_weight.is_some() { count += 1; }
-    if state.tamper_output.is_some() { count += 1; }
+    if state.tamper_io.is_some() {
+        count += 1;
+    }
+    if state.tamper_weight.is_some() {
+        count += 1;
+    }
+    if state.tamper_output.is_some() {
+        count += 1;
+    }
     // Base adversarial tests from the test suite
-    if count > 0 { count + 53 } else { 0 }
+    if count > 0 {
+        count + 53
+    } else {
+        0
+    }
 }

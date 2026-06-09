@@ -145,7 +145,11 @@ impl QueueStats {
     pub fn snapshot(&self) -> QueueStatsSnapshot {
         let completed = self.completed.load(Ordering::Relaxed);
         let total_ms = self.total_prove_time_ms.load(Ordering::Relaxed);
-        let avg = if completed > 0 { total_ms / completed } else { 0 };
+        let avg = if completed > 0 {
+            total_ms / completed
+        } else {
+            0
+        };
 
         let per_gpu = self
             .per_gpu_active
@@ -369,8 +373,7 @@ impl GpuScheduler {
                 // Release active counters
                 job_stats.active.fetch_sub(1, Ordering::Relaxed);
                 job_stats.per_gpu_active[slot_idx].fetch_sub(1, Ordering::Relaxed);
-                job_stats.per_gpu_memory_used[slot_idx]
-                    .fetch_sub(estimated_mem, Ordering::Relaxed);
+                job_stats.per_gpu_memory_used[slot_idx].fetch_sub(estimated_mem, Ordering::Relaxed);
 
                 match result {
                     Ok(Ok(ref _res)) => {

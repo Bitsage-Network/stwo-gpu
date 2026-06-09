@@ -25,6 +25,8 @@
 pub mod checkpoint;
 pub mod chunked;
 pub mod dual;
+#[cfg(feature = "model-loading")]
+pub mod gguf_loader;
 pub mod graph;
 #[cfg(any(feature = "cli", feature = "model-loading"))]
 pub mod hf_loader;
@@ -32,9 +34,9 @@ pub mod inspect;
 pub mod onnx;
 pub mod prove;
 pub mod quantize_weights;
+#[cfg(any(feature = "cli", feature = "model-loading"))]
+pub mod qwen35;
 #[cfg(feature = "safetensors")]
 pub mod safetensors;
 #[cfg(feature = "safetensors")]
 pub mod streaming;
-#[cfg(feature = "model-loading")]
-pub mod gguf_loader;

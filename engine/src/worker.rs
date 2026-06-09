@@ -60,12 +60,10 @@ impl WorkerConfig {
             .or_else(|_| std::env::var("STARKNET_ACCOUNT_ADDRESS"))
             .unwrap_or_default();
 
-        let worker_address = std::env::var("WORKER_ADDRESS")
-            .unwrap_or_else(|_| {
-                let port = std::env::var("BIND_ADDR")
-                    .unwrap_or_else(|_| "0.0.0.0:8080".into());
-                format!("http://{port}")
-            });
+        let worker_address = std::env::var("WORKER_ADDRESS").unwrap_or_else(|_| {
+            let port = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
+            format!("http://{port}")
+        });
 
         // Auto-detect GPU
         let (gpu_model, vram_gb) = detect_gpu();
@@ -89,7 +87,10 @@ impl WorkerConfig {
 
 fn detect_gpu() -> (String, u32) {
     if let Ok(output) = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=name,memory.total", "--format=csv,noheader,nounits"])
+        .args([
+            "--query-gpu=name,memory.total",
+            "--format=csv,noheader,nounits",
+        ])
         .output()
     {
         if output.status.success() {
@@ -191,7 +192,15 @@ pub struct JobAssignment {
 /// Register this worker with the coordinator.
 async fn register(config: &WorkerConfig) -> Result<String, String> {
     let url = format!("{}/api/v1/workers/gpu/register", config.coordinator_url);
-    let worker_id = format!("{}-{}", config.worker_name, uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0000"));
+    let worker_id = format!(
+        "{}-{}",
+        config.worker_name,
+        uuid::Uuid::new_v4()
+            .to_string()
+            .split('-')
+            .next()
+            .unwrap_or("0000")
+    );
 
     let body = RegisterRequest {
         worker_id: worker_id.clone(),
@@ -223,7 +232,9 @@ async fn register(config: &WorkerConfig) -> Result<String, String> {
         return Err(format!("Registration rejected: {status} — {text}"));
     }
 
-    let reg: RegisterResponseOuter = resp.json().await
+    let reg: RegisterResponseOuter = resp
+        .json()
+        .await
         .map_err(|e| format!("Bad registration response: {e}"))?;
 
     match reg.data {
@@ -242,7 +253,11 @@ async fn send_heartbeat(
     let url = format!("{}/api/v1/workers/heartbeat", config.coordinator_url);
     let body = HeartbeatRequest {
         worker_id: worker_id.to_string(),
-        status: if active_jobs > 0 { "busy".into() } else { "online".into() },
+        status: if active_jobs > 0 {
+            "busy".into()
+        } else {
+            "online".into()
+        },
         model_loaded: model_loaded.map(|s| s.to_string()),
         active_workload: None,
         metrics: HeartbeatMetrics {
@@ -256,7 +271,7 @@ async fn send_heartbeat(
 
     let client = reqwest::Client::new();
     match client.post(&url).json(&body).send().await {
-        Ok(resp) if resp.status().is_success() => {},
+        Ok(resp) if resp.status().is_success() => {}
         Ok(resp) => warn!("Heartbeat rejected: {}", resp.status()),
         Err(e) => warn!("Heartbeat failed: {e}"),
     }
@@ -281,7 +296,10 @@ pub async fn submit_job_result(
     job_id: &str,
     result: Result<JobProofResult, String>,
 ) {
-    let url = format!("{}/api/v1/workers/job/{job_id}/result", config.coordinator_url);
+    let url = format!(
+        "{}/api/v1/workers/job/{job_id}/result",
+        config.coordinator_url
+    );
 
     let body = match result {
         Ok(proof) => JobResultSubmission {
@@ -312,7 +330,7 @@ pub async fn submit_job_result(
     match client.post(&url).json(&body).send().await {
         Ok(resp) if resp.status().is_success() => {
             info!("Job {job_id} result submitted to coordinator");
-        },
+        }
         Ok(resp) => warn!("Job result rejected: {}", resp.status()),
         Err(e) => error!("Failed to submit job result: {e}"),
     }
@@ -347,8 +365,14 @@ pub async fn start_worker(
     // Register
     info!(
         "Registering with coordinator: {} (GPU: {}, VRAM: {}GB, wallet: {})",
-        config.coordinator_url, config.gpu_model, config.vram_gb,
-        if config.wallet_address.is_empty() { "none" } else { &config.wallet_address }
+        config.coordinator_url,
+        config.gpu_model,
+        config.vram_gb,
+        if config.wallet_address.is_empty() {
+            "none"
+        } else {
+            &config.wallet_address
+        }
     );
 
     let worker_id = register(&config).await?;
@@ -365,9 +389,8 @@ pub async fn start_worker(
     let hb_worker_id = worker_id.clone();
     let mut hb_shutdown = shutdown.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(
-            std::time::Duration::from_secs(hb_config.heartbeat_secs)
-        );
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(hb_config.heartbeat_secs));
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -391,7 +414,10 @@ pub async fn start_worker(
         loop {
             let ws_url = format!(
                 "{}/ws/worker?worker_id={}",
-                ws_config.coordinator_url.replace("https://", "wss://").replace("http://", "ws://"),
+                ws_config
+                    .coordinator_url
+                    .replace("https://", "wss://")
+                    .replace("http://", "ws://"),
                 ws_worker_id,
             );
 

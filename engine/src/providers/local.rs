@@ -68,11 +68,21 @@ impl LocalProvider {
     /// - Directory with `config.json` → HuggingFace SafeTensors loader
     pub fn load(model_dir: &Path, name: Option<&str>) -> Result<Self, LocalProviderError> {
         // Auto-download if model directory doesn't have config.json
-        if !model_dir.join("config.json").exists() && !model_dir.extension().map(|e| e == "gguf").unwrap_or(false) {
-            let dir_name = model_dir.file_name()
+        if !model_dir.join("config.json").exists()
+            && !model_dir.extension().map(|e| e == "gguf").unwrap_or(false)
+        {
+            let dir_name = model_dir
+                .file_name()
                 .map(|n| n.to_string_lossy().to_lowercase())
                 .unwrap_or_default();
             let hf_repo = match dir_name.as_str() {
+                "qwen3.5-35b-a3b" | "qwen35b" | "qwen-35b" => Some("Qwen/Qwen3.5-35B-A3B"),
+                "qwen3.5-35b-a3b-fp8" | "qwen35b-fp8" | "qwen-35b-fp8" => {
+                    Some("Qwen/Qwen3.5-35B-A3B-FP8")
+                }
+                "qwen3.5-35b-a3b-gptq-int4" | "qwen35b-gptq-int4" | "qwen-35b-gptq-int4" => {
+                    Some("Qwen/Qwen3.5-35B-A3B-GPTQ-Int4")
+                }
                 "qwen2.5-14b" | "qwen-14b" => Some("Qwen/Qwen2.5-14B"),
                 "qwen2.5-7b" | "qwen-7b" => Some("Qwen/Qwen2.5-7B"),
                 "glm-4-9b" | "glm4" | "chatglm" => Some("THUDM/glm-4-9b"),
@@ -84,9 +94,18 @@ impl LocalProvider {
                 _ => None,
             };
             if let Some(repo) = hf_repo {
-                eprintln!("[local] Model not found at {}. Downloading {}...", model_dir.display(), repo);
+                eprintln!(
+                    "[local] Model not found at {}. Downloading {}...",
+                    model_dir.display(),
+                    repo
+                );
                 let status = std::process::Command::new("huggingface-cli")
-                    .args(["download", repo, "--local-dir", &model_dir.to_string_lossy()])
+                    .args([
+                        "download",
+                        repo,
+                        "--local-dir",
+                        &model_dir.to_string_lossy(),
+                    ])
                     .status();
                 match status {
                     Ok(s) if s.success() => eprintln!("[local] Download complete."),
@@ -104,7 +123,8 @@ impl LocalProvider {
         let model_name = name.unwrap_or(&dir_name).to_string();
         let is_gguf = model_dir.extension().map(|e| e == "gguf").unwrap_or(false);
 
-        eprintln!("[local] Loading model from {}{}...",
+        eprintln!(
+            "[local] Loading model from {}{}...",
             model_dir.display(),
             if is_gguf { " (GGUF)" } else { " (SafeTensors)" },
         );
@@ -126,15 +146,20 @@ impl LocalProvider {
             let parent = model_dir.parent().unwrap_or(Path::new("."));
             let tok_in_parent = parent.join("tokenizer.json");
             let tok_alongside = model_dir.with_extension("tokenizer.json");
-            if tok_in_parent.is_file() { tok_in_parent }
-            else if tok_alongside.is_file() { tok_alongside }
-            else { model_dir.with_file_name("tokenizer.json") }
+            if tok_in_parent.is_file() {
+                tok_in_parent
+            } else if tok_alongside.is_file() {
+                tok_alongside
+            } else {
+                model_dir.with_file_name("tokenizer.json")
+            }
         } else {
             model_dir.join("tokenizer.json")
         };
 
-        let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
-            .map_err(|e| LocalProviderError::LoadFailed(format!("tokenizer ({}): {e}", tok_path.display())))?;
+        let tokenizer = tokenizers::Tokenizer::from_file(&tok_path).map_err(|e| {
+            LocalProviderError::LoadFailed(format!("tokenizer ({}): {e}", tok_path.display()))
+        })?;
 
         let hidden_size = hf.input_shape.1;
         let num_layers = hf.graph.num_layers();
@@ -159,7 +184,10 @@ impl LocalProvider {
             .and_then(|s| s.parse().ok())
             .unwrap_or(1);
 
-        eprintln!("[local] Loaded: {} ({} layers, {} weights, d_model={})", model_name, num_layers, num_weights, hidden_size);
+        eprintln!(
+            "[local] Loaded: {} ({} layers, {} weights, d_model={})",
+            model_name, num_layers, num_weights, hidden_size
+        );
         if gpu_available {
             eprintln!("[local] GPU: {} (CUDA kernels active)", gpu_name);
         } else {
@@ -170,7 +198,11 @@ impl LocalProvider {
 
         Ok(Self {
             model_name,
-            model_dir: if is_gguf { model_dir.parent().unwrap_or(Path::new(".")).to_path_buf() } else { model_dir.to_path_buf() },
+            model_dir: if is_gguf {
+                model_dir.parent().unwrap_or(Path::new(".")).to_path_buf()
+            } else {
+                model_dir.to_path_buf()
+            },
             graph: Arc::new(hf.graph),
             weights: Arc::new(hf.weights),
             tokenizer: Arc::new(tokenizer),
@@ -192,7 +224,9 @@ impl LocalProvider {
         let t_start = Instant::now();
 
         // 1. Tokenize
-        let encoding = self.tokenizer.encode(prompt, false)
+        let encoding = self
+            .tokenizer
+            .encode(prompt, false)
             .map_err(|e| LocalProviderError::TokenizeFailed(format!("{e}")))?;
         let token_ids: Vec<u32> = encoding.get_ids().to_vec();
         if token_ids.is_empty() {
@@ -202,8 +236,11 @@ impl LocalProvider {
 
         // 2. Embed
         let (input_matrix, _vocab_size) = crate::compiler::hf_loader::load_embedding_row(
-            &self.model_dir, self.hidden_size, last_token_id,
-        ).map_err(|e| LocalProviderError::EmbedFailed(format!("{e}")))?;
+            &self.model_dir,
+            self.hidden_size,
+            last_token_id,
+        )
+        .map_err(|e| LocalProviderError::EmbedFailed(format!("{e}")))?;
 
         // 3. Execute + prove
         let trace = crate::vm::executor::execute_and_prove(
@@ -214,15 +251,15 @@ impl LocalProvider {
             Some(&PolicyConfig::standard()),
             token_ids.clone(),
             self.model_name.clone(),
-        ).map_err(|e| LocalProviderError::ProveFailed(format!("{e}")))?;
+        )
+        .map_err(|e| LocalProviderError::ProveFailed(format!("{e}")))?;
 
         // 4. Project to logits for predicted text
-        let predicted_text = crate::compiler::hf_loader::project_to_logits(
-            &self.model_dir, &trace.output,
-        )
-        .ok()
-        .and_then(|(tid, _)| self.tokenizer.decode(&[tid], true).ok())
-        .unwrap_or_default();
+        let predicted_text =
+            crate::compiler::hf_loader::project_to_logits(&self.model_dir, &trace.output)
+                .ok()
+                .and_then(|(tid, _)| self.tokenizer.decode(&[tid], true).ok())
+                .unwrap_or_default();
 
         let inference_time_ms = t_start.elapsed().as_millis() as u64;
 
@@ -258,7 +295,9 @@ impl LocalProvider {
         mut on_token: impl FnMut(&str, u32, usize),
     ) -> Result<(String, Vec<u32>), LocalProviderError> {
         // Tokenize the full prompt
-        let encoding = self.tokenizer.encode(prompt, false)
+        let encoding = self
+            .tokenizer
+            .encode(prompt, false)
             .map_err(|e| LocalProviderError::TokenizeFailed(format!("{e}")))?;
         let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
         if prompt_ids.is_empty() {
@@ -267,8 +306,12 @@ impl LocalProvider {
 
         // EOS tokens
         let eos_ids: Vec<u32> = vec![
-            0, 1, 2,
-            self.tokenizer.token_to_id("<|endoftext|>").unwrap_or(u32::MAX),
+            0,
+            1,
+            2,
+            self.tokenizer
+                .token_to_id("<|endoftext|>")
+                .unwrap_or(u32::MAX),
             self.tokenizer.token_to_id("</s>").unwrap_or(u32::MAX),
             self.tokenizer.token_to_id("<|im_end|>").unwrap_or(u32::MAX),
             self.tokenizer.token_to_id("<|end|>").unwrap_or(u32::MAX),
@@ -283,12 +326,18 @@ impl LocalProvider {
         // build_hf_full_graph which produces GraphOp::Attention nodes.
         // This is tracked as the next optimization step.
         let last_token_id = *prompt_ids.last().unwrap();
-        eprintln!("[generate] Phase 1: Prefill (last token {last_token_id} of {} prompt tokens)", prompt_ids.len());
+        eprintln!(
+            "[generate] Phase 1: Prefill (last token {last_token_id} of {} prompt tokens)",
+            prompt_ids.len()
+        );
         let t_prefill = std::time::Instant::now();
 
         let (input_matrix, _) = crate::compiler::hf_loader::load_embedding_row(
-            &self.model_dir, self.hidden_size, last_token_id,
-        ).map_err(|e| LocalProviderError::EmbedFailed(format!("{e}")))?;
+            &self.model_dir,
+            self.hidden_size,
+            last_token_id,
+        )
+        .map_err(|e| LocalProviderError::EmbedFailed(format!("{e}")))?;
 
         // Trust weight claims in recursive STARK verification — skip expensive
         // MLE re-evaluation (10+ min for 14B models). Weight binding is verified
@@ -296,13 +345,17 @@ impl LocalProvider {
         std::env::set_var("OBELYZK_TRUST_WEIGHT_CLAIMS", "1");
 
         let proof = crate::aggregation::prove_model_pure_gkr_auto_with_cache(
-            &self.graph, &input_matrix, &self.weights,
-            self.weight_cache.as_ref(), None,
-        ).map_err(|e| LocalProviderError::ProveFailed(format!("prefill prove: {e}")))?;
+            &self.graph,
+            &input_matrix,
+            &self.weights,
+            self.weight_cache.as_ref(),
+            None,
+        )
+        .map_err(|e| LocalProviderError::ProveFailed(format!("prefill prove: {e}")))?;
 
-        let (mut next_id, _) = crate::compiler::hf_loader::project_to_logits(
-            &self.model_dir, &proof.execution.output,
-        ).map_err(|e| LocalProviderError::ProveFailed(format!("logits: {e}")))?;
+        let (mut next_id, _) =
+            crate::compiler::hf_loader::project_to_logits(&self.model_dir, &proof.execution.output)
+                .map_err(|e| LocalProviderError::ProveFailed(format!("logits: {e}")))?;
 
         eprintln!(
             "[generate] Prefill done in {:.1}s",
@@ -322,8 +375,7 @@ impl LocalProvider {
             }
 
             // Decode token to text
-            let token_text = self.tokenizer.decode(&[next_id], true)
-                .unwrap_or_default();
+            let token_text = self.tokenizer.decode(&[next_id], true).unwrap_or_default();
 
             generated_ids.push(next_id);
             generated_text.push_str(&token_text);
@@ -333,17 +385,26 @@ impl LocalProvider {
 
             // Embed single token and prove (full GKR path)
             let (token_input, _) = crate::compiler::hf_loader::load_embedding_row(
-                &self.model_dir, self.hidden_size, next_id,
-            ).map_err(|e| LocalProviderError::EmbedFailed(format!("{e}")))?;
+                &self.model_dir,
+                self.hidden_size,
+                next_id,
+            )
+            .map_err(|e| LocalProviderError::EmbedFailed(format!("{e}")))?;
 
             let decode_proof = crate::aggregation::prove_model_pure_gkr_auto_with_cache(
-                &self.graph, &token_input, &self.weights,
-                self.weight_cache.as_ref(), None,
-            ).map_err(|e| LocalProviderError::ProveFailed(format!("decode step {step}: {e}")))?;
+                &self.graph,
+                &token_input,
+                &self.weights,
+                self.weight_cache.as_ref(),
+                None,
+            )
+            .map_err(|e| LocalProviderError::ProveFailed(format!("decode step {step}: {e}")))?;
 
             let (predicted, _) = crate::compiler::hf_loader::project_to_logits(
-                &self.model_dir, &decode_proof.execution.output,
-            ).map_err(|e| LocalProviderError::ProveFailed(format!("logits step {step}: {e}")))?;
+                &self.model_dir,
+                &decode_proof.execution.output,
+            )
+            .map_err(|e| LocalProviderError::ProveFailed(format!("logits step {step}: {e}")))?;
 
             eprintln!(
                 "[generate] Decode step {step}: token={next_id} ({token_text:?}) in {:.1}s",
@@ -352,7 +413,9 @@ impl LocalProvider {
 
             // Compress decode proof to recursive STARK
             Self::compress_to_recursive_stark(
-                &decode_proof, &self.graph, &self.weights,
+                &decode_proof,
+                &self.graph,
+                &self.weights,
                 &format!("decode-{step}"),
             );
 
@@ -376,7 +439,9 @@ impl LocalProvider {
 
         let (text, ids) = self.generate(prompt, max_tokens, on_token)?;
 
-        let meta = PROOF_META.with(|cell| cell.borrow_mut().take()).unwrap_or_default();
+        let meta = PROOF_META
+            .with(|cell| cell.borrow_mut().take())
+            .unwrap_or_default();
         Ok((text, ids, meta))
     }
 
@@ -415,7 +480,8 @@ impl LocalProvider {
         } else {
             stwo::core::fields::qm31::QM31::default()
         };
-        let io_commitment = crate::crypto::poseidon_channel::felt_to_securefield(proof.io_commitment);
+        let io_commitment =
+            crate::crypto::poseidon_channel::felt_to_securefield(proof.io_commitment);
         let gkr_time = 0.0;
 
         let t_recursive = std::time::Instant::now();
@@ -431,9 +497,8 @@ impl LocalProvider {
             gkr_time,
         ) {
             Ok(recursive_proof) => {
-                let calldata = crate::cairo_serde::serialize_recursive_proof_calldata(
-                    &recursive_proof,
-                );
+                let calldata =
+                    crate::cairo_serde::serialize_recursive_proof_calldata(&recursive_proof);
                 eprintln!(
                     "[recursive] {label}: STARK compressed in {:.1}s (log_size={}, {} poseidon perms, {} calldata felts)",
                     t_recursive.elapsed().as_secs_f64(),
@@ -443,9 +508,8 @@ impl LocalProvider {
                 );
 
                 // Auto-submit on-chain if STARKNET_PRIVATE_KEY is set
-                let calldata_hex: Vec<String> = calldata.iter()
-                    .map(|f| format!("0x{:064x}", f))
-                    .collect();
+                let calldata_hex: Vec<String> =
+                    calldata.iter().map(|f| format!("0x{:064x}", f)).collect();
 
                 // model_id = hash of weight commitments (stable per model)
                 let model_id = if !gkr_proof.weight_commitments.is_empty() {
@@ -511,11 +575,16 @@ impl LocalProvider {
                                     }
                                 }
                                 // Parse RESULT_JSON from script output
-                                if let Some(json_line) = stdout.lines().find(|l| l.starts_with("RESULT_JSON:")) {
+                                if let Some(json_line) =
+                                    stdout.lines().find(|l| l.starts_with("RESULT_JSON:"))
+                                {
                                     let json_str = &json_line["RESULT_JSON:".len()..];
-                                    if let Ok(result) = serde_json::from_str::<serde_json::Value>(json_str) {
+                                    if let Ok(result) =
+                                        serde_json::from_str::<serde_json::Value>(json_str)
+                                    {
                                         let tx = result["tx_hash"].as_str().map(String::from);
-                                        let explorer = result["explorer_url"].as_str().map(String::from);
+                                        let explorer =
+                                            result["explorer_url"].as_str().map(String::from);
                                         PROOF_META.with(|cell| {
                                             let mut meta = cell.borrow_mut();
                                             let m = meta.get_or_insert_with(ProofMeta::default);
@@ -523,14 +592,18 @@ impl LocalProvider {
                                             m.explorer_url = explorer;
                                             m.calldata_felts = Some(calldata.len());
                                             m.model_id = Some(format!("0x{:064x}", model_id));
-                                            m.io_commitment = Some(format!("0x{:064x}", proof.io_commitment));
-                                            m.recursive_time_secs = Some(t_recursive.elapsed().as_secs_f64());
+                                            m.io_commitment =
+                                                Some(format!("0x{:064x}", proof.io_commitment));
+                                            m.recursive_time_secs =
+                                                Some(t_recursive.elapsed().as_secs_f64());
                                         });
                                     }
                                 }
                             }
                             Err(e) => {
-                                eprintln!("[on-chain] {label}: node not found or script failed: {e}");
+                                eprintln!(
+                                    "[on-chain] {label}: node not found or script failed: {e}"
+                                );
                                 eprintln!("[on-chain] proof saved to {proof_path} — submit manually with:");
                                 eprintln!("  node scripts/submit_recursive.mjs {proof_path}");
                             }
@@ -571,19 +644,29 @@ impl LocalProvider {
             std::path::PathBuf::from("engine/scripts/submit_recursive.mjs"),
         ];
         // Also try relative to the binary
-        let exe_candidates: Vec<std::path::PathBuf> = std::env::current_exe().ok()
+        let exe_candidates: Vec<std::path::PathBuf> = std::env::current_exe()
+            .ok()
             .and_then(|e| e.parent().map(|p| p.to_path_buf()))
-            .map(|dir| vec![
-                dir.join("../../scripts/submit_recursive.mjs"),
-                dir.join("../../../scripts/submit_recursive.mjs"),
-                dir.join("../../../../engine/scripts/submit_recursive.mjs"),
-            ])
+            .map(|dir| {
+                vec![
+                    dir.join("../../scripts/submit_recursive.mjs"),
+                    dir.join("../../../scripts/submit_recursive.mjs"),
+                    dir.join("../../../../engine/scripts/submit_recursive.mjs"),
+                ]
+            })
             .unwrap_or_default();
 
-        candidates.iter().chain(exe_candidates.iter())
+        candidates
+            .iter()
+            .chain(exe_candidates.iter())
             .find(|p| p.exists())
             .cloned()
-            .or_else(|| std::env::var("OBELYSK_RECURSIVE_SCRIPT").ok().map(std::path::PathBuf::from).filter(|p| p.exists()))
+            .or_else(|| {
+                std::env::var("OBELYSK_RECURSIVE_SCRIPT")
+                    .ok()
+                    .map(std::path::PathBuf::from)
+                    .filter(|p| p.exists())
+            })
     }
 
     /// No-op when the `cli` feature (which includes recursive STARK) is not enabled.
@@ -594,7 +677,9 @@ impl LocalProvider {
         _weights: &GraphWeights,
         label: &str,
     ) {
-        eprintln!("[recursive] {label}: recursive STARK requires 'cli' feature — skipping compression");
+        eprintln!(
+            "[recursive] {label}: recursive STARK requires 'cli' feature — skipping compression"
+        );
     }
 
     /// Fast inference — forward pass ONLY, no proving.
@@ -606,7 +691,9 @@ impl LocalProvider {
         prompt: &str,
     ) -> Result<(String, Vec<u32>, M31Matrix), LocalProviderError> {
         // 1. Tokenize
-        let encoding = self.tokenizer.encode(prompt, false)
+        let encoding = self
+            .tokenizer
+            .encode(prompt, false)
             .map_err(|e| LocalProviderError::TokenizeFailed(format!("{e}")))?;
         let token_ids: Vec<u32> = encoding.get_ids().to_vec();
         if token_ids.is_empty() {
@@ -616,21 +703,26 @@ impl LocalProvider {
 
         // 2. Embed
         let (input_matrix, _) = crate::compiler::hf_loader::load_embedding_row(
-            &self.model_dir, self.hidden_size, last_token_id,
-        ).map_err(|e| LocalProviderError::EmbedFailed(format!("{e}")))?;
+            &self.model_dir,
+            self.hidden_size,
+            last_token_id,
+        )
+        .map_err(|e| LocalProviderError::EmbedFailed(format!("{e}")))?;
 
         // 3. Fast forward pass — just matmul chain, no proving
         let output = crate::aggregation::execute_forward_pass_fast(
-            &self.graph, &input_matrix, &self.weights,
-        ).map_err(|e| LocalProviderError::ProveFailed(format!("{e}")))?;
+            &self.graph,
+            &input_matrix,
+            &self.weights,
+        )
+        .map_err(|e| LocalProviderError::ProveFailed(format!("{e}")))?;
 
         // 4. Project to logits for predicted text
-        let predicted_text = crate::compiler::hf_loader::project_to_logits(
-            &self.model_dir, &output,
-        )
-        .ok()
-        .and_then(|(tid, _)| self.tokenizer.decode(&[tid], true).ok())
-        .unwrap_or_default();
+        let predicted_text =
+            crate::compiler::hf_loader::project_to_logits(&self.model_dir, &output)
+                .ok()
+                .and_then(|(tid, _)| self.tokenizer.decode(&[tid], true).ok())
+                .unwrap_or_default();
 
         Ok((predicted_text, token_ids, input_matrix))
     }
@@ -643,17 +735,29 @@ impl LocalProvider {
     pub fn prove_batch(
         &self,
         token_ids: &[u32],
-    ) -> Result<(M31Matrix, crate::aggregation::AggregatedModelProofOnChain, u64), LocalProviderError> {
+    ) -> Result<
+        (
+            M31Matrix,
+            crate::aggregation::AggregatedModelProofOnChain,
+            u64,
+        ),
+        LocalProviderError,
+    > {
         let t_start = std::time::Instant::now();
 
         // Embed all tokens into (N, hidden_size) matrix
         let input_matrix = crate::compiler::hf_loader::load_embedding_batch(
-            &self.model_dir, self.hidden_size, token_ids,
-        ).map_err(|e| LocalProviderError::EmbedFailed(format!("{e}")))?;
+            &self.model_dir,
+            self.hidden_size,
+            token_ids,
+        )
+        .map_err(|e| LocalProviderError::EmbedFailed(format!("{e}")))?;
 
         eprintln!(
             "[local] Batched prove: {} tokens, input shape ({}, {})",
-            token_ids.len(), input_matrix.rows, input_matrix.cols
+            token_ids.len(),
+            input_matrix.rows,
+            input_matrix.cols
         );
 
         // Reshape graph for batch size
@@ -661,15 +765,21 @@ impl LocalProvider {
 
         // Run full proving pipeline with weight cache (skips weight commitment recomputation)
         let proof = crate::aggregation::prove_model_pure_gkr_auto_with_cache(
-            &batch_graph, &input_matrix, &self.weights,
-            self.weight_cache.as_ref(), None,
-        ).map_err(|e| LocalProviderError::ProveFailed(format!("{e}")))?;
+            &batch_graph,
+            &input_matrix,
+            &self.weights,
+            self.weight_cache.as_ref(),
+            None,
+        )
+        .map_err(|e| LocalProviderError::ProveFailed(format!("{e}")))?;
 
         let prove_time_ms = t_start.elapsed().as_millis() as u64;
         let tok_per_sec = token_ids.len() as f64 / (prove_time_ms as f64 / 1000.0);
         eprintln!(
             "[local] Batch proved: {} tokens in {:.1}s ({:.1} tok/s)",
-            token_ids.len(), prove_time_ms as f64 / 1000.0, tok_per_sec
+            token_ids.len(),
+            prove_time_ms as f64 / 1000.0,
+            tok_per_sec
         );
 
         Ok((proof.execution.output.clone(), proof, prove_time_ms))
@@ -684,8 +794,18 @@ impl LocalProvider {
     pub fn infer_traced(
         &self,
         prompt: &str,
-    ) -> Result<(String, Vec<u32>, M31Matrix, Option<crate::aggregation::ForwardPassResult>), LocalProviderError> {
-        let encoding = self.tokenizer.encode(prompt, false)
+    ) -> Result<
+        (
+            String,
+            Vec<u32>,
+            M31Matrix,
+            Option<crate::aggregation::ForwardPassResult>,
+        ),
+        LocalProviderError,
+    > {
+        let encoding = self
+            .tokenizer
+            .encode(prompt, false)
             .map_err(|e| LocalProviderError::TokenizeFailed(format!("{e}")))?;
         let token_ids: Vec<u32> = encoding.get_ids().to_vec();
         if token_ids.is_empty() {
@@ -694,20 +814,25 @@ impl LocalProvider {
         let last_token_id = *token_ids.last().unwrap();
 
         let (input_matrix, _) = crate::compiler::hf_loader::load_embedding_row(
-            &self.model_dir, self.hidden_size, last_token_id,
-        ).map_err(|e| LocalProviderError::EmbedFailed(format!("{e}")))?;
+            &self.model_dir,
+            self.hidden_size,
+            last_token_id,
+        )
+        .map_err(|e| LocalProviderError::EmbedFailed(format!("{e}")))?;
 
         // Run traced execution — captures ForwardPassResult via thread-local
         let (_output, fwd) = crate::aggregation::execute_forward_pass_traced(
-            &self.graph, &input_matrix, &self.weights,
-        ).map_err(|e| LocalProviderError::ProveFailed(format!("{e}")))?;
-
-        let predicted_text = crate::compiler::hf_loader::project_to_logits(
-            &self.model_dir, &fwd.output,
+            &self.graph,
+            &input_matrix,
+            &self.weights,
         )
-        .ok()
-        .and_then(|(tid, _)| self.tokenizer.decode(&[tid], true).ok())
-        .unwrap_or_default();
+        .map_err(|e| LocalProviderError::ProveFailed(format!("{e}")))?;
+
+        let predicted_text =
+            crate::compiler::hf_loader::project_to_logits(&self.model_dir, &fwd.output)
+                .ok()
+                .and_then(|(tid, _)| self.tokenizer.decode(&[tid], true).ok())
+                .unwrap_or_default();
 
         Ok((predicted_text, token_ids, input_matrix, Some(fwd)))
     }

@@ -37,10 +37,7 @@ pub struct LayerKVState {
 
 impl KVCacheState {
     /// Snapshot live KV cache and commitment into a serializable form.
-    pub fn from_live(
-        kv_cache: &ModelKVCache,
-        _commitment: &IncrementalKVCommitment,
-    ) -> Self {
+    pub fn from_live(kv_cache: &ModelKVCache, _commitment: &IncrementalKVCommitment) -> Self {
         let mut layers = BTreeMap::new();
         let mut max_len = 0usize;
 
@@ -67,13 +64,16 @@ impl KVCacheState {
                 max_len = cache.cached_len;
             }
 
-            layers.insert(layer_id, LayerKVState {
-                k_cache: k_data,
-                v_cache: v_data,
-                cached_len: cache.cached_len,
-                num_kv_heads: cache.num_kv_heads,
-                d_k: cache.d_k,
-            });
+            layers.insert(
+                layer_id,
+                LayerKVState {
+                    k_cache: k_data,
+                    v_cache: v_data,
+                    cached_len: cache.cached_len,
+                    num_kv_heads: cache.num_kv_heads,
+                    d_k: cache.d_k,
+                },
+            );
         }
 
         Self {
@@ -91,21 +91,29 @@ impl KVCacheState {
 
         for (&layer_id, layer) in &self.layers {
             // Reconstruct per-head M31Matrix directly from serialized u32 data
-            let k_cache: Vec<M31Matrix> = layer.k_cache.iter().map(|k_vals| {
-                let mut m = M31Matrix::new(layer.cached_len, layer.d_k);
-                for (i, &v) in k_vals.iter().enumerate() {
-                    m.data[i] = M31::from(v);
-                }
-                m
-            }).collect();
+            let k_cache: Vec<M31Matrix> = layer
+                .k_cache
+                .iter()
+                .map(|k_vals| {
+                    let mut m = M31Matrix::new(layer.cached_len, layer.d_k);
+                    for (i, &v) in k_vals.iter().enumerate() {
+                        m.data[i] = M31::from(v);
+                    }
+                    m
+                })
+                .collect();
 
-            let v_cache: Vec<M31Matrix> = layer.v_cache.iter().map(|v_vals| {
-                let mut m = M31Matrix::new(layer.cached_len, layer.d_k);
-                for (i, &v) in v_vals.iter().enumerate() {
-                    m.data[i] = M31::from(v);
-                }
-                m
-            }).collect();
+            let v_cache: Vec<M31Matrix> = layer
+                .v_cache
+                .iter()
+                .map(|v_vals| {
+                    let mut m = M31Matrix::new(layer.cached_len, layer.d_k);
+                    for (i, &v) in v_vals.iter().enumerate() {
+                        m.data[i] = M31::from(v);
+                    }
+                    m
+                })
+                .collect();
 
             let cache = KVCache {
                 k_cache,
@@ -118,10 +126,7 @@ impl KVCacheState {
         }
 
         // Rebuild Merkle commitment from the restored KV cache
-        let commitment = IncrementalKVCommitment::from_kv_cache(
-            &model_cache,
-            self.merkle_capacity,
-        );
+        let commitment = IncrementalKVCommitment::from_kv_cache(&model_cache, self.merkle_capacity);
 
         (model_cache, commitment)
     }
@@ -136,7 +141,6 @@ impl KVCacheState {
     /// Load from a JSON file.
     pub fn load(path: &Path) -> Result<Self, std::io::Error> {
         let json = std::fs::read_to_string(path)?;
-        serde_json::from_str(&json)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        serde_json::from_str(&json).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
     }
 }

@@ -20,7 +20,7 @@ use obelyzk::policy::PolicyConfig;
 
 // ─── Firewall Logic (mirrors Cairo AgentFirewallZK exactly) ──────────────────
 
-const EMA_ALPHA_UP: u64 = 500;   // fast up (bad actions)
+const EMA_ALPHA_UP: u64 = 500; // fast up (bad actions)
 const EMA_ALPHA_DOWN: u64 = 100; // slow down (safe actions)
 const EMA_ALPHA_DEN: u64 = 1000;
 const DEFAULT_ESCALATE: u32 = 40_000;
@@ -35,7 +35,11 @@ struct Agent {
 
 impl Agent {
     fn new() -> Self {
-        Self { trust_score: 0, strikes: 0, active: true }
+        Self {
+            trust_score: 0,
+            strikes: 0,
+            active: true,
+        }
     }
 
     fn apply_score(&mut self, threat_score: u32) -> u8 {
@@ -44,13 +48,12 @@ impl Agent {
         // Slow down (alpha=0.1): safe actions lower score slowly
         let threat_u64 = threat_score as u64;
         let alpha = if threat_u64 > self.trust_score {
-            EMA_ALPHA_UP     // 0.5
+            EMA_ALPHA_UP // 0.5
         } else {
-            EMA_ALPHA_DOWN   // 0.1
+            EMA_ALPHA_DOWN // 0.1
         };
-        let new_score = (alpha * threat_u64
-            + (EMA_ALPHA_DEN - alpha) * self.trust_score)
-            / EMA_ALPHA_DEN;
+        let new_score =
+            (alpha * threat_u64 + (EMA_ALPHA_DEN - alpha) * self.trust_score) / EMA_ALPHA_DEN;
         self.trust_score = new_score;
 
         // 2. Decision
@@ -74,9 +77,7 @@ impl Agent {
     }
 
     fn is_trusted(&self) -> bool {
-        self.active
-            && self.trust_score < DEFAULT_BLOCK as u64
-            && self.strikes < DEFAULT_MAX_STRIKES
+        self.active && self.trust_score < DEFAULT_BLOCK as u64 && self.strikes < DEFAULT_MAX_STRIKES
     }
 }
 
@@ -95,9 +96,9 @@ fn test_e2e_classifier_prove_verify_approve() {
         selector: 0xa9059cbb,                  // ERC20 transfer
         calldata_prefix: [0x5678, 0, 0, 0, 0, 0, 0, 0],
         calldata_len: 68,
-        agent_trust_score: 5000,               // low score = good history
+        agent_trust_score: 5000, // low score = good history
         agent_strikes: 0,
-        agent_age_blocks: 50000,               // old agent
+        agent_age_blocks: 50000, // old agent
         target_flags: TargetFlags {
             is_verified: true,
             is_proxy: false,
@@ -106,7 +107,7 @@ fn test_e2e_classifier_prove_verify_approve() {
         },
         value_features: ValueFeatures {
             log2_value: 17,
-            value_balance_ratio: 100,   // 0.1% of balance
+            value_balance_ratio: 100, // 0.1% of balance
             is_max_approval: false,
             is_zero_value: false,
         },
@@ -125,11 +126,14 @@ fn test_e2e_classifier_prove_verify_approve() {
     };
 
     // === 3. Prove classifier inference (REAL GKR proof) ===
-    let result = evaluate_transaction(&tx, &model, &policy)
-        .expect("classifier proving should succeed");
+    let result =
+        evaluate_transaction(&tx, &model, &policy).expect("classifier proving should succeed");
 
     eprintln!("=== Classifier Result ===");
-    eprintln!("  Scores: {:?} (safe, suspicious, malicious)", result.scores);
+    eprintln!(
+        "  Scores: {:?} (safe, suspicious, malicious)",
+        result.scores
+    );
     eprintln!("  Threat score: {}/100000", result.threat_score);
     eprintln!("  Decision: {}", result.decision);
     eprintln!("  Prove time: {}ms", result.prove_time_ms);
@@ -149,14 +153,21 @@ fn test_e2e_classifier_prove_verify_approve() {
     );
 
     // === 5. Verify IO commitment is real ===
-    assert_ne!(result.io_commitment, FieldElement::ZERO, "IO commitment must be non-zero");
+    assert_ne!(
+        result.io_commitment,
+        FieldElement::ZERO,
+        "IO commitment must be non-zero"
+    );
 
     // === 6. Apply firewall logic (same as Cairo contract) ===
     let mut agent = Agent::new();
     let decision = agent.apply_score(result.threat_score);
 
     eprintln!("\n=== Firewall Decision ===");
-    eprintln!("  Decision code: {} (1=approve, 2=escalate, 3=block)", decision);
+    eprintln!(
+        "  Decision code: {} (1=approve, 2=escalate, 3=block)",
+        decision
+    );
     eprintln!("  Trust score after EMA: {}/100000", agent.trust_score);
     eprintln!("  Strikes: {}", agent.strikes);
     eprintln!("  Agent still trusted: {}", agent.is_trusted());
@@ -168,7 +179,10 @@ fn test_e2e_classifier_prove_verify_approve() {
     // Whatever the decision, asymmetric EMA must be applied correctly.
     // First score: prev=0, so score > prev → alpha_up=0.5
     let expected_ema = (EMA_ALPHA_UP * result.threat_score as u64) / EMA_ALPHA_DEN;
-    assert_eq!(agent.trust_score, expected_ema, "asymmetric EMA must match (first score, prev=0)");
+    assert_eq!(
+        agent.trust_score, expected_ema,
+        "asymmetric EMA must match (first score, prev=0)"
+    );
 }
 
 #[test]
@@ -213,8 +227,8 @@ fn test_e2e_repeated_suspicious_triggers_freeze() {
         },
     };
 
-    let result = evaluate_transaction(&tx, &model, &policy)
-        .expect("classifier proving should succeed");
+    let result =
+        evaluate_transaction(&tx, &model, &policy).expect("classifier proving should succeed");
 
     eprintln!("=== Suspicious TX Classifier Result ===");
     eprintln!("  Scores: {:?}", result.scores);
@@ -231,7 +245,11 @@ fn test_e2e_repeated_suspicious_triggers_freeze() {
         let decision = agent.apply_score(simulated_high_score);
         eprintln!(
             "  Action {}: decision={}, trust={}, strikes={}, active={}",
-            i + 1, decision, agent.trust_score, agent.strikes, agent.active
+            i + 1,
+            decision,
+            agent.trust_score,
+            agent.strikes,
+            agent.active
         );
         assert_eq!(decision, 3, "score 75000 should always be BLOCK");
     }
@@ -248,7 +266,10 @@ fn test_e2e_repeated_suspicious_triggers_freeze() {
     // Round 3: 500*75000 + 500*56250 / 1000 = 37500 + 28125 = 65625
     // Round 4: 500*75000 + 500*65625 / 1000 = 37500 + 32812 = 70312
     // Round 5: 500*75000 + 500*70312 / 1000 = 37500 + 35156 = 72656
-    assert_eq!(agent.trust_score, 72656, "asymmetric EMA after 5 rounds of 75000 (alpha_up=0.5)");
+    assert_eq!(
+        agent.trust_score, 72656,
+        "asymmetric EMA after 5 rounds of 75000 (alpha_up=0.5)"
+    );
 }
 
 #[test]
@@ -279,13 +300,25 @@ fn test_e2e_different_transactions_different_proofs() {
         selector: 0x095ea7b3,                  // approve instead of transfer
         calldata_prefix: [0xFF, 0xFF, 0, 0, 0, 0, 0, 0],
         calldata_len: 68,
-        agent_trust_score: 50000,              // worse history
+        agent_trust_score: 50000, // worse history
         agent_strikes: 3,
         agent_age_blocks: 50,
-        target_flags: TargetFlags { is_proxy: true, ..Default::default() },
-        value_features: ValueFeatures { is_max_approval: true, ..Default::default() },
-        selector_features: SelectorFeatures { is_approve: true, ..Default::default() },
-        behavioral: BehavioralFeatures { tx_frequency: 100, ..Default::default() },
+        target_flags: TargetFlags {
+            is_proxy: true,
+            ..Default::default()
+        },
+        value_features: ValueFeatures {
+            is_max_approval: true,
+            ..Default::default()
+        },
+        selector_features: SelectorFeatures {
+            is_approve: true,
+            ..Default::default()
+        },
+        behavioral: BehavioralFeatures {
+            tx_frequency: 100,
+            ..Default::default()
+        },
     };
 
     let r1 = evaluate_transaction(&tx1, &model, &policy).unwrap();
@@ -295,12 +328,16 @@ fn test_e2e_different_transactions_different_proofs() {
     eprintln!("TX2: score={}, decision={}", r2.threat_score, r2.decision);
 
     // Same policy → same policy commitment
-    assert_eq!(r1.policy_commitment, r2.policy_commitment,
-        "same policy should produce same commitment");
+    assert_eq!(
+        r1.policy_commitment, r2.policy_commitment,
+        "same policy should produce same commitment"
+    );
 
     // Different inputs → different IO commitments
-    assert_ne!(r1.io_commitment, r2.io_commitment,
-        "different transactions should produce different IO commitments");
+    assert_ne!(
+        r1.io_commitment, r2.io_commitment,
+        "different transactions should produce different IO commitments"
+    );
 
     // Both should have valid scores
     assert!(r1.threat_score <= 100_000);
@@ -348,6 +385,12 @@ fn test_e2e_wrong_policy_produces_different_commitment() {
     // If someone submits a relaxed proof, the firewall rejects because:
     // relaxed_hash != registered_strict_hash
     let registered_policy = PolicyConfig::strict().policy_commitment();
-    assert_eq!(strict_result.policy_commitment, registered_policy, "strict proof passes");
-    assert_ne!(relaxed_result.policy_commitment, registered_policy, "relaxed proof rejected");
+    assert_eq!(
+        strict_result.policy_commitment, registered_policy,
+        "strict proof passes"
+    );
+    assert_ne!(
+        relaxed_result.policy_commitment, registered_policy,
+        "relaxed proof rejected"
+    );
 }

@@ -1961,11 +1961,14 @@ impl GpuSumcheckExecutor {
         session: &GpuMleFoldSession,
     ) -> Result<GpuMleFoldSession, CudaFftError> {
         let n_u32 = session.n_points * 4;
-        let mut d_clone = unsafe { self.device.alloc::<u32>(n_u32) }
-            .map_err(|e| CudaFftError::MemoryAllocation(format!("clone_fold_session alloc: {:?}", e)))?;
+        let mut d_clone = unsafe { self.device.alloc::<u32>(n_u32) }.map_err(|e| {
+            CudaFftError::MemoryAllocation(format!("clone_fold_session alloc: {:?}", e))
+        })?;
         self.device
             .dtod_copy(&session.d_current, &mut d_clone)
-            .map_err(|e| CudaFftError::MemoryTransfer(format!("clone_fold_session copy: {:?}", e)))?;
+            .map_err(|e| {
+                CudaFftError::MemoryTransfer(format!("clone_fold_session copy: {:?}", e))
+            })?;
         Ok(GpuMleFoldSession {
             d_current: d_clone,
             n_points: session.n_points,
@@ -2710,10 +2713,12 @@ impl GpuSumcheckExecutor {
             let mut gpu_fb = vec![0u32; pk * 4];
             self.device.dtoh_sync_copy_into(&d_f_a, &mut gpu_fa).ok();
             self.device.dtoh_sync_copy_into(&d_f_b, &mut gpu_fb).ok();
-            let gpu_fa_sf: Vec<SecureField> = gpu_fa.chunks_exact(4)
+            let gpu_fa_sf: Vec<SecureField> = gpu_fa
+                .chunks_exact(4)
                 .map(|c| u32s_to_secure_field(&[c[0], c[1], c[2], c[3]]))
                 .collect();
-            let gpu_fb_sf: Vec<SecureField> = gpu_fb.chunks_exact(4)
+            let gpu_fb_sf: Vec<SecureField> = gpu_fb
+                .chunks_exact(4)
                 .map(|c| u32s_to_secure_field(&[c[0], c[1], c[2], c[3]]))
                 .collect();
             // CPU restrict
@@ -2721,7 +2726,10 @@ impl GpuSumcheckExecutor {
             let cpu_fb = crate::components::matmul::restrict_cols_unpadded(b, r_j, pk);
             let fa_match = gpu_fa_sf == cpu_fa;
             let fb_match = gpu_fb_sf == cpu_fb;
-            eprintln!("[MatMul GPU] restrict check: fa_match={} fb_match={} pk={}", fa_match, fb_match, pk);
+            eprintln!(
+                "[MatMul GPU] restrict check: fa_match={} fb_match={} pk={}",
+                fa_match, fb_match, pk
+            );
             if !fa_match {
                 for i in 0..pk.min(4) {
                     eprintln!("  fa[{}]: gpu={:?} cpu={:?}", i, gpu_fa_sf[i], cpu_fa[i]);
@@ -2733,7 +2741,9 @@ impl GpuSumcheckExecutor {
                 }
             }
             // Check sum
-            let gpu_sum: SecureField = gpu_fa_sf.iter().zip(&gpu_fb_sf)
+            let gpu_sum: SecureField = gpu_fa_sf
+                .iter()
+                .zip(&gpu_fb_sf)
                 .map(|(&a, &b)| a * b)
                 .fold(SecureField::zero(), |acc, v| acc + v);
             eprintln!("[MatMul GPU] inner product = {:?}", gpu_sum);
@@ -2762,8 +2772,12 @@ impl GpuSumcheckExecutor {
         let mut gpu_channel: Option<crate::crypto::gpu_poseidon::GpuPoseidonChannel> = None;
         if use_gpu_poseidon {
             match crate::crypto::gpu_poseidon::GpuPoseidonChannel::from_cpu(channel, &self.device) {
-                Ok(gc) => { gpu_channel = Some(gc); }
-                Err(e) => { eprintln!("  [gpu-poseidon] Init failed: {e}, falling back to CPU"); }
+                Ok(gc) => {
+                    gpu_channel = Some(gc);
+                }
+                Err(e) => {
+                    eprintln!("  [gpu-poseidon] Init failed: {e}, falling back to CPU");
+                }
             }
         }
 
@@ -2773,7 +2787,8 @@ impl GpuSumcheckExecutor {
             // ── GPU Poseidon path: entire round on-device ──
             if let Some(ref mut gc) = gpu_channel {
                 // Compute round poly (stay on GPU)
-                let (d_s0, d_s1, d_s2) = self.compute_round_poly_device(&d_f_a_cur, &d_f_b_cur, mid)?;
+                let (d_s0, d_s1, d_s2) =
+                    self.compute_round_poly_device(&d_f_a_cur, &d_f_b_cur, mid)?;
 
                 // Also download for CPU-side record keeping (round_polys, challenges)
                 let mut s0_raw = [0u32; 4];
@@ -2791,7 +2806,8 @@ impl GpuSumcheckExecutor {
                 round_polys.push(crate::components::matmul::RoundPoly { c0, c1, c2 });
 
                 // GPU Fiat-Shamir: mix + draw entirely on device
-                let d_alpha = gc.mix_and_draw_gpu(&d_s0, &d_s1, &d_s2)
+                let d_alpha = gc
+                    .mix_and_draw_gpu(&d_s0, &d_s1, &d_s2)
                     .map_err(|e| CudaFftError::KernelExecution(format!("gpu poseidon: {e}")))?;
 
                 // Also update CPU channel to stay in sync (for proof assembly)
@@ -2827,7 +2843,11 @@ impl GpuSumcheckExecutor {
                 let p0_plus_p1 = s0 + s1;
                 eprintln!(
                     "[GPU-SC] round {}/{}: s0+s1={:?} mid={} cur_n={}",
-                    round_polys.len(), log_k, p0_plus_p1, mid, cur_n,
+                    round_polys.len(),
+                    log_k,
+                    p0_plus_p1,
+                    mid,
+                    cur_n,
                 );
             }
 
@@ -2925,10 +2945,22 @@ impl GpuSumcheckExecutor {
         };
 
         unsafe {
-            self.sumcheck_round_fn.clone().launch(
-                cfg,
-                (d_f_a, d_f_b, &mut d_block_s0, &mut d_block_s1, &mut d_block_s2, mid as u32),
-            ).map_err(|e| CudaFftError::KernelExecution(format!("sumcheck_round device: {:?}", e)))?;
+            self.sumcheck_round_fn
+                .clone()
+                .launch(
+                    cfg,
+                    (
+                        d_f_a,
+                        d_f_b,
+                        &mut d_block_s0,
+                        &mut d_block_s1,
+                        &mut d_block_s2,
+                        mid as u32,
+                    ),
+                )
+                .map_err(|e| {
+                    CudaFftError::KernelExecution(format!("sumcheck_round device: {:?}", e))
+                })?;
         }
 
         if n_blocks == 1 {
@@ -2942,36 +2974,58 @@ impl GpuSumcheckExecutor {
             .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
 
         let s0_len = n_blocks * 4;
-        self.device.dtod_copy(&d_block_s0, &mut d_partials.slice_mut(0..s0_len))
+        self.device
+            .dtod_copy(&d_block_s0, &mut d_partials.slice_mut(0..s0_len))
             .map_err(|e| CudaFftError::MemoryTransfer(format!("dtod s0: {:?}", e)))?;
-        self.device.dtod_copy(&d_block_s1, &mut d_partials.slice_mut(s0_len..2 * s0_len))
+        self.device
+            .dtod_copy(&d_block_s1, &mut d_partials.slice_mut(s0_len..2 * s0_len))
             .map_err(|e| CudaFftError::MemoryTransfer(format!("dtod s1: {:?}", e)))?;
-        self.device.dtod_copy(&d_block_s2, &mut d_partials.slice_mut(2 * s0_len..3 * s0_len))
+        self.device
+            .dtod_copy(
+                &d_block_s2,
+                &mut d_partials.slice_mut(2 * s0_len..3 * s0_len),
+            )
             .map_err(|e| CudaFftError::MemoryTransfer(format!("dtod s2: {:?}", e)))?;
 
         let mut d_output = unsafe { self.device.alloc::<u32>(12) }
             .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
 
         unsafe {
-            self.sumcheck_reduce_fn.clone().launch(
-                LaunchConfig { grid_dim: (3, 1, 1), block_dim: (block_size, 1, 1), shared_mem_bytes: 256 * 4 * 4 },
-                (&d_partials, &mut d_output, n_blocks as u32),
-            ).map_err(|e| CudaFftError::KernelExecution(format!("reduce device: {:?}", e)))?;
+            self.sumcheck_reduce_fn
+                .clone()
+                .launch(
+                    LaunchConfig {
+                        grid_dim: (3, 1, 1),
+                        block_dim: (block_size, 1, 1),
+                        shared_mem_bytes: 256 * 4 * 4,
+                    },
+                    (&d_partials, &mut d_output, n_blocks as u32),
+                )
+                .map_err(|e| CudaFftError::KernelExecution(format!("reduce device: {:?}", e)))?;
         }
 
         // Split d_output[0..12] into 3 CudaSlice of 4 u32 each
-        let mut d_s0: CudaSlice<u32> = self.device.alloc_zeros(4)
+        let mut d_s0: CudaSlice<u32> = self
+            .device
+            .alloc_zeros(4)
             .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
-        let mut d_s1: CudaSlice<u32> = self.device.alloc_zeros(4)
+        let mut d_s1: CudaSlice<u32> = self
+            .device
+            .alloc_zeros(4)
             .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
-        let mut d_s2: CudaSlice<u32> = self.device.alloc_zeros(4)
+        let mut d_s2: CudaSlice<u32> = self
+            .device
+            .alloc_zeros(4)
             .map_err(|e| CudaFftError::MemoryAllocation(format!("{:?}", e)))?;
 
-        self.device.dtod_copy(&d_output.slice(0..4), &mut d_s0)
+        self.device
+            .dtod_copy(&d_output.slice(0..4), &mut d_s0)
             .map_err(|e| CudaFftError::MemoryTransfer(format!("split s0: {:?}", e)))?;
-        self.device.dtod_copy(&d_output.slice(4..8), &mut d_s1)
+        self.device
+            .dtod_copy(&d_output.slice(4..8), &mut d_s1)
             .map_err(|e| CudaFftError::MemoryTransfer(format!("split s1: {:?}", e)))?;
-        self.device.dtod_copy(&d_output.slice(8..12), &mut d_s2)
+        self.device
+            .dtod_copy(&d_output.slice(8..12), &mut d_s2)
             .map_err(|e| CudaFftError::MemoryTransfer(format!("split s2: {:?}", e)))?;
 
         Ok((d_s0, d_s1, d_s2))
@@ -3012,21 +3066,26 @@ impl GpuSumcheckExecutor {
     ) -> Result<CudaSlice<u32>, CudaFftError> {
         let half_n = cur_n / 2;
         // d_challenge is already on GPU (4 u32 = 1 QM31)
-        let d_output: CudaSlice<u32> = self.device.alloc_zeros(half_n * 4)
+        let d_output: CudaSlice<u32> = self
+            .device
+            .alloc_zeros(half_n * 4)
             .map_err(|e| CudaFftError::MemoryAllocation(format!("fold_device: {:?}", e)))?;
 
         let block_size = 256u32;
         let grid_size = (half_n as u32 + block_size - 1) / block_size;
 
         unsafe {
-            self.mle_fold_fn.clone().launch(
-                LaunchConfig {
-                    grid_dim: (grid_size, 1, 1),
-                    block_dim: (block_size, 1, 1),
-                    shared_mem_bytes: 0,
-                },
-                (d_input, d_challenge, &d_output, half_n as u32),
-            ).map_err(|e| CudaFftError::KernelExecution(format!("fold_device: {:?}", e)))?;
+            self.mle_fold_fn
+                .clone()
+                .launch(
+                    LaunchConfig {
+                        grid_dim: (grid_size, 1, 1),
+                        block_dim: (block_size, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    (d_input, d_challenge, &d_output, half_n as u32),
+                )
+                .map_err(|e| CudaFftError::KernelExecution(format!("fold_device: {:?}", e)))?;
         }
 
         Ok(d_output)
@@ -4132,7 +4191,10 @@ pub fn prove_matmul_batch_onchain_gpu(
     let use_gpu_poseidon_batch = std::env::var("OBELYZK_GPU_POSEIDON").ok().as_deref() == Some("1");
     let mut gpu_channel: Option<crate::crypto::gpu_poseidon::GpuPoseidonChannel> = None;
     if use_gpu_poseidon_batch {
-        match crate::crypto::gpu_poseidon::GpuPoseidonChannel::from_cpu(&channel, &gpu_executor.device) {
+        match crate::crypto::gpu_poseidon::GpuPoseidonChannel::from_cpu(
+            &channel,
+            &gpu_executor.device,
+        ) {
             Ok(gc) => {
                 eprintln!("    [gpu-poseidon] GPU Fiat-Shamir enabled for batch sumcheck");
                 gpu_channel = Some(gc);
@@ -4184,15 +4246,22 @@ pub fn prove_matmul_batch_onchain_gpu(
             let c1_u32 = secure_field_to_u32s(c1);
             let c2_u32 = secure_field_to_u32s(c2);
 
-            let d_c0 = gpu_executor.device.htod_sync_copy(&c0_u32)
+            let d_c0 = gpu_executor
+                .device
+                .htod_sync_copy(&c0_u32)
                 .map_err(|e| MatMulError::SumcheckFailed(format!("upload c0: {e:?}")))?;
-            let d_c1 = gpu_executor.device.htod_sync_copy(&c1_u32)
+            let d_c1 = gpu_executor
+                .device
+                .htod_sync_copy(&c1_u32)
                 .map_err(|e| MatMulError::SumcheckFailed(format!("upload c1: {e:?}")))?;
-            let d_c2 = gpu_executor.device.htod_sync_copy(&c2_u32)
+            let d_c2 = gpu_executor
+                .device
+                .htod_sync_copy(&c2_u32)
                 .map_err(|e| MatMulError::SumcheckFailed(format!("upload c2: {e:?}")))?;
 
             // GPU Poseidon: mix + draw on device
-            let d_challenge = gc.mix_and_draw_gpu(&d_c0, &d_c1, &d_c2)
+            let d_challenge = gc
+                .mix_and_draw_gpu(&d_c0, &d_c1, &d_c2)
                 .map_err(|e| MatMulError::SumcheckFailed(format!("gpu poseidon batch: {e}")))?;
 
             // Also update CPU channel to stay in sync
@@ -4202,10 +4271,16 @@ pub fn prove_matmul_batch_onchain_gpu(
 
             // GPU fold with device-resident challenge
             for i in 0..num_entries {
-                let new_a = gpu_executor.mle_fold_device(&d_f_a_list[i], cur_n_points, &d_challenge)
-                    .map_err(|e| MatMulError::SumcheckFailed(format!("gpu fold batch a {i}: {e}")))?;
-                let new_b = gpu_executor.mle_fold_device(&d_f_b_list[i], cur_n_points, &d_challenge)
-                    .map_err(|e| MatMulError::SumcheckFailed(format!("gpu fold batch b {i}: {e}")))?;
+                let new_a = gpu_executor
+                    .mle_fold_device(&d_f_a_list[i], cur_n_points, &d_challenge)
+                    .map_err(|e| {
+                        MatMulError::SumcheckFailed(format!("gpu fold batch a {i}: {e}"))
+                    })?;
+                let new_b = gpu_executor
+                    .mle_fold_device(&d_f_b_list[i], cur_n_points, &d_challenge)
+                    .map_err(|e| {
+                        MatMulError::SumcheckFailed(format!("gpu fold batch b {i}: {e}"))
+                    })?;
                 d_f_a_list[i] = new_a;
                 d_f_b_list[i] = new_b;
             }
@@ -4467,7 +4542,7 @@ pub fn prepare_batch_entry_cached(
                 f_b: entry.f_b.clone(),
                 b_commitment: entry.b_commitment,
                 r_j: entry.r_j.clone(),
-                initial_mle_root: None, // Populated during MLE opening
+                initial_mle_root: None,       // Populated during MLE opening
                 merkle_tree_cache_path: None, // Populated if STWO_MERKLE_TREE_CACHE_DIR is set
             },
         );

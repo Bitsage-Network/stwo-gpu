@@ -1076,8 +1076,7 @@ mod tests {
         // Read meta.json and verify anchors are present
         let meta_path = dir.join("meta.json");
         let meta_file = File::open(&meta_path).expect("open meta");
-        let meta: serde_json::Value =
-            serde_json::from_reader(meta_file).expect("parse meta");
+        let meta: serde_json::Value = serde_json::from_reader(meta_file).expect("parse meta");
 
         assert!(
             meta.get("last_entry_hash").is_some(),

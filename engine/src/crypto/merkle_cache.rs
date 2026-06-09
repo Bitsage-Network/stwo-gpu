@@ -100,8 +100,9 @@ impl MmapMerkleTree {
         // Read root hash
         let mut root_bytes = [0u8; 32];
         root_bytes.copy_from_slice(&mmap[24..56]);
-        let root = FieldElement::from_bytes_be(&root_bytes)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("invalid root: {e:?}")))?;
+        let root = FieldElement::from_bytes_be(&root_bytes).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("invalid root: {e:?}"))
+        })?;
 
         // Read layer table
         let table_start = HEADER_SIZE;
@@ -117,12 +118,11 @@ impl MmapMerkleTree {
         let mut layer_offsets = Vec::with_capacity(n_layers);
         for i in 0..n_layers {
             let entry_start = table_start + i * LAYER_ENTRY_SIZE;
-            let offset = u64::from_le_bytes(
-                mmap[entry_start..entry_start + 8].try_into().unwrap(),
-            ) as usize;
-            let count = u64::from_le_bytes(
-                mmap[entry_start + 8..entry_start + 16].try_into().unwrap(),
-            ) as usize;
+            let offset =
+                u64::from_le_bytes(mmap[entry_start..entry_start + 8].try_into().unwrap()) as usize;
+            let count =
+                u64::from_le_bytes(mmap[entry_start + 8..entry_start + 16].try_into().unwrap())
+                    as usize;
             // offset is relative to data section start
             layer_offsets.push((data_section_start + offset, count));
         }
@@ -164,10 +164,7 @@ impl MmapMerkleTree {
     /// `leaf_felts` are the FieldElement leaves (packed QM31 values).
     /// The tree is built using CPU Poseidon hashing, then each layer is written
     /// to the cache file. The file is then mmap'd for fast random access.
-    pub fn build_and_cache(
-        leaf_felts: &[FieldElement],
-        path: &Path,
-    ) -> io::Result<Self> {
+    pub fn build_and_cache(leaf_felts: &[FieldElement], path: &Path) -> io::Result<Self> {
         use crate::crypto::poseidon_merkle::PoseidonMerkleTree;
 
         // Build the full tree on CPU
@@ -312,10 +309,7 @@ pub fn open_merkle_cache(node_id: usize, round: usize) -> Option<MmapMerkleTree>
     match MmapMerkleTree::open(&path) {
         Ok(tree) => Some(tree),
         Err(e) => {
-            eprintln!(
-                "[GKR] Failed to open Merkle cache {}: {e}",
-                path.display()
-            );
+            eprintln!("[GKR] Failed to open Merkle cache {}: {e}", path.display());
             None
         }
     }
@@ -324,8 +318,8 @@ pub fn open_merkle_cache(node_id: usize, round: usize) -> Option<MmapMerkleTree>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::poseidon_merkle::PoseidonMerkleTree;
     use crate::crypto::poseidon_channel::securefield_to_felt;
+    use crate::crypto::poseidon_merkle::PoseidonMerkleTree;
     use stwo::core::fields::cm31::CM31;
     use stwo::core::fields::m31::M31;
     use stwo::core::fields::qm31::QM31;
@@ -334,8 +328,14 @@ mod tests {
         (0..n)
             .map(|i| {
                 let sf = QM31(
-                    CM31(M31::from((i * 7 + 3) as u32), M31::from((i * 13 + 1) as u32)),
-                    CM31(M31::from((i * 5 + 2) as u32), M31::from((i * 11 + 4) as u32)),
+                    CM31(
+                        M31::from((i * 7 + 3) as u32),
+                        M31::from((i * 13 + 1) as u32),
+                    ),
+                    CM31(
+                        M31::from((i * 5 + 2) as u32),
+                        M31::from((i * 11 + 4) as u32),
+                    ),
                 );
                 securefield_to_felt(sf)
             })
@@ -451,7 +451,9 @@ mod tests {
         assert!(result.is_err(), "crafted .smtc with bad offsets must fail");
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("layer 0") || err_msg.contains("overflow") || err_msg.contains("extends beyond"),
+            err_msg.contains("layer 0")
+                || err_msg.contains("overflow")
+                || err_msg.contains("extends beyond"),
             "error should mention layer bounds issue: {err_msg}"
         );
 

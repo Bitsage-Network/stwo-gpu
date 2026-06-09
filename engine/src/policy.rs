@@ -51,7 +51,6 @@ pub enum WeightBindingMode {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PolicyConfig {
     // ── Soundness gates (verifier-side) ──────────────────────────────────
-
     /// Allow proofs with missing LayerNorm/RMSNorm sub-proofs.
     /// Env: `STWO_ALLOW_MISSING_NORM_PROOF`
     pub allow_missing_norm_proof: bool,
@@ -65,7 +64,6 @@ pub struct PolicyConfig {
     pub allow_missing_segment_binding: bool,
 
     // ── Prover feature flags ─────────────────────────────────────────────
-
     /// Skip RMSNorm Part 0 (variance) self-verification.
     /// Non-fatal: Cairo on-chain verifier is authoritative.
     /// Env: `STWO_SKIP_RMS_SQ_PROOF`
@@ -88,7 +86,6 @@ pub struct PolicyConfig {
     pub skip_unified_stark: bool,
 
     // ── Weight binding ───────────────────────────────────────────────────
-
     /// Weight binding strategy. Unifies `STWO_WEIGHT_BINDING`,
     /// `STWO_GKR_AGGREGATE_WEIGHT_BINDING`, `STWO_GKR_TRUSTLESS_MODE2/3`.
     pub weight_binding_mode: WeightBindingMode,
@@ -102,7 +99,6 @@ pub struct PolicyConfig {
     pub aggregated_rlc_only: bool,
 
     // ── Serialization ────────────────────────────────────────────────────
-
     /// Pack IO data (8 M31 per felt252).
     /// Env: `STWO_NO_IO_PACK` (negated — presence disables)
     pub io_packing: bool,
@@ -116,7 +112,6 @@ pub struct PolicyConfig {
     pub double_packed_proof: bool,
 
     // ── Decode chain ─────────────────────────────────────────────────────
-
     /// Enforce decode chain continuity validation for sequential inference.
     /// When true, KV-cache commitments must chain correctly between steps.
     /// Previously a caller-supplied parameter; now policy-bound.
@@ -275,10 +270,9 @@ impl PolicyConfig {
         let trustless_mode3 = self.weight_binding_mode == WeightBindingMode::TrustlessMode3;
         let trustless_mode2 =
             self.weight_binding_mode == WeightBindingMode::TrustlessMode2 && !trustless_mode3;
-        let aggregate_weight_binding = matches!(
-            self.weight_binding_mode,
-            WeightBindingMode::Aggregated
-        ) && !(trustless_mode2 || trustless_mode3);
+        let aggregate_weight_binding =
+            matches!(self.weight_binding_mode, WeightBindingMode::Aggregated)
+                && !(trustless_mode2 || trustless_mode3);
         WeightModeFlags {
             aggregate_weight_binding,
             trustless_mode2,
@@ -541,8 +535,7 @@ impl SoundnessGateGuard {
         allow_logup: Option<bool>,
     ) -> Self {
         let prev_skip_rms_sq = SKIP_RMS_SQ_OVERRIDE.with(|c| c.replace(skip_rms_sq));
-        let prev_missing_norm =
-            ALLOW_MISSING_NORM_OVERRIDE.with(|c| c.replace(allow_missing_norm));
+        let prev_missing_norm = ALLOW_MISSING_NORM_OVERRIDE.with(|c| c.replace(allow_missing_norm));
         let prev_piecewise = PIECEWISE_ACTIVATION_OVERRIDE.with(|c| c.replace(piecewise));
         let prev_logup = ALLOW_LOGUP_ACTIVATION_OVERRIDE.with(|c| c.replace(allow_logup));
         Self {
@@ -626,9 +619,15 @@ pub fn apply_to_env(policy: &PolicyConfig) {
             std::env::remove_var(name);
         }
     };
-    set("STWO_ALLOW_MISSING_NORM_PROOF", policy.allow_missing_norm_proof);
+    set(
+        "STWO_ALLOW_MISSING_NORM_PROOF",
+        policy.allow_missing_norm_proof,
+    );
     set("STWO_ALLOW_LOGUP_ACTIVATION", policy.allow_logup_activation);
-    set("STWO_ALLOW_MISSING_SEGMENT_BINDING", policy.allow_missing_segment_binding);
+    set(
+        "STWO_ALLOW_MISSING_SEGMENT_BINDING",
+        policy.allow_missing_segment_binding,
+    );
     if policy.skip_rms_sq_proof {
         std::env::set_var("STWO_SKIP_RMS_SQ_PROOF", "1");
     } else {
@@ -642,15 +641,30 @@ pub fn apply_to_env(policy: &PolicyConfig) {
         std::env::set_var("STWO_PIECEWISE_ACTIVATION", "0");
     }
     set("STWO_SKIP_BATCH_TOKENS", policy.skip_batch_tokens);
-    set("STWO_PURE_GKR_SKIP_UNIFIED_STARK", policy.skip_unified_stark);
-    set("STWO_AGGREGATED_FULL_BINDING", policy.aggregated_full_binding);
+    set(
+        "STWO_PURE_GKR_SKIP_UNIFIED_STARK",
+        policy.skip_unified_stark,
+    );
+    set(
+        "STWO_AGGREGATED_FULL_BINDING",
+        policy.aggregated_full_binding,
+    );
     set("STWO_AGGREGATED_RLC_ONLY", policy.aggregated_rlc_only);
-    if !policy.io_packing { std::env::set_var("STWO_NO_IO_PACK", "1"); }
-    else { std::env::remove_var("STWO_NO_IO_PACK"); }
-    if !policy.packed_proof { std::env::set_var("STWO_NO_PACKED", "1"); }
-    else { std::env::remove_var("STWO_NO_PACKED"); }
-    if !policy.double_packed_proof { std::env::set_var("STWO_NO_DOUBLE_PACK", "1"); }
-    else { std::env::remove_var("STWO_NO_DOUBLE_PACK"); }
+    if !policy.io_packing {
+        std::env::set_var("STWO_NO_IO_PACK", "1");
+    } else {
+        std::env::remove_var("STWO_NO_IO_PACK");
+    }
+    if !policy.packed_proof {
+        std::env::set_var("STWO_NO_PACKED", "1");
+    } else {
+        std::env::remove_var("STWO_NO_PACKED");
+    }
+    if !policy.double_packed_proof {
+        std::env::set_var("STWO_NO_DOUBLE_PACK", "1");
+    } else {
+        std::env::remove_var("STWO_NO_DOUBLE_PACK");
+    }
     set("STWO_VALIDATE_DECODE_CHAIN", policy.validate_decode_chain);
     // Sync weight binding mode
     match policy.weight_binding_mode {
@@ -746,9 +760,21 @@ impl std::fmt::Display for PolicyConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "PolicyConfig {{")?;
         writeln!(f, "  soundness:")?;
-        writeln!(f, "    allow_missing_norm_proof: {}", self.allow_missing_norm_proof)?;
-        writeln!(f, "    allow_logup_activation: {}", self.allow_logup_activation)?;
-        writeln!(f, "    allow_missing_segment_binding: {}", self.allow_missing_segment_binding)?;
+        writeln!(
+            f,
+            "    allow_missing_norm_proof: {}",
+            self.allow_missing_norm_proof
+        )?;
+        writeln!(
+            f,
+            "    allow_logup_activation: {}",
+            self.allow_logup_activation
+        )?;
+        writeln!(
+            f,
+            "    allow_missing_segment_binding: {}",
+            self.allow_missing_segment_binding
+        )?;
         writeln!(f, "  prover:")?;
         writeln!(f, "    skip_rms_sq_proof: {}", self.skip_rms_sq_proof)?;
         writeln!(f, "    piecewise_activation: {}", self.piecewise_activation)?;
@@ -806,9 +832,18 @@ mod tests {
     #[test]
     fn test_policy_commitment_not_zero() {
         // No preset should produce a zero commitment (reserved for "no policy").
-        assert_ne!(PolicyConfig::strict().policy_commitment(), FieldElement::ZERO);
-        assert_ne!(PolicyConfig::standard().policy_commitment(), FieldElement::ZERO);
-        assert_ne!(PolicyConfig::relaxed().policy_commitment(), FieldElement::ZERO);
+        assert_ne!(
+            PolicyConfig::strict().policy_commitment(),
+            FieldElement::ZERO
+        );
+        assert_ne!(
+            PolicyConfig::standard().policy_commitment(),
+            FieldElement::ZERO
+        );
+        assert_ne!(
+            PolicyConfig::relaxed().policy_commitment(),
+            FieldElement::ZERO
+        );
     }
 
     #[test]
@@ -862,7 +897,10 @@ mod tests {
             assert!(piecewise_activation_enabled());
         }
         // Inner dropped — outer's overrides restored, not the env-var fallback.
-        assert!(skip_rms_sq_proof(), "inner drop must restore outer override");
+        assert!(
+            skip_rms_sq_proof(),
+            "inner drop must restore outer override"
+        );
         assert!(!piecewise_activation_enabled());
     }
 
@@ -891,13 +929,13 @@ mod tests {
         // Hardened Apr 30 2026 (two-pass):
         // Pass 1: skip_rms_sq_proof + allow_missing_norm_proof closed.
         // Pass 2: piecewise_activation enabled + allow_logup_activation closed.
-        assert!(!p.skip_rms_sq_proof);           // CLOSED — RMS Part 0 proven
-        assert!(!p.allow_missing_norm_proof);    // CLOSED — norm sub-proofs required
-        assert!(p.piecewise_activation);         // CLOSED — full-precision activation
-        assert!(!p.allow_logup_activation);      // CLOSED — no lower-bits-only fallback
-        assert!(p.aggregated_full_binding);      // STWO_AGGREGATED_FULL_BINDING=1
-        assert!(p.skip_batch_tokens);            // STWO_SKIP_BATCH_TOKENS=1 (still open)
-        assert!(p.skip_unified_stark);           // STWO_PURE_GKR_SKIP_UNIFIED_STARK=1
+        assert!(!p.skip_rms_sq_proof); // CLOSED — RMS Part 0 proven
+        assert!(!p.allow_missing_norm_proof); // CLOSED — norm sub-proofs required
+        assert!(p.piecewise_activation); // CLOSED — full-precision activation
+        assert!(!p.allow_logup_activation); // CLOSED — no lower-bits-only fallback
+        assert!(p.aggregated_full_binding); // STWO_AGGREGATED_FULL_BINDING=1
+        assert!(p.skip_batch_tokens); // STWO_SKIP_BATCH_TOKENS=1 (still open)
+        assert!(p.skip_unified_stark); // STWO_PURE_GKR_SKIP_UNIFIED_STARK=1
     }
 
     #[test]
@@ -1064,9 +1102,9 @@ mod tests {
     /// Fiat-Shamir channel binding → GKR prove → GKR verify.
     #[test]
     fn test_prove_verify_with_explicit_strict_policy() {
-        use crate::gkr::circuit::LayeredCircuit;
-        use crate::crypto::poseidon_channel::PoseidonChannel;
         use crate::components::matmul::matmul_m31;
+        use crate::crypto::poseidon_channel::PoseidonChannel;
+        use crate::gkr::circuit::LayeredCircuit;
 
         let policy = PolicyConfig::strict();
         let (graph, input, weights) = build_test_model();
@@ -1084,28 +1122,46 @@ mod tests {
         // Prove with strict policy
         let mut prove_channel = PoseidonChannel::new();
         let proof = crate::gkr::prove_gkr_with_cache(
-            &circuit, &execution, &weights, &mut prove_channel, None, Some(&policy),
-        ).unwrap();
+            &circuit,
+            &execution,
+            &weights,
+            &mut prove_channel,
+            None,
+            Some(&policy),
+        )
+        .unwrap();
 
         // Verify with the SAME policy → should succeed
         let mut verify_channel = PoseidonChannel::new();
         let result = crate::gkr::verifier::verify_gkr_with_policy(
-            &circuit, &proof, &output, Some(&weights), &mut verify_channel, &policy,
+            &circuit,
+            &proof,
+            &output,
+            Some(&weights),
+            &mut verify_channel,
+            &policy,
         );
-        assert!(result.is_ok(), "verify with matching policy should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "verify with matching policy should succeed: {:?}",
+            result.err()
+        );
     }
 
     /// Prove with strict, verify with standard → must FAIL (different policy commitments
     /// produce different Fiat-Shamir challenges → sumcheck verification fails).
     #[test]
     fn test_prove_verify_policy_mismatch_fails() {
-        use crate::gkr::circuit::LayeredCircuit;
-        use crate::crypto::poseidon_channel::PoseidonChannel;
         use crate::components::matmul::matmul_m31;
+        use crate::crypto::poseidon_channel::PoseidonChannel;
+        use crate::gkr::circuit::LayeredCircuit;
 
         let prove_policy = PolicyConfig::strict();
         let verify_policy = PolicyConfig::standard();
-        assert_ne!(prove_policy.policy_commitment(), verify_policy.policy_commitment());
+        assert_ne!(
+            prove_policy.policy_commitment(),
+            verify_policy.policy_commitment()
+        );
 
         let (graph, input, weights) = build_test_model();
         let circuit = LayeredCircuit::from_graph(&graph).unwrap();
@@ -1121,13 +1177,24 @@ mod tests {
         // Prove with strict
         let mut prove_channel = PoseidonChannel::new();
         let proof = crate::gkr::prove_gkr_with_cache(
-            &circuit, &execution, &weights, &mut prove_channel, None, Some(&prove_policy),
-        ).unwrap();
+            &circuit,
+            &execution,
+            &weights,
+            &mut prove_channel,
+            None,
+            Some(&prove_policy),
+        )
+        .unwrap();
 
         // Verify with standard → should fail
         let mut verify_channel = PoseidonChannel::new();
         let result = crate::gkr::verifier::verify_gkr_with_policy(
-            &circuit, &proof, &output, Some(&weights), &mut verify_channel, &verify_policy,
+            &circuit,
+            &proof,
+            &output,
+            Some(&weights),
+            &mut verify_channel,
+            &verify_policy,
         );
         assert!(result.is_err(), "verify with mismatched policy should fail");
     }
@@ -1140,8 +1207,13 @@ mod tests {
         let (graph, input, weights) = build_test_model();
 
         let proof = crate::aggregation::prove_model_pure_gkr_auto_with_cache(
-            &graph, &input, &weights, None, Some(&policy),
-        ).unwrap();
+            &graph,
+            &input,
+            &weights,
+            None,
+            Some(&policy),
+        )
+        .unwrap();
 
         assert_eq!(
             proof.policy_commitment,

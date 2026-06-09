@@ -81,8 +81,8 @@ pub fn evaluate_transaction(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::model::build_test_classifier;
+    use super::*;
 
     fn sample_tx() -> TransactionFeatures {
         TransactionFeatures {
@@ -113,7 +113,11 @@ mod tests {
         let result = evaluate_transaction(&tx, &model, &policy).unwrap();
 
         // Score should be in valid range
-        assert!(result.threat_score <= 100_000, "score out of range: {}", result.threat_score);
+        assert!(
+            result.threat_score <= 100_000,
+            "score out of range: {}",
+            result.threat_score
+        );
 
         // Decision should match score
         assert_eq!(result.decision, Decision::from_score(result.threat_score));
@@ -125,7 +129,11 @@ mod tests {
         assert_eq!(result.policy_commitment, policy.policy_commitment());
 
         // Prove time should be reasonable (<60 seconds in debug, <1s in release)
-        assert!(result.prove_time_ms < 60_000, "proving took {}ms", result.prove_time_ms);
+        assert!(
+            result.prove_time_ms < 60_000,
+            "proving took {}ms",
+            result.prove_time_ms
+        );
 
         eprintln!("Classifier result:");
         eprintln!("  scores: {:?}", result.scores);
@@ -149,7 +157,10 @@ mod tests {
         assert_eq!(strict_result.threat_score, standard_result.threat_score);
 
         // But different policies = different policy commitments
-        assert_ne!(strict_result.policy_commitment, standard_result.policy_commitment);
+        assert_ne!(
+            strict_result.policy_commitment,
+            standard_result.policy_commitment
+        );
 
         // IO commitment is the same (computed from raw IO data, not Fiat-Shamir)
         // because the model output is identical regardless of policy.

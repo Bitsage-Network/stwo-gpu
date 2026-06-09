@@ -1,7 +1,6 @@
 use elo_cairo_verifier::channel::{
-    channel_default, channel_mix_u64, channel_mix_felt,
-    channel_draw_qm31, channel_draw_qm31s, channel_mix_poly_coeffs,
-    channel_draw_query_indices,
+    channel_default, channel_draw_qm31, channel_draw_qm31s, channel_draw_query_indices,
+    channel_mix_felt, channel_mix_poly_coeffs, channel_mix_u64,
 };
 use elo_cairo_verifier::field::{M31_P, qm31_new};
 

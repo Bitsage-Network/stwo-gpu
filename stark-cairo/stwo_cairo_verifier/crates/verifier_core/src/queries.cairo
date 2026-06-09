@@ -57,7 +57,7 @@ pub impl QueriesImpl of QueriesImplTrait {
         while k < len {
             used.append(false);
             k += 1;
-        };
+        }
         let mut i: u32 = 0;
         while i < len {
             let mut min_val: u32 = pow2(log_domain_size);
@@ -67,21 +67,26 @@ pub impl QueriesImpl of QueriesImplTrait {
                 if !*used[j] && *sorted[j] < min_val {
                     min_val = *sorted[j];
                     min_idx = j;
-                };
+                }
                 j += 1;
-            };
+            }
             result.append(min_val);
-            used = {
-                let mut new_used: Array<bool> = array![];
-                let mut m: u32 = 0;
-                while m < len {
-                    new_used.append(if m == min_idx { true } else { *used[m] });
-                    m += 1;
+            used =
+                {
+                    let mut new_used: Array<bool> = array![];
+                    let mut m: u32 = 0;
+                    while m < len {
+                        new_used.append(if m == min_idx {
+                            true
+                        } else {
+                            *used[m]
+                        });
+                        m += 1;
+                    }
+                    new_used
                 };
-                new_used
-            };
             i += 1;
-        };
+        }
 
         Queries { positions: result.span(), log_domain_size }
     }

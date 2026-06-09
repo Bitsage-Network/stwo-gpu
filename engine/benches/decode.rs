@@ -1,8 +1,6 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use stwo::core::fields::m31::M31;
-use stwo_ml::aggregation::{
-    prove_model_pure_gkr_decode_step, prove_model_pure_gkr_prefill,
-};
+use stwo_ml::aggregation::{prove_model_pure_gkr_decode_step, prove_model_pure_gkr_prefill};
 use stwo_ml::compiler::graph::{ComputationGraph, GraphOp, GraphWeights};
 use stwo_ml::components::attention::{ModelKVCache, MultiHeadAttentionConfig};
 use stwo_ml::components::matmul::M31Matrix;
@@ -21,9 +19,7 @@ fn make_matrix(rows: usize, cols: usize) -> M31Matrix {
     m
 }
 
-fn build_test_graph(
-    seq_len: usize,
-) -> (ComputationGraph, GraphWeights) {
+fn build_test_graph(seq_len: usize) -> (ComputationGraph, GraphWeights) {
     let config = MultiHeadAttentionConfig {
         d_model: D_MODEL,
         num_heads: NUM_HEADS,
@@ -66,8 +62,7 @@ fn build_test_graph(
 fn prefill(graph: &ComputationGraph, weights: &GraphWeights) -> ModelKVCache {
     let input = make_matrix(PREFILL_LEN, D_MODEL);
     let mut kvc = ModelKVCache::new();
-    prove_model_pure_gkr_prefill(graph, &input, weights, &mut kvc)
-        .expect("prefill should succeed");
+    prove_model_pure_gkr_prefill(graph, &input, weights, &mut kvc).expect("prefill should succeed");
     kvc
 }
 
@@ -79,10 +74,7 @@ fn bench_decode_step_base(c: &mut Criterion) {
         b.iter_batched(
             || prefill(&graph, &weights),
             |mut kvc| {
-                prove_model_pure_gkr_decode_step(
-                    &graph, &token, &weights, &mut kvc, None,
-                )
-                .unwrap();
+                prove_model_pure_gkr_decode_step(&graph, &token, &weights, &mut kvc, None).unwrap();
             },
             criterion::BatchSize::SmallInput,
         );
@@ -96,29 +88,23 @@ fn bench_decode_scaling(c: &mut Criterion) {
         let (graph, weights) = build_test_graph(cache_len);
         let token = make_matrix(1, D_MODEL);
 
-        group.bench_with_input(
-            BenchmarkId::new("step", cache_len),
-            &cache_len,
-            |b, _| {
-                b.iter_batched(
-                    || {
-                        // Prefill to the target cache length
-                        let input = make_matrix(cache_len, D_MODEL);
-                        let mut kvc = ModelKVCache::new();
-                        prove_model_pure_gkr_prefill(&graph, &input, &weights, &mut kvc)
-                            .expect("prefill should succeed");
-                        kvc
-                    },
-                    |mut kvc| {
-                        prove_model_pure_gkr_decode_step(
-                            &graph, &token, &weights, &mut kvc, None,
-                        )
+        group.bench_with_input(BenchmarkId::new("step", cache_len), &cache_len, |b, _| {
+            b.iter_batched(
+                || {
+                    // Prefill to the target cache length
+                    let input = make_matrix(cache_len, D_MODEL);
+                    let mut kvc = ModelKVCache::new();
+                    prove_model_pure_gkr_prefill(&graph, &input, &weights, &mut kvc)
+                        .expect("prefill should succeed");
+                    kvc
+                },
+                |mut kvc| {
+                    prove_model_pure_gkr_decode_step(&graph, &token, &weights, &mut kvc, None)
                         .unwrap();
-                    },
-                    criterion::BatchSize::SmallInput,
-                );
-            },
-        );
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
     }
     group.finish();
 }

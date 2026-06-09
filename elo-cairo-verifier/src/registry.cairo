@@ -14,10 +14,7 @@ use starknet::ContractAddress;
 pub trait IContractRegistry<TContractState> {
     /// Attest contract metadata (owner only).
     fn attest(
-        ref self: TContractState,
-        contract_address: felt252,
-        is_verified: bool,
-        has_source: bool,
+        ref self: TContractState, contract_address: felt252, is_verified: bool, has_source: bool,
     );
 
     /// Batch attest multiple contracts (owner only).
@@ -44,7 +41,7 @@ pub trait IContractRegistry<TContractState> {
 #[starknet::contract]
 pub mod ContractRegistry {
     use starknet::storage::{
-        StoragePointerReadAccess, StoragePointerWriteAccess, Map, StoragePathEntry,
+        Map, StoragePathEntry, StoragePointerReadAccess, StoragePointerWriteAccess,
     };
     use starknet::{ContractAddress, get_caller_address};
 
@@ -79,19 +76,19 @@ pub mod ContractRegistry {
     #[abi(embed_v0)]
     impl ContractRegistryImpl of super::IContractRegistry<ContractState> {
         fn attest(
-            ref self: ContractState,
-            contract_address: felt252,
-            is_verified: bool,
-            has_source: bool,
+            ref self: ContractState, contract_address: felt252, is_verified: bool, has_source: bool,
         ) {
             assert!(get_caller_address() == self.owner.read(), "ONLY_OWNER");
             assert!(contract_address != 0, "ADDRESS_CANNOT_BE_ZERO");
             self.contract_verified.entry(contract_address).write(is_verified);
             self.contract_has_source.entry(contract_address).write(has_source);
             self.contract_attested.entry(contract_address).write(true);
-            self.emit(ContractAttested {
-                contract_address, is_verified, has_source, attester: get_caller_address(),
-            });
+            self
+                .emit(
+                    ContractAttested {
+                        contract_address, is_verified, has_source, attester: get_caller_address(),
+                    },
+                );
         }
 
         fn attest_batch(
@@ -115,10 +112,15 @@ pub mod ContractRegistry {
                 self.contract_verified.entry(addr).write(v);
                 self.contract_has_source.entry(addr).write(s);
                 self.contract_attested.entry(addr).write(true);
-                self.emit(ContractAttested {
-                    contract_address: addr, is_verified: v, has_source: s,
-                    attester: get_caller_address(),
-                });
+                self
+                    .emit(
+                        ContractAttested {
+                            contract_address: addr,
+                            is_verified: v,
+                            has_source: s,
+                            attester: get_caller_address(),
+                        },
+                    );
                 i += 1;
             };
         }

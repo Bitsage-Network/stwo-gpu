@@ -428,7 +428,13 @@ fn test_gkr_roundtrip_matmul_only() {
     // Verify the proof is valid via GKR verifier
     let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&graph).expect("circuit should compile");
     let mut ch = PoseidonChannel::new();
-    let result = obelyzk::gkr::verify_gkr_with_weights(&circuit, gkr, &proof.execution.output, &weights, &mut ch);
+    let result = obelyzk::gkr::verify_gkr_with_weights(
+        &circuit,
+        gkr,
+        &proof.execution.output,
+        &weights,
+        &mut ch,
+    );
     assert!(
         result.is_ok(),
         "GKR verification should pass: {:?}",
@@ -517,7 +523,13 @@ fn test_gkr_roundtrip_with_activation() {
     // Verify the proof is valid
     let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&graph).expect("circuit should compile");
     let mut ch = PoseidonChannel::new();
-    let result = obelyzk::gkr::verify_gkr_with_weights(&circuit, gkr, &proof.execution.output, &weights, &mut ch);
+    let result = obelyzk::gkr::verify_gkr_with_weights(
+        &circuit,
+        gkr,
+        &proof.execution.output,
+        &weights,
+        &mut ch,
+    );
     assert!(
         result.is_ok(),
         "GKR verification should pass: {:?}",
@@ -659,7 +671,8 @@ fn test_gkr_rejects_wrong_output() {
     bad_output.data[0] = M31::from(bad_output.data[0].0.wrapping_add(1));
 
     let mut ch = PoseidonChannel::new();
-    let result = obelyzk::gkr::verify_gkr_with_weights(&circuit, gkr, &bad_output, &weights, &mut ch);
+    let result =
+        obelyzk::gkr::verify_gkr_with_weights(&circuit, gkr, &bad_output, &weights, &mut ch);
     assert!(
         result.is_err(),
         "verification should reject tampered output"
@@ -691,7 +704,13 @@ fn test_gkr_rejects_tampered_round_poly() {
     let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&graph).expect("circuit should compile");
 
     let mut ch = PoseidonChannel::new();
-    let result = obelyzk::gkr::verify_gkr_with_weights(&circuit, &gkr, &proof.execution.output, &weights, &mut ch);
+    let result = obelyzk::gkr::verify_gkr_with_weights(
+        &circuit,
+        &gkr,
+        &proof.execution.output,
+        &weights,
+        &mut ch,
+    );
     assert!(
         result.is_err(),
         "verification should reject tampered round poly"
@@ -721,7 +740,13 @@ fn test_gkr_rejects_tampered_final_eval() {
     let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&graph).expect("circuit should compile");
 
     let mut ch = PoseidonChannel::new();
-    let result = obelyzk::gkr::verify_gkr_with_weights(&circuit, &gkr, &proof.execution.output, &weights, &mut ch);
+    let result = obelyzk::gkr::verify_gkr_with_weights(
+        &circuit,
+        &gkr,
+        &proof.execution.output,
+        &weights,
+        &mut ch,
+    );
     assert!(
         result.is_err(),
         "verification should reject tampered final eval"
@@ -802,7 +827,13 @@ fn test_gkr_rejects_wrong_input_claim() {
     let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&graph).expect("circuit should compile");
 
     let mut ch = PoseidonChannel::new();
-    let result = obelyzk::gkr::verify_gkr_with_weights(&circuit, &gkr, &proof.execution.output, &weights, &mut ch);
+    let result = obelyzk::gkr::verify_gkr_with_weights(
+        &circuit,
+        &gkr,
+        &proof.execution.output,
+        &weights,
+        &mut ch,
+    );
     assert!(
         result.is_err(),
         "verification should reject tampered input claim"
@@ -865,21 +896,24 @@ fn test_gkr_rejects_tampered_activation_input_eval() {
     let mut found = false;
     for lp in &mut gkr.layer_proofs {
         if let obelyzk::gkr::types::LayerProof::Activation { input_eval, .. } = lp {
-            *input_eval = *input_eval
-                + stwo::core::fields::qm31::QM31::from_u32_unchecked(1, 0, 0, 0);
+            *input_eval =
+                *input_eval + stwo::core::fields::qm31::QM31::from_u32_unchecked(1, 0, 0, 0);
             found = true;
             break;
         }
     }
-    assert!(
-        found,
-        "should have found an Activation layer to tamper"
-    );
+    assert!(found, "should have found an Activation layer to tamper");
 
     let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&graph).expect("circuit should compile");
 
     let mut ch = PoseidonChannel::new();
-    let result = obelyzk::gkr::verify_gkr_with_weights(&circuit, &gkr, &proof.execution.output, &weights, &mut ch);
+    let result = obelyzk::gkr::verify_gkr_with_weights(
+        &circuit,
+        &gkr,
+        &proof.execution.output,
+        &weights,
+        &mut ch,
+    );
     assert!(
         result.is_err(),
         "verification should reject tampered activation input_eval"
@@ -966,7 +1000,13 @@ fn test_gkr_roundtrip_with_layernorm() {
     // Verify the proof passes GKR verification
     let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&graph).expect("circuit should compile");
     let mut ch = PoseidonChannel::new();
-    let result = obelyzk::gkr::verify_gkr_with_weights(&circuit, gkr, &proof.execution.output, &weights, &mut ch);
+    let result = obelyzk::gkr::verify_gkr_with_weights(
+        &circuit,
+        gkr,
+        &proof.execution.output,
+        &weights,
+        &mut ch,
+    );
     assert!(
         result.is_ok(),
         "GKR verification should pass: {:?}",
@@ -1000,7 +1040,13 @@ fn test_sp3_export_mlp_proof_calldata() {
     // Verify it passes
     let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&graph).expect("circuit should compile");
     let mut ch = PoseidonChannel::new();
-    let result = obelyzk::gkr::verify_gkr_with_weights(&circuit, gkr, &proof.execution.output, &weights, &mut ch);
+    let result = obelyzk::gkr::verify_gkr_with_weights(
+        &circuit,
+        gkr,
+        &proof.execution.output,
+        &weights,
+        &mut ch,
+    );
     assert!(result.is_ok(), "proof must verify before export");
 
     let final_digest = ch.digest();
@@ -1063,8 +1109,13 @@ fn test_sp3_export_mlp_proof_calldata() {
 
     // Verify it FAILS
     let mut ch2 = PoseidonChannel::new();
-    let tampered_result =
-        obelyzk::gkr::verify_gkr_with_weights(&circuit, &tampered_gkr, &proof.execution.output, &weights, &mut ch2);
+    let tampered_result = obelyzk::gkr::verify_gkr_with_weights(
+        &circuit,
+        &tampered_gkr,
+        &proof.execution.output,
+        &weights,
+        &mut ch2,
+    );
     assert!(
         tampered_result.is_err(),
         "tampered proof must fail verification"
@@ -1106,7 +1157,13 @@ fn test_sp3_export_matmul_only_proof() {
 
     let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&graph).unwrap();
     let mut ch = PoseidonChannel::new();
-    let result = obelyzk::gkr::verify_gkr_with_weights(&circuit, gkr, &proof.execution.output, &weights, &mut ch);
+    let result = obelyzk::gkr::verify_gkr_with_weights(
+        &circuit,
+        gkr,
+        &proof.execution.output,
+        &weights,
+        &mut ch,
+    );
     assert!(result.is_ok());
 
     // Serialize weight opening proofs (Array<MleOpeningProof> format for Cairo Serde)
@@ -1228,7 +1285,8 @@ fn test_verify_model_gkr_calldata_matmul_only() {
 
     // Test verify calldata
     let raw_io_data = obelyzk::cairo_serde::serialize_raw_io(&input, &proof.execution.output);
-    let verify_calldata = build_verify_model_gkr_calldata(gkr, &circuit, model_id, &raw_io_data).expect("build verify calldata");
+    let verify_calldata = build_verify_model_gkr_calldata(gkr, &circuit, model_id, &raw_io_data)
+        .expect("build verify calldata");
     assert!(
         verify_calldata.total_felts > 10,
         "should have substantial calldata"
@@ -1277,7 +1335,8 @@ fn test_verify_model_gkr_calldata_mlp_relu() {
     assert!(dequantize_bits.is_empty());
 
     let raw_io_data = obelyzk::cairo_serde::serialize_raw_io(&input, &proof.execution.output);
-    let verify_calldata = build_verify_model_gkr_calldata(gkr, &circuit, model_id, &raw_io_data).expect("build verify calldata");
+    let verify_calldata = build_verify_model_gkr_calldata(gkr, &circuit, model_id, &raw_io_data)
+        .expect("build verify calldata");
     assert!(
         verify_calldata.total_felts > 50,
         "MLP calldata should be larger"
@@ -1324,7 +1383,8 @@ fn test_d7_export_onchain_calldata() {
 
     // Build verification calldata
     let raw_io_data = obelyzk::cairo_serde::serialize_raw_io(&input, &proof.execution.output);
-    let verify_calldata = build_verify_model_gkr_calldata(gkr, &circuit, model_id, &raw_io_data).expect("build verify calldata");
+    let verify_calldata = build_verify_model_gkr_calldata(gkr, &circuit, model_id, &raw_io_data)
+        .expect("build verify calldata");
 
     // Write to artifacts
     let artifacts_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1421,7 +1481,8 @@ fn test_d9_export_mlp_onchain_calldata() {
 
     // Build verification calldata
     let raw_io_data = obelyzk::cairo_serde::serialize_raw_io(&input, &proof.execution.output);
-    let verify_calldata = build_verify_model_gkr_calldata(gkr, &circuit, model_id, &raw_io_data).expect("build verify calldata");
+    let verify_calldata = build_verify_model_gkr_calldata(gkr, &circuit, model_id, &raw_io_data)
+        .expect("build verify calldata");
 
     // Validate calldata structure
     let parts = &verify_calldata.calldata_parts;
@@ -1512,8 +1573,8 @@ fn test_d10_export_layernorm_onchain_calldata() {
     // Build calldata via GkrStarknetProof (V1 calldata builder doesn't support LayerNorm tag)
     let register_calldata =
         build_register_gkr_calldata(model_id, &gkr.weight_commitments, &circuit_desc);
-    let gkr_sn = build_gkr_starknet_proof(&proof, model_id, &input)
-        .expect("starknet proof should succeed");
+    let gkr_sn =
+        build_gkr_starknet_proof(&proof, model_id, &input).expect("starknet proof should succeed");
 
     assert!(gkr_sn.total_calldata_size > 0);
 
@@ -1603,8 +1664,13 @@ fn test_d11_export_residual_onchain_calldata() {
     // Verify the GKR proof with Rust verifier
     {
         let mut verify_ch = obelyzk::crypto::poseidon_channel::PoseidonChannel::new();
-        let result =
-            obelyzk::gkr::verify_gkr_with_weights(&circuit, gkr, &proof.execution.output, &weights, &mut verify_ch);
+        let result = obelyzk::gkr::verify_gkr_with_weights(
+            &circuit,
+            gkr,
+            &proof.execution.output,
+            &weights,
+            &mut verify_ch,
+        );
         result.expect("D11 GKR proof should verify in Rust");
         eprintln!("D11 Rust GKR verification: PASS");
     }
@@ -1622,8 +1688,8 @@ fn test_d11_export_residual_onchain_calldata() {
     let register_calldata =
         build_register_gkr_calldata(model_id, &gkr.weight_commitments, &circuit_desc);
     // V1 calldata builder doesn't support Add layer — use GkrStarknetProof instead
-    let gkr_sn = build_gkr_starknet_proof(&proof, model_id, &input)
-        .expect("starknet proof should succeed");
+    let gkr_sn =
+        build_gkr_starknet_proof(&proof, model_id, &input).expect("starknet proof should succeed");
 
     assert!(gkr_sn.total_calldata_size > 0);
 
@@ -1667,12 +1733,12 @@ fn test_d11_export_residual_onchain_calldata() {
 
 #[test]
 fn test_e2e_decode_cairo_verify() {
-    use obelyzk::aggregation::{IncrementalKVCommitment, prove_model_pure_gkr_decode_step};
+    use obelyzk::aggregation::{prove_model_pure_gkr_decode_step, IncrementalKVCommitment};
+    use obelyzk::compiler::graph::GraphBuilder;
+    use obelyzk::compiler::onnx::generate_weights_for_graph;
     use obelyzk::components::attention::{
         attention_forward_cached, AttentionWeights, ModelKVCache,
     };
-    use obelyzk::compiler::graph::GraphBuilder;
-    use obelyzk::compiler::onnx::generate_weights_for_graph;
     use obelyzk::starknet::{extract_matmul_dims, replay_verify_serialized_proof};
 
     let d_model = 64;
@@ -1703,10 +1769,26 @@ fn test_e2e_decode_cairo_verify() {
     for &node_id in &topo {
         let node = &graph.nodes[node_id];
         if let obelyzk::compiler::graph::GraphOp::Attention { config: _ } = &node.op {
-            weights.add_named_weight(node.id, "w_q", random_m31(d_model, d_model, 200 + node.id as u64));
-            weights.add_named_weight(node.id, "w_k", random_m31(d_model, d_model, 300 + node.id as u64));
-            weights.add_named_weight(node.id, "w_v", random_m31(d_model, d_model, 400 + node.id as u64));
-            weights.add_named_weight(node.id, "w_o", random_m31(d_model, d_model, 500 + node.id as u64));
+            weights.add_named_weight(
+                node.id,
+                "w_q",
+                random_m31(d_model, d_model, 200 + node.id as u64),
+            );
+            weights.add_named_weight(
+                node.id,
+                "w_k",
+                random_m31(d_model, d_model, 300 + node.id as u64),
+            );
+            weights.add_named_weight(
+                node.id,
+                "w_v",
+                random_m31(d_model, d_model, 400 + node.id as u64),
+            );
+            weights.add_named_weight(
+                node.id,
+                "w_o",
+                random_m31(d_model, d_model, 500 + node.id as u64),
+            );
         }
     }
 
@@ -1723,7 +1805,13 @@ fn test_e2e_decode_cairo_verify() {
                 w_o: weights.get_named_weight(node.id, "w_o").unwrap().clone(),
             };
             let cache = kv_cache.get_or_create(node.id, config);
-            let _ = attention_forward_cached(&prefill_input, &attn_weights, config, cache, config.causal);
+            let _ = attention_forward_cached(
+                &prefill_input,
+                &attn_weights,
+                config,
+                cache,
+                config.causal,
+            );
         }
     }
 
@@ -1731,18 +1819,35 @@ fn test_e2e_decode_cairo_verify() {
     let token_input = random_m31(1, d_model, 999);
     let mut kv_commitment = IncrementalKVCommitment::from_kv_cache(&kv_cache, 16);
     let (proof, kv_commit) = obelyzk::aggregation::prove_model_pure_gkr_decode_step_incremental(
-        &graph, &token_input, &weights, &mut kv_cache, &mut kv_commitment, None, None,
-    ).expect("decode proving should succeed");
+        &graph,
+        &token_input,
+        &weights,
+        &mut kv_cache,
+        &mut kv_commitment,
+        None,
+        None,
+    )
+    .expect("decode proving should succeed");
 
     let gkr = proof.gkr_proof.as_ref().expect("should have GKR proof");
     assert!(!gkr.layer_proofs.is_empty(), "should have layer proofs");
-    assert!(gkr.kv_cache_commitment.is_some(), "should have KV commitment");
-    assert_eq!(gkr.kv_cache_commitment.unwrap(), kv_commit, "KV commitment mismatch");
+    assert!(
+        gkr.kv_cache_commitment.is_some(),
+        "should have KV commitment"
+    );
+    assert_eq!(
+        gkr.kv_cache_commitment.unwrap(),
+        kv_commit,
+        "KV commitment mismatch"
+    );
 
     // Serialize proof data (unpacked for simplicity)
     let mut proof_data = Vec::new();
     obelyzk::cairo_serde::serialize_gkr_proof_data_only(gkr, &mut proof_data);
-    assert!(!proof_data.is_empty(), "serialized proof should be non-empty");
+    assert!(
+        !proof_data.is_empty(),
+        "serialized proof should be non-empty"
+    );
 
     // Build matmul dims from circuit
     let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&graph).unwrap();

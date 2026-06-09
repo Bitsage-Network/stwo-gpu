@@ -7,15 +7,15 @@
 //   0=MatMul, 1=Add, 2=Mul, 3=Activation, 4=LayerNorm,
 //   5=Attention, 6=Dequantize, 7=MatMulDualSimd, 8=RMSNorm
 
-use crate::field::{
-    QM31, qm31_one, qm31_add, qm31_sub, qm31_mul, qm31_eq,
-    poly_eval_degree2, poly_eval_degree3, eq_eval, log2_ceil,
-};
 use crate::channel::{
-    PoseidonChannel, channel_mix_u64, channel_mix_secure_field,
-    channel_mix_poly_coeffs, channel_mix_poly_coeffs_deg3, channel_draw_qm31,
+    PoseidonChannel, channel_draw_qm31, channel_mix_poly_coeffs, channel_mix_poly_coeffs_deg3,
+    channel_mix_secure_field, channel_mix_u64,
 };
-use crate::types::{GKRClaim, CompressedRoundPoly, CompressedGkrRoundPoly};
+use crate::field::{
+    QM31, eq_eval, log2_ceil, poly_eval_degree2, poly_eval_degree3, qm31_add, qm31_eq, qm31_mul,
+    qm31_one, qm31_sub,
+};
+use crate::types::{CompressedGkrRoundPoly, CompressedRoundPoly, GKRClaim};
 
 // ============================================================================
 // Helpers
@@ -31,7 +31,7 @@ pub fn clone_point(point: @Array<QM31>) -> Array<QM31> {
         }
         result.append(*point.at(i));
         i += 1;
-    };
+    }
     result
 }
 
@@ -87,7 +87,7 @@ pub fn verify_multiplicity_sumcheck(
         // Update: current_sum = c0 + c1 * r
         current_sum = qm31_add(c0, qm31_mul(c1, r));
         i += 1;
-    };
+    }
 
     // After all rounds, the remaining sum should equal the final MLE evaluation
     assert!(qm31_eq(current_sum, final_eval), "MULT_SUMCHECK_FINAL_EVAL_MISMATCH");
@@ -131,12 +131,13 @@ pub fn verify_add_layer(
     let _alpha = channel_draw_qm31(ref ch);
 
     // Step 5: Return claim with trunk value
-    let trunk_eval = if trunk_idx == 1 { rhs_eval } else { lhs_eval };
+    let trunk_eval = if trunk_idx == 1 {
+        rhs_eval
+    } else {
+        lhs_eval
+    };
 
-    GKRClaim {
-        point: clone_point(output_claim.point),
-        value: trunk_eval,
-    }
+    GKRClaim { point: clone_point(output_claim.point), value: trunk_eval }
 }
 
 // ============================================================================
@@ -228,7 +229,7 @@ pub fn verify_matmul_layer(
         current_sum = poly_eval_degree2(cpoly.c0, c1, cpoly.c2, challenge);
 
         round += 1;
-    };
+    }
 
     // Step 4: Verify final evaluation: sum == final_a * final_b
     let expected = qm31_mul(final_a_eval, final_b_eval);
@@ -248,7 +249,7 @@ pub fn verify_matmul_layer(
         }
         new_point.append(*output_claim.point.at(i));
         i += 1;
-    };
+    }
     // Append k challenges
     i = 0;
     loop {
@@ -257,12 +258,9 @@ pub fn verify_matmul_layer(
         }
         new_point.append(*k_challenges.at(i));
         i += 1;
-    };
-
-    GKRClaim {
-        point: new_point,
-        value: final_a_eval,
     }
+
+    GKRClaim { point: new_point, value: final_a_eval }
 }
 
 // ============================================================================
@@ -307,8 +305,7 @@ fn verify_logup_eq_sumcheck(
 
         // Reconstruct c1 = current_sum - 2*c0 - c2 - c3
         let c1 = qm31_sub(
-            qm31_sub(qm31_sub(current_sum, qm31_add(cpoly.c0, cpoly.c0)), cpoly.c2),
-            cpoly.c3,
+            qm31_sub(qm31_sub(current_sum, qm31_add(cpoly.c0, cpoly.c0)), cpoly.c2), cpoly.c3,
         );
 
         // Mix round polynomial
@@ -322,7 +319,7 @@ fn verify_logup_eq_sumcheck(
         current_sum = poly_eval_degree3(cpoly.c0, c1, cpoly.c2, cpoly.c3, challenge);
 
         round += 1;
-    };
+    }
 
     // Final check: current_sum == eq(r[..num_vars], challenges) * w(s) * d(s)
     // where d(s) = gamma - in(s) - beta * out(s)
@@ -336,7 +333,7 @@ fn verify_logup_eq_sumcheck(
         }
         r_slice.append(*output_claim_point.at(i));
         i += 1;
-    };
+    }
 
     let eq_val = eq_eval(r_slice.span(), challenges.span());
     let expected = qm31_mul(eq_val, qm31_mul(final_w_eval, d_eval));
@@ -376,8 +373,7 @@ fn verify_linear_eq_sumcheck(
 
         // Reconstruct c1 = current_sum - 2*c0 - c2 - c3
         let c1 = qm31_sub(
-            qm31_sub(qm31_sub(current_sum, qm31_add(cpoly.c0, cpoly.c0)), cpoly.c2),
-            cpoly.c3,
+            qm31_sub(qm31_sub(current_sum, qm31_add(cpoly.c0, cpoly.c0)), cpoly.c2), cpoly.c3,
         );
 
         // Mix round polynomial
@@ -391,7 +387,7 @@ fn verify_linear_eq_sumcheck(
         current_sum = poly_eval_degree3(cpoly.c0, c1, cpoly.c2, cpoly.c3, challenge);
 
         round += 1;
-    };
+    }
 
     // Final check: current_sum == eq(r[..num_vars], challenges) * lhs_final * rhs_final
     let mut r_slice: Array<QM31> = array![];
@@ -402,7 +398,7 @@ fn verify_linear_eq_sumcheck(
         }
         r_slice.append(*output_claim_point.at(i));
         i += 1;
-    };
+    }
 
     let eq_val = eq_eval(r_slice.span(), challenges.span());
     let expected = qm31_mul(eq_val, qm31_mul(lhs_final, rhs_final));
@@ -476,10 +472,7 @@ pub fn verify_activation_layer(
     channel_mix_secure_field(ref ch, input_eval);
     channel_mix_secure_field(ref ch, output_eval);
 
-    GKRClaim {
-        point: clone_point(output_claim.point),
-        value: input_eval,
-    }
+    GKRClaim { point: clone_point(output_claim.point), value: input_eval }
 }
 
 // ============================================================================
@@ -673,8 +666,5 @@ pub fn verify_rmsnorm_layer(
     channel_mix_secure_field(ref ch, input_eval);
     channel_mix_secure_field(ref ch, output_eval);
 
-    GKRClaim {
-        point: clone_point(output_claim.point),
-        value: input_eval,
-    }
+    GKRClaim { point: clone_point(output_claim.point), value: input_eval }
 }

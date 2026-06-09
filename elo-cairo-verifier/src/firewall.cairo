@@ -86,14 +86,12 @@ pub trait IAgentFirewall<TContractState> {
     /// Reject an escalated action (agent owner only).
     fn reject_escalated(ref self: TContractState, action_id: u64);
 
-    // ── Admin ─────────────────────────────────────────────────────────
+    // ── Admin
+    // ─────────────────────────────────────────────────────────
 
     /// Update scoring thresholds (contract owner only).
     fn set_thresholds(
-        ref self: TContractState,
-        escalate_threshold: u32,
-        block_threshold: u32,
-        max_strikes: u32,
+        ref self: TContractState, escalate_threshold: u32, block_threshold: u32, max_strikes: u32,
     );
 
     /// Emergency pause (contract owner only). Blocks submit + resolve.
@@ -119,11 +117,10 @@ pub trait IAgentFirewall<TContractState> {
 
     /// Update classifier model ID and expected weight hash (contract owner only).
     /// Both must be provided — prevents model substitution attacks.
-    fn set_classifier_model(
-        ref self: TContractState, model_id: felt252, weight_root_hash: felt252,
-    );
+    fn set_classifier_model(ref self: TContractState, model_id: felt252, weight_root_hash: felt252);
 
-    // ── Queries ──────────────────────────────────────────────────────
+    // ── Queries
+    // ──────────────────────────────────────────────────────
 
     /// Check if a specific action has been approved.
     fn is_action_approved(self: @TContractState, action_id: u64) -> bool;
@@ -226,17 +223,16 @@ fn bit_length_u128(val: u128) -> u32 {
 #[starknet::contract]
 pub mod AgentFirewallZK {
     use starknet::storage::{
-        StoragePointerReadAccess, StoragePointerWriteAccess, Map, StoragePathEntry,
+        Map, StoragePathEntry, StoragePointerReadAccess, StoragePointerWriteAccess,
     };
-    use starknet::{ContractAddress, get_caller_address, get_block_timestamp};
+    use starknet::{ContractAddress, get_block_timestamp, get_caller_address};
     use super::{
-        IVerifierDispatcher, IVerifierDispatcherTrait,
-        IERC20Dispatcher, IERC20DispatcherTrait,
-        IRegistryDispatcher, IRegistryDispatcherTrait,
-        extract_m31, bit_length_u128,
+        IERC20Dispatcher, IERC20DispatcherTrait, IRegistryDispatcher, IRegistryDispatcherTrait,
+        IVerifierDispatcher, IVerifierDispatcherTrait, bit_length_u128, extract_m31,
     };
 
-    // ── Constants ────────────────────────────────────────────────────
+    // ── Constants
+    // ────────────────────────────────────────────────────
 
     /// EMA alpha for INCREASING scores (score > prev): fast up.
     /// 500 / 1000 = 0.5 — bad actions raise the score quickly.
@@ -262,7 +258,8 @@ pub mod AgentFirewallZK {
     /// Default max strikes before auto-freeze.
     const DEFAULT_MAX_STRIKES: u32 = 5;
 
-    // ── Storage ──────────────────────────────────────────────────────
+    // ── Storage
+    // ──────────────────────────────────────────────────────
 
     #[storage]
     struct Storage {
@@ -284,16 +281,16 @@ pub mod AgentFirewallZK {
         contract_registry: ContractAddress,
         /// ERC20 token contract for value_balance_ratio computation.
         token_address: ContractAddress,
-
-        // ── Agent registry ───────────────────────────────────────────
+        // ── Agent registry
+        // ───────────────────────────────────────────
         agent_owner: Map<felt252, ContractAddress>,
         agent_trust_score: Map<felt252, u64>,
         agent_strikes: Map<felt252, u32>,
         agent_active: Map<felt252, bool>,
         agent_registered: Map<felt252, bool>,
         agent_registered_at: Map<felt252, u64>,
-
-        // ── Action queue ─────────────────────────────────────────────
+        // ── Action queue
+        // ─────────────────────────────────────────────
         next_action_id: u64,
         action_agent: Map<u64, felt252>,
         action_target: Map<u64, felt252>,
@@ -306,13 +303,12 @@ pub mod AgentFirewallZK {
         action_threat_score: Map<u64, u32>,
         action_proof_hash: Map<u64, felt252>,
         action_submitted_at: Map<u64, u64>,
-
-        // ── Per-agent rate limiting ──────────────────────────────────
+        // ── Per-agent rate limiting
+        // ──────────────────────────────────
         /// agent_id → number of currently pending (unresolved) actions.
         agent_pending_count: Map<felt252, u32>,
         /// Maximum pending actions per agent (default: 10).
         max_pending_per_agent: u32,
-
         // ── Behavioral tracking (accumulated per submit_action) ─────
         /// (agent_id, target) → interaction count with this target.
         interaction_count: Map<(felt252, felt252), u32>,
@@ -328,19 +324,20 @@ pub mod AgentFirewallZK {
         agent_window_value_sum: Map<felt252, u64>,
         /// agent_id → max value in current window.
         agent_window_value_max: Map<felt252, u64>,
-
-        // ── Proof replay protection ──────────────────────────────────
+        // ── Proof replay protection
+        // ──────────────────────────────────
         /// proof_hash → whether this proof has been used to resolve an action.
         /// Prevents the same proof from being replayed across multiple actions.
         used_proof_hashes: Map<felt252, bool>,
-
-        // ── Thresholds ───────────────────────────────────────────────
+        // ── Thresholds
+        // ───────────────────────────────────────────────
         escalate_threshold: u32,
         block_threshold: u32,
         max_strikes: u32,
     }
 
-    // ── Events ───────────────────────────────────────────────────────
+    // ── Events
+    // ───────────────────────────────────────────────────────
 
     #[event]
     #[derive(Drop, starknet::Event)]
@@ -441,7 +438,8 @@ pub mod AgentFirewallZK {
         new_owner: ContractAddress,
     }
 
-    // ── Constructor ──────────────────────────────────────────────────
+    // ── Constructor
+    // ──────────────────────────────────────────────────
 
     #[constructor]
     fn constructor(
@@ -463,7 +461,8 @@ pub mod AgentFirewallZK {
         self.next_action_id.write(1);
     }
 
-    // ── Implementation ───────────────────────────────────────────────
+    // ── Implementation
+    // ───────────────────────────────────────────────
 
     #[abi(embed_v0)]
     impl AgentFirewallImpl of super::IAgentFirewall<ContractState> {
@@ -488,8 +487,7 @@ pub mod AgentFirewallZK {
             let caller = get_caller_address();
             let agent_owner = self.agent_owner.entry(agent_id).read();
             assert!(
-                caller == agent_owner || caller == self.owner.read(),
-                "NOT_AGENT_OR_CONTRACT_OWNER"
+                caller == agent_owner || caller == self.owner.read(), "NOT_AGENT_OR_CONTRACT_OWNER",
             );
             self.agent_active.entry(agent_id).write(false);
             self.emit(AgentDeactivated { agent_id, deactivated_by: caller });
@@ -584,11 +582,15 @@ pub mod AgentFirewallZK {
                 }
             }
 
-            self.agent_total_actions.entry(agent_id).write(
-                self.agent_total_actions.entry(agent_id).read() + 1
-            );
+            self
+                .agent_total_actions
+                .entry(agent_id)
+                .write(self.agent_total_actions.entry(agent_id).read() + 1);
 
-            self.emit(ActionSubmitted { action_id, agent_id, target, value, selector, io_commitment });
+            self
+                .emit(
+                    ActionSubmitted { action_id, agent_id, target, value, selector, io_commitment },
+                );
 
             action_id
         }
@@ -617,17 +619,14 @@ pub mod AgentFirewallZK {
             let caller = get_caller_address();
             let agent_owner = self.agent_owner.entry(agent_id).read();
             assert!(
-                caller == agent_owner || caller == self.owner.read(),
-                "NOT_AGENT_OR_CONTRACT_OWNER"
+                caller == agent_owner || caller == self.owner.read(), "NOT_AGENT_OR_CONTRACT_OWNER",
             );
 
             // Agent must still be active (frozen agents can't resolve)
             assert!(self.agent_active.entry(agent_id).read(), "AGENT_FROZEN");
 
             // 1. Verify the ZKML proof was verified on ObelyskVerifier
-            let verifier = IVerifierDispatcher {
-                contract_address: self.verifier_address.read()
-            };
+            let verifier = IVerifierDispatcher { contract_address: self.verifier_address.read() };
             assert!(verifier.is_proof_verified(proof_hash), "PROOF_NOT_VERIFIED");
 
             // 2. Verify proof hasn't been used for another action (replay protection)
@@ -654,7 +653,7 @@ pub mod AgentFirewallZK {
                 }
                 commitment_input.append(*packed_span.at(ci));
                 ci += 1;
-            };
+            }
             let recomputed_io = core::poseidon::poseidon_hash_span(commitment_input.span());
 
             // Verify against the stored action io_commitment
@@ -701,7 +700,10 @@ pub mod AgentFirewallZK {
             assert!(out_len == out_rows * out_cols, "OUTPUT_DIMENSION_MISMATCH");
 
             // Validate total IO length matches original_io_len
-            let expected_io_len: u32 = 3 + in_len + 3 + out_len; // 3 input header + data + 3 output header + data
+            let expected_io_len: u32 = 3
+                + in_len
+                + 3
+                + out_len; // 3 input header + data + 3 output header + data
             assert!(original_io_len == expected_io_len, "IO_LEN_TOTAL_MISMATCH");
 
             // Ensure we can read all 3 output scores
@@ -740,23 +742,20 @@ pub mod AgentFirewallZK {
                 reconstructed = reconstructed + chunk_val * shift;
                 shift = shift * 0x80000000; // 2^31
                 chunk_idx += 1;
-            };
+            }
             // Compare lower 248 bits of target against reconstructed
             let target_u256: u256 = stored_target.into();
-            let mask_248: u256 = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF; // 2^248 - 1
+            let mask_248: u256 =
+                0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF; // 2^248 - 1
             assert!(
-                (reconstructed & mask_248) == (target_u256 & mask_248),
-                "INPUT_TARGET_MISMATCH"
+                (reconstructed & mask_248) == (target_u256 & mask_248), "INPUT_TARGET_MISMATCH",
             );
 
             // Verify selector: feature 16 at M31 index (input_start + 16)
             let encoded_selector: u32 = extract_m31(packed_span, input_start + 16);
             let stored_selector: u32 = self.action_selector.entry(action_id).read();
             // Selector is masked to 31 bits in the encoder (& 0x7FFFFFFF)
-            assert!(
-                encoded_selector == (stored_selector & 0x7FFFFFFF),
-                "INPUT_SELECTOR_MISMATCH"
-            );
+            assert!(encoded_selector == (stored_selector & 0x7FFFFFFF), "INPUT_SELECTOR_MISMATCH");
 
             // Verify agent metadata features against on-chain state.
             // These are the most dangerous soft features to fake — an attacker
@@ -830,7 +829,11 @@ pub mod AgentFirewallZK {
             assert!(encoded_max_approval == expected_max_approval, "INPUT_MAX_APPROVAL_MISMATCH");
 
             // Feature 36: is_zero_value
-            let expected_zero: u32 = if value_low == 0 { 1 } else { 0 };
+            let expected_zero: u32 = if value_low == 0 {
+                1
+            } else {
+                0
+            };
             let encoded_zero: u32 = extract_m31(packed_span, input_start + 36);
             assert!(encoded_zero == expected_zero, "INPUT_ZERO_VALUE_MISMATCH");
 
@@ -838,17 +841,27 @@ pub mod AgentFirewallZK {
             let sel: u32 = self.action_selector.entry(action_id).read();
 
             // Feature 37: is_transfer (ERC20 transfer / transferFrom)
-            let expected_transfer: u32 = if sel == 0xa9059cbb || sel == 0x23b872dd { 1 } else { 0 };
+            let expected_transfer: u32 = if sel == 0xa9059cbb || sel == 0x23b872dd {
+                1
+            } else {
+                0
+            };
             let encoded_transfer: u32 = extract_m31(packed_span, input_start + 37);
             assert!(encoded_transfer == expected_transfer, "INPUT_IS_TRANSFER_MISMATCH");
 
             // Feature 38: is_approve
-            let expected_approve: u32 = if sel == 0x095ea7b3 { 1 } else { 0 };
+            let expected_approve: u32 = if sel == 0x095ea7b3 {
+                1
+            } else {
+                0
+            };
             let encoded_approve: u32 = extract_m31(packed_span, input_start + 38);
             assert!(encoded_approve == expected_approve, "INPUT_IS_APPROVE_MISMATCH");
 
             // Feature 39: is_swap (Uniswap/Sushi common selectors)
-            let expected_swap: u32 = if sel == 0x38ed1739 || sel == 0x7ff36ab5 || sel == 0x18cbafe5 {
+            let expected_swap: u32 = if sel == 0x38ed1739
+                || sel == 0x7ff36ab5
+                || sel == 0x18cbafe5 {
                 1
             } else {
                 0
@@ -857,7 +870,11 @@ pub mod AgentFirewallZK {
             assert!(encoded_swap == expected_swap, "INPUT_IS_SWAP_MISMATCH");
 
             // Feature 40: is_unknown (selector == 0)
-            let expected_unknown: u32 = if sel == 0 { 1 } else { 0 };
+            let expected_unknown: u32 = if sel == 0 {
+                1
+            } else {
+                0
+            };
             let encoded_unknown: u32 = extract_m31(packed_span, input_start + 40);
             assert!(encoded_unknown == expected_unknown, "INPUT_IS_UNKNOWN_MISMATCH");
 
@@ -873,12 +890,20 @@ pub mod AgentFirewallZK {
                 // Only check if the registry has an attestation for this target
                 if registry.is_attested(target_felt) {
                     // Feature 29: is_verified
-                    let onchain_verified: u32 = if registry.is_verified(target_felt) { 1 } else { 0 };
+                    let onchain_verified: u32 = if registry.is_verified(target_felt) {
+                        1
+                    } else {
+                        0
+                    };
                     let encoded_verified: u32 = extract_m31(packed_span, input_start + 29);
                     assert!(encoded_verified == onchain_verified, "INPUT_IS_VERIFIED_MISMATCH");
 
                     // Feature 31: has_source
-                    let onchain_source: u32 = if registry.has_source(target_felt) { 1 } else { 0 };
+                    let onchain_source: u32 = if registry.has_source(target_felt) {
+                        1
+                    } else {
+                        0
+                    };
                     let encoded_source: u32 = extract_m31(packed_span, input_start + 31);
                     assert!(encoded_source == onchain_source, "INPUT_HAS_SOURCE_MISMATCH");
                 }
@@ -896,7 +921,9 @@ pub mod AgentFirewallZK {
 
                 if balance_low > 0 {
                     // Ratio = (value / balance) * 100000 (fixed-point)
-                    let onchain_ratio: u32 = ((value_low * 100000) / balance_low).try_into().unwrap();
+                    let onchain_ratio: u32 = ((value_low * 100000) / balance_low)
+                        .try_into()
+                        .unwrap();
                     let encoded_ratio: u32 = extract_m31(packed_span, input_start + 34);
                     // Allow ±5000 tolerance (balance can change between submit and resolve)
                     let ratio_diff: u32 = if encoded_ratio > onchain_ratio {
@@ -911,9 +938,10 @@ pub mod AgentFirewallZK {
             // Verify behavioral features (indices 41-44) from contract-internal tracking.
             // Feature 32: interaction_count for this (agent, target) pair
             let stored_target_for_behavioral: felt252 = self.action_target.entry(action_id).read();
-            let onchain_interactions: u32 = self.interaction_count.entry(
-                (agent_id, stored_target_for_behavioral)
-            ).read();
+            let onchain_interactions: u32 = self
+                .interaction_count
+                .entry((agent_id, stored_target_for_behavioral))
+                .read();
             let encoded_interactions: u32 = extract_m31(packed_span, input_start + 32);
             // Allow ±5 tolerance (interactions may have changed between submit and resolve)
             let interact_diff: u32 = if encoded_interactions > onchain_interactions {
@@ -964,7 +992,11 @@ pub mod AgentFirewallZK {
                 // Max: 100000 (when malicious == total), always fits u32
                 let raw: u64 = (score_malicious * 100000) / total;
                 // Defensive clamp (mathematically unnecessary but safe)
-                if raw > 100000 { 100000 } else { raw.try_into().unwrap() }
+                if raw > 100000 {
+                    100000
+                } else {
+                    raw.try_into().unwrap()
+                }
             };
 
             // 6. Verify the proof came from the registered classifier model.
@@ -1007,17 +1039,19 @@ pub mod AgentFirewallZK {
             let prev_score = self.agent_trust_score.entry(agent_id).read();
             let threat_u64: u64 = threat_score.into();
             let alpha_num = if threat_u64 > prev_score {
-                EMA_ALPHA_UP_NUM    // 0.5 — bad scores hit hard
+                EMA_ALPHA_UP_NUM // 0.5 — bad scores hit hard
             } else {
-                EMA_ALPHA_DOWN_NUM  // 0.1 — safe scores forgive slowly
+                EMA_ALPHA_DOWN_NUM // 0.1 — safe scores forgive slowly
             };
-            let new_score = (alpha_num * threat_u64
-                + (EMA_ALPHA_DEN - alpha_num) * prev_score)
+            let new_score = (alpha_num * threat_u64 + (EMA_ALPHA_DEN - alpha_num) * prev_score)
                 / EMA_ALPHA_DEN;
             self.agent_trust_score.entry(agent_id).write(new_score);
-            self.emit(TrustScoreUpdated {
-                agent_id, old_score: prev_score, new_score, raw_score: threat_score
-            });
+            self
+                .emit(
+                    TrustScoreUpdated {
+                        agent_id, old_score: prev_score, new_score, raw_score: threat_score,
+                    },
+                );
 
             // 9. Strike mechanism (strikes on escalate or block)
             if threat_score >= escalate_threshold {
@@ -1027,9 +1061,7 @@ pub mod AgentFirewallZK {
                 // Auto-freeze at max strikes
                 if strikes >= self.max_strikes.read() {
                     self.agent_active.entry(agent_id).write(false);
-                    self.emit(AgentFrozen {
-                        agent_id, strikes, final_trust_score: new_score
-                    });
+                    self.emit(AgentFrozen { agent_id, strikes, final_trust_score: new_score });
                 }
             }
 
@@ -1044,9 +1076,7 @@ pub mod AgentFirewallZK {
                 self.agent_pending_count.entry(agent_id).write(pending - 1);
             }
 
-            self.emit(ActionResolved {
-                action_id, agent_id, decision, threat_score, proof_hash
-            });
+            self.emit(ActionResolved { action_id, agent_id, decision, threat_score, proof_hash });
         }
 
         fn approve_escalated(ref self: ContractState, action_id: u64) {
@@ -1062,8 +1092,7 @@ pub mod AgentFirewallZK {
             let caller = get_caller_address();
             let agent_owner = self.agent_owner.entry(agent_id).read();
             assert!(
-                caller == agent_owner || caller == self.owner.read(),
-                "NOT_AGENT_OR_CONTRACT_OWNER"
+                caller == agent_owner || caller == self.owner.read(), "NOT_AGENT_OR_CONTRACT_OWNER",
             );
 
             self.action_decision.entry(action_id).write(1); // approved
@@ -1074,11 +1103,16 @@ pub mod AgentFirewallZK {
                 self.agent_pending_count.entry(agent_id).write(pending - 1);
             }
 
-            self.emit(ActionResolved {
-                action_id, agent_id, decision: 1,
-                threat_score: self.action_threat_score.entry(action_id).read(),
-                proof_hash: self.action_proof_hash.entry(action_id).read(),
-            });
+            self
+                .emit(
+                    ActionResolved {
+                        action_id,
+                        agent_id,
+                        decision: 1,
+                        threat_score: self.action_threat_score.entry(action_id).read(),
+                        proof_hash: self.action_proof_hash.entry(action_id).read(),
+                    },
+                );
         }
 
         fn reject_escalated(ref self: ContractState, action_id: u64) {
@@ -1094,8 +1128,7 @@ pub mod AgentFirewallZK {
             let caller = get_caller_address();
             let agent_owner = self.agent_owner.entry(agent_id).read();
             assert!(
-                caller == agent_owner || caller == self.owner.read(),
-                "NOT_AGENT_OR_CONTRACT_OWNER"
+                caller == agent_owner || caller == self.owner.read(), "NOT_AGENT_OR_CONTRACT_OWNER",
             );
 
             self.action_decision.entry(action_id).write(3); // blocked
@@ -1115,14 +1148,20 @@ pub mod AgentFirewallZK {
                 self.agent_pending_count.entry(agent_id).write(pending - 1);
             }
 
-            self.emit(ActionResolved {
-                action_id, agent_id, decision: 3,
-                threat_score: self.action_threat_score.entry(action_id).read(),
-                proof_hash: self.action_proof_hash.entry(action_id).read(),
-            });
+            self
+                .emit(
+                    ActionResolved {
+                        action_id,
+                        agent_id,
+                        decision: 3,
+                        threat_score: self.action_threat_score.entry(action_id).read(),
+                        proof_hash: self.action_proof_hash.entry(action_id).read(),
+                    },
+                );
         }
 
-        // ── Admin ─────────────────────────────────────────────────────
+        // ── Admin
+        // ─────────────────────────────────────────────────────
 
         fn set_thresholds(
             ref self: ContractState,
@@ -1137,10 +1176,15 @@ pub mod AgentFirewallZK {
             self.escalate_threshold.write(escalate_threshold);
             self.block_threshold.write(block_threshold);
             self.max_strikes.write(max_strikes);
-            self.emit(ThresholdsUpdated {
-                escalate_threshold, block_threshold, max_strikes,
-                updated_by: get_caller_address(),
-            });
+            self
+                .emit(
+                    ThresholdsUpdated {
+                        escalate_threshold,
+                        block_threshold,
+                        max_strikes,
+                        updated_by: get_caller_address(),
+                    },
+                );
         }
 
         fn pause(ref self: ContractState) {
@@ -1201,7 +1245,8 @@ pub mod AgentFirewallZK {
             self.classifier_weight_root_hash.write(weight_root_hash);
         }
 
-        // ── Queries ──────────────────────────────────────────────────
+        // ── Queries
+        // ──────────────────────────────────────────────────
 
         fn is_action_approved(self: @ContractState, action_id: u64) -> bool {
             self.action_resolved.entry(action_id).read()
@@ -1210,10 +1255,14 @@ pub mod AgentFirewallZK {
 
         fn is_trusted(self: @ContractState, agent_id: felt252) -> bool {
             self.agent_active.entry(agent_id).read()
-                && self.agent_trust_score.entry(agent_id).read()
-                    < self.block_threshold.read().into()
-                && self.agent_strikes.entry(agent_id).read()
-                    < self.max_strikes.read()
+                && self
+                    .agent_trust_score
+                    .entry(agent_id)
+                    .read() < self
+                    .block_threshold
+                    .read()
+                    .into()
+                && self.agent_strikes.entry(agent_id).read() < self.max_strikes.read()
         }
 
         fn get_trust_score(self: @ContractState, agent_id: felt252) -> u64 {
@@ -1265,11 +1314,7 @@ pub mod AgentFirewallZK {
         }
 
         fn get_thresholds(self: @ContractState) -> (u32, u32, u32) {
-            (
-                self.escalate_threshold.read(),
-                self.block_threshold.read(),
-                self.max_strikes.read(),
-            )
+            (self.escalate_threshold.read(), self.block_threshold.read(), self.max_strikes.read())
         }
 
         fn is_paused(self: @ContractState) -> bool {

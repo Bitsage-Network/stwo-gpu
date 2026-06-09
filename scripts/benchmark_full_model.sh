@@ -18,20 +18,22 @@
 #   ssh h200
 #   cd /path/to/bitsage-network/libs
 #   bash scripts/benchmark_full_model.sh \
-#     --layers 40 \
-#     --model-dir ~/models/qwen3-14b \
-#     --output benchmarks/qwen3_14b_full.json
+#     --layers all \
+#     --model-dir ~/models/qwen3.5-35b-a3b \
+#     --output benchmarks/qwen35b_full.json
 #
 # For quick single-block validation:
-#   bash scripts/benchmark_full_model.sh --layers 1 --model-dir ~/models/qwen3-14b
+#   bash scripts/benchmark_full_model.sh --layers 1 --model-dir ~/models/qwen3.5-35b-a3b
 #
 # For full-model one-shot (all N blocks in a single prove-model call):
-#   bash scripts/benchmark_full_model.sh --layers 40 --model-dir ~/models/qwen3-14b --one-shot
+#   bash scripts/benchmark_full_model.sh --layers all --model-dir ~/models/qwen3.5-35b-a3b --one-shot
 #
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="${SCRIPT_DIR}/.."
+ENGINE_DIR="${REPO_DIR}/engine"
+STARK_CAIRO_DIR="${REPO_DIR}/stark-cairo"
 RESULTS_DIR="${REPO_DIR}/benchmarks"
 
 # Colors
@@ -43,7 +45,7 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 # Defaults
-NUM_LAYERS=40
+NUM_LAYERS=all
 MODEL_DIR=""
 OUTPUT_FILE=""
 SKIP_BUILD=false
@@ -67,8 +69,8 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --layers N          Number of transformer blocks (default: 40)"
-            echo "  --model-dir PATH    Path to Qwen3-14B weights (SafeTensors)"
+            echo "  --layers N|all      Number of transformer blocks (default: all from config.json)"
+            echo "  --model-dir PATH    Path to Qwen3.5-35B-A3B weights (SafeTensors)"
             echo "  --output PATH       Output JSON file for results"
             echo "  --skip-build        Skip building binaries"
             echo "  --skip-recursive    Skip recursive STARK generation"
@@ -82,16 +84,44 @@ done
 
 if [ -z "$MODEL_DIR" ]; then
     echo -e "${RED}ERROR: --model-dir is required${NC}"
-    echo "  Example: --model-dir ~/models/qwen3-14b"
+    echo "  Example: --model-dir ~/models/qwen3.5-35b-a3b"
     exit 1
 fi
+
+if [ ! -f "${MODEL_DIR}/config.json" ]; then
+    echo -e "${RED}ERROR: config.json not found in ${MODEL_DIR}${NC}"
+    exit 1
+fi
+
+case "${NUM_LAYERS}" in
+    all|full|0|"")
+        NUM_LAYERS=$(python3 - "${MODEL_DIR}/config.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+for key in ("num_hidden_layers", "num_layers", "n_layer", "n_layers"):
+    value = cfg.get(key)
+    if isinstance(value, int) and value > 0:
+        print(value)
+        break
+else:
+    raise SystemExit("could not find num_hidden_layers/num_layers in config.json")
+PY
+)
+        ;;
+esac
+
+LAYER_ARGS=(--layers "${NUM_LAYERS}")
 
 mkdir -p "$RESULTS_DIR"
 
 # Default output file
 if [ -z "$OUTPUT_FILE" ]; then
     TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-    OUTPUT_FILE="${RESULTS_DIR}/bench_qwen3_14b_${NUM_LAYERS}blocks_${TIMESTAMP}.json"
+    OUTPUT_FILE="${RESULTS_DIR}/bench_qwen35b_${NUM_LAYERS}blocks_${TIMESTAMP}.json"
 fi
 
 echo -e "${CYAN}${BOLD}"
@@ -164,14 +194,14 @@ CAIRO_PROVE_BIN=""
 if [ "$SKIP_BUILD" = false ]; then
     echo -e "${YELLOW}[BUILD] Building prove-model + cairo-prove${NC}"
 
-    # Build stwo-ml prove-model
+    # Build engine prove-model
     echo "  Building prove-model..."
     BUILD_START=$(date +%s%N)
     (
-        cd "${REPO_DIR}/stwo-ml"
-        FEATURES="cli"
+        cd "${ENGINE_DIR}"
+        FEATURES="std,gpu,onnx,safetensors,model-loading,cli,audit"
         if command -v nvidia-smi &>/dev/null; then
-            FEATURES="cli,cuda-runtime"
+            FEATURES="${FEATURES},cuda-runtime"
         fi
         cargo build --release \
             --bin prove-model \
@@ -179,26 +209,26 @@ if [ "$SKIP_BUILD" = false ]; then
     )
     BUILD_END=$(date +%s%N)
     BUILD_SEC=$(echo "scale=1; ($BUILD_END - $BUILD_START) / 1000000000" | bc)
-    PROVE_BIN=$(find "${REPO_DIR}" -name "prove-model" -path "*/release/*" -type f 2>/dev/null | head -1)
+    PROVE_BIN="${ENGINE_DIR}/target/release/prove-model"
     echo -e "  ${GREEN}prove-model built in ${BUILD_SEC}s${NC}"
 
     # Build cairo-prove
     echo "  Building cairo-prove..."
     (
-        cd "${REPO_DIR}/stwo-cairo/cairo-prove"
+        cd "${STARK_CAIRO_DIR}/cairo-prove"
         cargo build --release 2>&1 | tail -5
     )
-    CAIRO_PROVE_BIN=$(find "${REPO_DIR}" -name "cairo-prove" -path "*/release/*" -type f 2>/dev/null | head -1)
+    CAIRO_PROVE_BIN="${STARK_CAIRO_DIR}/cairo-prove/target/release/cairo-prove"
 
     echo -e "  ${GREEN}Build complete${NC}"
 else
-    PROVE_BIN=$(find "${REPO_DIR}" -name "prove-model" -path "*/release/*" -type f 2>/dev/null | head -1)
-    CAIRO_PROVE_BIN=$(find "${REPO_DIR}" -name "cairo-prove" -path "*/release/*" -type f 2>/dev/null | head -1)
+    PROVE_BIN="${ENGINE_DIR}/target/release/prove-model"
+    CAIRO_PROVE_BIN="${STARK_CAIRO_DIR}/cairo-prove/target/release/cairo-prove"
     echo -e "${YELLOW}[BUILD] Skipped (--skip-build) — using existing binary${NC}"
     echo -e "${YELLOW}  WARNING: If you recently changed code, remove --skip-build to rebuild!${NC}"
 fi
 
-if [ -z "$PROVE_BIN" ]; then
+if [ -z "$PROVE_BIN" ] || [ ! -f "$PROVE_BIN" ]; then
     echo -e "${RED}ERROR: prove-model binary not found${NC}"
     exit 1
 fi
@@ -210,7 +240,7 @@ echo ""
 # Validate model
 # ─────────────────────────────────────────────────────────────────────────────
 echo -e "${YELLOW}[VALIDATE] Checking model directory${NC}"
-${PROVE_BIN} --model-dir "${MODEL_DIR}" --layers "${NUM_LAYERS}" --validate 2>&1 || {
+${PROVE_BIN} --model-dir "${MODEL_DIR}" "${LAYER_ARGS[@]}" --validate 2>&1 || {
     echo -e "${RED}ERROR: Model validation failed${NC}"
     exit 1
 }
@@ -249,7 +279,7 @@ fi
 echo -e "${CYAN}${BOLD}"
 echo "════════════════════════════════════════════════════════════════════"
 echo "  PROVING ${NUM_LAYERS} TRANSFORMER BLOCKS"
-echo "  Model: Qwen3-14B | GPU: ${GPU_NAME}"
+echo "  Model: Qwen3.5-35B-A3B | GPU: ${GPU_NAME}"
 echo "════════════════════════════════════════════════════════════════════"
 echo -e "${NC}"
 
@@ -257,6 +287,8 @@ BLOCK_TIMES=()
 PROOF_SIZES=()
 MATMUL_COUNTS=()
 PEAK_GPU_MEM=0
+FULL_PROOF="benchmarks/full_${NUM_LAYERS}blocks_proof.json"
+FULL_LOG="benchmarks/full_${NUM_LAYERS}blocks.log"
 
 if [ "$ONE_SHOT" = true ]; then
     # ── ONE-SHOT MODE: Prove all N layers in a single invocation ──
@@ -264,9 +296,6 @@ if [ "$ONE_SHOT" = true ]; then
     echo ""
 
     # Prove once in cairo_serde format — reused by recursive pipeline (no double-proving)
-    FULL_PROOF="benchmarks/full_${NUM_LAYERS}blocks_proof.json"
-    FULL_LOG="benchmarks/full_${NUM_LAYERS}blocks.log"
-
     GPU_MEM_BEFORE=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 | xargs || echo "0")
     echo -e "  GPU memory before: ${GPU_MEM_BEFORE} MiB"
 
@@ -275,7 +304,7 @@ if [ "$ONE_SHOT" = true ]; then
     # Stream stderr to BOTH terminal and log file so the user sees live progress
     ${PROVE_BIN} \
         --model-dir "${MODEL_DIR}" \
-        --layers "${NUM_LAYERS}" \
+        "${LAYER_ARGS[@]}" \
         --output "${FULL_PROOF}" \
         --format cairo_serde \
         --gpu 2>&1 | tee "${FULL_LOG}" || true
@@ -356,6 +385,7 @@ else
     TOTAL_PROVE_END=$(date +%s%N)
     TOTAL_PROVE_MS=$(( (TOTAL_PROVE_END - TOTAL_PROVE_START) / 1000000 ))
     TOTAL_PROVE_SEC=$(echo "scale=3; ${TOTAL_PROVE_MS}/1000" | bc)
+    FULL_PROOF="benchmarks/block_${NUM_LAYERS}_proof.json"
 fi
 
 echo ""
@@ -377,7 +407,7 @@ if [ "$SKIP_RECURSIVE" = false ] && [ -n "$CAIRO_PROVE_BIN" ]; then
     echo -e "  Reusing proof from proving phase: ${CAIRO_SERDE_PROOF}"
 
     if [ -f "$CAIRO_SERDE_PROOF" ]; then
-        EXECUTABLE="${REPO_DIR}/stwo-cairo/stwo_cairo_verifier/target/dev/obelysk_ml_verifier.executable.json"
+        EXECUTABLE="${STARK_CAIRO_DIR}/stwo_cairo_verifier/target/dev/obelysk_ml_verifier.executable.json"
         if [ ! -f "$EXECUTABLE" ] && [ -f "${REPO_DIR}/artifacts/obelysk_ml_verifier.executable.json" ]; then
             EXECUTABLE="${REPO_DIR}/artifacts/obelysk_ml_verifier.executable.json"
         fi
@@ -446,8 +476,8 @@ cat > "${OUTPUT_FILE}" << ENDJSON
     "rust_version": "${RUST_VERSION}"
   },
   "model": {
-    "name": "Qwen3-14B",
-    "parameters": "14.7B",
+    "name": "Qwen3.5-35B-A3B",
+    "parameters": "35B total / 3B active",
     "architecture": "Transformer decoder",
     "num_blocks": ${NUM_LAYERS},
     "d_model": 5120,
@@ -468,10 +498,10 @@ cat > "${OUTPUT_FILE}" << ENDJSON
     "proof_size_bytes": "${RECURSIVE_PROOF_SIZE}"
   },
   "security": {
-    "pow_bits": 26,
-    "n_queries": 70,
-    "log_blowup_factor": 1,
-    "security_bits": 96,
+    "pow_bits": 20,
+    "n_queries": 28,
+    "log_blowup_factor": 5,
+    "security_bits": 160,
     "trusted_setup": false,
     "field": "M31 (p = 2^31 - 1)",
     "channel": "Poseidon252 (on-chain), Blake2s (CPU)"
@@ -479,7 +509,7 @@ cat > "${OUTPUT_FILE}" << ENDJSON
   "notes": [
     "All times measured with wall-clock (date +%s%N)",
     "GPU warmup: ${WARMUP_RUNS} pass(es) before measurement",
-    "Proving uses cuda-runtime feature with GPU residency",
+    "Proving uses cuda-runtime feature with GPU residency when NVIDIA CUDA is available",
     "Peak GPU memory is max observed across all blocks",
     "Per-block times are cumulative (block N = prove layers 1..N)"
   ]
@@ -497,7 +527,7 @@ echo "╔═══════════════════════�
 echo "║                    BENCHMARK RESULTS SUMMARY                     ║"
 echo "╠═══════════════════════════════════════════════════════════════════╣"
 echo "║                                                                   ║"
-printf "║  Model:           Qwen3-14B (%d blocks)\n" "${NUM_LAYERS}"
+printf "║  Model:           Qwen3.5-35B-A3B (%d blocks)\n" "${NUM_LAYERS}"
 printf "║  GPU:             %s\n" "${GPU_NAME}"
 echo "║                                                                   ║"
 echo "║  ── Proving ──────────────────────────────────────────────────── ║"
@@ -510,7 +540,7 @@ printf "║  Recursive time:  %-10s\n" "${RECURSIVE_TIME_SEC}s"
 printf "║  Recursive size:  %-10s\n" "${RECURSIVE_PROOF_SIZE} bytes"
 echo "║                                                                   ║"
 echo "║  ── Security ─────────────────────────────────────────────────── ║"
-echo "║  96-bit (pow=26, queries=70, blowup=1). No trusted setup.        ║"
+echo "║  160-bit target (pow=20, queries=28, blowup=5). No trusted setup.║"
 echo "║                                                                   ║"
 echo "╚═══════════════════════════════════════════════════════════════════╝"
 echo -e "${NC}"

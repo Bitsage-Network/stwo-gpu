@@ -17,7 +17,7 @@ use crate::components::matmul::{
     matrix_to_mle_pub as matrix_to_mle, pad_matrix_pow2, M31Matrix, RoundPoly,
 };
 use crate::crypto::aggregated_opening::{verify_aggregated_binding, AggregatedWeightClaim};
-use crate::crypto::poseidon_channel::PoseidonChannel;
+use crate::crypto::poseidon_channel::{PoseidonChannel, VerifierChannel};
 use crate::gadgets::lookup_table::PrecomputedTable;
 
 use super::circuit::{LayerType, LayeredCircuit};
@@ -77,12 +77,28 @@ pub fn verify_gkr_with_policy(
     verify_gkr_inner(circuit, proof, output, weights, channel, Some(policy))
 }
 
-fn verify_gkr_inner(
+/// Verify a GKR proof over any transcript-compatible channel.
+///
+/// This is the boundary used by recursive witness generation: `PoseidonChannel`
+/// remains the production channel, while `InstrumentedChannel` records the
+/// same transcript operations for recursive AIR/STARK-in-STARK work.
+pub(crate) fn verify_gkr_on_channel<C: VerifierChannel>(
     circuit: &LayeredCircuit,
     proof: &GKRProof,
     output: &M31Matrix,
     weights: Option<&GraphWeights>,
-    channel: &mut PoseidonChannel,
+    channel: &mut C,
+    policy: Option<&crate::policy::PolicyConfig>,
+) -> Result<GKRClaim, GKRError> {
+    verify_gkr_inner(circuit, proof, output, weights, channel, policy)
+}
+
+fn verify_gkr_inner<C: VerifierChannel>(
+    circuit: &LayeredCircuit,
+    proof: &GKRProof,
+    output: &M31Matrix,
+    weights: Option<&GraphWeights>,
+    channel: &mut C,
     policy: Option<&crate::policy::PolicyConfig>,
 ) -> Result<GKRClaim, GKRError> {
     let d = circuit.layers.len();
@@ -116,7 +132,10 @@ fn verify_gkr_inner(
     let _v_trace = std::env::var("STWO_CHANNEL_TRACE").is_ok();
     if _v_trace {
         eprintln!("[VERIFIER] ch after seeding+policy: {:?}", channel.digest());
-        eprintln!("[VERIFIER] policy: {:?}, skip={}", policy_commitment, skip_policy);
+        eprintln!(
+            "[VERIFIER] policy: {:?}, skip={}",
+            policy_commitment, skip_policy
+        );
     }
 
     // Reconstruct output claim
@@ -172,23 +191,35 @@ fn verify_gkr_inner(
                 if let LayerType::TopK { num_experts, top_k } = &layer.layer_type {
                     if proof_idx < proof.layer_proofs.len() {
                         if let LayerProof::TopK {
-                            num_experts: pn, top_k: pk,
-                            selected_indices, selected_values,
-                            threshold_gap, logits_commitment,
-                        } = &proof.layer_proofs[proof_idx] {
+                            num_experts: pn,
+                            top_k: pk,
+                            selected_indices,
+                            selected_values,
+                            threshold_gap,
+                            logits_commitment,
+                        } = &proof.layer_proofs[proof_idx]
+                        {
                             proof_idx += 1;
 
                             // Structural checks
                             if selected_indices.len() != *pk {
                                 return Err(GKRError::VerificationError {
                                     layer_idx,
-                                    reason: format!("TopK: expected {} selected indices, got {}", pk, selected_indices.len()),
+                                    reason: format!(
+                                        "TopK: expected {} selected indices, got {}",
+                                        pk,
+                                        selected_indices.len()
+                                    ),
                                 });
                             }
                             if selected_values.len() != *pk {
                                 return Err(GKRError::VerificationError {
                                     layer_idx,
-                                    reason: format!("TopK: expected {} selected values, got {}", pk, selected_values.len()),
+                                    reason: format!(
+                                        "TopK: expected {} selected values, got {}",
+                                        pk,
+                                        selected_values.len()
+                                    ),
                                 });
                             }
 
@@ -625,10 +656,10 @@ fn verify_gkr_inner(
     // In batched/aggregated modes, deferred weight bindings are verified in the
     // aggregated pass — not per-deferred Merkle openings. This covers both the old
     // BatchedRlcDirectEvalV1 mode and the new AggregatedOracleSumcheck mode.
-    let batched_rlc_mode =
-        proof.weight_opening_transcript_mode == WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1
-            || proof.weight_opening_transcript_mode
-                == WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
+    let batched_rlc_mode = proof.weight_opening_transcript_mode
+        == WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1
+        || proof.weight_opening_transcript_mode
+            == WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
 
     // Verify deferred proofs for skip branches of DAG Add layers.
     // Fiat-Shamir order: walk → deferred proofs → weight openings.
@@ -828,9 +859,7 @@ fn verify_gkr_inner(
                 }
             }
             LayerProof::Add {
-                lhs_eval,
-                rhs_eval,
-                ..
+                lhs_eval, rhs_eval, ..
             } => {
                 // Deferred Add proof: verify Add reduction (lhs + rhs == claim).
                 // Used when a transformer-block residual Add is on a deferred skip branch.
@@ -879,10 +908,7 @@ fn verify_gkr_inner(
                     _ => {
                         return Err(GKRError::VerificationError {
                             layer_idx: 0,
-                            reason: format!(
-                                "deferred proof {} skip layer is not RMSNorm",
-                                i
-                            ),
+                            reason: format!("deferred proof {} skip layer is not RMSNorm", i),
                         })
                     }
                 };
@@ -1371,8 +1397,7 @@ fn verify_gkr_inner(
                 // Each group covers a subset of claims and is verified independently
                 // through the same Fiat-Shamir channel.
                 let group_size = crate::gkr::prover::BINDING_GROUP_SIZE;
-                let expected_groups =
-                    (agg_claims.len() + group_size - 1) / group_size;
+                let expected_groups = (agg_claims.len() + group_size - 1) / group_size;
                 if proof.binding_groups.len() != expected_groups {
                     return Err(GKRError::VerificationError {
                         layer_idx: 0,
@@ -1440,26 +1465,35 @@ fn verify_gkr_inner(
                     for deferred in proof.deferred_proofs.iter() {
                         if let Some(claim) = deferred.weight_claim() {
                             let weight = weights.get_weight(claim.weight_node_id).ok_or(
-                                GKRError::MissingWeight { node_id: claim.weight_node_id },
+                                GKRError::MissingWeight {
+                                    node_id: claim.weight_node_id,
+                                },
                             )?;
-                            let actual = evaluate_weight_claim_against_matrix(weight, &claim.eval_point)
-                                .map_err(|reason| GKRError::VerificationError {
-                                    layer_idx: 0,
-                                    reason: format!("RLC deferred weight claim failed: {}", reason),
-                                })?;
+                            let actual =
+                                evaluate_weight_claim_against_matrix(weight, &claim.eval_point)
+                                    .map_err(|reason| GKRError::VerificationError {
+                                        layer_idx: 0,
+                                        reason: format!(
+                                            "RLC deferred weight claim failed: {}",
+                                            reason
+                                        ),
+                                    })?;
                             combined_actual += rho_pow2 * actual;
                             rho_pow2 = rho_pow2 * rho;
                         }
                     }
                     for claim in proof.weight_claims.iter() {
                         let weight = weights.get_weight(claim.weight_node_id).ok_or(
-                            GKRError::MissingWeight { node_id: claim.weight_node_id },
+                            GKRError::MissingWeight {
+                                node_id: claim.weight_node_id,
+                            },
                         )?;
-                        let actual = evaluate_weight_claim_against_matrix(weight, &claim.eval_point)
-                            .map_err(|reason| GKRError::VerificationError {
-                                layer_idx: 0,
-                                reason: format!("RLC weight claim failed: {}", reason),
-                            })?;
+                        let actual =
+                            evaluate_weight_claim_against_matrix(weight, &claim.eval_point)
+                                .map_err(|reason| GKRError::VerificationError {
+                                    layer_idx: 0,
+                                    reason: format!("RLC weight claim failed: {}", reason),
+                                })?;
                         combined_actual += rho_pow2 * actual;
                         rho_pow2 = rho_pow2 * rho;
                     }
@@ -1663,23 +1697,35 @@ fn verify_gkr_simd_inner(
                 if let LayerType::TopK { num_experts, top_k } = &layer.layer_type {
                     if proof_idx < proof.layer_proofs.len() {
                         if let LayerProof::TopK {
-                            num_experts: pn, top_k: pk,
-                            selected_indices, selected_values,
-                            threshold_gap, logits_commitment,
-                        } = &proof.layer_proofs[proof_idx] {
+                            num_experts: pn,
+                            top_k: pk,
+                            selected_indices,
+                            selected_values,
+                            threshold_gap,
+                            logits_commitment,
+                        } = &proof.layer_proofs[proof_idx]
+                        {
                             proof_idx += 1;
 
                             // Structural checks
                             if selected_indices.len() != *pk {
                                 return Err(GKRError::VerificationError {
                                     layer_idx,
-                                    reason: format!("TopK: expected {} selected indices, got {}", pk, selected_indices.len()),
+                                    reason: format!(
+                                        "TopK: expected {} selected indices, got {}",
+                                        pk,
+                                        selected_indices.len()
+                                    ),
                                 });
                             }
                             if selected_values.len() != *pk {
                                 return Err(GKRError::VerificationError {
                                     layer_idx,
-                                    reason: format!("TopK: expected {} selected values, got {}", pk, selected_values.len()),
+                                    reason: format!(
+                                        "TopK: expected {} selected values, got {}",
+                                        pk,
+                                        selected_values.len()
+                                    ),
                                 });
                             }
 
@@ -2095,10 +2141,10 @@ fn verify_gkr_simd_inner(
         });
     }
 
-    let batched_rlc_mode =
-        proof.weight_opening_transcript_mode == WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1
-            || proof.weight_opening_transcript_mode
-                == WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
+    let batched_rlc_mode = proof.weight_opening_transcript_mode
+        == WeightOpeningTranscriptMode::BatchedRlcDirectEvalV1
+        || proof.weight_opening_transcript_mode
+            == WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
 
     // Verify deferred proofs for skip branches of DAG Add layers.
     // Fiat-Shamir order: walk → deferred proofs → weight openings.
@@ -2691,8 +2737,9 @@ fn verify_gkr_simd_inner(
                 if !verify_aggregated_binding(binding_proof, &agg_claims, channel) {
                     return Err(GKRError::VerificationError {
                         layer_idx: 0,
-                        reason: "SIMD aggregated oracle sumcheck weight binding verification failed"
-                            .to_string(),
+                        reason:
+                            "SIMD aggregated oracle sumcheck weight binding verification failed"
+                                .to_string(),
                     });
                 }
             } else if !proof.binding_groups.is_empty() {
@@ -2707,7 +2754,8 @@ fn verify_gkr_simd_inner(
                             layer_idx: 0,
                             reason: format!(
                                 "SIMD grouped binding verification failed at group {}/{}",
-                                g + 1, proof.binding_groups.len(),
+                                g + 1,
+                                proof.binding_groups.len(),
                             ),
                         });
                     }
@@ -2731,7 +2779,7 @@ fn verify_gkr_simd_inner(
 // ===== Per-Layer Verification =====
 
 /// Verify a matmul reduction: replay sumcheck and check round polynomials.
-fn verify_matmul_reduction(
+fn verify_matmul_reduction<C: VerifierChannel>(
     output_claim: &GKRClaim,
     round_polys: &[RoundPoly],
     final_a_eval: SecureField,
@@ -2740,7 +2788,7 @@ fn verify_matmul_reduction(
     k: usize,
     n: usize,
     layer_idx: usize,
-    channel: &mut PoseidonChannel,
+    channel: &mut C,
 ) -> Result<GKRClaim, GKRError> {
     let pm = m.next_power_of_two();
     let pk = k.next_power_of_two();
@@ -2798,6 +2846,7 @@ fn verify_matmul_reduction(
                 ),
             });
         }
+        channel.record_equality_check(p0 + p1, current_sum);
 
         // Replay Fiat-Shamir: mix round poly, draw challenge
         channel.mix_poly_coeffs(rp.c0, rp.c1, rp.c2);
@@ -2805,7 +2854,9 @@ fn verify_matmul_reduction(
         sumcheck_challenges.push(r_k);
 
         // Update sum: p(r_k) = c0 + c1*r_k + c2*r_k^2
-        current_sum = rp.c0 + rp.c1 * r_k + rp.c2 * r_k * r_k;
+        let next_sum = rp.c0 + rp.c1 * r_k + rp.c2 * r_k * r_k;
+        channel.record_sumcheck_round_deg2(*rp, current_sum, r_k, next_sum);
+        current_sum = next_sum;
     }
 
     // After all rounds: current_sum should equal final_a_eval * final_b_eval
@@ -2819,6 +2870,8 @@ fn verify_matmul_reduction(
             ),
         });
     }
+    channel.record_qm31_mul(final_a_eval, final_b_eval, expected_product);
+    channel.record_equality_check(current_sum, expected_product);
 
     // Mix final evals (same as prover)
     mix_secure_field(channel, final_a_eval);
@@ -2846,7 +2899,7 @@ fn verify_matmul_reduction(
 ///
 /// Final check: running_sum == eq(r_simd, block_challenges) * final_a * final_b
 /// (because ext_w encodes the Lagrange basis of the SIMD challenges).
-fn verify_matmul_dual_simd_reduction(
+fn verify_matmul_dual_simd_reduction<C: VerifierChannel>(
     output_claim: &GKRClaim,
     round_polys: &[RoundPolyDeg3],
     final_a_eval: SecureField,
@@ -2858,7 +2911,7 @@ fn verify_matmul_dual_simd_reduction(
     n: usize,
     n_blocks: usize,
     layer_idx: usize,
-    channel: &mut PoseidonChannel,
+    channel: &mut C,
 ) -> Result<GKRClaim, GKRError> {
     let pm = m.next_power_of_two();
     let pk = k.next_power_of_two();
@@ -2927,12 +2980,15 @@ fn verify_matmul_dual_simd_reduction(
                 ),
             });
         }
+        channel.record_equality_check(p0 + p1, current_sum);
 
         channel.mix_poly_coeffs_deg3(rp.c0, rp.c1, rp.c2, rp.c3);
         let challenge = channel.draw_qm31();
         sumcheck_challenges.push(challenge);
 
-        current_sum = rp.eval(challenge);
+        let next_sum = rp.eval(challenge);
+        channel.record_sumcheck_round_deg3(*rp, current_sum, challenge, next_sum);
+        current_sum = next_sum;
     }
 
     // Final check: the sumcheck should reduce to ext_w(s) * ext_a(s) * ext_b(s)
@@ -2952,6 +3008,8 @@ fn verify_matmul_dual_simd_reduction(
             ),
         });
     }
+    channel.record_qm31_mul(final_a_eval, final_b_eval, final_a_eval * final_b_eval);
+    channel.record_equality_check(current_sum, expected);
 
     // Mix final evals
     mix_secure_field(channel, final_a_eval);
@@ -2974,13 +3032,13 @@ fn verify_matmul_dual_simd_reduction(
 }
 
 /// Verify an Add reduction: check lhs_eval + rhs_eval == claimed.
-fn verify_add_reduction(
+fn verify_add_reduction<C: VerifierChannel>(
     output_claim: &GKRClaim,
     lhs_eval: SecureField,
     rhs_eval: SecureField,
     input_layers: &[usize],
     layer_idx: usize,
-    channel: &mut PoseidonChannel,
+    channel: &mut C,
 ) -> Result<GKRClaim, GKRError> {
     let sum = lhs_eval + rhs_eval;
     if sum != output_claim.value {
@@ -2992,6 +3050,8 @@ fn verify_add_reduction(
             ),
         });
     }
+    channel.record_qm31_add(lhs_eval, rhs_eval, sum);
+    channel.record_equality_check(sum, output_claim.value);
 
     // Replay channel operations (must match prover exactly)
     mix_secure_field(channel, lhs_eval);
@@ -3019,13 +3079,13 @@ fn verify_add_reduction(
 ///
 /// At each round checks p(0) + p(1) == current_sum, where p is degree 3.
 /// After all rounds, checks: final_sum == eq(r, challenges) · lhs_eval · rhs_eval.
-fn verify_mul_reduction(
+fn verify_mul_reduction<C: VerifierChannel>(
     output_claim: &GKRClaim,
     eq_round_polys: &[RoundPolyDeg3],
     lhs_eval: SecureField,
     rhs_eval: SecureField,
     layer_idx: usize,
-    channel: &mut PoseidonChannel,
+    channel: &mut C,
 ) -> Result<GKRClaim, GKRError> {
     let num_vars = eq_round_polys.len();
 
@@ -3063,6 +3123,7 @@ fn verify_mul_reduction(
                 ),
             });
         }
+        channel.record_equality_check(p0 + p1, current_sum);
 
         // Fiat-Shamir: mix round poly, draw challenge
         channel.mix_poly_coeffs_deg3(rp.c0, rp.c1, rp.c2, rp.c3);
@@ -3070,7 +3131,9 @@ fn verify_mul_reduction(
         sumcheck_challenges.push(challenge);
 
         // Update sum: p(challenge) = c0 + c1*r + c2*r² + c3*r³
-        current_sum = rp.eval(challenge);
+        let next_sum = rp.eval(challenge);
+        channel.record_sumcheck_round_deg3(*rp, current_sum, challenge, next_sum);
+        current_sum = next_sum;
     }
 
     // Final check: current_sum == eq(r, challenges) · lhs_eval · rhs_eval
@@ -3087,6 +3150,8 @@ fn verify_mul_reduction(
             ),
         });
     }
+    channel.record_qm31_mul(lhs_eval, rhs_eval, lhs_eval * rhs_eval);
+    channel.record_equality_check(current_sum, expected);
 
     // Mix final evals (same as prover)
     mix_secure_field(channel, lhs_eval);
@@ -3114,7 +3179,7 @@ fn verify_mul_reduction(
 /// 5. Verifies degree-3 eq-sumcheck: Σ eq(r,x)·w(x)·d(x) = 1
 ///    where d_i = γ - in_i - β·out_i, w_i = 1/d_i
 /// 6. Final check: eq(r,s)·w(s)·d(s) matches the sumcheck output
-fn verify_activation_reduction(
+fn verify_activation_reduction<C: VerifierChannel>(
     output_claim: &GKRClaim,
     activation_type: ActivationType,
     logup_proof: Option<&LogUpProof>,
@@ -3126,7 +3191,7 @@ fn verify_activation_reduction(
     table_commitment: starknet_ff::FieldElement,
     expected_size: usize,
     layer_idx: usize,
-    channel: &mut PoseidonChannel,
+    channel: &mut C,
     simd_combined: bool,
 ) -> Result<GKRClaim, GKRError> {
     // Piecewise-linear algebraic activation verification (GELU/Sigmoid/Softmax)
@@ -3342,21 +3407,31 @@ fn verify_activation_reduction(
 
 /// Number of piecewise-linear segments for algebraic activation verification.
 const PIECEWISE_NUM_SEGMENTS: usize = 16;
+/// Number of low bits below the 4-bit piecewise segment index.
+const PIECEWISE_LOW_BITS: usize = 27;
+/// Prefix-AND columns over 4 segment bits + 27 low bits.
+const PIECEWISE_CANONICAL_ANDS: usize = 4 + PIECEWISE_LOW_BITS;
 
 /// Verify piecewise-linear algebraic activation reduction.
 ///
-/// Verifies a combined degree-3 eq-sumcheck with 18 constraints:
+/// Verifies a combined degree-3 eq-sumcheck with 83 constraints:
 ///   - η^0: output matches Σ I_i · (a_i · input + b_i)
 ///   - η^1: Σ I_i = 1  (partition of unity)
 ///   - η^{2..17}: I_i · (1 - I_i) = 0  (binary indicators)
-fn verify_piecewise_activation_reduction(
+///   - η^18: segment bits encode selected indicator index
+///   - η^{19..22}: segment bit binary enforcement
+///   - η^23: input equals low bits plus 2^27 times segment index
+///   - η^{24..50}: low-bit binary enforcement
+///   - η^{51..81}: prefix-AND chain over all decomposition bits
+///   - η^82: final prefix-AND is zero (canonical M31 representation)
+fn verify_piecewise_activation_reduction<C: VerifierChannel>(
     output_claim: &GKRClaim,
     activation_type: ActivationType,
     proof: &super::types::PiecewiseAlgebraicProof,
     expected_input_eval: SecureField,
     expected_size: usize,
     layer_idx: usize,
-    channel: &mut PoseidonChannel,
+    channel: &mut C,
 ) -> Result<GKRClaim, GKRError> {
     use crate::components::activation::PiecewiseLinearCoeffs;
 
@@ -3409,9 +3484,27 @@ fn verify_piecewise_activation_reduction(
     // Draw η (same as prover)
     let eta = channel.draw_qm31();
 
-    // Precompute eta powers: η^0, η^1, ..., η^{22} (18 original + 5 segment binding)
+    // Precompute eta powers for the active constraint set.
     let has_seg_bits = proof.seg_bit_evals.is_some();
-    let num_eta_powers = if has_seg_bits { 2 + PIECEWISE_NUM_SEGMENTS + 1 + 4 } else { 2 + PIECEWISE_NUM_SEGMENTS };
+    let has_low_bits = proof.low_bit_evals.is_some();
+    let has_canonical_ands = proof.canonical_and_evals.is_some();
+    let num_eta_powers = if has_seg_bits {
+        2 + PIECEWISE_NUM_SEGMENTS
+            + 1
+            + 4
+            + if has_low_bits {
+                1 + PIECEWISE_LOW_BITS
+                    + if has_canonical_ands {
+                        PIECEWISE_CANONICAL_ANDS + 1
+                    } else {
+                        0
+                    }
+            } else {
+                0
+            }
+    } else {
+        2 + PIECEWISE_NUM_SEGMENTS
+    };
     let mut eta_powers = Vec::with_capacity(num_eta_powers);
     eta_powers.push(SecureField::one());
     for i in 1..num_eta_powers {
@@ -3465,7 +3558,8 @@ fn verify_piecewise_activation_reduction(
     let mut ind_sum = SecureField::zero();
     for i in 0..PIECEWISE_NUM_SEGMENTS {
         ind_sum = ind_sum + proof.indicator_evals[i];
-        piecewise_val = piecewise_val + proof.indicator_evals[i] * (slopes_sf[i] * inp + intercepts_sf[i]);
+        piecewise_val =
+            piecewise_val + proof.indicator_evals[i] * (slopes_sf[i] * inp + intercepts_sf[i]);
     }
     let mut h = eta_powers[0] * (out - piecewise_val);
 
@@ -3486,13 +3580,99 @@ fn verify_piecewise_activation_reduction(
         }
         let mut ind_index_sum = SecureField::zero();
         for i in 0..PIECEWISE_NUM_SEGMENTS {
-            ind_index_sum = ind_index_sum + SecureField::from(M31::from(i as u32)) * proof.indicator_evals[i];
+            ind_index_sum =
+                ind_index_sum + SecureField::from(M31::from(i as u32)) * proof.indicator_evals[i];
         }
         h = h + eta_powers[18] * (bit_sum - ind_index_sum);
 
         // η^{19..22}: segment bits binary
         for k in 0..4 {
             h = h + eta_powers[19 + k] * seg_bit_evals[k] * (one - seg_bit_evals[k]);
+        }
+
+        if let Some(low_bit_evals) = &proof.low_bit_evals {
+            if low_bit_evals.len() != PIECEWISE_LOW_BITS {
+                return Err(GKRError::VerificationError {
+                    layer_idx,
+                    reason: format!(
+                        "piecewise activation: low-bit binding has {} evals, expected 27",
+                        low_bit_evals.len()
+                    ),
+                });
+            }
+
+            let mut low_sum = SecureField::zero();
+            let mut pow2 = SecureField::one();
+            let two_sf = SecureField::from(M31::from(2u32));
+            for bit in low_bit_evals {
+                low_sum = low_sum + pow2 * *bit;
+                pow2 = pow2 * two_sf;
+            }
+
+            // pow2 is now 2^27.
+            h = h + eta_powers[23] * (inp - low_sum - pow2 * bit_sum);
+
+            for (k, bit) in low_bit_evals.iter().enumerate() {
+                h = h + eta_powers[24 + k] * *bit * (one - *bit);
+            }
+
+            if let Some(canonical_and_evals) = &proof.canonical_and_evals {
+                if canonical_and_evals.len() != PIECEWISE_CANONICAL_ANDS {
+                    return Err(GKRError::VerificationError {
+                        layer_idx,
+                        reason: format!(
+                            "piecewise activation: canonicality chain has {} evals, expected {}",
+                            canonical_and_evals.len(),
+                            PIECEWISE_CANONICAL_ANDS
+                        ),
+                    });
+                }
+
+                for k in 0..PIECEWISE_CANONICAL_ANDS {
+                    let bit = if k < 4 {
+                        seg_bit_evals[k]
+                    } else {
+                        low_bit_evals[k - 4]
+                    };
+                    let expected = if k == 0 {
+                        bit
+                    } else {
+                        canonical_and_evals[k - 1] * bit
+                    };
+                    h = h + eta_powers[51 + k] * (canonical_and_evals[k] - expected);
+                }
+                h = h + eta_powers[51 + PIECEWISE_CANONICAL_ANDS]
+                    * canonical_and_evals[PIECEWISE_CANONICAL_ANDS - 1];
+            } else {
+                let allow_missing = std::env::var("STWO_ALLOW_MISSING_SEGMENT_BINDING")
+                    .map(|v| {
+                        let s = v.trim();
+                        s == "1" || s.eq_ignore_ascii_case("true")
+                    })
+                    .unwrap_or(false);
+                if !allow_missing {
+                    return Err(GKRError::VerificationError {
+                        layer_idx,
+                        reason:
+                            "piecewise activation: missing canonical decomposition binding proof"
+                                .into(),
+                    });
+                }
+            }
+        } else {
+            let allow_missing = std::env::var("STWO_ALLOW_MISSING_SEGMENT_BINDING")
+                .map(|v| {
+                    let s = v.trim();
+                    s == "1" || s.eq_ignore_ascii_case("true")
+                })
+                .unwrap_or(false);
+            if !allow_missing {
+                return Err(GKRError::VerificationError {
+                    layer_idx,
+                    reason: "piecewise activation: missing low-bit segment-input binding proof"
+                        .into(),
+                });
+            }
         }
     } else {
         // Soundness gate: reject missing segment binding proof
@@ -3544,6 +3724,16 @@ fn verify_piecewise_activation_reduction(
             mix_secure_field(channel, sb);
         }
     }
+    if let Some(low_bit_evals) = &proof.low_bit_evals {
+        for &lb in low_bit_evals {
+            mix_secure_field(channel, lb);
+        }
+    }
+    if let Some(canonical_and_evals) = &proof.canonical_and_evals {
+        for &ca in canonical_and_evals {
+            mix_secure_field(channel, ca);
+        }
+    }
 
     Ok(GKRClaim {
         point: sumcheck_challenges,
@@ -3562,12 +3752,12 @@ const PHASE_B_NUM_BITS: usize = 30;
 ///   `V_out(r) = Σ_x eq(r,x) · [b·in + η·b·(1-b) + η²·decomp + Σ η^{j+3}·bit_j·(1-bit_j)]`
 ///
 /// Phase B activates when `proof.bit_evals` is `Some(...)`.
-fn verify_activation_product_reduction(
+fn verify_activation_product_reduction<C: VerifierChannel>(
     output_claim: &GKRClaim,
     proof: &super::types::ActivationProductProof,
     expected_input_eval: SecureField,
     layer_idx: usize,
-    channel: &mut PoseidonChannel,
+    channel: &mut C,
 ) -> Result<GKRClaim, GKRError> {
     let num_vars = proof.round_polys.len();
     if num_vars == 0 {
@@ -3725,7 +3915,7 @@ fn verify_activation_product_reduction(
 /// - Table built from QuantParams (deterministic: INT4→16, INT8→256 entries)
 /// - "DEQLOG" Fiat-Shamir tag
 /// - Table commitment derived from (bits, scale, zero_point) hash
-fn verify_dequantize_reduction(
+fn verify_dequantize_reduction<C: VerifierChannel>(
     output_claim: &GKRClaim,
     params: &crate::gadgets::quantize::QuantParams,
     logup_proof: Option<&LogUpProof>,
@@ -3734,7 +3924,7 @@ fn verify_dequantize_reduction(
     output_eval: SecureField,
     table_commitment: starknet_ff::FieldElement,
     layer_idx: usize,
-    channel: &mut PoseidonChannel,
+    channel: &mut C,
 ) -> Result<GKRClaim, GKRError> {
     use super::prover::compute_dequantize_table_commitment;
     use crate::components::dequantize::build_dequantize_table;
@@ -3903,7 +4093,7 @@ fn project_claim_point(point: &[SecureField], n_vars: usize) -> Vec<SecureField>
 }
 
 /// Verify a Quantize reduction via LogUp eq-sumcheck.
-fn verify_quantize_reduction(
+fn verify_quantize_reduction<C: VerifierChannel>(
     output_claim: &GKRClaim,
     params: &crate::gadgets::quantize::QuantParams,
     logup_proof: Option<&LogUpProof>,
@@ -3912,7 +4102,7 @@ fn verify_quantize_reduction(
     table_inputs: &[M31],
     table_outputs: &[M31],
     layer_idx: usize,
-    channel: &mut PoseidonChannel,
+    channel: &mut C,
 ) -> Result<GKRClaim, GKRError> {
     use crate::gadgets::quantize::{dequantize_value, quantize_value, QuantParams, QuantStrategy};
 
@@ -4054,7 +4244,7 @@ fn verify_quantize_reduction(
 }
 
 /// Verify an Embedding reduction via LogUp eq-sumcheck.
-fn verify_embedding_reduction(
+fn verify_embedding_reduction<C: VerifierChannel>(
     output_claim: &GKRClaim,
     vocab_size: usize,
     embed_dim: usize,
@@ -4064,7 +4254,7 @@ fn verify_embedding_reduction(
     input_num_vars: usize,
     weight_node_id: usize,
     layer_idx: usize,
-    channel: &mut PoseidonChannel,
+    channel: &mut C,
     weights: Option<&GraphWeights>,
 ) -> Result<GKRClaim, GKRError> {
     let weights = weights.ok_or_else(|| GKRError::VerificationError {
@@ -4204,7 +4394,7 @@ fn verify_embedding_reduction(
 /// The prover commits to mean and rsqrt_var evaluations, then proves
 /// the linear relationship output = (input - mean) × rsqrt and that
 /// the rsqrt values come from the precomputed rsqrt table.
-fn verify_layernorm_reduction(
+fn verify_layernorm_reduction<C: VerifierChannel>(
     output_claim: &GKRClaim,
     logup_proof: Option<&LogUpProof>,
     multiplicity_sumcheck: Option<&MultiplicitySumcheckProof>,
@@ -4218,7 +4408,7 @@ fn verify_layernorm_reduction(
     simd_combined: bool,
     dim: usize,
     layer_idx: usize,
-    channel: &mut PoseidonChannel,
+    channel: &mut C,
     mean_var_round_polys: Option<&Vec<RoundPolyDeg3>>,
     mean_var_final_evals: Option<(SecureField, SecureField)>,
     var_eval: Option<SecureField>,
@@ -4279,7 +4469,8 @@ fn verify_layernorm_reduction(
                 layer_idx,
                 reason: format!(
                     "layernorm: mean-variance sumcheck has {} rounds, expected {}",
-                    mv_polys.len(), num_vars,
+                    mv_polys.len(),
+                    num_vars,
                 ),
             });
         }
@@ -4310,7 +4501,9 @@ fn verify_layernorm_reduction(
                     layer_idx,
                     reason: format!(
                         "layernorm mean-variance round {}: p(0)+p(1) = {} != sum {}",
-                        round, p0 + p1, current_sum,
+                        round,
+                        p0 + p1,
+                        current_sum,
                     ),
                 });
             }
@@ -4319,12 +4512,11 @@ fn verify_layernorm_reduction(
             mv_challenges.push(ch);
             current_sum = poly.eval(ch);
         }
-        let (mv_input_final, mv_mean_final) = mean_var_final_evals.ok_or_else(|| {
-            GKRError::VerificationError {
+        let (mv_input_final, mv_mean_final) =
+            mean_var_final_evals.ok_or_else(|| GKRError::VerificationError {
                 layer_idx,
                 reason: "layernorm: mean_var_round_polys present but final_evals missing".into(),
-            }
-        })?;
+            })?;
         mix_secure_field(channel, mv_input_final);
         mix_secure_field(channel, mv_mean_final);
         // Final check: η₀·input_final + η₁·(input_final - mean_final)² == current_sum
@@ -4386,7 +4578,9 @@ fn verify_layernorm_reduction(
                 let mut base = total % p;
                 let mut exp = p - 2;
                 while exp > 0 {
-                    if exp & 1 == 1 { result = result * base % p; }
+                    if exp & 1 == 1 {
+                        result = result * base % p;
+                    }
                     base = base * base % p;
                     exp >>= 1;
                 }
@@ -4418,10 +4612,7 @@ fn verify_layernorm_reduction(
             if rm.len() != rows {
                 return Err(GKRError::VerificationError {
                     layer_idx,
-                    reason: format!(
-                        "layernorm row_means length {} != rows {}",
-                        rm.len(), rows,
-                    ),
+                    reason: format!("layernorm row_means length {} != rows {}", rm.len(), rows,),
                 });
             }
             // Reconstruct mean(s₀) from per-row means.
@@ -4458,19 +4649,21 @@ fn verify_layernorm_reduction(
             // fold_mle fixes MSB first, so mv_challenges[0..log_rows] are the row
             // variables (high bits of the array index), and mv_challenges[k]
             // corresponds to row bit (log_rows - 1 - k).
-            let expected_mean: SecureField = (0..rows).map(|r| {
-                let mut eq_val = SecureField::one();
-                for k in 0..log_rows {
-                    let s_bit = mv_challenges[k];
-                    let row_bit = (r >> (log_rows - 1 - k)) & 1;
-                    if row_bit == 1 {
-                        eq_val = eq_val * s_bit;
-                    } else {
-                        eq_val = eq_val * (SecureField::one() - s_bit);
+            let expected_mean: SecureField = (0..rows)
+                .map(|r| {
+                    let mut eq_val = SecureField::one();
+                    for k in 0..log_rows {
+                        let s_bit = mv_challenges[k];
+                        let row_bit = (r >> (log_rows - 1 - k)) & 1;
+                        if row_bit == 1 {
+                            eq_val = eq_val * s_bit;
+                        } else {
+                            eq_val = eq_val * (SecureField::one() - s_bit);
+                        }
                     }
-                }
-                eq_val * SecureField::from(rm[r])
-            }).sum();
+                    eq_val * SecureField::from(rm[r])
+                })
+                .sum();
             if mv_mean_final != expected_mean {
                 return Err(GKRError::VerificationError {
                     layer_idx,
@@ -4489,23 +4682,26 @@ fn verify_layernorm_reduction(
                         layer_idx,
                         reason: format!(
                             "layernorm row_variances length {} != rows {}",
-                            rv.len(), rows,
+                            rv.len(),
+                            rows,
                         ),
                     });
                 }
-                let expected_var: SecureField = (0..rows).map(|r| {
-                    let mut eq_val = SecureField::one();
-                    for k in 0..log_rows {
-                        let s_bit = mv_challenges[k];
-                        let row_bit = (r >> (log_rows - 1 - k)) & 1;
-                        if row_bit == 1 {
-                            eq_val = eq_val * s_bit;
-                        } else {
-                            eq_val = eq_val * (SecureField::one() - s_bit);
+                let expected_var: SecureField = (0..rows)
+                    .map(|r| {
+                        let mut eq_val = SecureField::one();
+                        for k in 0..log_rows {
+                            let s_bit = mv_challenges[k];
+                            let row_bit = (r >> (log_rows - 1 - k)) & 1;
+                            if row_bit == 1 {
+                                eq_val = eq_val * s_bit;
+                            } else {
+                                eq_val = eq_val * (SecureField::one() - s_bit);
+                            }
                         }
-                    }
-                    eq_val * SecureField::from(rv[r])
-                }).sum();
+                        eq_val * SecureField::from(rv[r])
+                    })
+                    .sum();
                 if ve != expected_var {
                     return Err(GKRError::VerificationError {
                         layer_idx,
@@ -4518,7 +4714,8 @@ fn verify_layernorm_reduction(
             } else if !simd_combined {
                 return Err(GKRError::VerificationError {
                     layer_idx,
-                    reason: "multi-row LayerNorm missing row_variances for binding verification".into(),
+                    reason: "multi-row LayerNorm missing row_variances for binding verification"
+                        .into(),
                 });
             }
         } else if !simd_combined {
@@ -4602,7 +4799,8 @@ fn verify_layernorm_reduction(
                 layer_idx,
                 reason: format!(
                     "layernorm centered binding failed: centered={} != input-mean={}",
-                    centered_final, cb_input - cb_mean,
+                    centered_final,
+                    cb_input - cb_mean,
                 ),
             });
         }
@@ -4739,7 +4937,7 @@ fn verify_layernorm_reduction(
 ///
 /// Unlike LayerNorm, RMSNorm has no mean subtraction:
 ///   output = input × rsqrt(mean(x²) + ε)
-fn verify_rmsnorm_reduction(
+fn verify_rmsnorm_reduction<C: VerifierChannel>(
     output_claim: &GKRClaim,
     logup_proof: Option<&LogUpProof>,
     multiplicity_sumcheck: Option<&MultiplicitySumcheckProof>,
@@ -4753,7 +4951,7 @@ fn verify_rmsnorm_reduction(
     simd_combined: bool,
     dim: usize,
     layer_idx: usize,
-    channel: &mut PoseidonChannel,
+    channel: &mut C,
     rms_sq_round_polys: Option<&Vec<RoundPolyDeg3>>,
     rms_sq_input_final: Option<SecureField>,
     rms_sq_claimed_sq_sum: Option<SecureField>,
@@ -4809,7 +5007,8 @@ fn verify_rmsnorm_reduction(
                 layer_idx,
                 reason: format!(
                     "rmsnorm: RMS² sumcheck has {} rounds, expected {}",
-                    rms_polys.len(), num_vars,
+                    rms_polys.len(),
+                    num_vars,
                 ),
             });
         }
@@ -4830,7 +5029,9 @@ fn verify_rmsnorm_reduction(
                     layer_idx,
                     reason: format!(
                         "rmsnorm RMS² round {}: p(0)+p(1) = {} != sum {}",
-                        round, p0 + p1, current_sum,
+                        round,
+                        p0 + p1,
+                        current_sum,
                     ),
                 });
             }
@@ -4849,7 +5050,8 @@ fn verify_rmsnorm_reduction(
                 layer_idx,
                 reason: format!(
                     "rmsnorm RMS² final check failed: in²={} != sum={}",
-                    input_final * input_final, current_sum,
+                    input_final * input_final,
+                    current_sum,
                 ),
             });
         }
@@ -4893,10 +5095,7 @@ fn verify_rmsnorm_reduction(
             if rr.len() != rows {
                 return Err(GKRError::VerificationError {
                     layer_idx,
-                    reason: format!(
-                        "rmsnorm row_rms_sq length {} != rows {}",
-                        rr.len(), rows,
-                    ),
+                    reason: format!("rmsnorm row_rms_sq length {} != rows {}", rr.len(), rows,),
                 });
             }
             // rms_sq_mle is constant per row: rms_sq(s) = Σ_r rms_sq_r * eq(s_row, r)
@@ -4906,19 +5105,21 @@ fn verify_rmsnorm_reduction(
             // row variables, with point[k] corresponding to row bit (log_rows-1-k).
             let log_cols = cols_padded.ilog2() as usize;
             let log_rows = num_vars - log_cols;
-            let expected_rms_sq: SecureField = (0..rows).map(|r| {
-                let mut eq_val = SecureField::one();
-                for k in 0..log_rows {
-                    let s_bit = output_claim.point[k];
-                    let row_bit = (r >> (log_rows - 1 - k)) & 1;
-                    if row_bit == 1 {
-                        eq_val = eq_val * s_bit;
-                    } else {
-                        eq_val = eq_val * (SecureField::one() - s_bit);
+            let expected_rms_sq: SecureField = (0..rows)
+                .map(|r| {
+                    let mut eq_val = SecureField::one();
+                    for k in 0..log_rows {
+                        let s_bit = output_claim.point[k];
+                        let row_bit = (r >> (log_rows - 1 - k)) & 1;
+                        if row_bit == 1 {
+                            eq_val = eq_val * s_bit;
+                        } else {
+                            eq_val = eq_val * (SecureField::one() - s_bit);
+                        }
                     }
-                }
-                eq_val * SecureField::from(rr[r])
-            }).sum();
+                    eq_val * SecureField::from(rr[r])
+                })
+                .sum();
             if rms_sq_eval != expected_rms_sq {
                 return Err(GKRError::VerificationError {
                     layer_idx,
@@ -5137,7 +5338,7 @@ fn verify_rmsnorm_reduction(
 ///   2H+1..2H+3: V, K, Q projection matmuls (fresh claims)
 ///
 /// Total expected: 4 + 2 × num_heads
-pub(crate) fn verify_attention_reduction(
+pub(crate) fn verify_attention_reduction<C: VerifierChannel>(
     output_claim: &GKRClaim,
     config: &MultiHeadAttentionConfig,
     sub_proofs: &[LayerProof],
@@ -5145,7 +5346,7 @@ pub(crate) fn verify_attention_reduction(
     softmax_sum_proofs: &[super::types::SoftmaxSumProof],
     r_simd: Option<&[SecureField]>,
     layer_idx: usize,
-    channel: &mut PoseidonChannel,
+    channel: &mut C,
 ) -> Result<GKRClaim, GKRError> {
     let num_heads = config.num_heads;
     let seq_len = config.seq_len;
@@ -5205,7 +5406,7 @@ pub(crate) fn verify_attention_reduction(
                                    k: usize,
                                    n: usize,
                                    r_simd: Option<&[SecureField]>,
-                                   channel: &mut PoseidonChannel|
+                                   channel: &mut C|
      -> Result<GKRClaim, GKRError> {
         let pm = m.next_power_of_two();
         let pn = n.next_power_of_two();
@@ -5344,7 +5545,8 @@ pub(crate) fn verify_attention_reduction(
                     layer_idx,
                     reason: format!(
                         "softmax sum proof: expected {} rounds, got {}",
-                        num_vars, sp.round_polys.len(),
+                        num_vars,
+                        sp.round_polys.len(),
                     ),
                 });
             }
@@ -5394,7 +5596,8 @@ pub(crate) fn verify_attention_reduction(
                         layer_idx,
                         reason: format!(
                             "softmax sum: expected {} row sums, got {}",
-                            expected_rows, sp.row_sums.len(),
+                            expected_rows,
+                            sp.row_sums.len(),
                         ),
                     });
                 }
@@ -5428,7 +5631,11 @@ pub(crate) fn verify_attention_reduction(
                             "softmax sum: row-sum binding failed. \
                              expected total {} (from {} row sums + {} pad_cols + {} pad_rows), \
                              got claimed_sum M31 component {}",
-                            expected_m31.0, sp.row_sums.len(), pad_cols, pad_rows, claimed_m31.0,
+                            expected_m31.0,
+                            sp.row_sums.len(),
+                            pad_cols,
+                            pad_rows,
+                            claimed_m31.0,
                         ),
                     });
                 }
@@ -5523,7 +5730,7 @@ pub(crate) fn verify_attention_reduction(
 }
 
 /// Verify a decode-step attention reduction (DCOD domain tag, asymmetric dims).
-pub(crate) fn verify_attention_reduction_decode(
+pub(crate) fn verify_attention_reduction_decode<C: VerifierChannel>(
     output_claim: &GKRClaim,
     sub_proofs: &[LayerProof],
     sub_claim_values: &[SecureField],
@@ -5535,7 +5742,7 @@ pub(crate) fn verify_attention_reduction_decode(
     causal: bool,
     position_offset: usize,
     layer_idx: usize,
-    channel: &mut PoseidonChannel,
+    channel: &mut C,
 ) -> Result<GKRClaim, GKRError> {
     let d_k = d_model / num_heads;
     // GQA support (G23 fix, Apr 30 2026): K/V projection target dim is
@@ -5591,7 +5798,7 @@ pub(crate) fn verify_attention_reduction_decode(
                                    m: usize,
                                    k: usize,
                                    n: usize,
-                                   channel: &mut PoseidonChannel|
+                                   channel: &mut C|
      -> Result<GKRClaim, GKRError> {
         let pm = m.next_power_of_two();
         let pn = n.next_power_of_two();
@@ -5870,9 +6077,9 @@ fn compute_activation_table_commitment(
 /// For each round: verifies p(0) + p(1) == current_sum, mixes (c0, c1),
 /// draws challenge, updates current_sum = c0 + c1 * r.
 /// After all rounds: asserts current_sum == final_eval.
-fn verify_multiplicity_sumcheck(
+fn verify_multiplicity_sumcheck<C: VerifierChannel>(
     proof: &MultiplicitySumcheckProof,
-    channel: &mut PoseidonChannel,
+    channel: &mut C,
 ) -> Result<(), GKRError> {
     let mut current_sum = proof.claimed_sum;
     for &(c0, c1) in &proof.round_polys {
@@ -5898,8 +6105,8 @@ fn verify_multiplicity_sumcheck(
 
 /// Mix a SecureField into PoseidonChannel via packed felt252 (1 hades instead of 4).
 /// Must match Cairo's channel_mix_secure_field and prover's mix_secure_field.
-fn mix_secure_field(channel: &mut PoseidonChannel, v: SecureField) {
-    channel.mix_felt(crate::crypto::poseidon_channel::securefield_to_felt(v));
+fn mix_secure_field<C: VerifierChannel>(channel: &mut C, v: SecureField) {
+    channel.mix_securefield(v);
 }
 
 #[cfg(test)]
@@ -5914,9 +6121,10 @@ mod tests {
     use crate::gadgets::quantize::{dequantize_value, quantize_value, QuantParams, QuantStrategy};
     use crate::gkr::circuit::LayeredCircuit;
     use crate::gkr::prover::{
-        prove_gkr, prove_gkr_with_cache, reduce_activation_layer_for_test, reduce_embedding_layer_for_test,
-        reduce_layernorm_layer_for_test, reduce_layernorm_simd_for_test, reduce_mul_layer_for_test,
-        reduce_quantize_layer_for_test, reduce_rmsnorm_layer_for_test,
+        prove_gkr, prove_gkr_with_cache, reduce_activation_layer_for_test,
+        reduce_embedding_layer_for_test, reduce_layernorm_layer_for_test,
+        reduce_layernorm_simd_for_test, reduce_mul_layer_for_test, reduce_quantize_layer_for_test,
+        reduce_rmsnorm_layer_for_test,
     };
     use num_traits::Zero;
     use stwo::core::fields::m31::M31;
@@ -5931,10 +6139,15 @@ mod tests {
 
     impl EnvVarGuard {
         fn set(key: &'static str, value: &str) -> Self {
-            let lock = crate::test_utils::ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = crate::test_utils::ENV_MUTEX
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let prev = std::env::var(key).ok();
             std::env::set_var(key, value);
-            Self { entries: vec![(key, prev)], _lock: lock }
+            Self {
+                entries: vec![(key, prev)],
+                _lock: lock,
+            }
         }
 
         /// Set an additional env var under the same lock (no deadlock).
@@ -6134,7 +6347,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Known: deferred proof claim chain mismatch in batched RLC path"]    fn test_batched_rlc_direct_eval_with_deferred_claims() {
+    #[ignore = "Known: deferred proof claim chain mismatch in batched RLC path"]
+    fn test_batched_rlc_direct_eval_with_deferred_claims() {
         // Residual DAG: x -> MatMul(0) -> MatMul(1) -> Add(with skip from MatMul(0))
         let mut builder = GraphBuilder::new((1, 4));
         builder.linear(4);
@@ -7210,7 +7424,11 @@ mod tests {
             m
         };
         let result = prove_and_verify_activation_logup(ActivationType::GELU, &input, 0xAC10);
-        assert!(result.is_ok(), "GELU LogUp should verify: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "GELU LogUp should verify: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -7225,7 +7443,11 @@ mod tests {
             m
         };
         let result = prove_and_verify_activation_logup(ActivationType::Sigmoid, &input, 0x5101);
-        assert!(result.is_ok(), "Sigmoid LogUp should verify: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Sigmoid LogUp should verify: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -7240,7 +7462,11 @@ mod tests {
             m
         };
         let result = prove_and_verify_activation_logup(ActivationType::Softmax, &input, 0x5F01);
-        assert!(result.is_ok(), "Softmax LogUp should verify: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Softmax LogUp should verify: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -7289,7 +7515,10 @@ mod tests {
         // but in the real dispatch, ReLU goes through the algebraic path.
         match &proof {
             LayerProof::Activation { logup_proof, .. } => {
-                assert!(logup_proof.is_some(), "reduce_activation_layer now always produces LogUp");
+                assert!(
+                    logup_proof.is_some(),
+                    "reduce_activation_layer now always produces LogUp"
+                );
             }
             _ => panic!("expected Activation proof"),
         }
@@ -7487,7 +7716,10 @@ mod tests {
         let input_eval = SecureField::from(M31::from(42u32));
         let output_eval = SecureField::from(M31::from(99u32));
         let output_claim = GKRClaim {
-            point: vec![SecureField::from(M31::from(1u32)), SecureField::from(M31::from(2u32))],
+            point: vec![
+                SecureField::from(M31::from(1u32)),
+                SecureField::from(M31::from(2u32)),
+            ],
             value: output_eval,
         };
 
@@ -7522,7 +7754,10 @@ mod tests {
         let input_eval = SecureField::from(M31::from(42u32));
         let output_eval = SecureField::from(M31::from(99u32));
         let output_claim = GKRClaim {
-            point: vec![SecureField::from(M31::from(1u32)), SecureField::from(M31::from(2u32))],
+            point: vec![
+                SecureField::from(M31::from(1u32)),
+                SecureField::from(M31::from(2u32)),
+            ],
             value: output_eval,
         };
 
@@ -7542,7 +7777,10 @@ mod tests {
             &mut channel,
             true, // simd_combined: allows missing proofs
         );
-        assert!(result.is_ok(), "SIMD combined path should accept None proofs");
+        assert!(
+            result.is_ok(),
+            "SIMD combined path should accept None proofs"
+        );
     }
 
     // ===== LayerNorm Tests =====
@@ -7631,8 +7869,7 @@ mod tests {
                 sq_sum = sq_sum + x * x;
             }
             let rms_sq_raw = sq_sum * inv_n;
-            let rms_sq =
-                M31::from(rms_sq_raw.0 & ((1u32 << config.rsqrt_table_log_size) - 1));
+            let rms_sq = M31::from(rms_sq_raw.0 & ((1u32 << config.rsqrt_table_log_size) - 1));
             let rsqrt = rsqrt_table
                 .lookup(rms_sq)
                 .expect("rms_sq reduced to table range");
@@ -7944,10 +8181,7 @@ mod tests {
                     row_means.as_ref(),
                     row_variances.as_ref(),
                 );
-                assert!(
-                    result.is_err(),
-                    "tampered row_means should be rejected"
-                );
+                assert!(result.is_err(), "tampered row_means should be rejected");
                 let err_msg = format!("{:?}", result.err().unwrap());
                 assert!(
                     err_msg.contains("multi-row mean binding failed"),
@@ -7993,8 +8227,7 @@ mod tests {
         };
 
         let (proof, _) =
-            reduce_rmsnorm_layer_for_test(&output_claim, &input, dim, &mut prover_channel)
-                .unwrap();
+            reduce_rmsnorm_layer_for_test(&output_claim, &input, dim, &mut prover_channel).unwrap();
 
         let mut verifier_channel = PoseidonChannel::new();
         verifier_channel.mix_u64(0x524E_4D52);
@@ -8085,8 +8318,7 @@ mod tests {
         };
 
         let (mut proof, _) =
-            reduce_rmsnorm_layer_for_test(&output_claim, &input, dim, &mut prover_channel)
-                .unwrap();
+            reduce_rmsnorm_layer_for_test(&output_claim, &input, dim, &mut prover_channel).unwrap();
 
         // Tamper row_rms_sq[0] — malicious prover sets fake rms_sq for row 0
         if let LayerProof::RMSNorm {
@@ -8140,10 +8372,7 @@ mod tests {
                     *rms_sq_claimed_sq_sum,
                     row_rms_sq.as_ref(),
                 );
-                assert!(
-                    result.is_err(),
-                    "tampered row_rms_sq should be rejected"
-                );
+                assert!(result.is_err(), "tampered row_rms_sq should be rejected");
                 let err_msg = format!("{:?}", result.err().unwrap());
                 assert!(
                     err_msg.contains("multi-row rms_sq binding failed"),
@@ -9982,7 +10211,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Known: deferred proof claim chain mismatch in dequantize DAG path"]    fn test_deferred_proof_dequantize_dag() {
+    #[ignore = "Known: deferred proof claim chain mismatch in dequantize DAG path"]
+    fn test_deferred_proof_dequantize_dag() {
         // DAG: Input(1×4) → Dequantize → fork → MatMul(4×4) → Add(deq_fork, matmul_out)
         // The Dequantize skip branch gets a Weightless deferred proof.
         let params = QuantParams {

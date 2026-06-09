@@ -343,8 +343,12 @@ impl TransformerConfig {
 
 fn add_norm(builder: &mut GraphBuilder, norm_type: NormType) {
     match norm_type {
-        NormType::LayerNorm => { builder.layer_norm(); }
-        NormType::RMSNorm => { builder.rms_norm(); }
+        NormType::LayerNorm => {
+            builder.layer_norm();
+        }
+        NormType::RMSNorm => {
+            builder.rms_norm();
+        }
     }
 }
 

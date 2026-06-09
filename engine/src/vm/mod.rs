@@ -11,7 +11,7 @@
 //! - Multi-GPU pipelining (chunks prove in parallel)
 //! - Trace replay (re-prove from saved trace without re-executing)
 
-pub mod trace;
 pub mod executor;
 pub mod prover;
 pub mod queue;
+pub mod trace;

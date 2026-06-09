@@ -82,10 +82,17 @@ function decodeProofMetadata(proof) {
     n_layers:        parseInt(r.calldata[12], 16),
     trace_log_size:  parseInt(r.calldata[22], 16),
     n_pos_perms:     parseInt(r.calldata[13], 16),
-    prev_kv:         r.calldata[24],             // NEW v4 header field
-    new_kv:          r.calldata[25],             // NEW v4 header field
+    prev_kv:         r.calldata[31],
+    new_kv:          r.calldata[32],
+    conversation_statement_hash: proof.conversation_statement_hash || r.conversation_statement_hash || "0x0",
+    statement_verifier: proof.statement_verifier || r.statement_verifier || "0x0",
+    statement_proof_hash: proof.statement_proof_hash || r.statement_proof_hash || "0x0",
     policy_commitment: proof.policy_commitment || r.policy_commitment || "0x0",
   };
+}
+
+function hasStatementHash(value) {
+  return BigInt(value || "0x0") !== 0n;
 }
 
 async function ensureModelRegistered(account, provider, manifest) {
@@ -155,24 +162,43 @@ async function startSession(account, provider, modelId, initialKvCommitment) {
 
 async function verifyDecodeStep(account, provider, sessionId, stepIdx, manifest, stepProof) {
   const meta = decodeProofMetadata(stepProof);
-  console.log("Step " + stepIdx + ": prev_kv=" + meta.prev_kv.slice(0, 18) + "... new_kv=" + meta.new_kv.slice(0, 18) + "... felts=" + meta.calldata.length);
+  meta.statement_verifier = meta.statement_verifier !== "0x0" ? meta.statement_verifier : (manifest.statement_verifier || process.env.STATEMENT_VERIFIER_CONTRACT || process.env.STWO_STATEMENT_VERIFIER || "0x0");
+  meta.statement_proof_hash = meta.statement_proof_hash !== "0x0" ? meta.statement_proof_hash : (manifest.statement_proof_hash || process.env.STATEMENT_PROOF_HASH || "0x0");
+  const bindStatement = hasStatementHash(meta.conversation_statement_hash);
+  const bindStatementFact = bindStatement && hasStatementHash(meta.statement_verifier);
+  const entrypoint = bindStatementFact ? "verify_decode_step_with_statement_fact" : (bindStatement ? "verify_decode_step_with_statement" : "verify_decode_step");
+  console.log("Step " + stepIdx + ": prev_kv=" + meta.prev_kv.slice(0, 18) + "... new_kv=" + meta.new_kv.slice(0, 18) + "... statement=" + meta.conversation_statement_hash.slice(0, 18) + "... entrypoint=" + entrypoint + " felts=" + meta.calldata.length);
+
+  const baseCalldata = {
+    session_id: sessionId.toString(),
+    expected_step_idx: stepIdx,
+    model_id: manifest.model_id,
+    io_commitment: meta.io_commitment_param,
+    circuit_hash: meta.circuit_hash,
+    weight_super_root: meta.weight_super_root,
+    n_layers: meta.n_layers,
+    n_matmuls: parseInt(process.env.N_MATMULS || manifest.n_matmuls || 6),
+    hidden_size: parseInt(process.env.HIDDEN_SIZE || manifest.hidden_size || 576),
+    num_transformer_blocks: parseInt(process.env.NUM_TRANSFORMER_BLOCKS || manifest.num_transformer_blocks || 1),
+    policy_commitment: meta.policy_commitment,
+    trace_log_size: meta.trace_log_size,
+  };
 
   const tx = await account.execute({
     contractAddress: CONTRACT,
-    entrypoint: "verify_decode_step",
-    calldata: CallData.compile({
-      session_id: sessionId.toString(),
-      expected_step_idx: stepIdx,
-      model_id: manifest.model_id,
-      io_commitment: meta.io_commitment_param,
-      circuit_hash: meta.circuit_hash,
-      weight_super_root: meta.weight_super_root,
-      n_layers: meta.n_layers,
-      n_matmuls: parseInt(process.env.N_MATMULS || manifest.n_matmuls || 6),
-      hidden_size: parseInt(process.env.HIDDEN_SIZE || manifest.hidden_size || 576),
-      num_transformer_blocks: parseInt(process.env.NUM_TRANSFORMER_BLOCKS || manifest.num_transformer_blocks || 1),
-      policy_commitment: meta.policy_commitment,
-      trace_log_size: meta.trace_log_size,
+    entrypoint,
+    calldata: CallData.compile(bindStatementFact ? {
+      ...baseCalldata,
+      expected_conversation_statement_hash: meta.conversation_statement_hash,
+      statement_verifier: meta.statement_verifier,
+      expected_statement_proof_hash: meta.statement_proof_hash,
+      stark_proof_data: meta.calldata,
+    } : bindStatement ? {
+      ...baseCalldata,
+      expected_conversation_statement_hash: meta.conversation_statement_hash,
+      stark_proof_data: meta.calldata,
+    } : {
+      ...baseCalldata,
       stark_proof_data: meta.calldata,
     }),
   });

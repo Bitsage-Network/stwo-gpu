@@ -257,8 +257,10 @@ pub struct PcsConfig {
 pub struct ModelProof {
     /// PCS security parameters.
     pub pcs_config: PcsConfig,
-    /// Raw IO data: [in_rows, in_cols, in_len, in_data..., out_rows, out_cols, out_len, out_data...].
-    /// The verifier recomputes Poseidon(raw_io_data) on-chain — never trusts a caller-supplied hash.
+    /// Raw IO data: [in_rows, in_cols, in_len, in_data..., out_rows, out_cols, out_len,
+    /// out_data...].
+    /// The verifier recomputes Poseidon(raw_io_data) on-chain — never trusts a caller-supplied
+    /// hash.
     pub raw_io_data: Array<felt252>,
     /// Running Poseidon hash of intermediate layer outputs.
     pub layer_chain_commitment: felt252,

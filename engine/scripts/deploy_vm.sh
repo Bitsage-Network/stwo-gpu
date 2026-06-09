@@ -263,6 +263,8 @@ if [[ ! -f \"\$MODEL_DIR/config.json\" ]]; then
 from huggingface_hub import snapshot_download
 import sys
 models = {
+    'qwen3.5-35b-a3b': 'Qwen/Qwen3.5-35B-A3B',
+    'qwen35b': 'Qwen/Qwen3.5-35B-A3B',
     'qwen2-0.5b': 'Qwen/Qwen2-0.5B',
     'phi3-mini': 'microsoft/Phi-3-mini-4k-instruct',
     'llama3-8b': 'meta-llama/Meta-Llama-3-8B',

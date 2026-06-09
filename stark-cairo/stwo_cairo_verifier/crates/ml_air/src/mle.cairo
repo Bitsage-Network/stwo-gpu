@@ -67,7 +67,7 @@ pub fn verify_mle_opening(
         channel.mix_felts([*sibling].span());
 
         layer_idx += 1;
-    };
+    }
 
     // TODO: Verify final Merkle root matches commitment.
     // Full Merkle verification requires Poseidon Merkle tree implementation.

@@ -202,10 +202,17 @@ pub struct ActivationProductProof {
 /// Piecewise-linear algebraic activation proof.
 ///
 /// Proves activation correctness via 16-segment linear approximation over the
-/// full M31 domain. Uses a combined degree-3 eq-sumcheck with 18 constraints:
+/// full M31 domain. Uses a combined degree-3 eq-sumcheck with 83 constraints:
 ///   - η^0: output matches piecewise evaluation
 ///   - η^1: partition of unity (indicators sum to 1)
 ///   - η^{2..17}: binary indicator enforcement (I_i ∈ {0,1})
+///   - η^18: segment bits encode selected indicator index
+///   - η^{19..22}: segment bit binary enforcement
+///   - η^23: input equals low bits plus 2^27 times segment index
+///   - η^{24..50}: low-bit binary enforcement
+///   - η^{51..81}: prefix-AND chain over all 31 decomposition bits
+///   - η^82: final prefix-AND is zero, excluding the invalid all-ones
+///     representation of the M31 modulus.
 ///
 /// Total degree: 3 (eq × indicator × (1 - indicator)).
 /// Eliminates lookup tables — ~82% calldata reduction vs LogUp.
@@ -224,6 +231,16 @@ pub struct PiecewiseAlgebraicProof {
     /// 4 bits encoding the segment index (top 4 bits of input).
     /// None for legacy proofs without segment-input binding.
     pub seg_bit_evals: Option<[SecureField; 4]>,
+    /// Low-bit MLE evaluations at the final sumcheck challenge point.
+    /// 27 bits proving `input = low_bits + 2^27 * segment_index`, which binds
+    /// the segment index to the input value instead of only to the indicator.
+    /// None for legacy proofs without full segment-input range binding.
+    pub low_bit_evals: Option<Vec<SecureField>>,
+    /// Prefix-AND evaluations for the 31 decomposition bits:
+    /// 4 segment bits followed by 27 low bits. These prove the decomposition is
+    /// canonical by rejecting the all-ones bit pattern, which represents the
+    /// M31 modulus and aliases to zero in-field.
+    pub canonical_and_evals: Option<Vec<SecureField>>,
 }
 
 /// Per-layer proof in the GKR protocol.

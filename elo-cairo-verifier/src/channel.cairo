@@ -23,8 +23,8 @@
 //     digest = poseidon_hash_many([digest, packed_values...])
 //     n_draws = 0
 
-use core::poseidon::{poseidon_hash_span, hades_permutation};
-use crate::field::{CM31, QM31, M31_SHIFT, m31_reduce};
+use core::poseidon::{hades_permutation, poseidon_hash_span};
+use crate::field::{CM31, M31_SHIFT, QM31, m31_reduce};
 
 /// Channel state matching STWO's Poseidon252Channel { digest, n_draws }.
 #[derive(Drop, Copy)]
@@ -86,9 +86,7 @@ pub fn channel_draw_felt252(ref ch: PoseidonChannel) -> felt252 {
 
 /// Extract 8 M31 values from a felt252 by successive floor_div(2^31).
 /// LSB first (index 0 = least significant 31 bits).
-fn felt252_to_m31_array_8(
-    value: felt252,
-) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
+fn felt252_to_m31_array_8(value: felt252) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
     let shift: u256 = 0x80000000; // 2^31
     let mut cur: u256 = value.into();
 
@@ -109,8 +107,14 @@ fn felt252_to_m31_array_8(
     let r7: u64 = (cur % shift).try_into().unwrap();
 
     (
-        m31_reduce(r0), m31_reduce(r1), m31_reduce(r2), m31_reduce(r3),
-        m31_reduce(r4), m31_reduce(r5), m31_reduce(r6), m31_reduce(r7),
+        m31_reduce(r0),
+        m31_reduce(r1),
+        m31_reduce(r2),
+        m31_reduce(r3),
+        m31_reduce(r4),
+        m31_reduce(r5),
+        m31_reduce(r6),
+        m31_reduce(r7),
     )
 }
 
@@ -120,10 +124,7 @@ fn felt252_to_m31_array_8(
 pub fn channel_draw_qm31(ref ch: PoseidonChannel) -> QM31 {
     let felt = channel_draw_felt252(ref ch);
     let (m0, m1, m2, m3, _, _, _, _) = felt252_to_m31_array_8(felt);
-    QM31 {
-        a: CM31 { a: m0, b: m1 },
-        b: CM31 { a: m2, b: m3 },
-    }
+    QM31 { a: CM31 { a: m0, b: m1 }, b: CM31 { a: m2, b: m3 } }
 }
 
 /// Draw multiple QM31 challenges from the channel.
@@ -136,7 +137,7 @@ pub fn channel_draw_qm31s(ref ch: PoseidonChannel, count: u32) -> Array<QM31> {
         }
         result.append(channel_draw_qm31(ref ch));
         i += 1;
-    };
+    }
     result
 }
 
@@ -221,7 +222,7 @@ pub fn channel_mix_felts(ref ch: PoseidonChannel, felts: Span<QM31>) {
             hash_inputs.append(packed);
             i += 1;
         }
-    };
+    }
     ch.digest = poseidon_hash_span(hash_inputs.span());
     ch.n_draws = 0;
 }
@@ -244,6 +245,6 @@ pub fn channel_draw_query_indices(
         let index: u32 = (val_u64 % half_n_u64).try_into().unwrap();
         indices.append(index);
         i += 1;
-    };
+    }
     indices
 }

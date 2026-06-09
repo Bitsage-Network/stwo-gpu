@@ -5,19 +5,19 @@
 #   bash scripts/benchmark_gpu.sh [LAYERS] [MODEL_DIR]
 #
 # Examples:
-#   bash scripts/benchmark_gpu.sh 1
-#   bash scripts/benchmark_gpu.sh 5 /path/to/qwen3-14b
-#   STWO_WEIGHT_BINDING=aggregated bash scripts/benchmark_gpu.sh 1
+#   bash scripts/benchmark_gpu.sh all
+#   bash scripts/benchmark_gpu.sh 5 /path/to/qwen3.5-35b-a3b
+#   STWO_WEIGHT_BINDING=aggregated bash scripts/benchmark_gpu.sh all
 #
 # Environment variables:
-#   LAYERS              Number of transformer layers (default: 1)
+#   LAYERS              Number of transformer layers, or all/full/0 (default: all)
 #   MODEL_DIR           Model directory (default: auto-detect)
 #   FORMAT              Output format: ml_gkr or cairo_serde (default: ml_gkr)
 #   STWO_WEIGHT_BINDING Weight binding mode: aggregated or unset (default: unset)
 #   SKIP_BUILD          Set to 1 to skip cargo build (default: 0)
 set -euo pipefail
 
-LAYERS="${1:-${LAYERS:-1}}"
+LAYERS="${1:-${LAYERS:-all}}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 FORMAT="${FORMAT:-ml_gkr}"
@@ -26,11 +26,28 @@ DECODE="${DECODE:-0}"
 PREFILL_LEN="${PREFILL_LEN:-8}"
 DECODE_STEPS="${DECODE_STEPS:-5}"
 
+case "${LAYERS}" in
+    all|full|0|"")
+        LAYERS_LABEL="all"
+        LAYER_FLAGS=()
+        ;;
+    *)
+        LAYERS_LABEL="${LAYERS}L"
+        LAYER_FLAGS=(--layers "${LAYERS}")
+        ;;
+esac
+
 # Auto-detect model directory
 if [[ -n "${2:-}" ]]; then
     MODEL_DIR="$2"
 elif [[ -n "${MODEL_DIR:-}" ]]; then
     : # already set
+elif [[ -d "/home/shadeform/.obelyzk/models/qwen3.5-35b-a3b" ]]; then
+    MODEL_DIR="/home/shadeform/.obelyzk/models/qwen3.5-35b-a3b"
+elif [[ -d "$HOME/.obelyzk/models/qwen3.5-35b-a3b" ]]; then
+    MODEL_DIR="$HOME/.obelyzk/models/qwen3.5-35b-a3b"
+elif [[ -d "$HOME/models/qwen3.5-35b-a3b" ]]; then
+    MODEL_DIR="$HOME/models/qwen3.5-35b-a3b"
 elif [[ -d "/home/shadeform/.obelysk/models/qwen3-14b" ]]; then
     MODEL_DIR="/home/shadeform/.obelysk/models/qwen3-14b"
 elif [[ -d "$HOME/.obelysk/models/qwen3-14b" ]]; then
@@ -53,12 +70,15 @@ fi
 
 echo "=== ZKML GPU Benchmark ==="
 echo "  Model     : ${MODEL_DIR}"
-echo "  Layers    : ${LAYERS}"
+echo "  Layers    : ${LAYERS_LABEL}"
 echo "  Format    : ${FORMAT}"
 echo "  GPU       : ${GPU_NAME} (${GPU_MEM})"
 echo "  Features  : ${FEATURES}"
 echo "  Binding   : ${STWO_WEIGHT_BINDING:-default (batched openings)}"
 [[ "${DECODE}" == "1" ]] && echo "  Decode    : ON (prefill=${PREFILL_LEN}, steps=${DECODE_STEPS})"
+if [[ "${LAYERS}" == "1" ]]; then
+    echo "  WARNING   : 1-layer mode is diagnostic only; production H100 runs should use all layers."
+fi
 echo ""
 
 if [[ "${SKIP_BUILD}" != "1" ]]; then
@@ -68,25 +88,25 @@ if [[ "${SKIP_BUILD}" != "1" ]]; then
     echo ""
 fi
 
-OUTPUT="/tmp/benchmark_qwen3_${LAYERS}L_$(date +%s).json"
+OUTPUT="/tmp/benchmark_qwen_${LAYERS_LABEL}_$(date +%s).json"
 
-DECODE_FLAGS=""
+DECODE_FLAGS=()
 if [[ "${DECODE}" == "1" ]]; then
-    DECODE_FLAGS="--decode --prefill-len ${PREFILL_LEN} --decode-steps ${DECODE_STEPS}"
+    DECODE_FLAGS=(--decode --prefill-len "${PREFILL_LEN}" --decode-steps "${DECODE_STEPS}")
     FORMAT="ml_gkr"  # decode requires ml_gkr
 fi
 
-echo "Starting prove (${LAYERS} layers, format=${FORMAT})..."
+echo "Starting prove (${LAYERS_LABEL} layers, format=${FORMAT})..."
 echo "Output: ${OUTPUT}"
 echo ""
 
 cd "${REPO_ROOT}"
 time target/release/prove-model \
     --model-dir "${MODEL_DIR}" \
-    --layers "${LAYERS}" \
+    "${LAYER_FLAGS[@]}" \
     --gpu \
     --format "${FORMAT}" \
-    ${DECODE_FLAGS} \
+    "${DECODE_FLAGS[@]}" \
     --output "${OUTPUT}" \
     2>&1 | tee /tmp/benchmark_latest.log
 

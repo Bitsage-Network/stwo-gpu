@@ -1129,10 +1129,7 @@ mod tests {
         // Loads should be reasonably balanced (within 30%)
         let max_load = load0.max(load1) as f64;
         let min_load = load0.min(load1) as f64;
-        assert!(
-            min_load / max_load > 0.7,
-            "unbalanced: {load0} vs {load1}"
-        );
+        assert!(min_load / max_load > 0.7, "unbalanced: {load0} vs {load1}");
     }
 
     #[test]
@@ -1172,9 +1169,15 @@ mod tests {
             cols: usize,
         }
         let items = vec![
-            Matrix { rows: 100, cols: 200 },
+            Matrix {
+                rows: 100,
+                cols: 200,
+            },
             Matrix { rows: 50, cols: 50 },
-            Matrix { rows: 80, cols: 100 },
+            Matrix {
+                rows: 80,
+                cols: 100,
+            },
         ];
         let bins = partition_by_size(&items, 2, |m| m.rows * m.cols);
         let load0: usize = bins[0].iter().map(|&i| items[i].rows * items[i].cols).sum();

@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-use crate::compiler::onnx::OnnxModel;
 use crate::compiler::graph::GraphWeights;
+use crate::compiler::onnx::OnnxModel;
 use crate::compiler::quantize_weights::quantize_weight_matrix;
 use crate::components::matmul::M31Matrix;
 
@@ -44,9 +44,16 @@ struct GgufHeader {
 /// GGUF metadata value types.
 #[derive(Debug, Clone)]
 pub enum GgufValue {
-    U8(u8), I8(i8), U16(u16), I16(i16),
-    U32(u32), I32(i32), U64(u64), I64(i64),
-    F32(f32), F64(f64),
+    U8(u8),
+    I8(i8),
+    U16(u16),
+    I16(i16),
+    U32(u32),
+    I32(i32),
+    U64(u64),
+    I64(i64),
+    F32(f32),
+    F64(f64),
     Bool(bool),
     String(String),
     Array(Vec<GgufValue>),
@@ -70,10 +77,17 @@ impl GgufValue {
         }
     }
     pub fn as_str(&self) -> Option<&str> {
-        match self { Self::String(s) => Some(s), _ => None }
+        match self {
+            Self::String(s) => Some(s),
+            _ => None,
+        }
     }
     pub fn as_f32(&self) -> Option<f32> {
-        match self { Self::F32(v) => Some(*v), Self::F64(v) => Some(*v as f32), _ => None }
+        match self {
+            Self::F32(v) => Some(*v),
+            Self::F64(v) => Some(*v as f32),
+            _ => None,
+        }
     }
 }
 
@@ -111,14 +125,21 @@ pub enum GgufDtype {
 impl GgufDtype {
     fn from_u32(v: u32) -> Option<Self> {
         match v {
-            0 => Some(Self::F32), 1 => Some(Self::F16),
-            2 => Some(Self::Q4_0), 3 => Some(Self::Q4_1),
-            6 => Some(Self::Q5_0), 7 => Some(Self::Q5_1),
-            8 => Some(Self::Q8_0), 9 => Some(Self::Q8_1),
-            10 => Some(Self::Q2_K), 11 => Some(Self::Q3_K),
-            12 => Some(Self::Q4_K), 13 => Some(Self::Q5_K),
+            0 => Some(Self::F32),
+            1 => Some(Self::F16),
+            2 => Some(Self::Q4_0),
+            3 => Some(Self::Q4_1),
+            6 => Some(Self::Q5_0),
+            7 => Some(Self::Q5_1),
+            8 => Some(Self::Q8_0),
+            9 => Some(Self::Q8_1),
+            10 => Some(Self::Q2_K),
+            11 => Some(Self::Q3_K),
+            12 => Some(Self::Q4_K),
+            13 => Some(Self::Q5_K),
             14 => Some(Self::Q6_K),
-            16 => Some(Self::IQ2_XXS), 17 => Some(Self::IQ2_XS),
+            16 => Some(Self::IQ2_XXS),
+            17 => Some(Self::IQ2_XS),
             30 => Some(Self::BF16),
             _ => None,
         }
@@ -129,16 +150,16 @@ impl GgufDtype {
         match self {
             Self::F32 => 4,
             Self::F16 | Self::BF16 => 2,
-            Self::Q8_0 => 34,    // 2 (scale f16) + 32 (i8 values)
-            Self::Q4_0 => 18,    // 2 (scale f16) + 16 (packed 4-bit, 32 values)
-            Self::Q4_1 => 20,    // 2+2 (scale+min f16) + 16 (packed)
-            Self::Q5_0 => 22,    // 2 + 4 (high bits) + 16 (low 4 bits)
+            Self::Q8_0 => 34, // 2 (scale f16) + 32 (i8 values)
+            Self::Q4_0 => 18, // 2 (scale f16) + 16 (packed 4-bit, 32 values)
+            Self::Q4_1 => 20, // 2+2 (scale+min f16) + 16 (packed)
+            Self::Q5_0 => 22, // 2 + 4 (high bits) + 16 (low 4 bits)
             Self::Q5_1 => 24,
-            Self::Q4_K => 144,   // super-block: 256 values
+            Self::Q4_K => 144, // super-block: 256 values
             Self::Q5_K => 176,
-            Self::Q6_K => 210,   // super-block: 256 values
+            Self::Q6_K => 210, // super-block: 256 values
             Self::Q8_1 => 36,
-            _ => 1,              // unsupported, will error
+            _ => 1, // unsupported, will error
         }
     }
 
@@ -159,31 +180,49 @@ impl GgufDtype {
 // ═══════════════════════════════════════════════════════════════════
 
 fn read_u8(r: &mut impl Read) -> std::io::Result<u8> {
-    let mut buf = [0u8; 1]; r.read_exact(&mut buf)?; Ok(buf[0])
+    let mut buf = [0u8; 1];
+    r.read_exact(&mut buf)?;
+    Ok(buf[0])
 }
 fn read_u32(r: &mut impl Read) -> std::io::Result<u32> {
-    let mut buf = [0u8; 4]; r.read_exact(&mut buf)?; Ok(u32::from_le_bytes(buf))
+    let mut buf = [0u8; 4];
+    r.read_exact(&mut buf)?;
+    Ok(u32::from_le_bytes(buf))
 }
 fn read_u64(r: &mut impl Read) -> std::io::Result<u64> {
-    let mut buf = [0u8; 8]; r.read_exact(&mut buf)?; Ok(u64::from_le_bytes(buf))
+    let mut buf = [0u8; 8];
+    r.read_exact(&mut buf)?;
+    Ok(u64::from_le_bytes(buf))
 }
 fn read_i8(r: &mut impl Read) -> std::io::Result<i8> {
-    let mut buf = [0u8; 1]; r.read_exact(&mut buf)?; Ok(buf[0] as i8)
+    let mut buf = [0u8; 1];
+    r.read_exact(&mut buf)?;
+    Ok(buf[0] as i8)
 }
 fn read_i16(r: &mut impl Read) -> std::io::Result<i16> {
-    let mut buf = [0u8; 2]; r.read_exact(&mut buf)?; Ok(i16::from_le_bytes(buf))
+    let mut buf = [0u8; 2];
+    r.read_exact(&mut buf)?;
+    Ok(i16::from_le_bytes(buf))
 }
 fn read_i32(r: &mut impl Read) -> std::io::Result<i32> {
-    let mut buf = [0u8; 4]; r.read_exact(&mut buf)?; Ok(i32::from_le_bytes(buf))
+    let mut buf = [0u8; 4];
+    r.read_exact(&mut buf)?;
+    Ok(i32::from_le_bytes(buf))
 }
 fn read_i64(r: &mut impl Read) -> std::io::Result<i64> {
-    let mut buf = [0u8; 8]; r.read_exact(&mut buf)?; Ok(i64::from_le_bytes(buf))
+    let mut buf = [0u8; 8];
+    r.read_exact(&mut buf)?;
+    Ok(i64::from_le_bytes(buf))
 }
 fn read_f32(r: &mut impl Read) -> std::io::Result<f32> {
-    let mut buf = [0u8; 4]; r.read_exact(&mut buf)?; Ok(f32::from_le_bytes(buf))
+    let mut buf = [0u8; 4];
+    r.read_exact(&mut buf)?;
+    Ok(f32::from_le_bytes(buf))
 }
 fn read_f64(r: &mut impl Read) -> std::io::Result<f64> {
-    let mut buf = [0u8; 8]; r.read_exact(&mut buf)?; Ok(f64::from_le_bytes(buf))
+    let mut buf = [0u8; 8];
+    r.read_exact(&mut buf)?;
+    Ok(f64::from_le_bytes(buf))
 }
 
 fn read_string(r: &mut impl Read) -> std::io::Result<String> {
@@ -198,7 +237,11 @@ fn read_gguf_value(r: &mut impl Read) -> std::io::Result<GgufValue> {
     match type_id {
         0 => Ok(GgufValue::U8(read_u8(r)?)),
         1 => Ok(GgufValue::I8(read_i8(r)?)),
-        2 => Ok(GgufValue::U16({ let mut b=[0u8;2]; r.read_exact(&mut b)?; u16::from_le_bytes(b) })),
+        2 => Ok(GgufValue::U16({
+            let mut b = [0u8; 2];
+            r.read_exact(&mut b)?;
+            u16::from_le_bytes(b)
+        })),
         3 => Ok(GgufValue::I16(read_i16(r)?)),
         4 => Ok(GgufValue::U32(read_u32(r)?)),
         5 => Ok(GgufValue::I32(read_i32(r)?)),
@@ -217,7 +260,11 @@ fn read_gguf_value(r: &mut impl Read) -> std::io::Result<GgufValue> {
                     5 => GgufValue::I32(read_i32(r)?),
                     6 => GgufValue::F32(read_f32(r)?),
                     8 => GgufValue::String(read_string(r)?),
-                    _ => { let mut b=[0u8;1]; r.read_exact(&mut b)?; GgufValue::U8(b[0]) }
+                    _ => {
+                        let mut b = [0u8; 1];
+                        r.read_exact(&mut b)?;
+                        GgufValue::U8(b[0])
+                    }
                 };
                 arr.push(val);
             }
@@ -237,22 +284,37 @@ fn read_gguf_value(r: &mut impl Read) -> std::io::Result<GgufValue> {
 fn parse_gguf_header(r: &mut impl Read) -> Result<GgufHeader, GgufError> {
     let magic = read_u32(r).map_err(|e| GgufError::ParseError(format!("magic: {e}")))?;
     if magic != GGUF_MAGIC {
-        return Err(GgufError::ParseError(format!("Bad magic: 0x{magic:08x}, expected 0x{GGUF_MAGIC:08x}")));
+        return Err(GgufError::ParseError(format!(
+            "Bad magic: 0x{magic:08x}, expected 0x{GGUF_MAGIC:08x}"
+        )));
     }
     let version = read_u32(r).map_err(|e| GgufError::ParseError(format!("version: {e}")))?;
     if version < 2 || version > 3 {
-        return Err(GgufError::ParseError(format!("Unsupported GGUF version {version}")));
+        return Err(GgufError::ParseError(format!(
+            "Unsupported GGUF version {version}"
+        )));
     }
-    let tensor_count = read_u64(r).map_err(|e| GgufError::ParseError(format!("tensor_count: {e}")))?;
-    let metadata_count = read_u64(r).map_err(|e| GgufError::ParseError(format!("metadata_count: {e}")))?;
-    Ok(GgufHeader { version, tensor_count, metadata_count })
+    let tensor_count =
+        read_u64(r).map_err(|e| GgufError::ParseError(format!("tensor_count: {e}")))?;
+    let metadata_count =
+        read_u64(r).map_err(|e| GgufError::ParseError(format!("metadata_count: {e}")))?;
+    Ok(GgufHeader {
+        version,
+        tensor_count,
+        metadata_count,
+    })
 }
 
-fn parse_gguf_metadata(r: &mut impl Read, count: u64) -> Result<HashMap<String, GgufValue>, GgufError> {
+fn parse_gguf_metadata(
+    r: &mut impl Read,
+    count: u64,
+) -> Result<HashMap<String, GgufValue>, GgufError> {
     let mut metadata = HashMap::new();
     for _ in 0..count {
-        let key = read_string(r).map_err(|e| GgufError::ParseError(format!("metadata key: {e}")))?;
-        let value = read_gguf_value(r).map_err(|e| GgufError::ParseError(format!("metadata value for '{key}': {e}")))?;
+        let key =
+            read_string(r).map_err(|e| GgufError::ParseError(format!("metadata key: {e}")))?;
+        let value = read_gguf_value(r)
+            .map_err(|e| GgufError::ParseError(format!("metadata value for '{key}': {e}")))?;
         metadata.insert(key, value);
     }
     Ok(metadata)
@@ -261,15 +323,22 @@ fn parse_gguf_metadata(r: &mut impl Read, count: u64) -> Result<HashMap<String, 
 fn parse_tensor_infos(r: &mut impl Read, count: u64) -> Result<Vec<GgufTensorInfo>, GgufError> {
     let mut tensors = Vec::with_capacity(count as usize);
     for _ in 0..count {
-        let name = read_string(r).map_err(|e| GgufError::ParseError(format!("tensor name: {e}")))?;
-        let n_dims = read_u32(r).map_err(|e| GgufError::ParseError(format!("n_dims: {e}")))? as usize;
+        let name =
+            read_string(r).map_err(|e| GgufError::ParseError(format!("tensor name: {e}")))?;
+        let n_dims =
+            read_u32(r).map_err(|e| GgufError::ParseError(format!("n_dims: {e}")))? as usize;
         let mut dimensions = Vec::with_capacity(n_dims);
         for _ in 0..n_dims {
             dimensions.push(read_u64(r).map_err(|e| GgufError::ParseError(format!("dim: {e}")))?);
         }
         let dtype = read_u32(r).map_err(|e| GgufError::ParseError(format!("dtype: {e}")))?;
         let offset = read_u64(r).map_err(|e| GgufError::ParseError(format!("offset: {e}")))?;
-        tensors.push(GgufTensorInfo { name, dimensions, dtype, offset });
+        tensors.push(GgufTensorInfo {
+            name,
+            dimensions,
+            dtype,
+            offset,
+        });
     }
     Ok(tensors)
 }
@@ -279,22 +348,29 @@ fn parse_tensor_infos(r: &mut impl Read, count: u64) -> Result<Vec<GgufTensorInf
 // ═══════════════════════════════════════════════════════════════════
 
 fn extract_model_config(metadata: &HashMap<String, GgufValue>) -> Result<HfConfig, GgufError> {
-    let arch = metadata.get("general.architecture")
+    let arch = metadata
+        .get("general.architecture")
         .and_then(|v| v.as_str())
         .unwrap_or("llama")
         .to_string();
 
-    let get_u32 = |key: &str| -> usize {
-        metadata.get(key).and_then(|v| v.as_u32()).unwrap_or(0) as usize
-    };
+    let get_u32 =
+        |key: &str| -> usize { metadata.get(key).and_then(|v| v.as_u32()).unwrap_or(0) as usize };
 
     let hidden_size = get_u32(&format!("{arch}.embedding_length"));
     let num_layers = get_u32(&format!("{arch}.block_count"));
     let num_heads = get_u32(&format!("{arch}.attention.head_count"));
     let num_kv_heads = get_u32(&format!("{arch}.attention.head_count_kv"));
     let intermediate_size = get_u32(&format!("{arch}.feed_forward_length"));
-    let vocab_size = metadata.get("tokenizer.ggml.tokens")
-        .and_then(|v| if let GgufValue::Array(arr) = v { Some(arr.len()) } else { None })
+    let vocab_size = metadata
+        .get("tokenizer.ggml.tokens")
+        .and_then(|v| {
+            if let GgufValue::Array(arr) = v {
+                Some(arr.len())
+            } else {
+                None
+            }
+        })
         .unwrap_or(32000);
     let max_pos = get_u32(&format!("{arch}.context_length"));
 
@@ -311,15 +387,32 @@ fn extract_model_config(metadata: &HashMap<String, GgufValue>) -> Result<HfConfi
         model_type: arch,
         hidden_size,
         num_attention_heads: num_heads,
-        num_key_value_heads: if num_kv_heads > 0 { num_kv_heads } else { num_heads },
+        num_key_value_heads: if num_kv_heads > 0 {
+            num_kv_heads
+        } else {
+            num_heads
+        },
         intermediate_size,
         num_hidden_layers: num_layers,
         vocab_size,
         hidden_act: "silu".to_string(), // default for llama-family
         max_position_embeddings: if max_pos > 0 { max_pos } else { 4096 },
-        head_dim: if num_heads > 0 { hidden_size / num_heads } else { 64 },
+        head_dim: if num_heads > 0 {
+            hidden_size / num_heads
+        } else {
+            64
+        },
         num_experts: 0,
         num_experts_per_tok: 0,
+        layer_types: Vec::new(),
+        moe_intermediate_size: None,
+        shared_expert_intermediate_size: None,
+        linear_key_head_dim: None,
+        linear_value_head_dim: None,
+        linear_num_key_heads: None,
+        linear_num_value_heads: None,
+        linear_conv_kernel_dim: None,
+        attn_output_gate: false,
     })
 }
 
@@ -332,11 +425,16 @@ fn f16_to_f32(bits: u16) -> f32 {
     let exp = ((bits >> 10) & 0x1F) as u32;
     let frac = (bits & 0x3FF) as u32;
     if exp == 0 {
-        if frac == 0 { return f32::from_bits(sign); }
+        if frac == 0 {
+            return f32::from_bits(sign);
+        }
         // subnormal
         let mut e = 0u32;
         let mut f = frac;
-        while (f & 0x400) == 0 { f <<= 1; e += 1; }
+        while (f & 0x400) == 0 {
+            f <<= 1;
+            e += 1;
+        }
         f &= 0x3FF;
         return f32::from_bits(sign | ((127 - 15 + 1 - e) << 23) | (f << 13));
     }
@@ -347,9 +445,13 @@ fn f16_to_f32(bits: u16) -> f32 {
 }
 
 /// Dequantize a GGUF tensor block to f32.
-pub fn dequantize_gguf_tensor(data: &[u8], dtype_id: u32, num_elements: usize) -> Result<Vec<f32>, GgufError> {
-    let dtype = GgufDtype::from_u32(dtype_id)
-        .ok_or_else(|| GgufError::UnsupportedDtype(dtype_id))?;
+pub fn dequantize_gguf_tensor(
+    data: &[u8],
+    dtype_id: u32,
+    num_elements: usize,
+) -> Result<Vec<f32>, GgufError> {
+    let dtype =
+        GgufDtype::from_u32(dtype_id).ok_or_else(|| GgufError::UnsupportedDtype(dtype_id))?;
 
     let mut output = Vec::with_capacity(num_elements);
 
@@ -422,8 +524,14 @@ pub fn dequantize_gguf_tensor(data: &[u8], dtype_id: u32, num_elements: usize) -
                     for i in 0..32 {
                         let byte_idx = sb * 16 + i / 2;
                         let q = if byte_idx < qs.len() {
-                            if i % 2 == 0 { qs[byte_idx] & 0x0F } else { qs[byte_idx] >> 4 }
-                        } else { 0 };
+                            if i % 2 == 0 {
+                                qs[byte_idx] & 0x0F
+                            } else {
+                                qs[byte_idx] >> 4
+                            }
+                        } else {
+                            0
+                        };
                         output.push(d_sc * q as f32 - dm);
                     }
                 }
@@ -437,7 +545,7 @@ pub fn dequantize_gguf_tensor(data: &[u8], dtype_id: u32, num_elements: usize) -
                 let block = &data[b * block_bytes..(b + 1) * block_bytes];
                 let d = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
 
-                let ql = &block[0..128];   // low 4 bits
+                let ql = &block[0..128]; // low 4 bits
                 let qh = &block[128..192]; // high 2 bits
                 let sc = &block[192..208]; // 16 scales (i8)
 
@@ -510,7 +618,8 @@ fn build_graph_from_config(config: &HfConfig) -> Result<OnnxModel, GgufError> {
     // Use the HF graph builder (reuses existing transformer graph construction)
     let transformer_config = config.to_transformer_config();
     let (graph, _moe_slots) = crate::compiler::hf_loader::build_hf_transformer_graph(
-        &transformer_config, config.num_hidden_layers,
+        &transformer_config,
+        config.num_hidden_layers,
     );
 
     Ok(OnnxModel {
@@ -543,8 +652,10 @@ pub fn load_gguf_model(path: &Path, layers: Option<usize>) -> Result<OnnxModel, 
 
     // 1. Parse header
     let header = parse_gguf_header(&mut file)?;
-    eprintln!("[gguf] Version: {}, tensors: {}, metadata: {}",
-        header.version, header.tensor_count, header.metadata_count);
+    eprintln!(
+        "[gguf] Version: {}, tensors: {}, metadata: {}",
+        header.version, header.tensor_count, header.metadata_count
+    );
 
     // 2. Parse metadata
     let metadata = parse_gguf_metadata(&mut file, header.metadata_count)?;
@@ -561,7 +672,8 @@ pub fn load_gguf_model(path: &Path, layers: Option<usize>) -> Result<OnnxModel, 
     let tensor_infos = parse_tensor_infos(&mut file, header.tensor_count)?;
 
     // Record the current position — tensor data starts after alignment
-    let data_offset = file.stream_position()
+    let data_offset = file
+        .stream_position()
         .map_err(|e| GgufError::IoError(format!("stream_position: {e}")))?;
     // Align to 32 bytes (GGUF spec)
     let aligned_offset = (data_offset + 31) & !31;
@@ -595,9 +707,18 @@ pub fn load_gguf_model(path: &Path, layers: Option<usize>) -> Result<OnnxModel, 
         gguf_name_to_node.insert(format!("blk.{layer_idx}.ffn_gate.weight"), base + 4);
         gguf_name_to_node.insert(format!("blk.{layer_idx}.ffn_down.weight"), base + 6);
         // Named weights
-        gguf_name_to_named.insert(format!("blk.{layer_idx}.ffn_up.weight"), (base + 6, "up_proj".into()));
-        gguf_name_to_named.insert(format!("blk.{layer_idx}.attn_norm.weight"), (base, "gamma".into()));
-        gguf_name_to_named.insert(format!("blk.{layer_idx}.ffn_norm.weight"), (base + 3, "gamma".into()));
+        gguf_name_to_named.insert(
+            format!("blk.{layer_idx}.ffn_up.weight"),
+            (base + 6, "up_proj".into()),
+        );
+        gguf_name_to_named.insert(
+            format!("blk.{layer_idx}.attn_norm.weight"),
+            (base, "gamma".into()),
+        );
+        gguf_name_to_named.insert(
+            format!("blk.{layer_idx}.ffn_norm.weight"),
+            (base + 3, "gamma".into()),
+        );
     }
 
     let mut loaded = 0usize;
@@ -607,7 +728,9 @@ pub fn load_gguf_model(path: &Path, layers: Option<usize>) -> Result<OnnxModel, 
         let hf_name = gguf_to_hf_name(&tensor_info.name);
         let num_elements: usize = tensor_info.dimensions.iter().product::<u64>() as usize;
 
-        if num_elements == 0 { continue; }
+        if num_elements == 0 {
+            continue;
+        }
 
         // Dequantize tensor data
         let tensor_offset = aligned_offset as usize + tensor_info.offset as usize;
@@ -617,8 +740,13 @@ pub fn load_gguf_model(path: &Path, layers: Option<usize>) -> Result<OnnxModel, 
         let data_size = num_blocks * dtype.block_size_bytes();
 
         if tensor_offset + data_size > mmap.len() {
-            eprintln!("[gguf]   Skipping {} (offset {} + size {} > file {})",
-                tensor_info.name, tensor_offset, data_size, mmap.len());
+            eprintln!(
+                "[gguf]   Skipping {} (offset {} + size {} > file {})",
+                tensor_info.name,
+                tensor_offset,
+                data_size,
+                mmap.len()
+            );
             skipped += 1;
             continue;
         }
@@ -628,14 +756,19 @@ pub fn load_gguf_model(path: &Path, layers: Option<usize>) -> Result<OnnxModel, 
 
         // Determine matrix shape
         let (rows, cols) = if tensor_info.dimensions.len() >= 2 {
-            (tensor_info.dimensions[1] as usize, tensor_info.dimensions[0] as usize)
+            (
+                tensor_info.dimensions[1] as usize,
+                tensor_info.dimensions[0] as usize,
+            )
         } else {
             (1, num_elements)
         };
 
         // Quantize to M31
         let (matrix, _params) = quantize_weight_matrix(
-            &f32_data, rows, cols,
+            &f32_data,
+            rows,
+            cols,
             crate::gadgets::quantize::QuantStrategy::Symmetric8,
         );
 
@@ -644,7 +777,9 @@ pub fn load_gguf_model(path: &Path, layers: Option<usize>) -> Result<OnnxModel, 
             weights.weights.push((node_id, matrix));
             loaded += 1;
         } else if let Some((node_id, label)) = gguf_name_to_named.get(&tensor_info.name) {
-            weights.named_weights.push((*node_id, label.clone(), matrix));
+            weights
+                .named_weights
+                .push((*node_id, label.clone(), matrix));
             loaded += 1;
         } else {
             skipped += 1;
@@ -690,10 +825,22 @@ mod tests {
 
     #[test]
     fn test_gguf_to_hf_name() {
-        assert_eq!(gguf_to_hf_name("blk.0.attn_q.weight"), "model.layers.0.self_attn.q_proj.weight");
-        assert_eq!(gguf_to_hf_name("blk.5.ffn_gate.weight"), "model.layers.5.mlp.gate_proj.weight");
-        assert_eq!(gguf_to_hf_name("blk.0.attn_norm.weight"), "model.layers.0.input_layernorm.weight");
-        assert_eq!(gguf_to_hf_name("token_embd.weight"), "model.embed_tokens.weight");
+        assert_eq!(
+            gguf_to_hf_name("blk.0.attn_q.weight"),
+            "model.layers.0.self_attn.q_proj.weight"
+        );
+        assert_eq!(
+            gguf_to_hf_name("blk.5.ffn_gate.weight"),
+            "model.layers.5.mlp.gate_proj.weight"
+        );
+        assert_eq!(
+            gguf_to_hf_name("blk.0.attn_norm.weight"),
+            "model.layers.0.input_layernorm.weight"
+        );
+        assert_eq!(
+            gguf_to_hf_name("token_embd.weight"),
+            "model.embed_tokens.weight"
+        );
         assert_eq!(gguf_to_hf_name("output.weight"), "lm_head.weight");
     }
 

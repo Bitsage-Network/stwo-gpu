@@ -12,11 +12,11 @@
 //! If ANY checkpoint disagrees between Rust and Cairo, all GKR verification will fail.
 //! This is the SP1 sync point.
 
-use stwo::core::fields::m31::M31;
 use obelyzk::compiler::graph::{GraphBuilder, GraphWeights};
 use obelyzk::components::activation::ActivationType;
 use obelyzk::components::matmul::M31Matrix;
 use obelyzk::crypto::poseidon_channel::PoseidonChannel;
+use stwo::core::fields::m31::M31;
 
 /// A checkpoint in the Fiat-Shamir transcript.
 #[derive(Debug)]
@@ -369,8 +369,20 @@ fn test_transcript_deterministic() {
     // Verify both
     let mut ch1 = PoseidonChannel::new();
     let mut ch2 = PoseidonChannel::new();
-    let r1 = obelyzk::gkr::verify_gkr_with_weights(&circuit, gkr1, &proof1.execution.output, &weights, &mut ch1);
-    let r2 = obelyzk::gkr::verify_gkr_with_weights(&circuit, gkr2, &proof2.execution.output, &weights, &mut ch2);
+    let r1 = obelyzk::gkr::verify_gkr_with_weights(
+        &circuit,
+        gkr1,
+        &proof1.execution.output,
+        &weights,
+        &mut ch1,
+    );
+    let r2 = obelyzk::gkr::verify_gkr_with_weights(
+        &circuit,
+        gkr2,
+        &proof2.execution.output,
+        &weights,
+        &mut ch2,
+    );
 
     assert!(r1.is_ok());
     assert!(r2.is_ok());

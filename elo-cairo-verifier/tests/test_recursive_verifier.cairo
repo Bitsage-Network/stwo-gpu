@@ -1,8 +1,8 @@
-use snforge_std::{declare, DeclareResultTrait, ContractClassTrait, start_cheat_caller_address};
-use starknet::ContractAddress;
 use elo_cairo_verifier::recursive_verifier::{
     IRecursiveVerifierDispatcher, IRecursiveVerifierDispatcherTrait,
 };
+use snforge_std::{ContractClassTrait, DeclareResultTrait, declare, start_cheat_caller_address};
+use starknet::ContractAddress;
 
 const OWNER_ADDR: felt252 = 0x1234;
 const ATTACKER_ADDR: felt252 = 0xBAD;
@@ -31,28 +31,57 @@ fn as_owner(verifier: @IRecursiveVerifierDispatcher) {
     start_cheat_caller_address(*verifier.contract_address, owner);
 }
 
-/// Build a fake proof header (26 felts) with specified circuit_hash and weight_root.
+/// Build a fake proof header (30 felts) with specified circuit_hash and weight_root.
 /// Values are placed in the low limb (ch3/wr3) for simplicity.
 /// This proof will fail at STARK verification but is sufficient to test
 /// pre-STARK asserts (circuit hash, weight binding, io commitment).
-fn build_fake_proof(circuit_hash: felt252, io_commit: felt252, weight_root: felt252) -> Array<felt252> {
+fn build_fake_proof(
+    circuit_hash: felt252, io_commit: felt252, weight_root: felt252,
+) -> Array<felt252> {
     let mut data: Array<felt252> = array![];
     // circuit_hash: QM31 as 4 M31 limbs [ch0, ch1, ch2, ch3]
-    data.append(0); data.append(0); data.append(0); data.append(circuit_hash);
+    data.append(0);
+    data.append(0);
+    data.append(0);
+    data.append(circuit_hash);
     // io_commitment: QM31 as 4 M31 limbs
-    data.append(0); data.append(0); data.append(0); data.append(io_commit);
+    data.append(0);
+    data.append(0);
+    data.append(0);
+    data.append(io_commit);
     // weight_super_root: QM31 as 4 M31 limbs
-    data.append(0); data.append(0); data.append(0); data.append(weight_root);
+    data.append(0);
+    data.append(0);
+    data.append(0);
+    data.append(weight_root);
     // n_layers, n_poseidon_perms
-    data.append(N_LAYERS.into()); data.append(EXPECTED_N_POSEIDON_PERMS.into());
+    data.append(N_LAYERS.into());
+    data.append(EXPECTED_N_POSEIDON_PERMS.into());
     // seed_digest: QM31 as 4 M31 limbs
-    data.append(0); data.append(0); data.append(0); data.append(0);
+    data.append(0);
+    data.append(0);
+    data.append(0);
+    data.append(0);
     // hades_commitment, full io_commitment, pass1_final_digest
-    data.append(0); data.append(io_commit); data.append(0x9999);
-    // final_digest, log_size, n_real_rows
-    data.append(0x1234); data.append(TRACE_LOG_SIZE.into()); data.append(EXPECTED_N_POSEIDON_PERMS.into());
-    // prev_kv_cache_commitment, kv_cache_commitment
-    data.append(0); data.append(0);
+    data.append(0);
+    data.append(io_commit);
+    data.append(0x9999);
+    // final_digest, log_size, chain/arithmetic/sumcheck/draw row counts
+    data.append(0x1234);
+    data.append(TRACE_LOG_SIZE.into());
+    data.append(EXPECTED_N_POSEIDON_PERMS.into());
+    data.append(0);
+    data.append(0);
+    data.append(0);
+    // logup_claimed_sum
+    data.append(0);
+    data.append(0);
+    data.append(0);
+    data.append(0);
+    // prev_kv_cache_commitment, kv_cache_commitment, conversation_statement_hash
+    data.append(0);
+    data.append(0);
+    data.append(0);
     data
 }
 
@@ -65,7 +94,18 @@ fn test_register_recursive_model() {
     let verifier = deploy_verifier();
     as_owner(@verifier);
 
-    verifier.register_model_recursive(MODEL_ID, CIRCUIT_HASH, WEIGHT_ROOT, POLICY_COMMITMENT, N_MATMULS, HIDDEN_SIZE, NUM_TRANSFORMER_BLOCKS, EXPECTED_N_POSEIDON_PERMS, LEVEL1_PROOF_HASH);
+    verifier
+        .register_model_recursive(
+            MODEL_ID,
+            CIRCUIT_HASH,
+            WEIGHT_ROOT,
+            POLICY_COMMITMENT,
+            N_MATMULS,
+            HIDDEN_SIZE,
+            NUM_TRANSFORMER_BLOCKS,
+            EXPECTED_N_POSEIDON_PERMS,
+            LEVEL1_PROOF_HASH,
+        );
 
     let info = verifier.get_recursive_model_info(MODEL_ID);
     assert!(info.circuit_hash == CIRCUIT_HASH, "circuit_hash mismatch");
@@ -82,7 +122,18 @@ fn test_register_recursive_model_non_owner_rejected() {
     let attacker: ContractAddress = ATTACKER_ADDR.try_into().unwrap();
     start_cheat_caller_address(verifier.contract_address, attacker);
 
-    verifier.register_model_recursive(MODEL_ID, CIRCUIT_HASH, WEIGHT_ROOT, POLICY_COMMITMENT, N_MATMULS, HIDDEN_SIZE, NUM_TRANSFORMER_BLOCKS, EXPECTED_N_POSEIDON_PERMS, LEVEL1_PROOF_HASH);
+    verifier
+        .register_model_recursive(
+            MODEL_ID,
+            CIRCUIT_HASH,
+            WEIGHT_ROOT,
+            POLICY_COMMITMENT,
+            N_MATMULS,
+            HIDDEN_SIZE,
+            NUM_TRANSFORMER_BLOCKS,
+            EXPECTED_N_POSEIDON_PERMS,
+            LEVEL1_PROOF_HASH,
+        );
 }
 
 #[test]
@@ -115,8 +166,30 @@ fn test_register_multiple_models() {
     let verifier = deploy_verifier();
     as_owner(@verifier);
 
-    verifier.register_model_recursive(0x1, 0xAA, 0xBB, POLICY_COMMITMENT, N_MATMULS, HIDDEN_SIZE, NUM_TRANSFORMER_BLOCKS, EXPECTED_N_POSEIDON_PERMS, LEVEL1_PROOF_HASH);
-    verifier.register_model_recursive(0x2, 0xCC, 0xDD, POLICY_COMMITMENT, N_MATMULS, HIDDEN_SIZE, NUM_TRANSFORMER_BLOCKS, EXPECTED_N_POSEIDON_PERMS, LEVEL1_PROOF_HASH);
+    verifier
+        .register_model_recursive(
+            0x1,
+            0xAA,
+            0xBB,
+            POLICY_COMMITMENT,
+            N_MATMULS,
+            HIDDEN_SIZE,
+            NUM_TRANSFORMER_BLOCKS,
+            EXPECTED_N_POSEIDON_PERMS,
+            LEVEL1_PROOF_HASH,
+        );
+    verifier
+        .register_model_recursive(
+            0x2,
+            0xCC,
+            0xDD,
+            POLICY_COMMITMENT,
+            N_MATMULS,
+            HIDDEN_SIZE,
+            NUM_TRANSFORMER_BLOCKS,
+            EXPECTED_N_POSEIDON_PERMS,
+            LEVEL1_PROOF_HASH,
+        );
 
     let info1 = verifier.get_recursive_model_info(0x1);
     let info2 = verifier.get_recursive_model_info(0x2);
@@ -133,8 +206,30 @@ fn test_re_register_model_rejected() {
     let verifier = deploy_verifier();
     as_owner(@verifier);
 
-    verifier.register_model_recursive(MODEL_ID, 0x111, 0x222, 0, N_MATMULS, HIDDEN_SIZE, NUM_TRANSFORMER_BLOCKS, EXPECTED_N_POSEIDON_PERMS, LEVEL1_PROOF_HASH);
-    verifier.register_model_recursive(MODEL_ID, 0x333, 0x444, 0, N_MATMULS, HIDDEN_SIZE, NUM_TRANSFORMER_BLOCKS, EXPECTED_N_POSEIDON_PERMS, LEVEL1_PROOF_HASH);
+    verifier
+        .register_model_recursive(
+            MODEL_ID,
+            0x111,
+            0x222,
+            0,
+            N_MATMULS,
+            HIDDEN_SIZE,
+            NUM_TRANSFORMER_BLOCKS,
+            EXPECTED_N_POSEIDON_PERMS,
+            LEVEL1_PROOF_HASH,
+        );
+    verifier
+        .register_model_recursive(
+            MODEL_ID,
+            0x333,
+            0x444,
+            0,
+            N_MATMULS,
+            HIDDEN_SIZE,
+            NUM_TRANSFORMER_BLOCKS,
+            EXPECTED_N_POSEIDON_PERMS,
+            LEVEL1_PROOF_HASH,
+        );
 }
 
 #[test]
@@ -142,7 +237,18 @@ fn test_register_model_owner_stored_correctly() {
     let verifier = deploy_verifier();
     as_owner(@verifier);
 
-    verifier.register_model_recursive(MODEL_ID, CIRCUIT_HASH, WEIGHT_ROOT, POLICY_COMMITMENT, N_MATMULS, HIDDEN_SIZE, NUM_TRANSFORMER_BLOCKS, EXPECTED_N_POSEIDON_PERMS, LEVEL1_PROOF_HASH);
+    verifier
+        .register_model_recursive(
+            MODEL_ID,
+            CIRCUIT_HASH,
+            WEIGHT_ROOT,
+            POLICY_COMMITMENT,
+            N_MATMULS,
+            HIDDEN_SIZE,
+            NUM_TRANSFORMER_BLOCKS,
+            EXPECTED_N_POSEIDON_PERMS,
+            LEVEL1_PROOF_HASH,
+        );
 
     let info = verifier.get_recursive_model_info(MODEL_ID);
     let owner: ContractAddress = OWNER_ADDR.try_into().unwrap();
@@ -157,7 +263,18 @@ fn test_register_with_zero_circuit_hash() {
     // Zero circuit_hash is allowed at registration time
     // but verify_recursive will reject it with "Model not registered"
     // because the check is `model.circuit_hash != 0`
-    verifier.register_model_recursive(MODEL_ID, 0, WEIGHT_ROOT, 0, N_MATMULS, HIDDEN_SIZE, NUM_TRANSFORMER_BLOCKS, EXPECTED_N_POSEIDON_PERMS, LEVEL1_PROOF_HASH);
+    verifier
+        .register_model_recursive(
+            MODEL_ID,
+            0,
+            WEIGHT_ROOT,
+            0,
+            N_MATMULS,
+            HIDDEN_SIZE,
+            NUM_TRANSFORMER_BLOCKS,
+            EXPECTED_N_POSEIDON_PERMS,
+            LEVEL1_PROOF_HASH,
+        );
 
     let info = verifier.get_recursive_model_info(MODEL_ID);
     assert!(info.circuit_hash == 0, "zero circuit_hash should be stored");
@@ -175,7 +292,20 @@ fn test_verify_unregistered_model_rejected() {
 
     // Submit proof for model that was never registered
     let fake_proof = build_fake_proof(CIRCUIT_HASH, IO_COMMITMENT, WEIGHT_ROOT);
-    verifier.verify_recursive(0xDEAD, IO_COMMITMENT, CIRCUIT_HASH, WEIGHT_ROOT, N_LAYERS, N_MATMULS, HIDDEN_SIZE, NUM_TRANSFORMER_BLOCKS, POLICY_COMMITMENT, TRACE_LOG_SIZE, fake_proof);
+    verifier
+        .verify_recursive(
+            0xDEAD,
+            IO_COMMITMENT,
+            CIRCUIT_HASH,
+            WEIGHT_ROOT,
+            N_LAYERS,
+            N_MATMULS,
+            HIDDEN_SIZE,
+            NUM_TRANSFORMER_BLOCKS,
+            POLICY_COMMITMENT,
+            TRACE_LOG_SIZE,
+            fake_proof,
+        );
 }
 
 #[test]
@@ -184,11 +314,35 @@ fn test_verify_proof_too_short() {
     let verifier = deploy_verifier();
     as_owner(@verifier);
 
-    verifier.register_model_recursive(MODEL_ID, CIRCUIT_HASH, WEIGHT_ROOT, POLICY_COMMITMENT, N_MATMULS, HIDDEN_SIZE, NUM_TRANSFORMER_BLOCKS, EXPECTED_N_POSEIDON_PERMS, LEVEL1_PROOF_HASH);
+    verifier
+        .register_model_recursive(
+            MODEL_ID,
+            CIRCUIT_HASH,
+            WEIGHT_ROOT,
+            POLICY_COMMITMENT,
+            N_MATMULS,
+            HIDDEN_SIZE,
+            NUM_TRANSFORMER_BLOCKS,
+            EXPECTED_N_POSEIDON_PERMS,
+            LEVEL1_PROOF_HASH,
+        );
 
-    // Submit proof with only 10 felts (need >= 20)
+    // Submit proof with only 10 felts (need >= 34)
     let short_proof: Array<felt252> = array![0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-    verifier.verify_recursive(MODEL_ID, IO_COMMITMENT, CIRCUIT_HASH, WEIGHT_ROOT, N_LAYERS, N_MATMULS, HIDDEN_SIZE, NUM_TRANSFORMER_BLOCKS, POLICY_COMMITMENT, TRACE_LOG_SIZE, short_proof);
+    verifier
+        .verify_recursive(
+            MODEL_ID,
+            IO_COMMITMENT,
+            CIRCUIT_HASH,
+            WEIGHT_ROOT,
+            N_LAYERS,
+            N_MATMULS,
+            HIDDEN_SIZE,
+            NUM_TRANSFORMER_BLOCKS,
+            POLICY_COMMITMENT,
+            TRACE_LOG_SIZE,
+            short_proof,
+        );
 }
 
 #[test]
@@ -198,11 +352,35 @@ fn test_verify_circuit_hash_mismatch() {
     as_owner(@verifier);
 
     // Register model with CIRCUIT_HASH
-    verifier.register_model_recursive(MODEL_ID, CIRCUIT_HASH, WEIGHT_ROOT, POLICY_COMMITMENT, N_MATMULS, HIDDEN_SIZE, NUM_TRANSFORMER_BLOCKS, EXPECTED_N_POSEIDON_PERMS, LEVEL1_PROOF_HASH);
+    verifier
+        .register_model_recursive(
+            MODEL_ID,
+            CIRCUIT_HASH,
+            WEIGHT_ROOT,
+            POLICY_COMMITMENT,
+            N_MATMULS,
+            HIDDEN_SIZE,
+            NUM_TRANSFORMER_BLOCKS,
+            EXPECTED_N_POSEIDON_PERMS,
+            LEVEL1_PROOF_HASH,
+        );
 
     // Build proof with DIFFERENT circuit_hash (0xBADBAD instead of 0x123456)
     let tampered_proof = build_fake_proof(0xBADBAD, IO_COMMITMENT, WEIGHT_ROOT);
-    verifier.verify_recursive(MODEL_ID, IO_COMMITMENT, CIRCUIT_HASH, WEIGHT_ROOT, N_LAYERS, N_MATMULS, HIDDEN_SIZE, NUM_TRANSFORMER_BLOCKS, POLICY_COMMITMENT, TRACE_LOG_SIZE, tampered_proof);
+    verifier
+        .verify_recursive(
+            MODEL_ID,
+            IO_COMMITMENT,
+            CIRCUIT_HASH,
+            WEIGHT_ROOT,
+            N_LAYERS,
+            N_MATMULS,
+            HIDDEN_SIZE,
+            NUM_TRANSFORMER_BLOCKS,
+            POLICY_COMMITMENT,
+            TRACE_LOG_SIZE,
+            tampered_proof,
+        );
 }
 
 #[test]
@@ -212,11 +390,35 @@ fn test_verify_weight_binding_mismatch() {
     as_owner(@verifier);
 
     // Register model with WEIGHT_ROOT
-    verifier.register_model_recursive(MODEL_ID, CIRCUIT_HASH, WEIGHT_ROOT, POLICY_COMMITMENT, N_MATMULS, HIDDEN_SIZE, NUM_TRANSFORMER_BLOCKS, EXPECTED_N_POSEIDON_PERMS, LEVEL1_PROOF_HASH);
+    verifier
+        .register_model_recursive(
+            MODEL_ID,
+            CIRCUIT_HASH,
+            WEIGHT_ROOT,
+            POLICY_COMMITMENT,
+            N_MATMULS,
+            HIDDEN_SIZE,
+            NUM_TRANSFORMER_BLOCKS,
+            EXPECTED_N_POSEIDON_PERMS,
+            LEVEL1_PROOF_HASH,
+        );
 
     // Build proof with correct circuit_hash but WRONG weight_root
     let tampered_proof = build_fake_proof(CIRCUIT_HASH, IO_COMMITMENT, 0xBADBAD);
-    verifier.verify_recursive(MODEL_ID, IO_COMMITMENT, CIRCUIT_HASH, WEIGHT_ROOT, N_LAYERS, N_MATMULS, HIDDEN_SIZE, NUM_TRANSFORMER_BLOCKS, POLICY_COMMITMENT, TRACE_LOG_SIZE, tampered_proof);
+    verifier
+        .verify_recursive(
+            MODEL_ID,
+            IO_COMMITMENT,
+            CIRCUIT_HASH,
+            WEIGHT_ROOT,
+            N_LAYERS,
+            N_MATMULS,
+            HIDDEN_SIZE,
+            NUM_TRANSFORMER_BLOCKS,
+            POLICY_COMMITMENT,
+            TRACE_LOG_SIZE,
+            tampered_proof,
+        );
 }
 
 // NOTE: io_commitment is NOT directly comparable between the parameter (Poseidon hash)
@@ -228,27 +430,75 @@ fn test_verify_weight_binding_mismatch() {
 fn test_verify_empty_proof_rejected() {
     let verifier = deploy_verifier();
     as_owner(@verifier);
-    verifier.register_model_recursive(MODEL_ID, CIRCUIT_HASH, WEIGHT_ROOT, POLICY_COMMITMENT, N_MATMULS, HIDDEN_SIZE, NUM_TRANSFORMER_BLOCKS, EXPECTED_N_POSEIDON_PERMS, LEVEL1_PROOF_HASH);
+    verifier
+        .register_model_recursive(
+            MODEL_ID,
+            CIRCUIT_HASH,
+            WEIGHT_ROOT,
+            POLICY_COMMITMENT,
+            N_MATMULS,
+            HIDDEN_SIZE,
+            NUM_TRANSFORMER_BLOCKS,
+            EXPECTED_N_POSEIDON_PERMS,
+            LEVEL1_PROOF_HASH,
+        );
 
     let empty_proof: Array<felt252> = array![];
-    verifier.verify_recursive(MODEL_ID, IO_COMMITMENT, CIRCUIT_HASH, WEIGHT_ROOT, N_LAYERS, N_MATMULS, HIDDEN_SIZE, NUM_TRANSFORMER_BLOCKS, POLICY_COMMITMENT, TRACE_LOG_SIZE, empty_proof);
+    verifier
+        .verify_recursive(
+            MODEL_ID,
+            IO_COMMITMENT,
+            CIRCUIT_HASH,
+            WEIGHT_ROOT,
+            N_LAYERS,
+            N_MATMULS,
+            HIDDEN_SIZE,
+            NUM_TRANSFORMER_BLOCKS,
+            POLICY_COMMITMENT,
+            TRACE_LOG_SIZE,
+            empty_proof,
+        );
 }
 
 #[test]
 #[should_panic(expected: "Proof too short")]
-fn test_verify_proof_boundary_19_felts_rejected() {
+fn test_verify_proof_boundary_33_felts_rejected() {
     let verifier = deploy_verifier();
     as_owner(@verifier);
-    verifier.register_model_recursive(MODEL_ID, CIRCUIT_HASH, WEIGHT_ROOT, POLICY_COMMITMENT, N_MATMULS, HIDDEN_SIZE, NUM_TRANSFORMER_BLOCKS, EXPECTED_N_POSEIDON_PERMS, LEVEL1_PROOF_HASH);
+    verifier
+        .register_model_recursive(
+            MODEL_ID,
+            CIRCUIT_HASH,
+            WEIGHT_ROOT,
+            POLICY_COMMITMENT,
+            N_MATMULS,
+            HIDDEN_SIZE,
+            NUM_TRANSFORMER_BLOCKS,
+            EXPECTED_N_POSEIDON_PERMS,
+            LEVEL1_PROOF_HASH,
+        );
 
-    // Exactly 19 felts — one short of the 20 minimum
+    // Exactly 33 felts — one short of the 34 minimum
     let mut short: Array<felt252> = array![];
     let mut i: u32 = 0;
-    while i < 19 {
+    while i < 33 {
         short.append(0);
         i += 1;
-    };
-    verifier.verify_recursive(MODEL_ID, IO_COMMITMENT, CIRCUIT_HASH, WEIGHT_ROOT, N_LAYERS, N_MATMULS, HIDDEN_SIZE, NUM_TRANSFORMER_BLOCKS, POLICY_COMMITMENT, TRACE_LOG_SIZE, short);
+    }
+    verifier
+        .verify_recursive(
+            MODEL_ID,
+            IO_COMMITMENT,
+            CIRCUIT_HASH,
+            WEIGHT_ROOT,
+            N_LAYERS,
+            N_MATMULS,
+            HIDDEN_SIZE,
+            NUM_TRANSFORMER_BLOCKS,
+            POLICY_COMMITMENT,
+            TRACE_LOG_SIZE,
+            short,
+        );
 }
 
 #[test]
@@ -260,10 +510,34 @@ fn test_verify_model_with_zero_circuit_hash_rejected() {
     // Register model with circuit_hash=0, then try to verify
     // The verify_recursive check is `model.circuit_hash != 0`
     // so this should be rejected even though the model was "registered"
-    verifier.register_model_recursive(MODEL_ID, 0, WEIGHT_ROOT, 0, N_MATMULS, HIDDEN_SIZE, NUM_TRANSFORMER_BLOCKS, EXPECTED_N_POSEIDON_PERMS, LEVEL1_PROOF_HASH);
+    verifier
+        .register_model_recursive(
+            MODEL_ID,
+            0,
+            WEIGHT_ROOT,
+            0,
+            N_MATMULS,
+            HIDDEN_SIZE,
+            NUM_TRANSFORMER_BLOCKS,
+            EXPECTED_N_POSEIDON_PERMS,
+            LEVEL1_PROOF_HASH,
+        );
 
     let fake_proof = build_fake_proof(0, IO_COMMITMENT, WEIGHT_ROOT);
-    verifier.verify_recursive(MODEL_ID, IO_COMMITMENT, CIRCUIT_HASH, WEIGHT_ROOT, N_LAYERS, N_MATMULS, HIDDEN_SIZE, NUM_TRANSFORMER_BLOCKS, POLICY_COMMITMENT, TRACE_LOG_SIZE, fake_proof);
+    verifier
+        .verify_recursive(
+            MODEL_ID,
+            IO_COMMITMENT,
+            CIRCUIT_HASH,
+            WEIGHT_ROOT,
+            N_LAYERS,
+            N_MATMULS,
+            HIDDEN_SIZE,
+            NUM_TRANSFORMER_BLOCKS,
+            POLICY_COMMITMENT,
+            TRACE_LOG_SIZE,
+            fake_proof,
+        );
 }
 
 #[test]
@@ -273,12 +547,47 @@ fn test_verify_swapped_models_rejected() {
     as_owner(@verifier);
 
     // Register two models with different circuit hashes
-    verifier.register_model_recursive(0x1, 0xAAA, WEIGHT_ROOT, POLICY_COMMITMENT, N_MATMULS, HIDDEN_SIZE, NUM_TRANSFORMER_BLOCKS, EXPECTED_N_POSEIDON_PERMS, LEVEL1_PROOF_HASH);
-    verifier.register_model_recursive(0x2, 0xBBB, WEIGHT_ROOT, POLICY_COMMITMENT, N_MATMULS, HIDDEN_SIZE, NUM_TRANSFORMER_BLOCKS, EXPECTED_N_POSEIDON_PERMS, LEVEL1_PROOF_HASH);
+    verifier
+        .register_model_recursive(
+            0x1,
+            0xAAA,
+            WEIGHT_ROOT,
+            POLICY_COMMITMENT,
+            N_MATMULS,
+            HIDDEN_SIZE,
+            NUM_TRANSFORMER_BLOCKS,
+            EXPECTED_N_POSEIDON_PERMS,
+            LEVEL1_PROOF_HASH,
+        );
+    verifier
+        .register_model_recursive(
+            0x2,
+            0xBBB,
+            WEIGHT_ROOT,
+            POLICY_COMMITMENT,
+            N_MATMULS,
+            HIDDEN_SIZE,
+            NUM_TRANSFORMER_BLOCKS,
+            EXPECTED_N_POSEIDON_PERMS,
+            LEVEL1_PROOF_HASH,
+        );
 
     // Try to verify model 0x1 with model 0x2's circuit hash
     let wrong_proof = build_fake_proof(0xBBB, IO_COMMITMENT, WEIGHT_ROOT);
-    verifier.verify_recursive(0x1, IO_COMMITMENT, 0xAAA, WEIGHT_ROOT, N_LAYERS, N_MATMULS, HIDDEN_SIZE, NUM_TRANSFORMER_BLOCKS, POLICY_COMMITMENT, TRACE_LOG_SIZE, wrong_proof);
+    verifier
+        .verify_recursive(
+            0x1,
+            IO_COMMITMENT,
+            0xAAA,
+            WEIGHT_ROOT,
+            N_LAYERS,
+            N_MATMULS,
+            HIDDEN_SIZE,
+            NUM_TRANSFORMER_BLOCKS,
+            POLICY_COMMITMENT,
+            TRACE_LOG_SIZE,
+            wrong_proof,
+        );
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -290,7 +599,18 @@ fn test_register_model_with_policy() {
     let verifier = deploy_verifier();
     as_owner(@verifier);
 
-    verifier.register_model_recursive(MODEL_ID, CIRCUIT_HASH, WEIGHT_ROOT, POLICY_COMMITMENT, N_MATMULS, HIDDEN_SIZE, NUM_TRANSFORMER_BLOCKS, EXPECTED_N_POSEIDON_PERMS, LEVEL1_PROOF_HASH);
+    verifier
+        .register_model_recursive(
+            MODEL_ID,
+            CIRCUIT_HASH,
+            WEIGHT_ROOT,
+            POLICY_COMMITMENT,
+            N_MATMULS,
+            HIDDEN_SIZE,
+            NUM_TRANSFORMER_BLOCKS,
+            EXPECTED_N_POSEIDON_PERMS,
+            LEVEL1_PROOF_HASH,
+        );
 
     let info = verifier.get_recursive_model_info(MODEL_ID);
     assert!(info.policy_commitment == POLICY_COMMITMENT, "policy_commitment mismatch");
@@ -305,7 +625,18 @@ fn test_register_model_without_policy() {
     as_owner(@verifier);
 
     // Zero policy = any policy accepted (backward compatible)
-    verifier.register_model_recursive(MODEL_ID, CIRCUIT_HASH, WEIGHT_ROOT, 0, N_MATMULS, HIDDEN_SIZE, NUM_TRANSFORMER_BLOCKS, EXPECTED_N_POSEIDON_PERMS, LEVEL1_PROOF_HASH);
+    verifier
+        .register_model_recursive(
+            MODEL_ID,
+            CIRCUIT_HASH,
+            WEIGHT_ROOT,
+            0,
+            N_MATMULS,
+            HIDDEN_SIZE,
+            NUM_TRANSFORMER_BLOCKS,
+            EXPECTED_N_POSEIDON_PERMS,
+            LEVEL1_PROOF_HASH,
+        );
 
     let policy = verifier.get_model_policy(MODEL_ID);
     assert!(policy == 0, "zero policy should be stored");
@@ -324,151 +655,166 @@ fn test_re_register_model_policy_update_rejected() {
     let verifier = deploy_verifier();
     as_owner(@verifier);
 
-    verifier.register_model_recursive(MODEL_ID, CIRCUIT_HASH, WEIGHT_ROOT, 0x111, N_MATMULS, HIDDEN_SIZE, NUM_TRANSFORMER_BLOCKS, EXPECTED_N_POSEIDON_PERMS, LEVEL1_PROOF_HASH);
-    verifier.register_model_recursive(MODEL_ID, CIRCUIT_HASH, WEIGHT_ROOT, 0x222, N_MATMULS, HIDDEN_SIZE, NUM_TRANSFORMER_BLOCKS, EXPECTED_N_POSEIDON_PERMS, LEVEL1_PROOF_HASH);
+    verifier
+        .register_model_recursive(
+            MODEL_ID,
+            CIRCUIT_HASH,
+            WEIGHT_ROOT,
+            0x111,
+            N_MATMULS,
+            HIDDEN_SIZE,
+            NUM_TRANSFORMER_BLOCKS,
+            EXPECTED_N_POSEIDON_PERMS,
+            LEVEL1_PROOF_HASH,
+        );
+    verifier
+        .register_model_recursive(
+            MODEL_ID,
+            CIRCUIT_HASH,
+            WEIGHT_ROOT,
+            0x222,
+            N_MATMULS,
+            HIDDEN_SIZE,
+            NUM_TRANSFORMER_BLOCKS,
+            EXPECTED_N_POSEIDON_PERMS,
+            LEVEL1_PROOF_HASH,
+        );
 }
 
 // ═══════════════════════════════════════════════════════════════
-// GROUP C: Real STARK Proof Tests (require test data from A10G)
-// These tests are commented out until test_recursive_data.cairo
-// is generated from a real proof run.
+// GROUP C: Real STARK Proof Tests
+// Uses a Rust-generated tiny 1-layer proof with Hades AIR + LogUp + 160-bit PCS.
 // ═══════════════════════════════════════════════════════════════
 
 use super::test_recursive_data;
 
+fn register_tiny_recursive_model(verifier: @IRecursiveVerifierDispatcher) {
+    verifier
+        .register_model_recursive(
+            test_recursive_data::tiny_model_id(),
+            test_recursive_data::tiny_circuit_hash(),
+            test_recursive_data::tiny_weight_root(),
+            test_recursive_data::tiny_policy_commitment(),
+            test_recursive_data::tiny_n_matmuls(),
+            test_recursive_data::tiny_hidden_size(),
+            test_recursive_data::tiny_num_transformer_blocks(),
+            test_recursive_data::tiny_expected_n_poseidon_perms(),
+            test_recursive_data::tiny_level1_proof_hash(),
+        );
+}
+
 #[test]
-#[ignore] // stale generated calldata; regenerate test_recursive_data.cairo for the 26-felt recursive header
+#[ignore] // 56,545-felt production fixture overflows Sierra when embedded in snforge source
 fn test_verify_recursive_proof_valid() {
     let verifier = deploy_verifier();
     as_owner(@verifier);
 
-    verifier.register_model_recursive(
-        test_recursive_data::smollm2_model_id(),
-        test_recursive_data::smollm2_circuit_hash(),
-        test_recursive_data::smollm2_weight_root(),
-        0, // policy_commitment: 0 = any policy (until test data module provides real value)
-        N_MATMULS,
-        HIDDEN_SIZE,
-        NUM_TRANSFORMER_BLOCKS,
-        EXPECTED_N_POSEIDON_PERMS,
-        LEVEL1_PROOF_HASH,
-    );
+    register_tiny_recursive_model(@verifier);
 
-    let result = verifier.verify_recursive(
-        test_recursive_data::smollm2_model_id(),
-        test_recursive_data::smollm2_io_commitment(),
-        test_recursive_data::smollm2_circuit_hash(),
-        test_recursive_data::smollm2_weight_root(),
-        N_LAYERS,
-        N_MATMULS,
-        HIDDEN_SIZE,
-        NUM_TRANSFORMER_BLOCKS,
-        0,
-        TRACE_LOG_SIZE,
-        test_recursive_data::smollm2_calldata(),
-    );
+    let result = verifier
+        .verify_recursive_with_statement(
+            test_recursive_data::tiny_model_id(),
+            test_recursive_data::tiny_io_commitment(),
+            test_recursive_data::tiny_circuit_hash(),
+            test_recursive_data::tiny_weight_root(),
+            test_recursive_data::tiny_n_layers(),
+            test_recursive_data::tiny_n_matmuls(),
+            test_recursive_data::tiny_hidden_size(),
+            test_recursive_data::tiny_num_transformer_blocks(),
+            test_recursive_data::tiny_policy_commitment(),
+            test_recursive_data::tiny_trace_log_size(),
+            test_recursive_data::tiny_statement_hash(),
+            test_recursive_data::tiny_calldata(),
+        );
     assert!(result, "proof should be valid");
 
-    let count = verifier.get_recursive_verification_count(
-        test_recursive_data::smollm2_model_id()
-    );
+    let count = verifier.get_recursive_verification_count(test_recursive_data::tiny_model_id());
     assert!(count == 1, "count should be 1 after verification");
 }
 
 #[test]
-#[ignore] // stale generated calldata; regenerate test_recursive_data.cairo for the 26-felt recursive header
+#[ignore] // 56,545-felt production fixture overflows Sierra when embedded in snforge source
 #[should_panic(expected: 'Already verified')]
 fn test_verify_proof_replay_rejected() {
     let verifier = deploy_verifier();
     as_owner(@verifier);
 
-    verifier.register_model_recursive(
-        test_recursive_data::smollm2_model_id(),
-        test_recursive_data::smollm2_circuit_hash(),
-        test_recursive_data::smollm2_weight_root(),
-        0, // policy_commitment: 0 = any policy (until test data module provides real value)
-        N_MATMULS,
-        HIDDEN_SIZE,
-        NUM_TRANSFORMER_BLOCKS,
-        EXPECTED_N_POSEIDON_PERMS,
-        LEVEL1_PROOF_HASH,
-    );
+    register_tiny_recursive_model(@verifier);
 
-    verifier.verify_recursive(
-        test_recursive_data::smollm2_model_id(),
-        test_recursive_data::smollm2_io_commitment(),
-        test_recursive_data::smollm2_circuit_hash(),
-        test_recursive_data::smollm2_weight_root(),
-        N_LAYERS,
-        N_MATMULS,
-        HIDDEN_SIZE,
-        NUM_TRANSFORMER_BLOCKS,
-        0,
-        TRACE_LOG_SIZE,
-        test_recursive_data::smollm2_calldata(),
-    );
+    verifier
+        .verify_recursive_with_statement(
+            test_recursive_data::tiny_model_id(),
+            test_recursive_data::tiny_io_commitment(),
+            test_recursive_data::tiny_circuit_hash(),
+            test_recursive_data::tiny_weight_root(),
+            test_recursive_data::tiny_n_layers(),
+            test_recursive_data::tiny_n_matmuls(),
+            test_recursive_data::tiny_hidden_size(),
+            test_recursive_data::tiny_num_transformer_blocks(),
+            test_recursive_data::tiny_policy_commitment(),
+            test_recursive_data::tiny_trace_log_size(),
+            test_recursive_data::tiny_statement_hash(),
+            test_recursive_data::tiny_calldata(),
+        );
 
     // Second submission → should panic
-    verifier.verify_recursive(
-        test_recursive_data::smollm2_model_id(),
-        test_recursive_data::smollm2_io_commitment(),
-        test_recursive_data::smollm2_circuit_hash(),
-        test_recursive_data::smollm2_weight_root(),
-        N_LAYERS,
-        N_MATMULS,
-        HIDDEN_SIZE,
-        NUM_TRANSFORMER_BLOCKS,
-        0,
-        TRACE_LOG_SIZE,
-        test_recursive_data::smollm2_calldata(),
-    );
+    verifier
+        .verify_recursive_with_statement(
+            test_recursive_data::tiny_model_id(),
+            test_recursive_data::tiny_io_commitment(),
+            test_recursive_data::tiny_circuit_hash(),
+            test_recursive_data::tiny_weight_root(),
+            test_recursive_data::tiny_n_layers(),
+            test_recursive_data::tiny_n_matmuls(),
+            test_recursive_data::tiny_hidden_size(),
+            test_recursive_data::tiny_num_transformer_blocks(),
+            test_recursive_data::tiny_policy_commitment(),
+            test_recursive_data::tiny_trace_log_size(),
+            test_recursive_data::tiny_statement_hash(),
+            test_recursive_data::tiny_calldata(),
+        );
 }
 
 #[test]
-#[should_panic]  // STARK verification rejects tampered proof
+#[ignore] // 56,545-felt production fixture overflows Sierra when embedded in snforge source
+#[should_panic] // STARK verification rejects tampered proof
 fn test_verify_bit_flip_rejected() {
     let verifier = deploy_verifier();
     as_owner(@verifier);
 
-    verifier.register_model_recursive(
-        test_recursive_data::smollm2_model_id(),
-        test_recursive_data::smollm2_circuit_hash(),
-        test_recursive_data::smollm2_weight_root(),
-        0, // policy_commitment: 0 = any policy (until test data module provides real value)
-        N_MATMULS,
-        HIDDEN_SIZE,
-        NUM_TRANSFORMER_BLOCKS,
-        EXPECTED_N_POSEIDON_PERMS,
-        LEVEL1_PROOF_HASH,
-    );
+    register_tiny_recursive_model(@verifier);
 
-    let real = test_recursive_data::smollm2_calldata();
+    let real = test_recursive_data::tiny_calldata();
     let mut tampered: Array<felt252> = array![];
     let real_span = real.span();
     let mut i: u32 = 0;
     loop {
-        if i >= real_span.len() { break; }
+        if i >= real_span.len() {
+            break;
+        }
         if i == 20 {
             tampered.append(*real_span.at(i) + 0xDEAD);
         } else {
             tampered.append(*real_span.at(i));
         }
         i += 1;
-    };
+    }
 
-    verifier.verify_recursive(
-        test_recursive_data::smollm2_model_id(),
-        test_recursive_data::smollm2_io_commitment(),
-        test_recursive_data::smollm2_circuit_hash(),
-        test_recursive_data::smollm2_weight_root(),
-        N_LAYERS,
-        N_MATMULS,
-        HIDDEN_SIZE,
-        NUM_TRANSFORMER_BLOCKS,
-        0,
-        TRACE_LOG_SIZE,
-        tampered,
-    );
+    verifier
+        .verify_recursive_with_statement(
+            test_recursive_data::tiny_model_id(),
+            test_recursive_data::tiny_io_commitment(),
+            test_recursive_data::tiny_circuit_hash(),
+            test_recursive_data::tiny_weight_root(),
+            test_recursive_data::tiny_n_layers(),
+            test_recursive_data::tiny_n_matmuls(),
+            test_recursive_data::tiny_hidden_size(),
+            test_recursive_data::tiny_num_transformer_blocks(),
+            test_recursive_data::tiny_policy_commitment(),
+            test_recursive_data::tiny_trace_log_size(),
+            test_recursive_data::tiny_statement_hash(),
+            tampered,
+        );
 }
 
 // ═══════════════════════════════════════════════════════════════

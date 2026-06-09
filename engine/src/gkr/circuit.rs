@@ -92,10 +92,7 @@ pub enum LayerType {
     /// Top-K selection for MoE routing.
     /// Proves that the K selected expert indices have the K largest router logits.
     /// Reduction: value binding (LogUp) + threshold range check + completeness.
-    TopK {
-        num_experts: usize,
-        top_k: usize,
-    },
+    TopK { num_experts: usize, top_k: usize },
 }
 
 /// SIMD batch configuration for identical transformer blocks.
@@ -270,7 +267,12 @@ impl LayeredCircuit {
                 vocab_size: *vocab_size,
                 embed_dim: *embed_dim,
             }),
-            GraphOp::Conv2D { in_channels, out_channels, kernel_size, .. } => {
+            GraphOp::Conv2D {
+                in_channels,
+                out_channels,
+                kernel_size,
+                ..
+            } => {
                 // Conv2D lowers to MatMul: im2col(input) × reshaped_kernel
                 // im2col output: (num_patches, patch_size) where patch_size = in_channels × kernel²
                 // Actual num_patches determined at proving time from input spatial dimensions.
@@ -293,7 +295,9 @@ impl LayeredCircuit {
             }),
             GraphOp::RMSNorm { dim } => Ok(LayerType::RMSNorm { dim: *dim }),
             GraphOp::RoPE { config } => Ok(LayerType::RoPE { config: *config }),
-            GraphOp::MoE { num_experts, top_k, .. } => Ok(LayerType::TopK {
+            GraphOp::MoE {
+                num_experts, top_k, ..
+            } => Ok(LayerType::TopK {
                 num_experts: *num_experts,
                 top_k: *top_k,
             }),

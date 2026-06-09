@@ -340,6 +340,31 @@ pub mod activations {
             M31::from(result.min((1u32 << 31) - 2))
         }
     }
+
+    /// Approximate softplus: log(1 + exp(x)).
+    ///
+    /// Uses the same 2^16 fixed-point convention as GELU/SiLU. Negative M31
+    /// values are interpreted using the standard field wrapping convention.
+    pub fn softplus_approx(x: M31) -> M31 {
+        let val = x.0;
+        let p = (1u64 << 31) - 1;
+        let half_p = (1u32 << 30) - 1;
+        let scale = GELU_FIXED_POINT_SCALE as f64;
+        let x_real = if val <= half_p {
+            val as f64 / scale
+        } else {
+            -((p - val as u64) as f64) / scale
+        };
+        let softplus = if x_real > 20.0 {
+            x_real
+        } else if x_real < -20.0 {
+            x_real.exp()
+        } else {
+            (1.0 + x_real.exp()).ln()
+        };
+        let result = (softplus * scale).round();
+        M31::from((result as u64).min(p - 1) as u32)
+    }
 }
 
 #[cfg(test)]
@@ -628,7 +653,9 @@ mod tests {
         assert!(
             diff <= 1,
             "SiLU(1.0): got {}, expected {} (diff {})",
-            result.0, expected, diff,
+            result.0,
+            expected,
+            diff,
         );
     }
 

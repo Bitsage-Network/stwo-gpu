@@ -344,8 +344,8 @@ pub struct GkrVerificationSubmitConfig {
 impl Default for GkrVerificationSubmitConfig {
     fn default() -> Self {
         Self {
-            verifier_contract:
-                "0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005".to_string(),
+            verifier_contract: "0x0121d1e9882967e03399f153d57fc208f3d9bce69adc48d9e12d424502a8c005"
+                .to_string(),
             network: "sepolia".to_string(),
             max_felts_per_tx: 7500,
             entrypoint: "verify_model_gkr".to_string(),
@@ -530,7 +530,10 @@ pub(crate) fn parse_felt(hex: &str, field_name: &str) -> Result<FieldElement, Au
 }
 
 /// Convert an M31 digest hex string to a (lo, hi) felt252 pair.
-pub(crate) fn digest_hex_to_felts(hex: &str, name: &str) -> Result<(FieldElement, FieldElement), AuditError> {
+pub(crate) fn digest_hex_to_felts(
+    hex: &str,
+    name: &str,
+) -> Result<(FieldElement, FieldElement), AuditError> {
     let digest = hex_to_digest(hex).map_err(|e| AuditError::Serde(format!("{}: {}", name, e)))?;
     digest_to_felt_pair(&digest)
 }

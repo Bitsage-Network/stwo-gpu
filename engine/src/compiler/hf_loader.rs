@@ -15,12 +15,12 @@ use std::path::{Path, PathBuf};
 
 use crate::compiler::graph::{ComputationGraph, GraphBuilder, GraphOp, GraphWeights};
 use crate::compiler::onnx::{ModelMetadata, OnnxError, OnnxModel, TransformerConfig};
-use crate::compiler::quantize_weights::quantize_weight_matrix;
+use crate::compiler::quantize_weights::{quantize_weight_matrix, WeightError};
 use crate::compiler::safetensors::{discover_shards, list_tensors_sharded, tensor_to_f32};
 use crate::components::activation::ActivationType;
 use crate::components::matmul::M31Matrix;
+use crate::gadgets::quantize::{quantize_tensor, QuantStrategy};
 use stwo::core::fields::m31::M31;
-use crate::gadgets::quantize::QuantStrategy;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Model Validation
@@ -194,6 +194,67 @@ pub fn validate_model_directory(model_dir: &Path, num_layers: Option<usize>) -> 
         });
     }
 
+    let experimental_qwen35 =
+        std::env::var("OBELYZK_EXPERIMENTAL_QWEN35").ok().as_deref() == Some("1");
+    let qwen35_requires_dedicated_graph = hf_config
+        .as_ref()
+        .is_some_and(|cfg| cfg.model_type == "qwen3_5_moe")
+        && !experimental_qwen35;
+    if let Some(summary) = hf_config
+        .as_ref()
+        .and_then(HfConfig::qwen35_architecture_summary)
+    {
+        checks.push(ValidationCheck {
+            name: "Qwen3.5-MoE architecture contract".into(),
+            passed: true,
+            detail: summary,
+        });
+    }
+    if let Some(ref cfg) = hf_config {
+        if cfg.model_type == "qwen3_5_moe" {
+            match crate::compiler::qwen35::Qwen35ProofPlan::from_hf_config(cfg) {
+                Ok(plan) => {
+                    checks.push(ValidationCheck {
+                        name: "Qwen3.5 proof plan".into(),
+                        passed: true,
+                        detail: plan.summary(),
+                    });
+                    match plan.execution_contract_summary() {
+                        Ok(detail) => checks.push(ValidationCheck {
+                            name: "Qwen3.5 execution contract".into(),
+                            passed: true,
+                            detail,
+                        }),
+                        Err(detail) => checks.push(ValidationCheck {
+                            name: "Qwen3.5 execution contract".into(),
+                            passed: false,
+                            detail,
+                        }),
+                    }
+                    let execution_plan = plan.execution_plan();
+                    checks.push(ValidationCheck {
+                        name: "Qwen3.5 typed prover readiness".into(),
+                        passed: !qwen35_requires_dedicated_graph
+                            || execution_plan.production_ready(),
+                        detail: execution_plan.readiness_summary(),
+                    });
+                }
+                Err(detail) => checks.push(ValidationCheck {
+                    name: "Qwen3.5 proof plan".into(),
+                    passed: false,
+                    detail,
+                }),
+            }
+        }
+    }
+    if qwen35_requires_dedicated_graph {
+        checks.push(ValidationCheck {
+            name: "Qwen3.5-MoE architecture support".into(),
+            passed: false,
+            detail: "current flat MatMul HF graph is disabled for production for this architecture; use the typed prover readiness report above to implement the missing components (set OBELYZK_EXPERIMENTAL_QWEN35=1 only for loader audits)".into(),
+        });
+    }
+
     // Check 5: SafeTensors weight files exist
     let shard_paths = discover_shards(model_dir, "model").unwrap_or_default();
     // Also try without "model" filter (some models use different naming)
@@ -261,8 +322,34 @@ pub fn validate_model_directory(model_dir: &Path, num_layers: Option<usize>) -> 
         }
     }
 
+    if let Some(ref cfg) = hf_config {
+        if cfg.model_type == "qwen3_5_moe" && !shard_paths.is_empty() {
+            match validate_qwen35_tensor_contract(&shard_paths, cfg) {
+                Ok(count) => checks.push(ValidationCheck {
+                    name: "Qwen3.5 language tensor contract".into(),
+                    passed: true,
+                    detail: format!(
+                        "{count} expected language tensors present with expected shapes"
+                    ),
+                }),
+                Err(detail) => checks.push(ValidationCheck {
+                    name: "Qwen3.5 language tensor contract".into(),
+                    passed: false,
+                    detail,
+                }),
+            }
+        }
+    }
+
     // Check 8: Required weight tensors exist for requested layers
     if let Some(ref cfg) = hf_config {
+        if qwen35_requires_dedicated_graph {
+            return ValidationReport {
+                model_dir: model_dir.to_path_buf(),
+                checks,
+            };
+        }
+
         let layers = num_layers.unwrap_or(cfg.num_hidden_layers);
         let layers = if layers == 0 {
             cfg.num_hidden_layers
@@ -350,6 +437,194 @@ fn validate_shard_headers(shard_paths: &[PathBuf]) -> Result<usize, String> {
     Ok(total_tensors)
 }
 
+fn validate_qwen35_tensor_contract(
+    shard_paths: &[PathBuf],
+    cfg: &HfConfig,
+) -> Result<usize, String> {
+    let mut shard_data: Vec<memmap2::Mmap> = Vec::new();
+    for path in shard_paths {
+        let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| e.to_string())?;
+        shard_data.push(mmap);
+    }
+
+    let mut available: HashMap<String, Vec<usize>> = HashMap::new();
+    for mmap in &shard_data {
+        let tensors = safetensors::SafeTensors::deserialize(mmap).map_err(|e| e.to_string())?;
+        for name in tensors.names() {
+            if let Ok(tensor) = tensors.tensor(name) {
+                available.insert(name.to_string(), tensor.shape().to_vec());
+            }
+        }
+    }
+
+    let plan = crate::compiler::qwen35::Qwen35ProofPlan::from_hf_config(cfg)?;
+    let expected = plan.expected_tensor_contract();
+
+    let mut errors = Vec::new();
+    for entry in &expected {
+        match available.get(&entry.name) {
+            Some(actual) if actual == &entry.shape => {}
+            Some(actual) => errors.push(format!(
+                "{}: shape {actual:?}, expected {:?}",
+                entry.name, entry.shape
+            )),
+            None => errors.push(format!("{}: missing", entry.name)),
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(expected.len())
+    } else {
+        let mut detail = errors
+            .iter()
+            .take(12)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; ");
+        if errors.len() > 12 {
+            detail.push_str(&format!("; ... {} more", errors.len() - 12));
+        }
+        Err(detail)
+    }
+}
+
+/// Load the safetensors-backed part of the Qwen3.5 typed witness inventory.
+///
+/// This intentionally records only manifest sources whose namespace is
+/// `safetensors`. Runtime activations, conversation recurrent state, and
+/// statement lookup tables must be supplied by the dedicated Qwen3.5 execution
+/// path before the full typed witness inventory can be validated.
+pub fn load_qwen35_typed_safetensors_inventory(
+    shard_paths: &[PathBuf],
+    cfg: &HfConfig,
+    seq_len: usize,
+    strategy: QuantStrategy,
+) -> Result<crate::compiler::qwen35::Qwen35TypedWitnessSourceInventory, WeightError> {
+    use crate::compiler::qwen35::{
+        Qwen35ProofPlan, Qwen35TypedWitnessCapturedValue, Qwen35TypedWitnessSourceInventory,
+        Qwen35TypedWitnessSourceKind,
+    };
+
+    let plan = Qwen35ProofPlan::from_hf_config(cfg).map_err(WeightError::IoError)?;
+    let manifest = plan
+        .typed_witness_manifest(seq_len)
+        .map_err(WeightError::IoError)?;
+    let requirements = manifest
+        .source_requirements()
+        .map_err(WeightError::IoError)?;
+
+    let mut shard_data: Vec<memmap2::Mmap> = Vec::new();
+    for path in shard_paths {
+        let file = std::fs::File::open(path).map_err(|e| WeightError::IoError(e.to_string()))?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }
+            .map_err(|e| WeightError::IoError(e.to_string()))?;
+        shard_data.push(mmap);
+    }
+
+    let mut tensor_to_shard: HashMap<String, usize> = HashMap::new();
+    for (shard_idx, mmap) in shard_data.iter().enumerate() {
+        let tensors = safetensors::SafeTensors::deserialize(mmap)
+            .map_err(|e| WeightError::IoError(e.to_string()))?;
+        for name in tensors.names() {
+            tensor_to_shard.insert(name.to_string(), shard_idx);
+        }
+    }
+
+    let mut inventory = Qwen35TypedWitnessSourceInventory::new();
+    for requirement in requirements
+        .iter()
+        .filter(|req| req.source_kind == Qwen35TypedWitnessSourceKind::Safetensors)
+    {
+        let tensor_name = requirement.source_body();
+        let shard_idx = *tensor_to_shard
+            .get(tensor_name)
+            .ok_or_else(|| WeightError::MissingTensor(tensor_name.to_string()))?;
+        let tensors = safetensors::SafeTensors::deserialize(&shard_data[shard_idx])
+            .map_err(|e| WeightError::IoError(e.to_string()))?;
+        let tensor = tensors
+            .tensor(tensor_name)
+            .map_err(|e| WeightError::IoError(format!("{tensor_name}: {e}")))?;
+        qwen35_validate_safetensors_shape(tensor_name, tensor.shape(), requirement.shape)?;
+
+        let mut data = tensor_to_f32(tensor.data(), tensor.dtype());
+        qwen35_apply_fp8_scale_if_present(tensor_name, tensor.shape(), &tensors, &mut data)?;
+        let (values, _) = quantize_tensor(&data, strategy);
+        inventory
+            .insert_safetensors_value(tensor_name, Qwen35TypedWitnessCapturedValue::Vector(values));
+    }
+
+    Ok(inventory)
+}
+
+fn qwen35_validate_safetensors_shape(
+    tensor_name: &str,
+    actual: &[usize],
+    expected: crate::compiler::qwen35::Qwen35TensorShape,
+) -> Result<(), WeightError> {
+    let expected_dims = match expected {
+        crate::compiler::qwen35::Qwen35TensorShape::Vector(n) => vec![n],
+        crate::compiler::qwen35::Qwen35TensorShape::Tensor3D(shape) => {
+            vec![shape.outer, shape.middle, shape.inner]
+        }
+        crate::compiler::qwen35::Qwen35TensorShape::Matrix(shape) => vec![shape.rows, shape.cols],
+    };
+    if actual != expected_dims.as_slice() {
+        return Err(WeightError::ShapeMismatch {
+            expected: format!("{tensor_name} {expected_dims:?}"),
+            actual: format!("{actual:?}"),
+        });
+    }
+    Ok(())
+}
+
+fn qwen35_apply_fp8_scale_if_present(
+    tensor_name: &str,
+    shape: &[usize],
+    tensors: &safetensors::SafeTensors<'_>,
+    data: &mut [f32],
+) -> Result<(), WeightError> {
+    let scale_name = format!("{tensor_name}_scale_inv");
+    let Ok(scale_tensor) = tensors.tensor(&scale_name) else {
+        return Ok(());
+    };
+    if shape.len() != 2 {
+        return Ok(());
+    }
+
+    let scales = tensor_to_f32(scale_tensor.data(), scale_tensor.dtype());
+    let scale_shape = scale_tensor.shape();
+    if scale_shape.len() != 2 {
+        return Ok(());
+    }
+
+    let (rows, cols) = (shape[0], shape[1]);
+    let (scale_rows, scale_cols) = (scale_shape[0], scale_shape[1]);
+    if rows == 0
+        || cols == 0
+        || scale_rows == 0
+        || scale_cols == 0
+        || scales.len() != scale_rows * scale_cols
+        || data.len() != rows * cols
+    {
+        return Err(WeightError::ShapeMismatch {
+            expected: format!("{scale_name} compatible with {tensor_name} {shape:?}"),
+            actual: format!("{scale_shape:?}"),
+        });
+    }
+
+    let block_rows = (rows / scale_rows).max(1);
+    let block_cols = (cols / scale_cols).max(1);
+    for row in 0..rows {
+        for col in 0..cols {
+            let scale_row = (row / block_rows).min(scale_rows - 1);
+            let scale_col = (col / block_cols).min(scale_cols - 1);
+            data[row * cols + col] *= scales[scale_row * scale_cols + scale_col];
+        }
+    }
+    Ok(())
+}
+
 /// Validate that weight tensor dimensions match the expected graph dimensions.
 fn validate_weight_dimensions(
     shard_paths: &[PathBuf],
@@ -432,6 +707,25 @@ pub struct HfConfig {
     pub num_experts: usize,
     /// Number of experts activated per token (top-K).
     pub num_experts_per_tok: usize,
+    /// Optional per-layer attention schedule, e.g. Qwen3.5 alternates
+    /// linear_attention and full_attention blocks.
+    pub layer_types: Vec<String>,
+    /// Routed expert hidden dimension for packed MoE models.
+    pub moe_intermediate_size: Option<usize>,
+    /// Always-on shared expert hidden dimension for Qwen3.5-style MoE.
+    pub shared_expert_intermediate_size: Option<usize>,
+    /// Linear-attention key head dimension for hybrid models.
+    pub linear_key_head_dim: Option<usize>,
+    /// Linear-attention value head dimension for hybrid models.
+    pub linear_value_head_dim: Option<usize>,
+    /// Linear-attention key head count.
+    pub linear_num_key_heads: Option<usize>,
+    /// Linear-attention value head count.
+    pub linear_num_value_heads: Option<usize>,
+    /// Depthwise convolution kernel used by Qwen3.5 GatedDeltaNet.
+    pub linear_conv_kernel_dim: Option<usize>,
+    /// Whether the attention output is gated before projection.
+    pub attn_output_gate: bool,
 }
 
 impl HfConfig {
@@ -445,20 +739,39 @@ impl HfConfig {
 
         // Support nested config (Qwen3.5, multimodal models with text_config)
         // Try root-level fields first, fall back to text_config sub-object
-        let tc = if json["text_config"].is_object() { &json["text_config"] } else { &json };
+        let tc = if json["text_config"].is_object() {
+            &json["text_config"]
+        } else {
+            &json
+        };
 
         // Helper: read u64 from tc first, then json root as fallback
-        let get_u64 = |key: &str| -> Option<u64> {
-            tc[key].as_u64().or_else(|| json[key].as_u64())
-        };
-        let get_str = |key: &str| -> Option<&str> {
-            tc[key].as_str().or_else(|| json[key].as_str())
-        };
+        let get_u64 =
+            |key: &str| -> Option<u64> { tc[key].as_u64().or_else(|| json[key].as_u64()) };
+        let get_str =
+            |key: &str| -> Option<&str> { tc[key].as_str().or_else(|| json[key].as_str()) };
+        let get_bool =
+            |key: &str| -> Option<bool> { tc[key].as_bool().or_else(|| json[key].as_bool()) };
+        let layer_types = tc["layer_types"]
+            .as_array()
+            .or_else(|| json["layer_types"].as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let moe_intermediate_size = get_u64("moe_intermediate_size").map(|v| v as usize);
+        let shared_expert_intermediate_size =
+            get_u64("shared_expert_intermediate_size").map(|v| v as usize);
 
         Ok(Self {
-            model_type: json["model_type"].as_str()
+            model_type: json["model_type"]
+                .as_str()
                 .or_else(|| tc["model_type"].as_str())
-                .unwrap_or("unknown").to_string(),
+                .unwrap_or("unknown")
+                .to_string(),
             hidden_size: get_u64("hidden_size")
                 .ok_or_else(|| OnnxError::ParseError("missing hidden_size".into()))?
                 as usize,
@@ -470,16 +783,24 @@ impl HfConfig {
                 .or_else(|| get_u64("multi_query_group_num"))
                 .unwrap_or(get_u64("num_attention_heads").unwrap_or(1))
                 as usize,
-            // GLM uses ffn_hidden_size instead of intermediate_size
+            // GLM uses ffn_hidden_size; Qwen3.5-MoE uses moe_intermediate_size
+            // for the routed expert FFN dimension and shared_expert_intermediate_size
+            // for the always-on shared expert.
             intermediate_size: get_u64("intermediate_size")
                 .or_else(|| get_u64("ffn_hidden_size"))
-                .ok_or_else(|| OnnxError::ParseError("missing intermediate_size/ffn_hidden_size".into()))?
-                as usize,
+                .or_else(|| get_u64("moe_intermediate_size"))
+                .or_else(|| get_u64("shared_expert_intermediate_size"))
+                .ok_or_else(|| {
+                    OnnxError::ParseError(
+                        "missing intermediate_size/ffn_hidden_size/moe_intermediate_size".into(),
+                    )
+                })? as usize,
             // GLM uses num_layers instead of num_hidden_layers
             num_hidden_layers: get_u64("num_hidden_layers")
                 .or_else(|| get_u64("num_layers"))
-                .ok_or_else(|| OnnxError::ParseError("missing num_hidden_layers/num_layers".into()))?
-                as usize,
+                .ok_or_else(|| {
+                    OnnxError::ParseError("missing num_hidden_layers/num_layers".into())
+                })? as usize,
             // GLM uses padded_vocab_size instead of vocab_size
             vocab_size: get_u64("vocab_size")
                 .or_else(|| get_u64("padded_vocab_size"))
@@ -488,16 +809,13 @@ impl HfConfig {
                 .or_else(|| get_str("hidden_activation"))
                 .unwrap_or("silu")
                 .to_string(),
-            max_position_embeddings: get_u64("max_position_embeddings").unwrap_or(2048)
-                as usize,
+            max_position_embeddings: get_u64("max_position_embeddings").unwrap_or(2048) as usize,
             // Head dimension: explicit in Qwen3-4B (128), defaults to hidden/heads
-            head_dim: get_u64("head_dim")
-                .map(|v| v as usize)
-                .unwrap_or_else(|| {
-                    let hs = get_u64("hidden_size").unwrap_or(1) as usize;
-                    let nh = get_u64("num_attention_heads").unwrap_or(1) as usize;
-                    hs / nh
-                }),
+            head_dim: get_u64("head_dim").map(|v| v as usize).unwrap_or_else(|| {
+                let hs = get_u64("hidden_size").unwrap_or(1) as usize;
+                let nh = get_u64("num_attention_heads").unwrap_or(1) as usize;
+                hs / nh
+            }),
             // MoE: MiniMax uses num_local_experts (256), Mixtral uses num_local_experts (8)
             num_experts: get_u64("num_local_experts")
                 .or_else(|| get_u64("num_experts"))
@@ -506,6 +824,15 @@ impl HfConfig {
             num_experts_per_tok: get_u64("num_experts_per_tok")
                 .or_else(|| get_u64("num_experts_per_token"))
                 .unwrap_or(0) as usize,
+            layer_types,
+            moe_intermediate_size,
+            shared_expert_intermediate_size,
+            linear_key_head_dim: get_u64("linear_key_head_dim").map(|v| v as usize),
+            linear_value_head_dim: get_u64("linear_value_head_dim").map(|v| v as usize),
+            linear_num_key_heads: get_u64("linear_num_key_heads").map(|v| v as usize),
+            linear_num_value_heads: get_u64("linear_num_value_heads").map(|v| v as usize),
+            linear_conv_kernel_dim: get_u64("linear_conv_kernel_dim").map(|v| v as usize),
+            attn_output_gate: get_bool("attn_output_gate").unwrap_or(false),
         })
     }
 
@@ -543,6 +870,57 @@ impl HfConfig {
     /// Whether this model uses Mixture of Experts.
     pub fn is_moe(&self) -> bool {
         self.num_experts > 0 && self.num_experts_per_tok > 0
+    }
+
+    pub fn qwen35_architecture_summary(&self) -> Option<String> {
+        if self.model_type != "qwen3_5_moe" {
+            return None;
+        }
+
+        let linear_layers = self
+            .layer_types
+            .iter()
+            .filter(|kind| kind.as_str() == "linear_attention")
+            .count();
+        let full_layers = self
+            .layer_types
+            .iter()
+            .filter(|kind| kind.as_str() == "full_attention")
+            .count();
+        let unknown_layers = self
+            .layer_types
+            .iter()
+            .filter(|kind| kind.as_str() != "linear_attention" && kind.as_str() != "full_attention")
+            .count();
+        let schedule = if self.layer_types.is_empty() {
+            "layer_types=missing".to_string()
+        } else {
+            format!(
+                "{} layer_types: {} linear_attention, {} full_attention, {} unknown",
+                self.layer_types.len(),
+                linear_layers,
+                full_layers,
+                unknown_layers
+            )
+        };
+
+        Some(format!(
+            "{schedule}; hidden={}, heads={}x{}, kv_heads={}, MoE={} experts top{}, routed_ff={}, shared_ff={}, linear_k={}x{}, linear_v={}x{}, conv_kernel={}, attn_output_gate={}",
+            self.hidden_size,
+            self.num_attention_heads,
+            self.head_dim,
+            self.num_key_value_heads,
+            self.num_experts,
+            self.num_experts_per_tok,
+            self.moe_intermediate_size.unwrap_or(self.intermediate_size),
+            self.shared_expert_intermediate_size.unwrap_or(0),
+            self.linear_num_key_heads.unwrap_or(0),
+            self.linear_key_head_dim.unwrap_or(0),
+            self.linear_num_value_heads.unwrap_or(0),
+            self.linear_value_head_dim.unwrap_or(0),
+            self.linear_conv_kernel_dim.unwrap_or(0),
+            self.attn_output_gate,
+        ))
     }
 }
 
@@ -767,7 +1145,13 @@ pub fn open_streaming_pipeline(
 ///   up   = input × W_up
 ///   hidden = gate * up
 ///   output = hidden × W_down
-pub(crate) fn build_hf_transformer_graph(config: &TransformerConfig, num_layers: usize) -> (ComputationGraph, Vec<(usize, crate::compiler::graph::MoESlotInfo)>) {
+pub(crate) fn build_hf_transformer_graph(
+    config: &TransformerConfig,
+    num_layers: usize,
+) -> (
+    ComputationGraph,
+    Vec<(usize, crate::compiler::graph::MoESlotInfo)>,
+) {
     use crate::compiler::onnx::NormType;
     let d = config.d_model;
     let d_ff = config.d_ff;
@@ -782,8 +1166,12 @@ pub(crate) fn build_hf_transformer_graph(config: &TransformerConfig, num_layers:
     for layer_idx in 0..num_layers {
         // Pre-attention norm
         match config.norm_type {
-            NormType::LayerNorm => { builder.layer_norm(); }
-            NormType::RMSNorm => { builder.rms_norm(); }
+            NormType::LayerNorm => {
+                builder.layer_norm();
+            }
+            NormType::RMSNorm => {
+                builder.rms_norm();
+            }
         }
         // Q projection (d → q_dim, where q_dim = num_heads × head_dim)
         builder.linear(q_dim);
@@ -791,13 +1179,22 @@ pub(crate) fn build_hf_transformer_graph(config: &TransformerConfig, num_layers:
         builder.linear(o_dim);
         // Post-attention norm
         match config.norm_type {
-            NormType::LayerNorm => { builder.layer_norm(); }
-            NormType::RMSNorm => { builder.rms_norm(); }
+            NormType::LayerNorm => {
+                builder.layer_norm();
+            }
+            NormType::RMSNorm => {
+                builder.rms_norm();
+            }
         }
         // FFN: dense (gated FFN) or MoE (multi-expert gated FFN)
         if config.num_experts > 0 && config.num_experts_per_tok > 0 {
             // MoE: router → TopK → K parallel expert FFNs → weighted sum
-            let moe_info = builder.moe_ffn(config.num_experts, config.num_experts_per_tok, d_ff, config.activation);
+            let moe_info = builder.moe_ffn(
+                config.num_experts,
+                config.num_experts_per_tok,
+                d_ff,
+                config.activation,
+            );
             moe_slot_infos.push((layer_idx, moe_info));
         } else {
             // Dense: single gated FFN (SwiGLU)
@@ -807,8 +1204,12 @@ pub(crate) fn build_hf_transformer_graph(config: &TransformerConfig, num_layers:
 
     // Final norm
     match config.norm_type {
-        NormType::LayerNorm => { builder.layer_norm(); }
-        NormType::RMSNorm => { builder.rms_norm(); }
+        NormType::LayerNorm => {
+            builder.layer_norm();
+        }
+        NormType::RMSNorm => {
+            builder.rms_norm();
+        }
     }
 
     (builder.build(), moe_slot_infos)
@@ -864,6 +1265,8 @@ pub(crate) fn build_weight_name_map(
         // Q projection (or fused QKV for Phi-3/GPT-2)
         let q_candidates = [
             format!("model.layers.{layer_idx}.self_attn.q_proj.weight"),
+            format!("model.language_model.layers.{layer_idx}.self_attn.q_proj.weight"),
+            format!("model.language_model.layers.{layer_idx}.linear_attn.in_proj_qkv.weight"),
             format!("model.layers.{layer_idx}.attention.wq.weight"),
             format!("transformer.h.{layer_idx}.attn.q_proj.weight"),
             // Fused QKV: store as Q, will be split during loading
@@ -883,6 +1286,8 @@ pub(crate) fn build_weight_name_map(
         // O projection
         let o_candidates = [
             format!("model.layers.{layer_idx}.self_attn.o_proj.weight"),
+            format!("model.language_model.layers.{layer_idx}.self_attn.o_proj.weight"),
+            format!("model.language_model.layers.{layer_idx}.linear_attn.out_proj.weight"),
             format!("model.layers.{layer_idx}.attention.wo.weight"),
             format!("transformer.h.{layer_idx}.attn.o_proj.weight"),
             // GPT-2
@@ -901,6 +1306,7 @@ pub(crate) fn build_weight_name_map(
         // Supports: separate gate_proj OR fused gate_up_proj (Phi-3 style)
         let gate_candidates = [
             format!("model.layers.{layer_idx}.mlp.gate_proj.weight"),
+            format!("model.language_model.layers.{layer_idx}.mlp.shared_expert.gate_proj.weight"),
             format!("model.layers.{layer_idx}.feed_forward.w1.weight"),
             format!("transformer.h.{layer_idx}.mlp.gate_proj.weight"),
             // GLM-4 gate_proj (part of fused dense_h_to_4h)
@@ -919,6 +1325,7 @@ pub(crate) fn build_weight_name_map(
         if !found_gate {
             let fused_candidates = [
                 format!("model.layers.{layer_idx}.mlp.gate_up_proj.weight"),
+                format!("model.language_model.layers.{layer_idx}.mlp.experts.gate_up_proj"),
                 // GLM-4 fused gate+up
                 format!("transformer.encoder.layers.{layer_idx}.mlp.dense_h_to_4h.weight"),
             ];
@@ -955,6 +1362,7 @@ pub(crate) fn build_weight_name_map(
         {
             let up_candidates = [
                 format!("model.layers.{layer_idx}.mlp.up_proj.weight"),
+                format!("model.language_model.layers.{layer_idx}.mlp.shared_expert.up_proj.weight"),
                 format!("model.layers.{layer_idx}.feed_forward.w3.weight"),
                 format!("transformer.h.{layer_idx}.mlp.up_proj.weight"),
             ];
@@ -969,6 +1377,7 @@ pub(crate) fn build_weight_name_map(
         // FFN down projection
         let down_candidates = [
             format!("model.layers.{layer_idx}.mlp.down_proj.weight"),
+            format!("model.language_model.layers.{layer_idx}.mlp.shared_expert.down_proj.weight"),
             format!("model.layers.{layer_idx}.feed_forward.w2.weight"),
             format!("transformer.h.{layer_idx}.mlp.down_proj.weight"),
             // GPT-2
@@ -988,6 +1397,7 @@ pub(crate) fn build_weight_name_map(
         let pre_norm_node = block_start;
         let pre_norm_candidates = [
             format!("model.layers.{layer_idx}.input_layernorm.weight"),
+            format!("model.language_model.layers.{layer_idx}.input_layernorm.weight"),
             format!("model.layers.{layer_idx}.ln1.weight"),
             format!("transformer.h.{layer_idx}.ln_1.weight"),
             // GLM-4
@@ -1005,6 +1415,7 @@ pub(crate) fn build_weight_name_map(
         let post_norm_node = block_start + 3;
         let post_norm_candidates = [
             format!("model.layers.{layer_idx}.post_attention_layernorm.weight"),
+            format!("model.language_model.layers.{layer_idx}.post_attention_layernorm.weight"),
             format!("model.layers.{layer_idx}.ln2.weight"),
             format!("transformer.h.{layer_idx}.ln_2.weight"),
             // GLM-4
@@ -1022,6 +1433,7 @@ pub(crate) fn build_weight_name_map(
     let final_norm_node = num_layers * nodes_per_block;
     let final_norm_candidates = [
         "model.norm.weight".to_string(),
+        "model.language_model.norm.weight".to_string(),
         "transformer.ln_f.weight".to_string(),
         "model.final_layernorm.weight".to_string(),
         // GLM-4
@@ -1054,11 +1466,15 @@ fn add_moe_weight_names(
 
     for (layer_idx, info) in moe_slot_infos {
         // Router gate weight
-        let router_name = format!(
-            "model.layers.{layer_idx}.block_sparse_moe.gate.weight"
-        );
-        if tensor_set.contains(router_name.as_str()) {
-            map.insert(info.router_node_id, router_name);
+        let router_candidates = [
+            format!("model.layers.{layer_idx}.block_sparse_moe.gate.weight"),
+            format!("model.language_model.layers.{layer_idx}.mlp.gate.weight"),
+        ];
+        for router_name in router_candidates {
+            if tensor_set.contains(router_name.as_str()) {
+                map.insert(info.router_node_id, router_name);
+                break;
+            }
         }
 
         // Per-expert weights: stored in MoEWeightBank, not in the graph directly.
@@ -1066,25 +1482,22 @@ fn add_moe_weight_names(
         // MoE expert tensors. These are loaded into the bank, not the graph weights.
         for expert_idx in 0..info.num_experts {
             // w1 = gate_proj
-            let w1_name = format!(
-                "model.layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w1.weight"
-            );
+            let w1_name =
+                format!("model.layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w1.weight");
             if tensor_set.contains(w1_name.as_str()) {
                 map.insert(30000 + layer_idx * 1000 + expert_idx * 10, w1_name);
             }
 
             // w3 = up_proj
-            let w3_name = format!(
-                "model.layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w3.weight"
-            );
+            let w3_name =
+                format!("model.layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w3.weight");
             if tensor_set.contains(w3_name.as_str()) {
                 map.insert(30000 + layer_idx * 1000 + expert_idx * 10 + 1, w3_name);
             }
 
             // w2 = down_proj
-            let w2_name = format!(
-                "model.layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w2.weight"
-            );
+            let w2_name =
+                format!("model.layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w2.weight");
             if tensor_set.contains(w2_name.as_str()) {
                 map.insert(30000 + layer_idx * 1000 + expert_idx * 10 + 2, w2_name);
             }
@@ -1208,15 +1621,21 @@ fn load_weights_from_shards(
             // FP8 per-block dequantization: apply weight_scale_inv if present.
             // MiniMax-M2.5, DeepSeek-V3 store FP8 weights with companion
             // scale tensors: tensor_name + "_scale_inv" with block_size [128, 128].
-            let is_fp8 = matches!(tensor.dtype(),
-                safetensors::Dtype::F8_E4M3 | safetensors::Dtype::F8_E5M2);
+            let is_fp8 = matches!(
+                tensor.dtype(),
+                safetensors::Dtype::F8_E4M3 | safetensors::Dtype::F8_E5M2
+            );
             if is_fp8 {
                 let scale_name = format!("{}_scale_inv", tensor_name);
                 if let Ok(scale_tensor) = tensors.tensor(&scale_name) {
                     let scales = tensor_to_f32(scale_tensor.data(), scale_tensor.dtype());
                     let scale_shape = scale_tensor.shape();
                     // Block size: weight shape / scale shape
-                    let (rows, cols) = if shape.len() == 2 { (shape[0], shape[1]) } else { (1, data.len()) };
+                    let (rows, cols) = if shape.len() == 2 {
+                        (shape[0], shape[1])
+                    } else {
+                        (1, data.len())
+                    };
                     let (s_rows, s_cols) = if scale_shape.len() == 2 {
                         (scale_shape[0], scale_shape[1])
                     } else {
@@ -1263,29 +1682,38 @@ fn load_weights_from_shards(
                 || (tensor_rows > *n && tensor_rows < 2 * *n && tensor_cols == *k);
             if is_fused_qkv {
                 let is_col_fused = tensor_cols > tensor_rows;
-                let multiplier = if is_col_fused { tensor_cols / *n } else { tensor_rows / *n };
+                let multiplier = if is_col_fused {
+                    tensor_cols / *n
+                } else {
+                    tensor_rows / *n
+                };
 
                 if is_col_fused {
                     // Shape [k, M*n]: take columns 0..n for Q
                     let q_data: Vec<f32> = (0..tensor_rows)
                         .flat_map(|r| data[r * tensor_cols..r * tensor_cols + *n].iter().copied())
                         .collect();
-                    eprintln!("  Splitting fused QKV for node {} ({}×): [{}×{}] → Q [{}×{}]",
-                        idx, multiplier, tensor_rows, tensor_cols, tensor_rows, *n);
+                    eprintln!(
+                        "  Splitting fused QKV for node {} ({}×): [{}×{}] → Q [{}×{}]",
+                        idx, multiplier, tensor_rows, tensor_cols, tensor_rows, *n
+                    );
                     *data = q_data;
                     shape[1] = *n;
                 } else {
                     // Shape [M*n, k]: take rows 0..n for Q
                     let q_data = data[..*n * tensor_cols].to_vec();
-                    eprintln!("  Splitting fused QKV for node {} ({}×): [{}×{}] → Q [{}×{}]",
-                        idx, multiplier, tensor_rows, tensor_cols, *n, tensor_cols);
+                    eprintln!(
+                        "  Splitting fused QKV for node {} ({}×): [{}×{}] → Q [{}×{}]",
+                        idx, multiplier, tensor_rows, tensor_cols, *n, tensor_cols
+                    );
                     *data = q_data;
                     shape[0] = *n;
                 }
             }
-
             // Check if this is a fused gate_up: tensor has 2× the expected output dimension
-            else if (tensor_rows == 2 * *n && tensor_cols == *k) || (tensor_cols == 2 * *n && tensor_rows == *k) {
+            else if (tensor_rows == 2 * *n && tensor_cols == *k)
+                || (tensor_cols == 2 * *n && tensor_rows == *k)
+            {
                 let is_transposed = tensor_rows == *k;
                 let (fused_rows, fused_cols) = if is_transposed {
                     (*k, 2 * *n)
@@ -1299,8 +1727,16 @@ fn load_weights_from_shards(
                 let up_data: Vec<f32>;
                 if is_transposed {
                     // Shape [k, 2n]: columns 0..n = gate, columns n..2n = up
-                    gate_data = (0..*k).flat_map(|r| data[r * fused_cols..r * fused_cols + *n].iter().copied()).collect();
-                    up_data = (0..*k).flat_map(|r| data[r * fused_cols + *n..r * fused_cols + 2 * *n].iter().copied()).collect();
+                    gate_data = (0..*k)
+                        .flat_map(|r| data[r * fused_cols..r * fused_cols + *n].iter().copied())
+                        .collect();
+                    up_data = (0..*k)
+                        .flat_map(|r| {
+                            data[r * fused_cols + *n..r * fused_cols + 2 * *n]
+                                .iter()
+                                .copied()
+                        })
+                        .collect();
                 } else {
                     // Shape [2n, k]: rows 0..n = gate, rows n..2n = up
                     gate_data = data[..half_rows * fused_cols].to_vec();
@@ -1318,7 +1754,12 @@ fn load_weights_from_shards(
                 // Store up_proj for later named weight creation
                 // The down_proj node is 2 nodes after gate_proj in 7-node blocks
                 let down_node_id = *idx + 2;
-                fused_up_proj_data.push((down_node_id, up_data, if is_transposed { *k } else { *n }, if is_transposed { *n } else { *k }));
+                fused_up_proj_data.push((
+                    down_node_id,
+                    up_data,
+                    if is_transposed { *k } else { *n },
+                    if is_transposed { *n } else { *k },
+                ));
             }
         }
     }
@@ -1328,7 +1769,11 @@ fn load_weights_from_shards(
         all_raw.len(),
         shards.len(),
         t_extract.elapsed().as_secs_f64(),
-        if fused_up_proj_data.is_empty() { String::new() } else { format!(" ({} fused splits)", fused_up_proj_data.len()) },
+        if fused_up_proj_data.is_empty() {
+            String::new()
+        } else {
+            format!(" ({} fused splits)", fused_up_proj_data.len())
+        },
     );
 
     // Drop shard mmaps to free virtual memory before parallel processing
@@ -1395,13 +1840,16 @@ fn load_weights_from_shards(
         }
         let (quantized, _params) = crate::gadgets::quantize::quantize_tensor(&transposed, strategy);
         let up_matrix = M31Matrix {
-            rows: *cols,   // in_features
-            cols: *rows,   // out_features
+            rows: *cols, // in_features
+            cols: *rows, // out_features
             data: quantized,
         };
         weights.add_named_weight(*down_node_id, "up_proj", up_matrix);
         loaded_count += 1;
-        eprintln!("  Stored fused up_proj for down_proj node {} ({}×{})", down_node_id, cols, rows);
+        eprintln!(
+            "  Stored fused up_proj for down_proj node {} ({}×{})",
+            down_node_id, cols, rows
+        );
     }
 
     // ── Phase 3: Load norm γ weights (1D vectors, stored as named weights) ──
@@ -1416,8 +1864,8 @@ fn load_weights_from_shards(
         // Re-open shards for gamma loading (lightweight — 1D vectors are small)
         let mut gamma_shards: Vec<memmap2::Mmap> = Vec::new();
         for path in shard_paths {
-            let file = std::fs::File::open(path)
-                .map_err(|e| WeightError::IoError(e.to_string()))?;
+            let file =
+                std::fs::File::open(path).map_err(|e| WeightError::IoError(e.to_string()))?;
             let mmap = unsafe { memmap2::Mmap::map(&file) }
                 .map_err(|e| WeightError::IoError(e.to_string()))?;
             gamma_shards.push(mmap);
@@ -1438,7 +1886,8 @@ fn load_weights_from_shards(
                 let dim = data.len();
 
                 // Quantize γ to M31 (same strategy as other weights)
-                let (quantized, _params) = crate::gadgets::quantize::quantize_tensor(&data, strategy);
+                let (quantized, _params) =
+                    crate::gadgets::quantize::quantize_tensor(&data, strategy);
 
                 // Store as a named weight "gamma" for this norm node
                 let gamma_matrix = M31Matrix {
@@ -1468,8 +1917,8 @@ fn load_weights_from_shards(
     if !up_proj_entries.is_empty() {
         let mut up_shards: Vec<memmap2::Mmap> = Vec::new();
         for path in shard_paths {
-            let file = std::fs::File::open(path)
-                .map_err(|e| WeightError::IoError(e.to_string()))?;
+            let file =
+                std::fs::File::open(path).map_err(|e| WeightError::IoError(e.to_string()))?;
             let mmap = unsafe { memmap2::Mmap::map(&file) }
                 .map_err(|e| WeightError::IoError(e.to_string()))?;
             up_shards.push(mmap);
@@ -1487,7 +1936,11 @@ fn load_weights_from_shards(
 
                 let data = tensor_to_f32(tensor.data(), tensor.dtype());
                 let shape = tensor.shape();
-                let (rows, cols) = if shape.len() == 2 { (shape[0], shape[1]) } else { (data.len(), 1) };
+                let (rows, cols) = if shape.len() == 2 {
+                    (shape[0], shape[1])
+                } else {
+                    (data.len(), 1)
+                };
 
                 // HF stores weights as (out_features, in_features).
                 // For input × W_up, we need W_up as (in_features, out_features).
@@ -1499,10 +1952,11 @@ fn load_weights_from_shards(
                     }
                 }
 
-                let (quantized, _params) = crate::gadgets::quantize::quantize_tensor(&transposed, strategy);
+                let (quantized, _params) =
+                    crate::gadgets::quantize::quantize_tensor(&transposed, strategy);
                 let up_matrix = M31Matrix {
-                    rows: cols,   // in_features
-                    cols: rows,   // out_features
+                    rows: cols, // in_features
+                    cols: rows, // out_features
                     data: quantized,
                 };
                 weights.add_named_weight(*node_id, "up_proj", up_matrix);
@@ -1534,7 +1988,10 @@ pub fn load_moe_weight_banks(
     name_map: &HashMap<usize, String>,
     moe_infos: &[(usize, crate::compiler::graph::MoESlotInfo)],
     strategy: QuantStrategy,
-) -> Result<Vec<(usize, crate::compiler::graph::MoEWeightBank)>, crate::compiler::quantize_weights::WeightError> {
+) -> Result<
+    Vec<(usize, crate::compiler::graph::MoEWeightBank)>,
+    crate::compiler::quantize_weights::WeightError,
+> {
     use crate::compiler::quantize_weights::WeightError;
 
     if moe_infos.is_empty() {
@@ -1545,7 +2002,8 @@ pub fn load_moe_weight_banks(
     let mut shard_mmaps: Vec<memmap2::Mmap> = Vec::new();
     for path in shard_paths {
         let file = std::fs::File::open(path).map_err(|e| WeightError::IoError(e.to_string()))?;
-        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| WeightError::IoError(e.to_string()))?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }
+            .map_err(|e| WeightError::IoError(e.to_string()))?;
         shard_mmaps.push(mmap);
     }
 
@@ -1562,16 +2020,27 @@ pub fn load_moe_weight_banks(
 
             let load_tensor = |key: usize| -> Result<M31Matrix, WeightError> {
                 let tensor_name = name_map.get(&key).ok_or_else(|| {
-                    WeightError::IoError(format!("MoE tensor key {} not in name_map (layer={}, expert={})", key, layer_idx, expert_idx))
+                    WeightError::IoError(format!(
+                        "MoE tensor key {} not in name_map (layer={}, expert={})",
+                        key, layer_idx, expert_idx
+                    ))
                 })?;
 
                 for mmap in &shard_mmaps {
-                    let Ok(tensors) = safetensors::SafeTensors::deserialize(mmap) else { continue };
-                    let Ok(tensor) = tensors.tensor(tensor_name) else { continue };
+                    let Ok(tensors) = safetensors::SafeTensors::deserialize(mmap) else {
+                        continue;
+                    };
+                    let Ok(tensor) = tensors.tensor(tensor_name) else {
+                        continue;
+                    };
 
                     let data = tensor_to_f32(tensor.data(), tensor.dtype());
                     let shape = tensor.shape();
-                    let (rows, cols) = if shape.len() == 2 { (shape[0], shape[1]) } else { (data.len(), 1) };
+                    let (rows, cols) = if shape.len() == 2 {
+                        (shape[0], shape[1])
+                    } else {
+                        (data.len(), 1)
+                    };
 
                     // Transpose: HF (out_features, in_features) → matmul (in_features, out_features)
                     let mut transposed = vec![0.0f32; data.len()];
@@ -1580,17 +2049,29 @@ pub fn load_moe_weight_banks(
                             transposed[c * rows + r] = data[r * cols + c];
                         }
                     }
-                    let (quantized, _) = crate::gadgets::quantize::quantize_tensor(&transposed, strategy);
-                    return Ok(M31Matrix { rows: cols, cols: rows, data: quantized });
+                    let (quantized, _) =
+                        crate::gadgets::quantize::quantize_tensor(&transposed, strategy);
+                    return Ok(M31Matrix {
+                        rows: cols,
+                        cols: rows,
+                        data: quantized,
+                    });
                 }
-                Err(WeightError::IoError(format!("tensor '{}' not found in any shard", tensor_name)))
+                Err(WeightError::IoError(format!(
+                    "tensor '{}' not found in any shard",
+                    tensor_name
+                )))
             };
 
             let gate_proj = load_tensor(gate_key)?;
             let up_proj = load_tensor(up_key)?;
             let down_proj = load_tensor(down_key)?;
 
-            experts.push(crate::compiler::graph::MoEExpertWeights { gate_proj, up_proj, down_proj });
+            experts.push(crate::compiler::graph::MoEExpertWeights {
+                gate_proj,
+                up_proj,
+                down_proj,
+            });
         }
 
         let bank = crate::compiler::graph::MoEWeightBank {
@@ -1602,7 +2083,10 @@ pub fn load_moe_weight_banks(
             top_k: info.top_k,
         };
         banks.push((*layer_idx, bank));
-        eprintln!("  Loaded MoE weight bank: layer {}, {} experts × 3 matrices", layer_idx, info.num_experts);
+        eprintln!(
+            "  Loaded MoE weight bank: layer {}, {} experts × 3 matrices",
+            layer_idx, info.num_experts
+        );
     }
 
     Ok(banks)
@@ -1672,8 +2156,12 @@ pub fn build_hf_full_graph_with_options(
     }
     // Final norm (matching prefill graph)
     match config.norm_type {
-        NormType::LayerNorm => { builder.layer_norm(); }
-        NormType::RMSNorm => { builder.rms_norm(); }
+        NormType::LayerNorm => {
+            builder.layer_norm();
+        }
+        NormType::RMSNorm => {
+            builder.rms_norm();
+        }
     }
     builder.build()
 }
@@ -1710,14 +2198,16 @@ fn build_decode_weight_name_map(
                 let candidates = |suffix: &str| -> Vec<String> {
                     vec![
                         format!("model.layers.{layer_idx}.self_attn.{suffix}.weight"),
-                        format!("model.layers.{layer_idx}.attention.{}.weight",
+                        format!(
+                            "model.layers.{layer_idx}.attention.{}.weight",
                             match suffix {
                                 "q_proj" => "wq",
                                 "k_proj" => "wk",
                                 "v_proj" => "wv",
                                 "o_proj" => "wo",
                                 _ => suffix,
-                            }),
+                            }
+                        ),
                         format!("transformer.h.{layer_idx}.attn.{suffix}.weight"),
                     ]
                 };
@@ -1747,7 +2237,10 @@ fn build_decode_weight_name_map(
                         format!("model.layers.{layer_idx}.feed_forward.w1.weight"),
                         format!("transformer.h.{layer_idx}.mlp.up_proj.weight"),
                     ];
-                    up_candidates.iter().find(|n| tensor_set.contains(n.as_str())).cloned()
+                    up_candidates
+                        .iter()
+                        .find(|n| tensor_set.contains(n.as_str()))
+                        .cloned()
                 } else {
                     // FFN down projection
                     let down_candidates = [
@@ -1755,7 +2248,10 @@ fn build_decode_weight_name_map(
                         format!("model.layers.{layer_idx}.feed_forward.w2.weight"),
                         format!("transformer.h.{layer_idx}.mlp.down_proj.weight"),
                     ];
-                    down_candidates.iter().find(|n| tensor_set.contains(n.as_str())).cloned()
+                    down_candidates
+                        .iter()
+                        .find(|n| tensor_set.contains(n.as_str()))
+                        .cloned()
                 };
                 if let Some(name) = tensor_name {
                     matmul_map.insert(idx, name);
@@ -1798,23 +2294,33 @@ pub fn load_hf_model_full(
     let hf_config = HfConfig::from_file(&config_path)?;
     let transformer_config = hf_config.to_transformer_config();
     let layers = num_layers.unwrap_or(hf_config.num_hidden_layers);
-    let layers = if layers == 0 { hf_config.num_hidden_layers } else { layers };
+    let layers = if layers == 0 {
+        hf_config.num_hidden_layers
+    } else {
+        layers
+    };
 
-    eprintln!("Model (full attention, seq_len={}): {} ({})",
-        seq_len, hf_config.model_type, model_dir.display());
+    eprintln!(
+        "Model (full attention, seq_len={}): {} ({})",
+        seq_len,
+        hf_config.model_type,
+        model_dir.display()
+    );
     eprintln!(
         "  hidden_size={}, heads={}/{} (q/kv), ff={}, layers={}/{}",
-        hf_config.hidden_size, hf_config.num_attention_heads,
-        hf_config.num_key_value_heads, hf_config.intermediate_size,
-        layers, hf_config.num_hidden_layers,
+        hf_config.hidden_size,
+        hf_config.num_attention_heads,
+        hf_config.num_key_value_heads,
+        hf_config.intermediate_size,
+        layers,
+        hf_config.num_hidden_layers,
     );
 
     // Include embedding node for LogUp proof of token→embedding lookup.
     // The 151K×896 embedding table is large (136M elements) but the Merkle
     // root is computed once and cached. Subsequent runs are instant.
-    let graph = build_hf_full_graph_with_options(
-        &transformer_config, &hf_config, layers, seq_len, true,
-    );
+    let graph =
+        build_hf_full_graph_with_options(&transformer_config, &hf_config, layers, seq_len, true);
 
     // Use the decode weight mapping (which handles Q/K/V/O + FFN)
     let shard_paths = discover_shards(model_dir, "model")
@@ -1827,7 +2333,8 @@ pub fn load_hf_model_full(
         build_decode_weight_name_map(&graph, layers, &all_tensor_names);
     eprintln!(
         "  Weight mapping: {} MatMul + {} Attention entries (all {} weight matrices)",
-        matmul_map.len(), attention_map.len(),
+        matmul_map.len(),
+        attention_map.len(),
         matmul_map.len() + attention_map.len(),
     );
 
@@ -1841,7 +2348,8 @@ pub fn load_hf_model_full(
     for (_, _, name) in &attention_map {
         for (si, sp) in shard_paths.iter().enumerate() {
             let file = std::fs::File::open(sp).map_err(|e| OnnxError::IoError(e.to_string()))?;
-            let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| OnnxError::IoError(e.to_string()))?;
+            let mmap = unsafe { memmap2::Mmap::map(&file) }
+                .map_err(|e| OnnxError::IoError(e.to_string()))?;
             let tensors = safetensors::SafeTensors::deserialize(&mmap)
                 .map_err(|e| OnnxError::WeightError(e.to_string()))?;
             if tensors.tensor(name).is_ok() {
@@ -1875,7 +2383,10 @@ pub fn load_hf_model_full(
                         // Transpose: safetensors stores (out_features, in_features)
                         // but matmul expects (in_features, out_features) for input × W
                         let (raw_matrix, _) = quantize_weight_matrix(
-                            &data_f32, shape[0], shape[1], QuantStrategy::Symmetric8,
+                            &data_f32,
+                            shape[0],
+                            shape[1],
+                            QuantStrategy::Symmetric8,
                         );
                         // Transpose (out_feat, in_feat) → (in_feat, out_feat)
                         let mut transposed = M31Matrix::new(shape[1], shape[0]);
@@ -1894,7 +2405,9 @@ pub fn load_hf_model_full(
     // Load embedding table for the Embedding node (if present in graph).
     // The table is 136M elements — first load is slow but the weight commitment
     // cache handles subsequent runs instantly.
-    let embed_node_id = graph.nodes.iter()
+    let embed_node_id = graph
+        .nodes
+        .iter()
         .find(|n| matches!(&n.op, GraphOp::Embedding { .. }))
         .map(|n| n.id);
 
@@ -1902,8 +2415,7 @@ pub fn load_hf_model_full(
         eprintln!("  Loading embedding table for LogUp proof...");
         // Load the full embedding table (vocab_size × hidden_size)
         for sp in &shard_paths {
-            let file = std::fs::File::open(sp)
-                .map_err(|e| OnnxError::IoError(e.to_string()))?;
+            let file = std::fs::File::open(sp).map_err(|e| OnnxError::IoError(e.to_string()))?;
             let mmap = unsafe { memmap2::Mmap::map(&file) }
                 .map_err(|e| OnnxError::IoError(e.to_string()))?;
             let tensors = safetensors::SafeTensors::deserialize(&mmap)
@@ -1915,7 +2427,10 @@ pub fn load_hf_model_full(
                     if shape.len() == 2 {
                         let data_f32 = tensor_to_f32(tensor.data(), tensor.dtype());
                         let (matrix, _) = quantize_weight_matrix(
-                            &data_f32, shape[0], shape[1], QuantStrategy::Symmetric8,
+                            &data_f32,
+                            shape[0],
+                            shape[1],
+                            QuantStrategy::Symmetric8,
                         );
                         weights.add_weight(embed_id, matrix);
                         eprintln!(
@@ -1934,8 +2449,16 @@ pub fn load_hf_model_full(
 
     eprintln!("  All weights loaded (FFN + Attention + Embedding) ✓");
 
-    let num_params: usize = weights.weights.iter().map(|(_, w)| w.rows * w.cols).sum::<usize>()
-        + weights.named_weights.iter().map(|(_, _, w)| w.rows * w.cols).sum::<usize>();
+    let num_params: usize = weights
+        .weights
+        .iter()
+        .map(|(_, w)| w.rows * w.cols)
+        .sum::<usize>()
+        + weights
+            .named_weights
+            .iter()
+            .map(|(_, _, w)| w.rows * w.cols)
+            .sum::<usize>();
     let metadata = crate::compiler::onnx::ModelMetadata {
         name: format!("{}_{}L_full", hf_config.model_type, layers),
         num_parameters: num_params,
@@ -1984,9 +2507,17 @@ pub fn load_hf_model_decode(
     let transformer_config = hf_config.to_transformer_config();
 
     let layers = num_layers.unwrap_or(hf_config.num_hidden_layers);
-    let layers = if layers == 0 { hf_config.num_hidden_layers } else { layers };
+    let layers = if layers == 0 {
+        hf_config.num_hidden_layers
+    } else {
+        layers
+    };
 
-    eprintln!("Model (decode): {} ({})", hf_config.model_type, model_dir.display());
+    eprintln!(
+        "Model (decode): {} ({})",
+        hf_config.model_type,
+        model_dir.display()
+    );
     eprintln!(
         "  hidden_size={}, heads={}/{} (q/kv), ff={}, layers={}/{}",
         hf_config.hidden_size,
@@ -2065,7 +2596,11 @@ pub fn load_hf_model_decode(
 
         // Attention weight shape: [out_features, in_features]
         // Quantize and store as named weight
-        let (rows, cols) = if shape.len() == 2 { (shape[0], shape[1]) } else { (1, data.len()) };
+        let (rows, cols) = if shape.len() == 2 {
+            (shape[0], shape[1])
+        } else {
+            (1, data.len())
+        };
         let (matrix, _) = quantize_weight_matrix(&data, cols, rows, QuantStrategy::Symmetric8);
         weights.add_named_weight(*node_id, key_name, matrix);
         attn_loaded += 1;
@@ -2212,7 +2747,11 @@ pub fn load_embedding_row(
                 if std::env::var("OBELYZK_VERBOSE").ok().as_deref() == Some("1") {
                     eprintln!(
                         "  Embedding row {}: extracted from '{}' ({}x{} table, {} dtype)",
-                        token_id, name, vocab_size, embed_dim, bw * 8,
+                        token_id,
+                        name,
+                        vocab_size,
+                        embed_dim,
+                        bw * 8,
                     );
                 }
                 return Ok((matrix, vocab_size));
@@ -2333,7 +2872,8 @@ pub fn project_to_logits(
         .map_err(|e| OnnxError::WeightError(format!("Cannot discover shards: {e}")))?;
 
     // Try lm_head.weight first, then fall back to tied embedding weights
-    let all_candidates: Vec<&str> = LM_HEAD_CANDIDATES.iter()
+    let all_candidates: Vec<&str> = LM_HEAD_CANDIDATES
+        .iter()
         .chain(EMBED_CANDIDATES.iter())
         .copied()
         .collect();
@@ -2349,14 +2889,20 @@ pub fn project_to_logits(
         for &name in &all_candidates {
             if let Ok(tensor) = tensors.tensor(name) {
                 let shape = tensor.shape();
-                if shape.len() != 2 { continue; }
+                if shape.len() != 2 {
+                    continue;
+                }
                 let vocab_size = shape[0];
                 let embed_dim = shape[1];
-                if embed_dim != d_model { continue; }
+                if embed_dim != d_model {
+                    continue;
+                }
 
                 // Dequantize hidden state from M31 → f32
                 let scale = 127.0_f32;
-                let hidden_f32: Vec<f32> = hidden_state.data.iter()
+                let hidden_f32: Vec<f32> = hidden_state
+                    .data
+                    .iter()
                     .take(d_model)
                     .map(|m| m.0 as f32 / scale)
                     .collect();
@@ -2445,6 +2991,174 @@ mod tests {
     }
 
     #[test]
+    fn test_hf_config_parse_nested_qwen35_moe() {
+        let json = r#"{
+            "model_type": "qwen3_5_moe",
+            "text_config": {
+                "model_type": "qwen3_5_moe_text",
+                "hidden_size": 2048,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 2,
+                "head_dim": 256,
+                "moe_intermediate_size": 512,
+                "shared_expert_intermediate_size": 512,
+                "linear_key_head_dim": 128,
+                "linear_value_head_dim": 128,
+                "linear_num_key_heads": 16,
+                "linear_num_value_heads": 32,
+                "linear_conv_kernel_dim": 4,
+                "attn_output_gate": true,
+                "layer_types": [
+                    "linear_attention",
+                    "linear_attention",
+                    "linear_attention",
+                    "full_attention"
+                ],
+                "num_hidden_layers": 40,
+                "num_experts": 256,
+                "num_experts_per_tok": 8,
+                "vocab_size": 248320,
+                "hidden_act": "silu",
+                "max_position_embeddings": 262144
+            }
+        }"#;
+
+        let tmp = std::env::temp_dir().join("test_qwen35_config.json");
+        std::fs::write(&tmp, json).unwrap();
+
+        let config = HfConfig::from_file(&tmp).unwrap();
+        assert_eq!(config.model_type, "qwen3_5_moe");
+        assert_eq!(config.hidden_size, 2048);
+        assert_eq!(config.num_attention_heads, 16);
+        assert_eq!(config.num_key_value_heads, 2);
+        assert_eq!(config.head_dim, 256);
+        assert_eq!(config.intermediate_size, 512);
+        assert_eq!(config.num_hidden_layers, 40);
+        assert_eq!(config.num_experts, 256);
+        assert_eq!(config.num_experts_per_tok, 8);
+        assert_eq!(config.layer_types.len(), 4);
+        assert_eq!(config.moe_intermediate_size, Some(512));
+        assert_eq!(config.shared_expert_intermediate_size, Some(512));
+        assert_eq!(config.linear_key_head_dim, Some(128));
+        assert_eq!(config.linear_value_head_dim, Some(128));
+        assert_eq!(config.linear_num_key_heads, Some(16));
+        assert_eq!(config.linear_num_value_heads, Some(32));
+        assert_eq!(config.linear_conv_kernel_dim, Some(4));
+        assert!(config.attn_output_gate);
+        let summary = config.qwen35_architecture_summary().unwrap();
+        assert!(summary.contains("4 layer_types"));
+        assert!(summary.contains("3 linear_attention"));
+        assert!(summary.contains("1 full_attention"));
+
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn qwen35_typed_safetensors_inventory_loads_manifest_weights() {
+        let cfg = HfConfig {
+            model_type: "qwen3_5_moe".to_string(),
+            hidden_size: 4,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            intermediate_size: 4,
+            num_hidden_layers: 1,
+            vocab_size: 16,
+            hidden_act: "silu".to_string(),
+            max_position_embeddings: 128,
+            head_dim: 2,
+            num_experts: 2,
+            num_experts_per_tok: 1,
+            layer_types: vec!["linear_attention".to_string()],
+            moe_intermediate_size: Some(4),
+            shared_expert_intermediate_size: Some(4),
+            linear_key_head_dim: Some(1),
+            linear_value_head_dim: Some(2),
+            linear_num_key_heads: Some(1),
+            linear_num_value_heads: Some(2),
+            linear_conv_kernel_dim: Some(3),
+            attn_output_gate: true,
+        };
+
+        fn f32_bytes(values: &[f32]) -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect()
+        }
+
+        let tmp = std::env::temp_dir().join("obelyzk_qwen35_typed_safetensors_inventory");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let conv_values = (0..18).map(|idx| idx as f32 + 1.0).collect::<Vec<_>>();
+        let a_log_values = vec![0.25f32, 0.5];
+        let dt_bias_values = vec![0.75f32, 1.0];
+        let norm_values = vec![1.25f32, 1.5];
+        let conv_bytes = f32_bytes(&conv_values);
+        let a_log_bytes = f32_bytes(&a_log_values);
+        let dt_bias_bytes = f32_bytes(&dt_bias_values);
+        let norm_bytes = f32_bytes(&norm_values);
+
+        let mut tensors = std::collections::HashMap::new();
+        tensors.insert(
+            "model.language_model.layers.0.linear_attn.conv1d.weight".to_string(),
+            safetensors::tensor::TensorView::new(
+                safetensors::Dtype::F32,
+                vec![6, 1, 3],
+                &conv_bytes,
+            )
+            .unwrap(),
+        );
+        tensors.insert(
+            "model.language_model.layers.0.linear_attn.A_log".to_string(),
+            safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![2], &a_log_bytes)
+                .unwrap(),
+        );
+        tensors.insert(
+            "model.language_model.layers.0.linear_attn.dt_bias".to_string(),
+            safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![2], &dt_bias_bytes)
+                .unwrap(),
+        );
+        tensors.insert(
+            "model.language_model.layers.0.linear_attn.norm.weight".to_string(),
+            safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![2], &norm_bytes)
+                .unwrap(),
+        );
+        let serialized = safetensors::serialize(&tensors, &None).unwrap();
+        let shard_path = tmp.join("model.safetensors");
+        std::fs::write(&shard_path, serialized).unwrap();
+
+        let inventory =
+            load_qwen35_typed_safetensors_inventory(&[shard_path], &cfg, 2, QuantStrategy::Direct)
+                .unwrap();
+        assert_eq!(inventory.runtime.len(), 0);
+        assert_eq!(inventory.safetensors.len(), 4);
+        assert_eq!(inventory.conversation_state.len(), 0);
+        assert_eq!(inventory.statement.len(), 0);
+
+        match inventory
+            .safetensors
+            .get("model.language_model.layers.0.linear_attn.conv1d.weight")
+            .unwrap()
+        {
+            crate::compiler::qwen35::Qwen35TypedWitnessCapturedValue::Vector(values) => {
+                assert_eq!(values.len(), 18);
+            }
+            other => panic!("unexpected conv1d typed value: {other:?}"),
+        }
+        match inventory
+            .safetensors
+            .get("model.language_model.layers.0.linear_attn.A_log")
+            .unwrap()
+        {
+            crate::compiler::qwen35::Qwen35TypedWitnessCapturedValue::Vector(values) => {
+                assert_eq!(values.len(), 2);
+            }
+            other => panic!("unexpected A_log typed value: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_build_hf_transformer_graph() {
         let config = TransformerConfig {
             d_model: 8,
@@ -2492,9 +3206,7 @@ mod tests {
         let vocab_size = 8;
         let hidden_size = 4;
         // Row-major: row i = [i*4, i*4+1, i*4+2, i*4+3] as f32
-        let data: Vec<f32> = (0..(vocab_size * hidden_size))
-            .map(|i| i as f32)
-            .collect();
+        let data: Vec<f32> = (0..(vocab_size * hidden_size)).map(|i| i as f32).collect();
         let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
 
         let mut tensors = std::collections::HashMap::new();
@@ -2538,12 +3250,8 @@ mod tests {
         let mut tensors = std::collections::HashMap::new();
         tensors.insert(
             "some.other.weight".to_string(),
-            safetensors::tensor::TensorView::new(
-                safetensors::Dtype::F32,
-                vec![4, 4],
-                &bytes,
-            )
-            .unwrap(),
+            safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![4, 4], &bytes)
+                .unwrap(),
         );
         let serialized = safetensors::serialize(&tensors, &None).unwrap();
         std::fs::write(tmp.join("model.safetensors"), &serialized).unwrap();

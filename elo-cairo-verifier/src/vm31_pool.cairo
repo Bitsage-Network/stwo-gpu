@@ -21,18 +21,16 @@
 // Gas amortization: Merkle tree updates are the expensive part (20 hashes per insert).
 // Chunking spreads this across multiple transactions (e.g., 50 inserts per chunk).
 
+use starknet::{ClassHash, ContractAddress};
+use crate::verifier::ISumcheckVerifierDispatcher;
 use crate::vm31_merkle::{
-    PackedDigest, packed_digest_zero, pack_m31x8, unpack_m31x8,
-    poseidon2_m31_compress_packed,
-    MERKLE_DEPTH,
+    MERKLE_DEPTH, PackedDigest, pack_m31x8, packed_digest_zero, poseidon2_m31_compress_packed,
+    unpack_m31x8,
 };
 use crate::vm31_verifier::{
-    BatchPublicInputs, DepositPublicInput, WithdrawPublicInput, SpendPublicInput,
-    verify_batch_public_inputs,
-    reconstruct_amount,
+    BatchPublicInputs, DepositPublicInput, SpendPublicInput, WithdrawPublicInput,
+    reconstruct_amount, verify_batch_public_inputs,
 };
-use crate::verifier::ISumcheckVerifierDispatcher;
-use starknet::{ContractAddress, ClassHash};
 
 // ============================================================================
 // ERC20 Interface (subset needed for custody)
@@ -42,10 +40,7 @@ use starknet::{ContractAddress, ClassHash};
 pub trait IERC20<TContractState> {
     fn transfer(ref self: TContractState, recipient: ContractAddress, amount: u256) -> bool;
     fn transfer_from(
-        ref self: TContractState,
-        sender: ContractAddress,
-        recipient: ContractAddress,
-        amount: u256,
+        ref self: TContractState, sender: ContractAddress, recipient: ContractAddress, amount: u256,
     ) -> bool;
     fn balance_of(self: @TContractState, account: ContractAddress) -> u256;
 }
@@ -83,20 +78,12 @@ pub trait IVM31Pool<TContractState> {
     // start: index of first transaction in this chunk
     // count: number of transactions to process in this chunk
     // Access: relayer-only before timeout; permissionless after timeout.
-    fn apply_batch_chunk(
-        ref self: TContractState,
-        batch_id: felt252,
-        start: u32,
-        count: u32,
-    );
+    fn apply_batch_chunk(ref self: TContractState, batch_id: felt252, start: u32, count: u32);
 
     // Step 3: Finalize the batch after all chunks are applied.
     // Verifies all transactions were processed and updates the canonical root.
     // Access: relayer-only before timeout; permissionless after timeout.
-    fn finalize_batch(
-        ref self: TContractState,
-        batch_id: felt252,
-    );
+    fn finalize_batch(ref self: TContractState, batch_id: felt252);
 
     // ── Direct Operations (single-tx, non-batched) ──
 
@@ -122,14 +109,10 @@ pub trait IVM31Pool<TContractState> {
     fn get_batch_total_txs(self: @TContractState, batch_id: felt252) -> u32;
     fn get_batch_processed_count(self: @TContractState, batch_id: felt252) -> u32;
     fn get_batch_withdrawal_binding(
-        self: @TContractState,
-        batch_id: felt252,
-        withdraw_idx: u32,
+        self: @TContractState, batch_id: felt252, withdraw_idx: u32,
     ) -> PackedDigest;
     fn get_batch_withdrawal_binding_felt(
-        self: @TContractState,
-        batch_id: felt252,
-        withdraw_idx: u32,
+        self: @TContractState, batch_id: felt252, withdraw_idx: u32,
     ) -> felt252;
     fn compute_withdrawal_binding_felt(
         self: @TContractState,
@@ -198,25 +181,21 @@ pub trait IVM31Pool<TContractState> {
 
 #[starknet::contract]
 pub mod VM31PoolContract {
-    use super::{
-        PackedDigest, packed_digest_zero, pack_m31x8, unpack_m31x8,
-        poseidon2_m31_compress_packed,
-        BatchPublicInputs, DepositPublicInput, WithdrawPublicInput, SpendPublicInput,
-        verify_batch_public_inputs,
-        reconstruct_amount,
-        ISumcheckVerifierDispatcher,
-        IERC20Dispatcher, IERC20DispatcherTrait,
-        MERKLE_DEPTH, UPGRADE_DELAY, DEFAULT_BATCH_TIMEOUT_BLOCKS,
-    };
-    use crate::verifier::ISumcheckVerifierDispatcherTrait;
-    use starknet::{
-        ClassHash, ContractAddress,
-        get_caller_address, get_block_number, get_block_timestamp, get_contract_address,
-    };
+    use core::poseidon::poseidon_hash_span;
     use starknet::storage::{
         Map, StoragePathEntry, StoragePointerReadAccess, StoragePointerWriteAccess,
     };
-    use core::poseidon::poseidon_hash_span;
+    use starknet::{
+        ClassHash, ContractAddress, get_block_number, get_block_timestamp, get_caller_address,
+        get_contract_address,
+    };
+    use crate::verifier::ISumcheckVerifierDispatcherTrait;
+    use super::{
+        BatchPublicInputs, DEFAULT_BATCH_TIMEOUT_BLOCKS, DepositPublicInput, IERC20Dispatcher,
+        IERC20DispatcherTrait, ISumcheckVerifierDispatcher, MERKLE_DEPTH, PackedDigest,
+        SpendPublicInput, UPGRADE_DELAY, WithdrawPublicInput, pack_m31x8, packed_digest_zero,
+        poseidon2_m31_compress_packed, reconstruct_amount, unpack_m31x8, verify_batch_public_inputs,
+    };
 
     // Batch status constants
     const BATCH_STATUS_NONE: u8 = 0;
@@ -247,7 +226,6 @@ pub mod VM31PoolContract {
         owner: ContractAddress,
         relayer: ContractAddress,
         verifier_contract: ContractAddress,
-
         // Merkle tree state
         merkle_root: PackedDigest,
         tree_size: u64,
@@ -258,18 +236,14 @@ pub mod VM31PoolContract {
         // Cached internal node hashes (level, index) → digest
         // Level 0 = leaf level, level MERKLE_DEPTH = root
         merkle_nodes: Map<(u32, u64), PackedDigest>,
-
         // Nullifier set
         nullifiers: Map<felt252, bool>,
-
         // Per-asset vault accounting
         asset_balances: Map<felt252, u64>,
-
         // Root history ring buffer
         root_history: Map<u32, PackedDigest>,
         root_history_index: u32,
         root_first_seen_seq: Map<felt252, u64>,
-
         // Batch state
         current_batch_id: felt252,
         batch_timeout_blocks: u64,
@@ -283,14 +257,12 @@ pub mod VM31PoolContract {
         batch_total_txs: Map<felt252, u32>,
         batch_processed_count: Map<felt252, u32>,
         batch_block: Map<felt252, u64>,
-
         // Batch deposit data (stored for chunk processing)
         batch_n_deposits: Map<felt252, u32>,
         batch_deposit_commitment: Map<(felt252, u32), PackedDigest>,
         batch_deposit_amount_lo: Map<(felt252, u32), u64>,
         batch_deposit_amount_hi: Map<(felt252, u32), u64>,
         batch_deposit_asset: Map<(felt252, u32), u64>,
-
         // Batch withdrawal data
         batch_n_withdrawals: Map<felt252, u32>,
         batch_withdraw_merkle_root: Map<(felt252, u32), PackedDigest>,
@@ -299,10 +271,10 @@ pub mod VM31PoolContract {
         batch_withdraw_amount_hi: Map<(felt252, u32), u64>,
         batch_withdraw_asset: Map<(felt252, u32), u64>,
         batch_withdraw_binding: Map<(felt252, u32), PackedDigest>,
-        // v1/v2 note: `batch_withdraw_recipient` remains the payout recipient for storage-key compatibility.
+        // v1/v2 note: `batch_withdraw_recipient` remains the payout recipient for storage-key
+        // compatibility.
         batch_withdraw_recipient: Map<(felt252, u32), ContractAddress>,
         batch_withdraw_credit_recipient: Map<(felt252, u32), ContractAddress>,
-
         // Batch spend data
         batch_n_spends: Map<felt252, u32>,
         batch_spend_merkle_root: Map<(felt252, u32), PackedDigest>,
@@ -310,30 +282,23 @@ pub mod VM31PoolContract {
         batch_spend_nullifier_1: Map<(felt252, u32), PackedDigest>,
         batch_spend_output_0: Map<(felt252, u32), PackedDigest>,
         batch_spend_output_1: Map<(felt252, u32), PackedDigest>,
-
         // Pending Merkle root during batch application
         batch_pending_root: Map<felt252, PackedDigest>,
         batch_pending_tree_size: Map<felt252, u64>,
-
         // Asset registry: internal asset_id <-> ERC20 token contract
         next_asset_id: u64,
         asset_token: Map<felt252, ContractAddress>,
         token_asset: Map<ContractAddress, felt252>,
-
         // Reentrancy guard
         reentrancy_locked: bool,
-
         // Timelocked upgradability
         pending_upgrade: ClassHash,
         upgrade_proposed_at: u64,
-
         // Emergency pause
         paused: bool,
-
         // Timelocked verifier change
         pending_verifier: ContractAddress,
         verifier_change_proposed_at: u64,
-
         // Timelocked kill-switch for legacy V1 withdrawal bindings
         v1_bindings_enabled: bool,
         v1_disable_proposed_at: u64,
@@ -544,7 +509,6 @@ pub mod VM31PoolContract {
 
     #[abi(embed_v0)]
     impl VM31PoolImpl of super::IVM31Pool<ContractState> {
-
         // Step 1: Submit batch proof
         fn submit_batch_proof(
             ref self: ContractState,
@@ -573,30 +537,21 @@ pub mod VM31PoolContract {
             let verifier_addr_felt: felt252 = verifier_addr.into();
             assert!(verifier_addr_felt != 0, "VM31: verifier contract not set");
             let verifier = ISumcheckVerifierDispatcher { contract_address: verifier_addr };
-            assert!(
-                verifier.is_proof_verified(proof_stark_hash),
-                "VM31: proof hash not verified"
-            );
+            assert!(verifier.is_proof_verified(proof_stark_hash), "VM31: proof hash not verified");
 
             let n_dep = deposits.len();
             let n_wit = withdrawals.len();
             let n_spe = spends.len();
             let total = n_dep + n_wit + n_spe;
             assert!(total > 0, "VM31: empty batch");
-            assert!(
-                payout_recipients.len() == n_wit,
-                "VM31: payout_recipients length mismatch"
-            );
-            assert!(
-                credit_recipients.len() == n_wit,
-                "VM31: credit_recipients length mismatch"
-            );
+            assert!(payout_recipients.len() == n_wit, "VM31: payout_recipients length mismatch");
+            assert!(credit_recipients.len() == n_wit, "VM31: credit_recipients length mismatch");
             let committed_public_hash = verifier.get_vm31_public_hash(proof_stark_hash);
 
             // Generate batch ID
             let nonce = self.next_batch_nonce.read();
             let batch_id = poseidon_hash_span(
-                array![nonce.into(), proof_stark_hash, caller.into()].span()
+                array![nonce.into(), proof_stark_hash, caller.into()].span(),
             );
             self.next_batch_nonce.write(nonce + 1);
 
@@ -636,7 +591,7 @@ pub mod VM31PoolContract {
                 self.batch_deposit_amount_hi.entry((batch_id, i)).write(*dep.amount_hi);
                 self.batch_deposit_asset.entry((batch_id, i)).write(*dep.asset_id);
                 i += 1;
-            };
+            }
 
             // Store withdrawal data
             self.batch_n_withdrawals.entry(batch_id).write(n_wit);
@@ -670,27 +625,23 @@ pub mod VM31PoolContract {
                     i,
                 );
                 let expected_binding_v1 = compute_withdrawal_binding_digest_v1(
-                    payout_recipient,
-                    (*wit.asset_id).into(),
-                    *wit.amount_lo,
-                    *wit.amount_hi,
-                    i,
+                    payout_recipient, (*wit.asset_id).into(), *wit.amount_lo, *wit.amount_hi, i,
                 );
                 if *wit.withdrawal_binding != expected_binding_v2 {
                     assert!(self.v1_bindings_enabled.read(), "VM31: v1 bindings disabled");
                     assert!(
                         *wit.withdrawal_binding == expected_binding_v1,
-                        "VM31: withdrawal binding mismatch"
+                        "VM31: withdrawal binding mismatch",
                     );
                     assert!(
                         payout_recipient == credit_recipient,
-                        "VM31: v1 binding requires payout==credit"
+                        "VM31: v1 binding requires payout==credit",
                     );
                 }
                 self.batch_withdraw_recipient.entry((batch_id, i)).write(payout_recipient);
                 self.batch_withdraw_credit_recipient.entry((batch_id, i)).write(credit_recipient);
                 i += 1;
-            };
+            }
 
             // Store spend data
             self.batch_n_spends.entry(batch_id).write(n_spe);
@@ -706,31 +657,29 @@ pub mod VM31PoolContract {
                 self.batch_spend_output_0.entry((batch_id, i)).write(*spe.output_commitment_0);
                 self.batch_spend_output_1.entry((batch_id, i)).write(*spe.output_commitment_1);
                 i += 1;
-            };
+            }
 
             // Initialize pending tree state from current
             self.batch_pending_root.entry(batch_id).write(self.merkle_root.read());
             self.batch_pending_tree_size.entry(batch_id).write(self.tree_size.read());
 
-            self.emit(BatchSubmitted {
-                batch_id,
-                submitter: caller,
-                n_deposits: n_dep,
-                n_withdrawals: n_wit,
-                n_spends: n_spe,
-                block_number: block,
-            });
+            self
+                .emit(
+                    BatchSubmitted {
+                        batch_id,
+                        submitter: caller,
+                        n_deposits: n_dep,
+                        n_withdrawals: n_wit,
+                        n_spends: n_spe,
+                        block_number: block,
+                    },
+                );
 
             batch_id
         }
 
         // Step 2: Apply a chunk of the batch
-        fn apply_batch_chunk(
-            ref self: ContractState,
-            batch_id: felt252,
-            start: u32,
-            count: u32,
-        ) {
+        fn apply_batch_chunk(ref self: ContractState, batch_id: felt252, start: u32, count: u32) {
             assert!(!self.paused.read(), "VM31: contract is paused");
             assert!(!self.reentrancy_locked.read(), "VM31: reentrant call");
             let caller = get_caller_address();
@@ -804,14 +753,18 @@ pub mod VM31PoolContract {
 
                     self.emit(NoteInserted { leaf_index: leaf_idx, commitment });
                     self.emit(DepositProcessed { commitment, amount, asset_id: asset_felt });
-
                 } else if idx < n_dep + n_wit {
                     // Process withdrawal: check nullifier, debit vault
                     let wit_idx = idx - n_dep;
-                    let merkle_root = self.batch_withdraw_merkle_root.entry((batch_id, wit_idx)).read();
+                    let merkle_root = self
+                        .batch_withdraw_merkle_root
+                        .entry((batch_id, wit_idx))
+                        .read();
                     assert!(
-                        InternalImpl::is_root_known_at_or_before(ref self, merkle_root, submit_root_seq),
-                        "VM31: unknown withdraw root"
+                        InternalImpl::is_root_known_at_or_before(
+                            ref self, merkle_root, submit_root_seq,
+                        ),
+                        "VM31: unknown withdraw root",
                     );
                     let nullifier = self.batch_withdraw_nullifier.entry((batch_id, wit_idx)).read();
                     let amount_lo = self.batch_withdraw_amount_lo.entry((batch_id, wit_idx)).read();
@@ -820,7 +773,9 @@ pub mod VM31PoolContract {
 
                     // Nullifier must not be spent
                     let nul_key = pack_digest_to_felt(nullifier);
-                    assert!(!self.nullifiers.entry(nul_key).read(), "VM31: nullifier already spent");
+                    assert!(
+                        !self.nullifiers.entry(nul_key).read(), "VM31: nullifier already spent",
+                    );
                     self.nullifiers.entry(nul_key).write(true);
 
                     // Debit asset vault + ERC20 transfer to stored recipient
@@ -844,25 +799,39 @@ pub mod VM31PoolContract {
 
                     self.emit(NullifierSpent { nullifier_hash: nul_key });
                     self.emit(WithdrawProcessed { nullifier, amount, asset_id: asset_felt });
-
                 } else {
                     // Process spend: check nullifiers + insert output commitments
                     let spe_idx = idx - n_dep - n_wit;
-                    let merkle_root = self.batch_spend_merkle_root.entry((batch_id, spe_idx)).read();
+                    let merkle_root = self
+                        .batch_spend_merkle_root
+                        .entry((batch_id, spe_idx))
+                        .read();
                     assert!(
-                        InternalImpl::is_root_known_at_or_before(ref self, merkle_root, submit_root_seq),
-                        "VM31: unknown spend root"
+                        InternalImpl::is_root_known_at_or_before(
+                            ref self, merkle_root, submit_root_seq,
+                        ),
+                        "VM31: unknown spend root",
                     );
-                    let nullifier_0 = self.batch_spend_nullifier_0.entry((batch_id, spe_idx)).read();
-                    let nullifier_1 = self.batch_spend_nullifier_1.entry((batch_id, spe_idx)).read();
+                    let nullifier_0 = self
+                        .batch_spend_nullifier_0
+                        .entry((batch_id, spe_idx))
+                        .read();
+                    let nullifier_1 = self
+                        .batch_spend_nullifier_1
+                        .entry((batch_id, spe_idx))
+                        .read();
                     let output_0 = self.batch_spend_output_0.entry((batch_id, spe_idx)).read();
                     let output_1 = self.batch_spend_output_1.entry((batch_id, spe_idx)).read();
 
                     // Both nullifiers must not be spent
                     let nul_key_0 = pack_digest_to_felt(nullifier_0);
                     let nul_key_1 = pack_digest_to_felt(nullifier_1);
-                    assert!(!self.nullifiers.entry(nul_key_0).read(), "VM31: nullifier 0 already spent");
-                    assert!(!self.nullifiers.entry(nul_key_1).read(), "VM31: nullifier 1 already spent");
+                    assert!(
+                        !self.nullifiers.entry(nul_key_0).read(), "VM31: nullifier 0 already spent",
+                    );
+                    assert!(
+                        !self.nullifiers.entry(nul_key_1).read(), "VM31: nullifier 1 already spent",
+                    );
                     self.nullifiers.entry(nul_key_0).write(true);
                     self.nullifiers.entry(nul_key_1).write(true);
 
@@ -887,7 +856,7 @@ pub mod VM31PoolContract {
                 }
 
                 idx += 1;
-            };
+            }
 
             // Update pending state
             self.batch_pending_tree_size.entry(batch_id).write(pending_tree_size);
@@ -898,19 +867,11 @@ pub mod VM31PoolContract {
             let pending_root = InternalImpl::compute_root(ref self, pending_tree_size);
             self.batch_pending_root.entry(batch_id).write(pending_root);
 
-            self.emit(BatchChunkApplied {
-                batch_id,
-                start,
-                count,
-                processed_total: new_processed,
-            });
+            self.emit(BatchChunkApplied { batch_id, start, count, processed_total: new_processed });
         }
 
         // Step 3: Finalize the batch
-        fn finalize_batch(
-            ref self: ContractState,
-            batch_id: felt252,
-        ) {
+        fn finalize_batch(ref self: ContractState, batch_id: felt252) {
             assert!(!self.paused.read(), "VM31: contract is paused");
             let caller = get_caller_address();
             let now_block = get_block_number();
@@ -942,12 +903,12 @@ pub mod VM31PoolContract {
             self.batch_status.entry(batch_id).write(BATCH_STATUS_FINALIZED);
             self.current_batch_id.write(0);
 
-            self.emit(BatchFinalized {
-                batch_id,
-                new_root,
-                new_tree_size: new_size,
-                total_txs: total,
-            });
+            self
+                .emit(
+                    BatchFinalized {
+                        batch_id, new_root, new_tree_size: new_size, total_txs: total,
+                    },
+                );
         }
 
         // Direct deposit (non-batched)
@@ -968,10 +929,7 @@ pub mod VM31PoolContract {
             let verifier_addr_felt: felt252 = verifier_addr.into();
             assert!(verifier_addr_felt != 0, "VM31: verifier contract not set");
             let verifier = ISumcheckVerifierDispatcher { contract_address: verifier_addr };
-            assert!(
-                verifier.is_proof_verified(proof_hash),
-                "VM31: proof hash not verified"
-            );
+            assert!(verifier.is_proof_verified(proof_hash), "VM31: proof hash not verified");
 
             // ERC20 custody: pull tokens from caller
             let token_addr = self.asset_token.entry(asset_id).read();
@@ -1047,17 +1005,13 @@ pub mod VM31PoolContract {
         }
 
         fn get_batch_withdrawal_binding(
-            self: @ContractState,
-            batch_id: felt252,
-            withdraw_idx: u32,
+            self: @ContractState, batch_id: felt252, withdraw_idx: u32,
         ) -> PackedDigest {
             self.batch_withdraw_binding.entry((batch_id, withdraw_idx)).read()
         }
 
         fn get_batch_withdrawal_binding_felt(
-            self: @ContractState,
-            batch_id: felt252,
-            withdraw_idx: u32,
+            self: @ContractState, batch_id: felt252, withdraw_idx: u32,
         ) -> felt252 {
             let binding = self.batch_withdraw_binding.entry((batch_id, withdraw_idx)).read();
             binding_digest_to_felt(binding)
@@ -1201,9 +1155,12 @@ pub mod VM31PoolContract {
             assert!(timeout_blocks >= 10, "VM31: timeout must be >= 10");
             let old_timeout = self.batch_timeout_blocks.read();
             self.batch_timeout_blocks.write(timeout_blocks);
-            self.emit(BatchTimeoutChanged {
-                old_timeout, new_timeout: timeout_blocks, changed_by: caller,
-            });
+            self
+                .emit(
+                    BatchTimeoutChanged {
+                        old_timeout, new_timeout: timeout_blocks, changed_by: caller,
+                    },
+                );
         }
 
         fn register_asset(ref self: ContractState, token_address: ContractAddress) -> felt252 {
@@ -1257,9 +1214,7 @@ pub mod VM31PoolContract {
             self.pending_verifier.write(new_verifier);
             self.verifier_change_proposed_at.write(now);
 
-            self.emit(VerifierChangeProposed {
-                new_verifier, proposed_at: now, proposer: caller,
-            });
+            self.emit(VerifierChangeProposed { new_verifier, proposed_at: now, proposer: caller });
         }
 
         fn execute_verifier_change(ref self: ContractState) {
@@ -1280,9 +1235,7 @@ pub mod VM31PoolContract {
             self.verifier_change_proposed_at.write(0);
             self.verifier_contract.write(new_verifier);
 
-            self.emit(VerifierChangeExecuted {
-                new_verifier, executed_at: now, executor: caller,
-            });
+            self.emit(VerifierChangeExecuted { new_verifier, executed_at: now, executor: caller });
         }
 
         fn cancel_verifier_change(ref self: ContractState) {
@@ -1297,9 +1250,10 @@ pub mod VM31PoolContract {
             self.pending_verifier.write(zero_addr);
             self.verifier_change_proposed_at.write(0);
 
-            self.emit(VerifierChangeCancelled {
-                cancelled_verifier: pending, cancelled_by: caller,
-            });
+            self
+                .emit(
+                    VerifierChangeCancelled { cancelled_verifier: pending, cancelled_by: caller },
+                );
         }
 
         // ── Timelocked V1 Binding Disable ──
@@ -1308,10 +1262,7 @@ pub mod VM31PoolContract {
             let caller = get_caller_address();
             assert!(caller == self.owner.read(), "VM31: owner only");
             assert!(self.v1_bindings_enabled.read(), "VM31: v1 bindings already disabled");
-            assert!(
-                self.v1_disable_proposed_at.read() == 0,
-                "VM31: v1 disable already pending"
-            );
+            assert!(self.v1_disable_proposed_at.read() == 0, "VM31: v1 disable already pending");
 
             let now = get_block_timestamp();
             self.v1_disable_proposed_at.write(now);
@@ -1356,9 +1307,12 @@ pub mod VM31PoolContract {
             self.pending_upgrade.write(new_class_hash);
             self.upgrade_proposed_at.write(now);
 
-            self.emit(UpgradeProposed {
-                new_class_hash, proposed_at: now, proposer: get_caller_address(),
-            });
+            self
+                .emit(
+                    UpgradeProposed {
+                        new_class_hash, proposed_at: now, proposer: get_caller_address(),
+                    },
+                );
         }
 
         fn execute_upgrade(ref self: ContractState) {
@@ -1375,9 +1329,12 @@ pub mod VM31PoolContract {
             self.pending_upgrade.write(0.try_into().unwrap());
             self.upgrade_proposed_at.write(0);
 
-            self.emit(UpgradeExecuted {
-                new_class_hash, executed_at: now, executor: get_caller_address(),
-            });
+            self
+                .emit(
+                    UpgradeExecuted {
+                        new_class_hash, executed_at: now, executor: get_caller_address(),
+                    },
+                );
 
             starknet::syscalls::replace_class_syscall(new_class_hash).unwrap();
         }
@@ -1391,9 +1348,12 @@ pub mod VM31PoolContract {
             self.pending_upgrade.write(0.try_into().unwrap());
             self.upgrade_proposed_at.write(0);
 
-            self.emit(UpgradeCancelled {
-                cancelled_class_hash: pending, cancelled_by: get_caller_address(),
-            });
+            self
+                .emit(
+                    UpgradeCancelled {
+                        cancelled_class_hash: pending, cancelled_by: get_caller_address(),
+                    },
+                );
         }
     }
 
@@ -1403,11 +1363,7 @@ pub mod VM31PoolContract {
     impl InternalImpl of InternalTrait {
         // Update the Merkle tree nodes along the path from a leaf to the root.
         // Uses a sparse representation: only non-empty nodes are stored.
-        fn update_merkle_path(
-            ref self: ContractState,
-            leaf_index: u64,
-            leaf_value: PackedDigest,
-        ) {
+        fn update_merkle_path(ref self: ContractState, leaf_index: u64, leaf_value: PackedDigest) {
             // Store at level 0
             self.merkle_nodes.entry((0, leaf_index)).write(leaf_value);
 
@@ -1458,9 +1414,7 @@ pub mod VM31PoolContract {
 
         // Root validity check bound by the root sequence at batch submission.
         fn is_root_known_at_or_before(
-            ref self: ContractState,
-            root: PackedDigest,
-            max_seq: u64,
+            ref self: ContractState, root: PackedDigest, max_seq: u64,
         ) -> bool {
             let key = pack_digest_to_felt(root);
             let seen = self.root_first_seen_seq.entry(key).read();
@@ -1489,14 +1443,10 @@ pub mod VM31PoolContract {
         let credit_recipient_felt: felt252 = credit_recipient.into();
         let binding_hash_felt = poseidon_hash_span(
             array![
-                WITHDRAW_BINDING_DOMAIN_V2,
-                payout_recipient_felt,
-                credit_recipient_felt,
-                asset_id,
-                amount_lo.into(),
-                amount_hi.into(),
-                withdraw_idx.into(),
-            ].span(),
+                WITHDRAW_BINDING_DOMAIN_V2, payout_recipient_felt, credit_recipient_felt, asset_id,
+                amount_lo.into(), amount_hi.into(), withdraw_idx.into(),
+            ]
+                .span(),
         );
         felt_to_binding_digest(binding_hash_felt)
     }
@@ -1514,13 +1464,10 @@ pub mod VM31PoolContract {
         let payout_recipient_felt: felt252 = payout_recipient.into();
         let binding_hash_felt = poseidon_hash_span(
             array![
-                WITHDRAW_BINDING_DOMAIN_V1,
-                payout_recipient_felt,
-                asset_id,
-                amount_lo.into(),
-                amount_hi.into(),
-                withdraw_idx.into(),
-            ].span(),
+                WITHDRAW_BINDING_DOMAIN_V1, payout_recipient_felt, asset_id, amount_lo.into(),
+                amount_hi.into(), withdraw_idx.into(),
+            ]
+                .span(),
         );
         felt_to_binding_digest(binding_hash_felt)
     }
@@ -1543,7 +1490,7 @@ pub mod VM31PoolContract {
             limbs.append(limb);
             x = x / U31_RADIX;
             i += 1;
-        };
+        }
         pack_m31x8(limbs.span())
     }
 
@@ -1563,7 +1510,7 @@ pub mod VM31PoolContract {
             acc += limb_felt * factor;
             factor *= radix;
             i += 1;
-        };
+        }
         acc
     }
 }

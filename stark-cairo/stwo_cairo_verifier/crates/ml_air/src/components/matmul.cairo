@@ -33,6 +33,6 @@ pub fn num_sumcheck_rounds(k: u32) -> u32 {
     while val < k {
         val = val * 2;
         log_k += 1;
-    };
+    }
     log_k
 }

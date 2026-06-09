@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# H200 Recursive ML Proof Pipeline
+# H100/H200 Recursive ML Proof Pipeline
 # ==================================
 # Full pipeline: GPU proof gen -> Cairo recursive verification -> Circle STARK proof
 #
 # Pipeline (two-step):
 #   Step A: prove-model (GPU, Rust)
-#     -> N matmul sumcheck proofs (Qwen3-14B blocks)
+#     -> N matmul sumcheck proofs (Qwen3.5-35B-A3B blocks)
 #     -> serialize as felt252 hex array (cairo_serde format)
 #     -> ml_proof.json
 #
@@ -18,14 +18,16 @@
 # Usage:
 #   ssh h200
 #   cd /path/to/bitsage-network/libs
-#   bash scripts/h200_recursive_pipeline.sh --layers 1 --model-dir ~/models/qwen3-14b
-#   bash scripts/h200_recursive_pipeline.sh --layers 40 --model-dir ~/models/qwen3-14b
-#   bash scripts/h200_recursive_pipeline.sh --skip-build --layers 1
+#   bash scripts/h200_recursive_pipeline.sh --layers all --model-dir ~/models/qwen3.5-35b-a3b
+#   bash scripts/h200_recursive_pipeline.sh --layers 40 --model-dir ~/models/qwen3.5-35b-a3b
+#   bash scripts/h200_recursive_pipeline.sh --skip-build --layers all
 #
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="${SCRIPT_DIR}/.."
+ENGINE_DIR="${REPO_DIR}/engine"
+STARK_CAIRO_DIR="${REPO_DIR}/stark-cairo"
 
 # Colors
 RED='\033[0;31m'
@@ -37,7 +39,7 @@ NC='\033[0m'
 
 # Defaults
 SKIP_BUILD=false
-NUM_LAYERS=1
+NUM_LAYERS=all
 MODEL_DIR=""
 ML_PROOF_OUTPUT="ml_proof.json"
 PROOF_OUTPUT="recursive_proof.json"
@@ -58,7 +60,7 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --layers N       Number of transformer blocks (default: 1)"
+            echo "  --layers N|all   Number of transformer blocks (default: all from config.json)"
             echo "  --model-dir PATH Path to HuggingFace model directory (SafeTensors)"
             echo "  --output PATH    Output recursive proof file (default: recursive_proof.json)"
             echo "  --ml-output PATH Output ML proof file (default: ml_proof.json)"
@@ -73,8 +75,8 @@ done
 
 echo -e "${CYAN}${BOLD}"
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║  Obelysk Protocol — H200 Recursive STARK Pipeline   ║"
-echo "║  Qwen3-14B -> Circle STARK Proof                    ║"
+echo "║  Obelysk Protocol — H100/H200 Recursive Pipeline    ║"
+echo "║  Qwen3.5-35B-A3B -> Circle STARK Proof              ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo -e "${NC}"
 echo "  Layers:      ${NUM_LAYERS}"
@@ -82,7 +84,21 @@ echo "  Model dir:   ${MODEL_DIR:-<not set>}"
 echo "  ML proof:    ${ML_PROOF_OUTPUT}"
 echo "  Recursive:   ${PROOF_OUTPUT}"
 echo "  GPU:         ${USE_GPU}"
+if [ "${NUM_LAYERS}" = "1" ]; then
+    echo -e "  ${YELLOW}WARNING: 1-layer mode is diagnostic only; production H100/H200 runs should use all layers.${NC}"
+fi
 echo ""
+
+case "${NUM_LAYERS}" in
+    all|full|0|"")
+        LAYER_ARG=""
+        LAYER_LABEL="all"
+        ;;
+    *)
+        LAYER_ARG="--layers ${NUM_LAYERS}"
+        LAYER_LABEL="${NUM_LAYERS}"
+        ;;
+esac
 
 # ----------------------------------------------------------------
 # Step 0: Environment checks
@@ -119,30 +135,30 @@ fi
 echo ""
 
 # ----------------------------------------------------------------
-# Step 1: Build prove-model (stwo-ml)
+# Step 1: Build prove-model (engine)
 # ----------------------------------------------------------------
 PROVE_MODEL_BIN=""
 
 if [ "$SKIP_BUILD" = false ]; then
-    echo -e "${YELLOW}[Step 1a] Building prove-model (stwo-ml + GPU)${NC}"
-    echo "  Directory: ${REPO_DIR}/stwo-ml"
+    echo -e "${YELLOW}[Step 1a] Building prove-model (engine + GPU)${NC}"
+    echo "  Directory: ${ENGINE_DIR}"
 
-    FEATURES="cli"
+    FEATURES="std,gpu,onnx,safetensors,model-loading,cli,audit"
     if [ "$USE_GPU" = true ] && command -v nvidia-smi &>/dev/null; then
-        FEATURES="cli,cuda-runtime"
+        FEATURES="${FEATURES},cuda-runtime"
         echo "  Features: ${FEATURES} (GPU enabled)"
     else
         echo "  Features: ${FEATURES} (CPU only)"
     fi
 
     (
-        cd "${REPO_DIR}/stwo-ml"
+        cd "${ENGINE_DIR}"
         cargo build --release --bin prove-model --features "${FEATURES}" 2>&1 | tail -5
     )
 
-    PROVE_MODEL_BIN=$(find "${REPO_DIR}/stwo-ml" -name "prove-model" -path "*/release/*" -type f 2>/dev/null | head -1)
+    PROVE_MODEL_BIN="${ENGINE_DIR}/target/release/prove-model"
 
-    if [ -n "$PROVE_MODEL_BIN" ]; then
+    if [ -f "$PROVE_MODEL_BIN" ]; then
         echo -e "  ${GREEN}prove-model built successfully${NC}"
         echo "  Binary: ${PROVE_MODEL_BIN}"
         echo "  Size: $(du -h "$PROVE_MODEL_BIN" | cut -f1)"
@@ -152,12 +168,12 @@ if [ "$SKIP_BUILD" = false ]; then
     fi
 else
     echo -e "${YELLOW}[Step 1a] Skipping prove-model build (--skip-build)${NC}"
-    PROVE_MODEL_BIN=$(find "${REPO_DIR}/stwo-ml" -name "prove-model" -path "*/release/*" -type f 2>/dev/null | head -1)
-    if [ -z "$PROVE_MODEL_BIN" ]; then
+    PROVE_MODEL_BIN="${ENGINE_DIR}/target/release/prove-model"
+    if [ ! -f "$PROVE_MODEL_BIN" ]; then
         # Also check workspace root
         PROVE_MODEL_BIN=$(find "${REPO_DIR}" -maxdepth 3 -name "prove-model" -path "*/release/*" -type f 2>/dev/null | head -1)
     fi
-    if [ -z "$PROVE_MODEL_BIN" ]; then
+    if [ -z "$PROVE_MODEL_BIN" ] || [ ! -f "$PROVE_MODEL_BIN" ]; then
         echo -e "${RED}  ERROR: prove-model not found. Run without --skip-build.${NC}"
         exit 1
     fi
@@ -168,19 +184,19 @@ echo ""
 # ----------------------------------------------------------------
 # Step 1b: Build cairo-prove
 # ----------------------------------------------------------------
-CAIRO_PROVE_BIN="${REPO_DIR}/stwo-cairo/cairo-prove/target/release/cairo-prove"
+CAIRO_PROVE_BIN="${STARK_CAIRO_DIR}/cairo-prove/target/release/cairo-prove"
 
 if [ "$SKIP_BUILD" = false ]; then
     echo -e "${YELLOW}[Step 1b] Building cairo-prove${NC}"
-    echo "  Directory: ${REPO_DIR}/stwo-cairo/cairo-prove"
+    echo "  Directory: ${STARK_CAIRO_DIR}/cairo-prove"
 
     (
-        cd "${REPO_DIR}/stwo-cairo/cairo-prove"
+        cd "${STARK_CAIRO_DIR}/cairo-prove"
         cargo build --release 2>&1 | tail -5
     ) || {
         echo -e "${YELLOW}  Build failed — trying with RUSTUP_TOOLCHAIN=nightly${NC}"
         (
-            cd "${REPO_DIR}/stwo-cairo/cairo-prove"
+            cd "${STARK_CAIRO_DIR}/cairo-prove"
             RUSTUP_TOOLCHAIN=nightly cargo build --release 2>&1 | tail -5
         )
     }
@@ -207,7 +223,7 @@ echo ""
 # ----------------------------------------------------------------
 # Step 2: Check/Build Cairo ML verifier executable
 # ----------------------------------------------------------------
-EXECUTABLE="${REPO_DIR}/stwo-cairo/stwo_cairo_verifier/target/dev/obelysk_ml_verifier.executable.json"
+EXECUTABLE="${STARK_CAIRO_DIR}/stwo_cairo_verifier/target/dev/obelysk_ml_verifier.executable.json"
 EXECUTABLE_ARTIFACT="${REPO_DIR}/artifacts/obelysk_ml_verifier.executable.json"
 
 echo -e "${YELLOW}[Step 2] Cairo ML verifier executable${NC}"
@@ -222,7 +238,7 @@ else
     echo "  Not found. Building with scarb..."
     if command -v scarb &>/dev/null; then
         (
-            cd "${REPO_DIR}/stwo-cairo/stwo_cairo_verifier"
+            cd "${STARK_CAIRO_DIR}/stwo_cairo_verifier"
             scarb build --package obelysk_ml_verifier 2>&1 | tail -3
         )
         if [ -f "$EXECUTABLE" ]; then
@@ -257,8 +273,8 @@ if [ -n "$MODEL_DIR" ]; then
         exit 1
     fi
 
-    # Quick validation via prove-model --validate
-    ${PROVE_MODEL_BIN} --model-dir "${MODEL_DIR}" --layers "${NUM_LAYERS}" --validate 2>&1 || {
+    # Quick validation via prove-model --validate. Omitting --layers means all config layers.
+    ${PROVE_MODEL_BIN} --model-dir "${MODEL_DIR}" ${LAYER_ARG} --validate 2>&1 || {
         echo -e "${RED}  ERROR: Model validation failed${NC}"
         exit 1
     }
@@ -274,29 +290,35 @@ echo ""
 echo -e "${CYAN}${BOLD}"
 echo "════════════════════════════════════════════════════════"
 echo "  PHASE 1: GPU ML PROOF GENERATION"
-echo "  Layers: ${NUM_LAYERS} | GPU: ${USE_GPU}"
+echo "  Layers: ${LAYER_LABEL} | GPU: ${USE_GPU}"
 echo "════════════════════════════════════════════════════════"
 echo -e "${NC}"
 
-PROVE_CMD="${PROVE_MODEL_BIN}"
-PROVE_CMD+=" --output ${ML_PROOF_OUTPUT}"
-PROVE_CMD+=" --format cairo_serde"
-PROVE_CMD+=" --model-id ${MODEL_ID}"
+PROVE_CMD=(
+    "${PROVE_MODEL_BIN}"
+    --output "${ML_PROOF_OUTPUT}"
+    --format cairo_serde
+    --model-id "${MODEL_ID}"
+)
 
 if [ -n "$MODEL_DIR" ]; then
-    PROVE_CMD+=" --model-dir ${MODEL_DIR}"
-    PROVE_CMD+=" --layers ${NUM_LAYERS}"
+    PROVE_CMD+=(--model-dir "${MODEL_DIR}")
+    if [ -n "${LAYER_ARG}" ]; then
+        PROVE_CMD+=(--layers "${NUM_LAYERS}")
+    fi
 fi
 
 if [ "$USE_GPU" = true ]; then
-    PROVE_CMD+=" --gpu"
+    PROVE_CMD+=(--gpu)
 fi
 
-echo "  Command: ${PROVE_CMD}"
+printf "  Command:"
+printf " %q" "${PROVE_CMD[@]}"
+echo ""
 echo ""
 
 PROVE_START=$(date +%s%N)
-eval ${PROVE_CMD}
+"${PROVE_CMD[@]}"
 PROVE_END=$(date +%s%N)
 PROVE_MS=$(( (PROVE_END - PROVE_START) / 1000000 ))
 PROVE_SEC=$(echo "scale=3; ${PROVE_MS}/1000" | bc)
@@ -321,16 +343,21 @@ echo "  ML proof -> Cairo VM -> Circle STARK"
 echo "════════════════════════════════════════════════════════"
 echo -e "${NC}"
 
-RECURSIVE_CMD="${CAIRO_PROVE_BIN} prove-ml"
-RECURSIVE_CMD+=" --verifier-executable ${EXECUTABLE}"
-RECURSIVE_CMD+=" --ml-proof ${ML_PROOF_OUTPUT}"
-RECURSIVE_CMD+=" --output ${PROOF_OUTPUT}"
+RECURSIVE_CMD=(
+    "${CAIRO_PROVE_BIN}"
+    prove-ml
+    --verifier-executable "${EXECUTABLE}"
+    --ml-proof "${ML_PROOF_OUTPUT}"
+    --output "${PROOF_OUTPUT}"
+)
 
-echo "  Command: ${RECURSIVE_CMD}"
+printf "  Command:"
+printf " %q" "${RECURSIVE_CMD[@]}"
+echo ""
 echo ""
 
 RECURSIVE_START=$(date +%s%N)
-eval ${RECURSIVE_CMD}
+"${RECURSIVE_CMD[@]}"
 RECURSIVE_END=$(date +%s%N)
 RECURSIVE_MS=$(( (RECURSIVE_END - RECURSIVE_START) / 1000000 ))
 RECURSIVE_SEC=$(echo "scale=3; ${RECURSIVE_MS}/1000" | bc)
@@ -365,6 +392,9 @@ echo ""
 # Summary
 # ----------------------------------------------------------------
 TOTAL_SEC=$(echo "scale=3; ${PROVE_SEC} + ${RECURSIVE_SEC}" | bc)
+TOKENS_PROVED=1
+PROVE_TOK_S=$(echo "scale=6; ${TOKENS_PROVED}/${PROVE_SEC}" | bc)
+PIPELINE_TOK_S=$(echo "scale=6; ${TOKENS_PROVED}/${TOTAL_SEC}" | bc)
 
 echo -e "${GREEN}${BOLD}"
 echo "╔══════════════════════════════════════════════════════╗"
@@ -374,6 +404,8 @@ echo "║                                                      ║"
 printf "║  GPU prove time:     %-30s ║\n" "${PROVE_SEC}s"
 printf "║  Recursive STARK:    %-30s ║\n" "${RECURSIVE_SEC}s"
 printf "║  Total pipeline:     %-30s ║\n" "${TOTAL_SEC}s"
+printf "║  GKR proof rate:     %-30s ║\n" "${PROVE_TOK_S} tok/s"
+printf "║  End-to-end rate:    %-30s ║\n" "${PIPELINE_TOK_S} tok/s"
 printf "║  ML proof:           %-30s ║\n" "$(du -h "${ML_PROOF_OUTPUT}" | cut -f1)"
 printf "║  Recursive proof:    %-30s ║\n" "$(du -h "${PROOF_OUTPUT}" | cut -f1)"
 echo "║                                                      ║"

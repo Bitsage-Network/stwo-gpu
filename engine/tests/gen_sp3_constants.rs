@@ -1,15 +1,19 @@
 //! Minimal test to regenerate SP3 matmul-only constants for Cairo tests (v19 transcript).
 
-use stwo::core::fields::m31::M31;
-use stwo::core::fields::qm31::SecureField;
 use num_traits::One;
 use obelyzk::cairo_serde::{serialize_gkr_proof_data_only, serialize_mle_opening_proof};
 use obelyzk::compiler::graph::{GraphBuilder, GraphWeights};
 use obelyzk::components::matmul::M31Matrix;
 use obelyzk::crypto::poseidon_channel::PoseidonChannel;
 use obelyzk::gkr::LayeredCircuit;
+use stwo::core::fields::m31::M31;
+use stwo::core::fields::qm31::SecureField;
 
-fn build_gkr_matmul_only() -> (obelyzk::compiler::graph::ComputationGraph, M31Matrix, GraphWeights) {
+fn build_gkr_matmul_only() -> (
+    obelyzk::compiler::graph::ComputationGraph,
+    M31Matrix,
+    GraphWeights,
+) {
     let mut builder = GraphBuilder::new((1, 4));
     builder.linear(2);
     let graph = builder.build();
@@ -39,7 +43,12 @@ fn evaluate_mle_2(vals: [SecureField; 2], r: SecureField) -> SecureField {
     vals[0] * (SecureField::one() - r) + vals[1] * r
 }
 
-fn poly_eval_deg2(c0: SecureField, c1: SecureField, c2: SecureField, t: SecureField) -> SecureField {
+fn poly_eval_deg2(
+    c0: SecureField,
+    c1: SecureField,
+    c2: SecureField,
+    t: SecureField,
+) -> SecureField {
     c0 + c1 * t + c2 * t * t
 }
 
@@ -61,7 +70,10 @@ fn gen_sp3_matmul_only_constants() {
 
     let qm31_hex = |v: SecureField| -> String {
         let c = v.to_m31_array();
-        format!("0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}", c[0].0, c[1].0, c[2].0, c[3].0)
+        format!(
+            "0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}",
+            c[0].0, c[1].0, c[2].0, c[3].0
+        )
     };
 
     eprintln!("=== SP3 v19 COMPRESSED PROOF DATA ===");
@@ -73,16 +85,40 @@ fn gen_sp3_matmul_only_constants() {
     for r in 0..2usize {
         let base = 2 + r * 12;
         eprintln!("// round[{}].c0", r);
-        eprintln!("0x{:x}, 0x{:x}, 0x{:x}, 0x{:x},", proof_data[base], proof_data[base+1], proof_data[base+2], proof_data[base+3]);
+        eprintln!(
+            "0x{:x}, 0x{:x}, 0x{:x}, 0x{:x},",
+            proof_data[base],
+            proof_data[base + 1],
+            proof_data[base + 2],
+            proof_data[base + 3]
+        );
         eprintln!("// round[{}].c2 (c1 omitted)", r);
-        eprintln!("0x{:x}, 0x{:x}, 0x{:x}, 0x{:x},", proof_data[base+8], proof_data[base+9], proof_data[base+10], proof_data[base+11]);
+        eprintln!(
+            "0x{:x}, 0x{:x}, 0x{:x}, 0x{:x},",
+            proof_data[base + 8],
+            proof_data[base + 9],
+            proof_data[base + 10],
+            proof_data[base + 11]
+        );
     }
     let fa = 2 + 2 * 12;
     eprintln!("// final_a_eval");
-    eprintln!("0x{:x}, 0x{:x}, 0x{:x}, 0x{:x},", proof_data[fa], proof_data[fa+1], proof_data[fa+2], proof_data[fa+3]);
+    eprintln!(
+        "0x{:x}, 0x{:x}, 0x{:x}, 0x{:x},",
+        proof_data[fa],
+        proof_data[fa + 1],
+        proof_data[fa + 2],
+        proof_data[fa + 3]
+    );
     eprintln!("// final_b_eval");
-    eprintln!("0x{:x}, 0x{:x}, 0x{:x}, 0x{:x},", proof_data[fa+4], proof_data[fa+5], proof_data[fa+6], proof_data[fa+7]);
-    eprintln!("0x{:x},", proof_data[fa+8]);
+    eprintln!(
+        "0x{:x}, 0x{:x}, 0x{:x}, 0x{:x},",
+        proof_data[fa + 4],
+        proof_data[fa + 5],
+        proof_data[fa + 6],
+        proof_data[fa + 7]
+    );
+    eprintln!("0x{:x},", proof_data[fa + 8]);
     eprintln!();
 
     // === Manually replicate the GKR walk transcript (matches Cairo verify_gkr_model) ===
@@ -120,10 +156,10 @@ fn gen_sp3_matmul_only_constants() {
     use stwo::core::fields::cm31::CM31;
     let read_qm31 = |data: &[starknet_ff::FieldElement], offset: usize| -> SecureField {
         let a = data[offset].to_string().parse::<u64>().unwrap();
-        let b = data[offset+1].to_string().parse::<u64>().unwrap();
-        let c = data[offset+2].to_string().parse::<u64>().unwrap();
-        let d = data[offset+3].to_string().parse::<u64>().unwrap();
-        SecureField::from_m31_array(std::array::from_fn(|i| M31::from([a,b,c,d][i] as u32)))
+        let b = data[offset + 1].to_string().parse::<u64>().unwrap();
+        let c = data[offset + 2].to_string().parse::<u64>().unwrap();
+        let d = data[offset + 3].to_string().parse::<u64>().unwrap();
+        SecureField::from_m31_array(std::array::from_fn(|i| M31::from([a, b, c, d][i] as u32)))
     };
 
     for r in 0..2 {
@@ -147,7 +183,11 @@ fn gen_sp3_matmul_only_constants() {
     let final_b = read_qm31(&proof_data, fa + 4);
 
     // Verify final: current_sum == final_a * final_b
-    assert_eq!(current_sum, final_a * final_b, "MATMUL_FINAL_MISMATCH in manual transcript");
+    assert_eq!(
+        current_sum,
+        final_a * final_b,
+        "MATMUL_FINAL_MISMATCH in manual transcript"
+    );
 
     // Mix final evaluations
     mix_secure_field(&mut ch, final_a);

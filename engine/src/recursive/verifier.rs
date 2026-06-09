@@ -33,6 +33,41 @@ pub fn verify_recursive(
     public_inputs: &RecursivePublicInputs,
     pass1_final_digest: starknet_ff::FieldElement,
     n_real_rows: u32,
+    n_arithmetic_rows: u32,
+    n_sumcheck_rows: u32,
+    n_draw_rows: u32,
+    log_size: u32,
+    final_digest: starknet_ff::FieldElement,
+    logup_claimed_sum: SecureField,
+) -> Result<(), RecursiveError> {
+    let io_commitment_felt252 =
+        crate::crypto::poseidon_channel::securefield_to_felt(public_inputs.io_commitment);
+    verify_recursive_with_io_felt(
+        stark_proof,
+        public_inputs,
+        io_commitment_felt252,
+        pass1_final_digest,
+        n_real_rows,
+        n_arithmetic_rows,
+        n_sumcheck_rows,
+        n_draw_rows,
+        log_size,
+        final_digest,
+        logup_claimed_sum,
+    )
+}
+
+/// Verify a recursive STARK proof while binding the exact felt252 IO commitment
+/// serialized in the proof body.
+pub fn verify_recursive_with_io_felt(
+    stark_proof: &stwo::core::proof::StarkProof<Poseidon252MerkleHasher>,
+    public_inputs: &RecursivePublicInputs,
+    io_commitment_felt252: starknet_ff::FieldElement,
+    pass1_final_digest: starknet_ff::FieldElement,
+    n_real_rows: u32,
+    n_arithmetic_rows: u32,
+    n_sumcheck_rows: u32,
+    n_draw_rows: u32,
     log_size: u32,
     final_digest: starknet_ff::FieldElement,
     logup_claimed_sum: SecureField,
@@ -47,17 +82,42 @@ pub fn verify_recursive(
         let test_mode = false;
         if test_mode {
             #[cfg(test)]
-            { PcsConfig::default() }
+            {
+                PcsConfig::default()
+            }
             #[cfg(not(test))]
-            { unreachable!() }
+            {
+                unreachable!()
+            }
         } else {
             PcsConfig {
                 pow_bits: 20,
-                fri_config: stwo::core::fri::FriConfig::new(0, 5, 16, 1),
+                fri_config: stwo::core::fri::FriConfig::new(0, 5, 28, 1),
                 lifting_log_size: None,
             }
         }
     };
+
+    // STWO appends the composition commitment after trace commitments.
+    // Chain-only and Hades-without-LogUp proofs have:
+    // preprocessed, trace, composition.
+    // Hades+LogUp proofs add an interaction trace before composition:
+    // preprocessed, trace, interaction, composition.
+    //
+    // The current Rust API does not pass `n_trace_columns`, so infer whether
+    // the unified Hades trace is present from the trace tree's sampled column
+    // count. This reconstructs the same component shape the prover used.
+    let trace_tree_columns = stark_proof
+        .sampled_values
+        .get(1)
+        .map(|tree| tree.len())
+        .unwrap_or(0);
+    let hades_active =
+        trace_tree_columns >= super::air::COLS_PER_ROW + super::hades_air::N_HADES_TRACE_COLUMNS;
+    let arithmetic_active = n_arithmetic_rows > 0;
+    let sumcheck_active = n_sumcheck_rows > 0;
+    let draw_active = n_draw_rows > 0;
+    let logup_active = stark_proof.commitments.len() >= 4;
 
     // Build evaluator from public inputs
     let zero_limbs = super::air::felt252_to_limbs(&starknet_ff::FieldElement::ZERO);
@@ -66,8 +126,16 @@ pub fn verify_recursive(
         n_real_rows,
         initial_digest_limbs: zero_limbs,
         final_digest_limbs: super::air::felt252_to_limbs(&final_digest),
-        hades_lookup: None, // LogUp disabled until multi-component STARK is wired
-        hades_enabled: false,
+        hades_lookup: None,
+        draw_felt_lookup: None,
+        challenge_lookup: None,
+        hades_enabled: hades_active,
+        arithmetic_enabled: arithmetic_active,
+        n_arithmetic_rows,
+        sumcheck_enabled: sumcheck_active,
+        n_sumcheck_rows,
+        draw_enabled: draw_active,
+        n_draw_rows,
     };
 
     // Build dummy component to get trace_log_degree_bounds
@@ -90,6 +158,10 @@ pub fn verify_recursive(
     ]);
     channel.mix_u64(public_inputs.n_layers as u64);
     channel.mix_u64(public_inputs.n_poseidon_perms as u64);
+    channel.mix_u64(n_real_rows as u64);
+    channel.mix_u64(n_arithmetic_rows as u64);
+    channel.mix_u64(n_sumcheck_rows as u64);
+    channel.mix_u64(n_draw_rows as u64);
     channel.mix_felts(&[public_inputs.seed_digest]);
     // hades_commitment binding (two-level recursion)
     {
@@ -106,6 +178,7 @@ pub fn verify_recursive(
     for fe in [
         public_inputs.prev_kv_cache_commitment,
         public_inputs.kv_cache_commitment,
+        public_inputs.conversation_statement_hash,
     ] {
         let bytes = fe.to_bytes_be();
         channel.mix_u64(u64::from_be_bytes(bytes[0..8].try_into().unwrap()));
@@ -116,9 +189,7 @@ pub fn verify_recursive(
 
     // Also bind the felt252 io_commitment (4 × u64, matching prover)
     {
-        let io_felt =
-            crate::crypto::poseidon_channel::securefield_to_felt(public_inputs.io_commitment);
-        let bytes = io_felt.to_bytes_be();
+        let bytes = io_commitment_felt252.to_bytes_be();
         let u0 = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
         let u1 = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
         let u2 = u64::from_be_bytes(bytes[16..24].try_into().unwrap());
@@ -156,19 +227,28 @@ pub fn verify_recursive(
     commitment_scheme.commit(stark_proof.commitments[0], &bounds[0], channel);
     commitment_scheme.commit(stark_proof.commitments[1], &bounds[1], channel);
 
-    // Detect LogUp: 3+ commitments means Tree 2 (interaction) is present.
-    let logup_active = stark_proof.commitments.len() >= 3
-        && logup_claimed_sum != SecureField::zero();
-
-    let logup_relation = if logup_active {
-        Some(super::air::HadesPermRelation::draw(channel))
+    let (logup_relation, draw_felt_relation, challenge_relation) = if logup_active {
+        let hades = Some(super::air::HadesPermRelation::draw(channel));
+        let draw_felt = if draw_active {
+            Some(super::air::DrawFeltRelation::draw(channel))
+        } else {
+            None
+        };
+        let challenge = if sumcheck_active && draw_active {
+            Some(super::air::SumcheckChallengeRelation::draw(channel))
+        } else {
+            None
+        };
+        (hades, draw_felt, challenge)
     } else {
-        None
+        (None, None, None)
     };
 
     // Build evaluator with LogUp if active
     let eval_final = RecursiveVerifierEval {
         hades_lookup: logup_relation,
+        draw_felt_lookup: draw_felt_relation,
+        challenge_lookup: challenge_relation,
         ..eval
     };
 
@@ -177,17 +257,17 @@ pub fn verify_recursive(
     let component = FrameworkComponent::new(
         &mut allocator,
         eval_final,
-        if logup_active { logup_claimed_sum } else { SecureField::zero() },
+        if logup_active {
+            logup_claimed_sum
+        } else {
+            SecureField::zero()
+        },
     );
     let all_bounds = Component::trace_log_degree_bounds(&component);
 
     // Commit Tree 2 (interaction) if present, using bounds from the component
     if logup_active && all_bounds.len() > 2 {
-        commitment_scheme.commit(
-            stark_proof.commitments[2],
-            &all_bounds[2],
-            channel,
-        );
+        commitment_scheme.commit(stark_proof.commitments[2], &all_bounds[2], channel);
     }
 
     // Verify
@@ -217,7 +297,7 @@ mod tests {
         // The Cairo contract uses mix_into(), so the prover must too.
         let config = PcsConfig {
             pow_bits: 20,
-            fri_config: stwo::core::fri::FriConfig::new(0, 5, 16, 1),
+            fri_config: stwo::core::fri::FriConfig::new(0, 5, 28, 1),
             lifting_log_size: None,
         };
 
@@ -233,7 +313,8 @@ mod tests {
         eprintln!("config.mix_into digest: {:?}", ch1.digest());
         eprintln!("manual mix_u64 digest:  {:?}", ch2.digest());
         assert_ne!(
-            ch1.digest(), ch2.digest(),
+            ch1.digest(),
+            ch2.digest(),
             "mix_into and manual mix_u64 MUST produce different digests"
         );
     }
@@ -309,6 +390,9 @@ mod tests {
             &recursive_proof.public_inputs,
             recursive_proof.pass1_final_digest,
             recursive_proof.n_real_rows,
+            recursive_proof.n_arithmetic_rows,
+            recursive_proof.n_sumcheck_rows,
+            recursive_proof.n_draw_rows,
             recursive_proof.log_size,
             recursive_proof.final_digest,
             recursive_proof.logup_claimed_sum,
@@ -385,7 +469,8 @@ mod tests {
 
         // Replay the FULL verification channel to extract random_coeff + oods_point
         let pcs_config = stwo::core::pcs::PcsConfig::default();
-        let channel = &mut <Poseidon252MerkleChannel as stwo::core::channel::MerkleChannel>::C::default();
+        let channel =
+            &mut <Poseidon252MerkleChannel as stwo::core::channel::MerkleChannel>::C::default();
 
         channel.mix_u64(pcs_config.pow_bits as u64);
         channel.mix_u64(pcs_config.fri_config.log_blowup_factor as u64);
@@ -398,9 +483,15 @@ mod tests {
         ]);
         channel.mix_u64(rp.public_inputs.n_layers as u64);
         channel.mix_u64(rp.public_inputs.n_poseidon_perms as u64);
+        channel.mix_u64(rp.n_real_rows as u64);
+        channel.mix_u64(rp.n_arithmetic_rows as u64);
+        channel.mix_u64(rp.n_sumcheck_rows as u64);
+        channel.mix_u64(rp.n_draw_rows as u64);
         channel.mix_felts(&[rp.public_inputs.seed_digest]);
         {
-            let io_felt = crate::crypto::poseidon_channel::securefield_to_felt(rp.public_inputs.io_commitment);
+            let io_felt = crate::crypto::poseidon_channel::securefield_to_felt(
+                rp.public_inputs.io_commitment,
+            );
             let bytes = io_felt.to_bytes_be();
             channel.mix_u64(u64::from_be_bytes(bytes[0..8].try_into().unwrap()));
             channel.mix_u64(u64::from_be_bytes(bytes[8..16].try_into().unwrap()));
@@ -422,13 +513,22 @@ mod tests {
             initial_digest_limbs: zero_limbs,
             final_digest_limbs: super::super::air::felt252_to_limbs(&rp.final_digest),
             hades_lookup: None,
+            draw_felt_lookup: None,
+            challenge_lookup: None,
             hades_enabled: false,
+            arithmetic_enabled: false,
+            n_arithmetic_rows: 0,
+            sumcheck_enabled: false,
+            n_sumcheck_rows: 0,
+            draw_enabled: false,
+            n_draw_rows: 0,
         };
         let mut allocator = TraceLocationAllocator::default();
         let component = FrameworkComponent::new(&mut allocator, eval, SecureField::zero());
         let bounds = Component::trace_log_degree_bounds(&component);
 
-        let mut cs = stwo::core::pcs::CommitmentSchemeVerifier::<Poseidon252MerkleChannel>::new(pcs_config);
+        let mut cs =
+            stwo::core::pcs::CommitmentSchemeVerifier::<Poseidon252MerkleChannel>::new(pcs_config);
         cs.commit(rp.stark_proof.commitments[0], &bounds[0], channel);
         cs.commit(rp.stark_proof.commitments[1], &bounds[1], channel);
 
@@ -449,7 +549,10 @@ mod tests {
         let rust_eval = {
             let mut acc = PointEvaluationAccumulator::new(random_coeff);
             component.evaluate_constraint_quotients_at_point(
-                oods_point, &rp.stark_proof.sampled_values, &mut acc, max_log_deg,
+                oods_point,
+                &rp.stark_proof.sampled_values,
+                &mut acc,
+                max_log_deg,
             );
             acc.finalize()
         };
@@ -485,12 +588,14 @@ mod tests {
         // C3: initial boundary ×9
         let init_limbs = super::super::air::felt252_to_limbs(&starknet_ff::FieldElement::ZERO);
         for j in 0..9usize {
-            cairo = cairo * random_coeff + denom_inv * is_first * (trace[j][0] - SecureField::from(init_limbs[j]));
+            cairo = cairo * random_coeff
+                + denom_inv * is_first * (trace[j][0] - SecureField::from(init_limbs[j]));
         }
         // C4: final boundary ×9
         let final_limbs = super::super::air::felt252_to_limbs(&rp.final_digest);
         for j in 0..9usize {
-            cairo = cairo * random_coeff + denom_inv * is_last * (trace[9 + j][0] - SecureField::from(final_limbs[j]));
+            cairo = cairo * random_coeff
+                + denom_inv * is_last * (trace[9 + j][0] - SecureField::from(final_limbs[j]));
         }
         // C5k: k boolean
         cairo = cairo * random_coeff + denom_inv * is_chain * add_k * (add_k - one);
@@ -507,9 +612,18 @@ mod tests {
             let add = trace[27 + j][0];
             let snb = trace[18 + j][0];
             let pj = SecureField::from(M31::from(p_28[j]));
-            let cin = if j == 0 { zero_sf } else { trace[36 + j - 1][0] };
-            let cout = if j < 8 { trace[36 + j][0] * two28 } else { zero_sf };
-            cairo = cairo * random_coeff + denom_inv * is_chain * (da + add + cin - snb - add_k * pj - cout);
+            let cin = if j == 0 {
+                zero_sf
+            } else {
+                trace[36 + j - 1][0]
+            };
+            let cout = if j < 8 {
+                trace[36 + j][0] * two28
+            } else {
+                zero_sf
+            };
+            cairo = cairo * random_coeff
+                + denom_inv * is_chain * (da + add + cin - snb - add_k * pj - cout);
         }
 
         eprintln!("cairo_eval: {:?}", cairo);
@@ -523,9 +637,18 @@ mod tests {
             // We can't easily get per-constraint values from FrameworkComponent.
             // But we know they should match. Let me print the first few constraint values.
             eprintln!("\nPer-constraint Cairo values:");
-            eprintln!("  C1 (is_active bool): {:?}", denom_inv * is_active * (one - is_active));
-            eprintln!("  C2 (accumulator):    {:?}", denom_inv * (ac_next - ac - is_active + corr));
-            eprintln!("  C3[0] (init bnd):    {:?}", denom_inv * is_first * (trace[0][0] - SecureField::from(init_limbs[0])));
+            eprintln!(
+                "  C1 (is_active bool): {:?}",
+                denom_inv * is_active * (one - is_active)
+            );
+            eprintln!(
+                "  C2 (accumulator):    {:?}",
+                denom_inv * (ac_next - ac - is_active + corr)
+            );
+            eprintln!(
+                "  C3[0] (init bnd):    {:?}",
+                denom_inv * is_first * (trace[0][0] - SecureField::from(init_limbs[0]))
+            );
         }
     }
 
@@ -534,7 +657,7 @@ mod tests {
         // Relabeling attack: same proof body, different io_commitment.
         // Fiat-Shamir channel binding causes FRI divergence → rejection.
         let _g = super::super::RecursiveTestModeGuard::enter();
-                let rp = adversarial_proof();
+        let rp = adversarial_proof();
 
         // Valid proof passes
         let ok = verify_recursive(
@@ -542,6 +665,9 @@ mod tests {
             &rp.public_inputs,
             rp.pass1_final_digest,
             rp.n_real_rows,
+            rp.n_arithmetic_rows,
+            rp.n_sumcheck_rows,
+            rp.n_draw_rows,
             rp.log_size,
             rp.final_digest,
             rp.logup_claimed_sum,
@@ -556,7 +682,18 @@ mod tests {
             ),
             ..rp.public_inputs
         };
-        let err = verify_recursive(&rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest, rp.logup_claimed_sum);
+        let err = verify_recursive(
+            &rp.stark_proof,
+            &tampered,
+            rp.pass1_final_digest,
+            rp.n_real_rows,
+            rp.n_arithmetic_rows,
+            rp.n_sumcheck_rows,
+            rp.n_draw_rows,
+            rp.log_size,
+            rp.final_digest,
+            rp.logup_claimed_sum,
+        );
         assert!(
             err.is_err(),
             "SECURITY: tampered io_commitment MUST be rejected"
@@ -568,13 +705,24 @@ mod tests {
     fn test_adversarial_tampered_n_layers_rejected() {
         // n_layers tampering: different layer count with same proof body.
         let _g = super::super::RecursiveTestModeGuard::enter();
-                let rp = adversarial_proof();
+        let rp = adversarial_proof();
 
         let tampered = RecursivePublicInputs {
             n_layers: rp.public_inputs.n_layers + 100,
             ..rp.public_inputs
         };
-        let err = verify_recursive(&rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest, rp.logup_claimed_sum);
+        let err = verify_recursive(
+            &rp.stark_proof,
+            &tampered,
+            rp.pass1_final_digest,
+            rp.n_real_rows,
+            rp.n_arithmetic_rows,
+            rp.n_sumcheck_rows,
+            rp.n_draw_rows,
+            rp.log_size,
+            rp.final_digest,
+            rp.logup_claimed_sum,
+        );
         assert!(err.is_err(), "SECURITY: tampered n_layers MUST be rejected");
         eprintln!("[adversarial] n_layers tampering rejected ✓");
     }
@@ -582,7 +730,7 @@ mod tests {
     #[test]
     fn test_adversarial_tampered_weight_super_root_rejected() {
         let _g = super::super::RecursiveTestModeGuard::enter();
-                let rp = adversarial_proof();
+        let rp = adversarial_proof();
 
         let tampered = RecursivePublicInputs {
             weight_super_root: QM31(
@@ -591,7 +739,18 @@ mod tests {
             ),
             ..rp.public_inputs
         };
-        let err = verify_recursive(&rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest, rp.logup_claimed_sum);
+        let err = verify_recursive(
+            &rp.stark_proof,
+            &tampered,
+            rp.pass1_final_digest,
+            rp.n_real_rows,
+            rp.n_arithmetic_rows,
+            rp.n_sumcheck_rows,
+            rp.n_draw_rows,
+            rp.log_size,
+            rp.final_digest,
+            rp.logup_claimed_sum,
+        );
         assert!(
             err.is_err(),
             "SECURITY: tampered weight_super_root MUST be rejected"
@@ -602,7 +761,7 @@ mod tests {
     #[test]
     fn test_adversarial_tampered_circuit_hash_rejected() {
         let _g = super::super::RecursiveTestModeGuard::enter();
-                let rp = adversarial_proof();
+        let rp = adversarial_proof();
 
         let tampered = RecursivePublicInputs {
             circuit_hash: QM31(
@@ -611,7 +770,18 @@ mod tests {
             ),
             ..rp.public_inputs
         };
-        let err = verify_recursive(&rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest, rp.logup_claimed_sum);
+        let err = verify_recursive(
+            &rp.stark_proof,
+            &tampered,
+            rp.pass1_final_digest,
+            rp.n_real_rows,
+            rp.n_arithmetic_rows,
+            rp.n_sumcheck_rows,
+            rp.n_draw_rows,
+            rp.log_size,
+            rp.final_digest,
+            rp.logup_claimed_sum,
+        );
         assert!(
             err.is_err(),
             "SECURITY: tampered circuit_hash MUST be rejected"
@@ -645,8 +815,20 @@ mod tests {
             hades_commitment: starknet_ff::FieldElement::ZERO,
             kv_cache_commitment: starknet_ff::FieldElement::ZERO,
             prev_kv_cache_commitment: starknet_ff::FieldElement::ZERO,
+            conversation_statement_hash: starknet_ff::FieldElement::ZERO,
         };
-        let err = verify_recursive(&rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest, rp.logup_claimed_sum);
+        let err = verify_recursive(
+            &rp.stark_proof,
+            &tampered,
+            rp.pass1_final_digest,
+            rp.n_real_rows,
+            rp.n_arithmetic_rows,
+            rp.n_sumcheck_rows,
+            rp.n_draw_rows,
+            rp.log_size,
+            rp.final_digest,
+            rp.logup_claimed_sum,
+        );
         assert!(
             err.is_err(),
             "SECURITY: fully tampered metadata MUST be rejected"
@@ -658,6 +840,9 @@ mod tests {
             &rp.public_inputs,
             rp.pass1_final_digest,
             rp.n_real_rows,
+            rp.n_arithmetic_rows,
+            rp.n_sumcheck_rows,
+            rp.n_draw_rows,
             rp.log_size,
             rp.final_digest,
             rp.logup_claimed_sum,
@@ -676,7 +861,7 @@ mod tests {
         // trivially small. Without the n_poseidon_perms channel binding, this
         // would produce a valid STARK proof without running the GKR verifier.
         let _g = super::super::RecursiveTestModeGuard::enter();
-                let rp = adversarial_proof();
+        let rp = adversarial_proof();
 
         // Tampered: claim only 2 Poseidon perms (trivially small chain)
         let tampered = RecursivePublicInputs {
@@ -684,7 +869,16 @@ mod tests {
             ..rp.public_inputs
         };
         let err = verify_recursive(
-            &rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest, rp.logup_claimed_sum,
+            &rp.stark_proof,
+            &tampered,
+            rp.pass1_final_digest,
+            rp.n_real_rows,
+            rp.n_arithmetic_rows,
+            rp.n_sumcheck_rows,
+            rp.n_draw_rows,
+            rp.log_size,
+            rp.final_digest,
+            rp.logup_claimed_sum,
         );
         assert!(
             err.is_err(),
@@ -697,13 +891,94 @@ mod tests {
             ..rp.public_inputs
         };
         let err = verify_recursive(
-            &rp.stark_proof, &tampered, rp.pass1_final_digest, rp.n_real_rows, rp.log_size, rp.final_digest, rp.logup_claimed_sum,
+            &rp.stark_proof,
+            &tampered,
+            rp.pass1_final_digest,
+            rp.n_real_rows,
+            rp.n_arithmetic_rows,
+            rp.n_sumcheck_rows,
+            rp.n_draw_rows,
+            rp.log_size,
+            rp.final_digest,
+            rp.logup_claimed_sum,
         );
         assert!(
             err.is_err(),
             "SECURITY: inflated n_poseidon_perms MUST be rejected"
         );
         eprintln!("[adversarial] trace miniaturization attack blocked ✓");
+    }
+
+    #[test]
+    fn test_adversarial_component_row_count_relabeling_rejected() {
+        // Row-count relabeling attack: keep the proof body and public inputs
+        // unchanged, but ask the verifier to reconstruct a different active
+        // component shape. These counts are now explicitly Fiat-Shamir bound
+        // in addition to driving AIR accumulator corrections.
+        let _g = super::super::RecursiveTestModeGuard::enter();
+        let rp = adversarial_proof();
+
+        let err = verify_recursive(
+            &rp.stark_proof,
+            &rp.public_inputs,
+            rp.pass1_final_digest,
+            rp.n_real_rows + 1,
+            rp.n_arithmetic_rows,
+            rp.n_sumcheck_rows,
+            rp.n_draw_rows,
+            rp.log_size,
+            rp.final_digest,
+            rp.logup_claimed_sum,
+        );
+        assert!(err.is_err(), "SECURITY: tampered chain row count must fail");
+
+        let err = verify_recursive(
+            &rp.stark_proof,
+            &rp.public_inputs,
+            rp.pass1_final_digest,
+            rp.n_real_rows,
+            rp.n_arithmetic_rows + 1,
+            rp.n_sumcheck_rows,
+            rp.n_draw_rows,
+            rp.log_size,
+            rp.final_digest,
+            rp.logup_claimed_sum,
+        );
+        assert!(
+            err.is_err(),
+            "SECURITY: tampered arithmetic row count must fail"
+        );
+
+        let err = verify_recursive(
+            &rp.stark_proof,
+            &rp.public_inputs,
+            rp.pass1_final_digest,
+            rp.n_real_rows,
+            rp.n_arithmetic_rows,
+            rp.n_sumcheck_rows + 1,
+            rp.n_draw_rows,
+            rp.log_size,
+            rp.final_digest,
+            rp.logup_claimed_sum,
+        );
+        assert!(
+            err.is_err(),
+            "SECURITY: tampered sumcheck row count must fail"
+        );
+
+        let err = verify_recursive(
+            &rp.stark_proof,
+            &rp.public_inputs,
+            rp.pass1_final_digest,
+            rp.n_real_rows,
+            rp.n_arithmetic_rows,
+            rp.n_sumcheck_rows,
+            rp.n_draw_rows + 1,
+            rp.log_size,
+            rp.final_digest,
+            rp.logup_claimed_sum,
+        );
+        assert!(err.is_err(), "SECURITY: tampered draw row count must fail");
     }
 
     #[test]

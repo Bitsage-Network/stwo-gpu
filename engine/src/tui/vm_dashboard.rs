@@ -39,25 +39,25 @@ use ratatui::{
 
 // ── Palette: Cipher Noir (shared with dashboard.rs) ────────────────
 
-const BG:          Color = Color::Reset;
-const LIME:        Color = Color::Indexed(118);
-const LIME_DIM:    Color = Color::Indexed(70);
-const EMERALD:     Color = Color::Indexed(48);
-const VIOLET:      Color = Color::Indexed(73);
-const WHITE:       Color = Color::Indexed(255);
-const SILVER:      Color = Color::Indexed(249);
-const SLATE:       Color = Color::Indexed(245);
-const GHOST:       Color = Color::Indexed(240);
-const AMBER:       Color = Color::Indexed(178);
-const ORANGE:      Color = Color::Indexed(208);
-const LILAC:       Color = Color::Indexed(141);
-const CYAN:        Color = Color::Indexed(44);
+const BG: Color = Color::Reset;
+const LIME: Color = Color::Indexed(118);
+const LIME_DIM: Color = Color::Indexed(70);
+const EMERALD: Color = Color::Indexed(48);
+const VIOLET: Color = Color::Indexed(73);
+const WHITE: Color = Color::Indexed(255);
+const SILVER: Color = Color::Indexed(249);
+const SLATE: Color = Color::Indexed(245);
+const GHOST: Color = Color::Indexed(240);
+const AMBER: Color = Color::Indexed(178);
+const ORANGE: Color = Color::Indexed(208);
+const LILAC: Color = Color::Indexed(141);
+const CYAN: Color = Color::Indexed(44);
 
 const H_LINE: &str = "─";
 const V_LINE: &str = "│";
 const DOT: &str = "·";
 const BLOCK_FULL: &str = "█";
-const BLOCK_LOW:  &str = "░";
+const BLOCK_LOW: &str = "░";
 const ARROW_R: &str = "▸";
 const CHECK: &str = "✓";
 const CROSS: &str = "✗";
@@ -69,7 +69,7 @@ const DIAMOND: &str = "◆";
 pub struct GpuWorkerState {
     pub device_id: usize,
     pub device_name: String,
-    pub utilization: f32,      // 0.0 - 1.0
+    pub utilization: f32, // 0.0 - 1.0
     pub current_job: Option<String>,
     pub memory_used_gb: f32,
     pub memory_total_gb: f32,
@@ -177,8 +177,8 @@ impl VmDashboardState {
         d_model: usize,
         uptime_secs: u64,
         queue: &crate::vm::queue::ProvingQueue,
-        sessions: &[(String, usize, usize)],  // (session_id, total_tokens, turns)
-        recent_turns: &[(String, String, usize, Option<String>, Option<u64>)],  // (user, ai, tokens, proof_id, time_ms)
+        sessions: &[(String, usize, usize)], // (session_id, total_tokens, turns)
+        recent_turns: &[(String, String, usize, Option<String>, Option<u64>)], // (user, ai, tokens, proof_id, time_ms)
     ) {
         self.model_name = model_name.to_string();
         self.model_params = model_params.to_string();
@@ -217,12 +217,17 @@ impl VmDashboardState {
                 self.workers[0].utilization = 0.0;
                 self.workers[0].current_job = None;
             }
-            if uptime_secs < 5 { VmStatus::Starting } else { VmStatus::Ready }
+            if uptime_secs < 5 {
+                VmStatus::Starting
+            } else {
+                VmStatus::Ready
+            }
         };
 
         // Sessions
-        self.sessions = sessions.iter().map(|(id, tokens, turns)| {
-            SessionSummary {
+        self.sessions = sessions
+            .iter()
+            .map(|(id, tokens, turns)| SessionSummary {
                 session_id: id.clone(),
                 model_id: model_name.to_string(),
                 total_tokens: *tokens,
@@ -230,22 +235,30 @@ impl VmDashboardState {
                 turns: *turns,
                 status: SessionStatus::Active,
                 last_commitment: None,
-            }
-        }).collect();
+            })
+            .collect();
 
         // Conversation turns
-        self.active_turns = recent_turns.iter().enumerate().map(|(i, (user, ai, tokens, proof_id, time_ms))| {
-            ConversationTurnView {
-                turn_index: i,
-                user_text: user.clone(),
-                ai_text: ai.clone(),
-                num_tokens: *tokens,
-                proof_id: proof_id.clone(),
-                prove_time_ms: *time_ms,
-                status: if proof_id.is_some() { TurnProofStatus::Proven } else { TurnProofStatus::Pending },
-                commitment: None,
-            }
-        }).collect();
+        self.active_turns = recent_turns
+            .iter()
+            .enumerate()
+            .map(
+                |(i, (user, ai, tokens, proof_id, time_ms))| ConversationTurnView {
+                    turn_index: i,
+                    user_text: user.clone(),
+                    ai_text: ai.clone(),
+                    num_tokens: *tokens,
+                    proof_id: proof_id.clone(),
+                    prove_time_ms: *time_ms,
+                    status: if proof_id.is_some() {
+                        TurnProofStatus::Proven
+                    } else {
+                        TurnProofStatus::Pending
+                    },
+                    commitment: None,
+                },
+            )
+            .collect();
     }
 }
 
@@ -298,15 +311,15 @@ pub fn render(frame: &mut Frame, state: &VmDashboardState) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),   // Header
-            Constraint::Length(1),   // Divider
-            Constraint::Length(12),  // GPU + Queue + Sessions (3-col)
-            Constraint::Length(1),   // Divider
+            Constraint::Length(5),  // Header
+            Constraint::Length(1),  // Divider
+            Constraint::Length(12), // GPU + Queue + Sessions (3-col)
+            Constraint::Length(1),  // Divider
             Constraint::Min(4),     // Conversation stream
-            Constraint::Length(1),   // Divider
-            Constraint::Length(5),   // On-chain proof status
-            Constraint::Length(1),   // Divider
-            Constraint::Length(2),   // Footer
+            Constraint::Length(1),  // Divider
+            Constraint::Length(5),  // On-chain proof status
+            Constraint::Length(1),  // Divider
+            Constraint::Length(2),  // Footer
         ])
         .split(area);
 
@@ -340,9 +353,18 @@ fn render_header(frame: &mut Frame, area: Rect, state: &VmDashboardState) {
     // Logo
     let logo = vec![
         Line::from(Span::styled("", Style::default())),
-        Line::from(Span::styled("  ╔═╗╔╗  ╔═╗╦  ╦ ╦╔═╗╦╔═", Style::default().fg(LIME))),
-        Line::from(Span::styled("  ║ ║╠╩╗ ╠═ ║  ╚╦╝╔═╝╠╩╗", Style::default().fg(LIME))),
-        Line::from(Span::styled("  ╚═╝╚═╝ ╚═╝╩═╝ ╩ ╚═╝╩ ╩", Style::default().fg(LIME_DIM))),
+        Line::from(Span::styled(
+            "  ╔═╗╔╗  ╔═╗╦  ╦ ╦╔═╗╦╔═",
+            Style::default().fg(LIME),
+        )),
+        Line::from(Span::styled(
+            "  ║ ║╠╩╗ ╠═ ║  ╚╦╝╔═╝╠╩╗",
+            Style::default().fg(LIME),
+        )),
+        Line::from(Span::styled(
+            "  ╚═╝╚═╝ ╚═╝╩═╝ ╩ ╚═╝╩ ╩",
+            Style::default().fg(LIME_DIM),
+        )),
     ];
     frame.render_widget(Paragraph::new(logo), cols[0]);
 
@@ -355,10 +377,22 @@ fn render_header(frame: &mut Frame, area: Rect, state: &VmDashboardState) {
         VmStatus::Error => ("ERROR", AMBER),
     };
 
-    let pulse = if state.frame_count % 4 < 2 { LIME } else { LIME_DIM };
-    let status_c = if state.status == VmStatus::Proving { pulse } else { status_color };
+    let pulse = if state.frame_count % 4 < 2 {
+        LIME
+    } else {
+        LIME_DIM
+    };
+    let status_c = if state.status == VmStatus::Proving {
+        pulse
+    } else {
+        status_color
+    };
 
-    let model_display = if state.model_name.is_empty() { "loading..." } else { &state.model_name };
+    let model_display = if state.model_name.is_empty() {
+        "loading..."
+    } else {
+        &state.model_name
+    };
     let gpu_count = state.workers.len();
     let gpu_label = if gpu_count == 1 { "GPU" } else { "GPUs" };
 
@@ -366,13 +400,25 @@ fn render_header(frame: &mut Frame, area: Rect, state: &VmDashboardState) {
         Line::from(Span::styled("", Style::default())),
         Line::from(vec![
             Span::styled("  MODEL  ", Style::default().fg(SLATE)),
-            Span::styled(model_display, Style::default().fg(WHITE).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("  {}", state.model_params), Style::default().fg(SILVER)),
+            Span::styled(
+                model_display,
+                Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  {}", state.model_params),
+                Style::default().fg(SILVER),
+            ),
         ]),
         Line::from(vec![
             Span::styled("  INFRA  ", Style::default().fg(SLATE)),
-            Span::styled(format!("{gpu_count}×{gpu_label}"), Style::default().fg(CYAN)),
-            Span::styled(format!("  d_model={}", state.d_model), Style::default().fg(GHOST)),
+            Span::styled(
+                format!("{gpu_count}×{gpu_label}"),
+                Style::default().fg(CYAN),
+            ),
+            Span::styled(
+                format!("  d_model={}", state.d_model),
+                Style::default().fg(GHOST),
+            ),
             Span::styled("  ZK INFERENCE VM", Style::default().fg(LIME_DIM)),
         ]),
         Line::from(vec![
@@ -458,7 +504,14 @@ fn render_gpu_workers(frame: &mut Frame, area: Rect, state: &VmDashboardState) {
 
         lines.push(Line::from(vec![
             Span::styled(format!(" {icon} "), Style::default().fg(icon_color)),
-            Span::styled(format!("GPU {}", w.device_id), Style::default().fg(if w.current_job.is_some() { WHITE } else { SLATE })),
+            Span::styled(
+                format!("GPU {}", w.device_id),
+                Style::default().fg(if w.current_job.is_some() {
+                    WHITE
+                } else {
+                    SLATE
+                }),
+            ),
             Span::styled(" ", Style::default()),
             Span::styled(BLOCK_FULL.repeat(filled), Style::default().fg(bar_color)),
             Span::styled(BLOCK_LOW.repeat(empty), Style::default().fg(GHOST)),
@@ -547,7 +600,11 @@ fn queue_stat_line(label: &str, count: usize, color: Color) -> Line<'static> {
         Span::styled(format!(" {:<10}", label), Style::default().fg(SLATE)),
         Span::styled(
             format!("{count}"),
-            Style::default().fg(color).add_modifier(if count > 0 { Modifier::BOLD } else { Modifier::empty() }),
+            Style::default().fg(color).add_modifier(if count > 0 {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            }),
         ),
     ])
 }
@@ -579,12 +636,13 @@ fn render_sessions(frame: &mut Frame, area: Rect, state: &VmDashboardState) {
             Span::styled(id_short, Style::default().fg(LILAC)),
             Span::styled(
                 format!(" {}t", s.total_tokens),
-                Style::default().fg(if s.tokens_proven == s.total_tokens { EMERALD } else { SILVER }),
+                Style::default().fg(if s.tokens_proven == s.total_tokens {
+                    EMERALD
+                } else {
+                    SILVER
+                }),
             ),
-            Span::styled(
-                format!(" {}T", s.turns),
-                Style::default().fg(GHOST),
-            ),
+            Span::styled(format!(" {}T", s.turns), Style::default().fg(GHOST)),
         ]));
 
         // Commitment line
@@ -627,15 +685,24 @@ fn render_conversation_stream(frame: &mut Frame, area: Rect, state: &VmDashboard
         // User line
         lines.push(Line::from(vec![
             Span::styled(format!(" {idx}"), Style::default().fg(GHOST)),
-            Span::styled(" YOU ", Style::default().fg(LIME).add_modifier(Modifier::BOLD)),
-            Span::styled(truncate(&turn.user_text, max_text), Style::default().fg(WHITE)),
+            Span::styled(
+                " YOU ",
+                Style::default().fg(LIME).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                truncate(&turn.user_text, max_text),
+                Style::default().fg(WHITE),
+            ),
         ]));
 
         // AI line
         lines.push(Line::from(vec![
             Span::styled("    ", Style::default()),
             Span::styled(" AI  ", Style::default().fg(EMERALD)),
-            Span::styled(truncate(&turn.ai_text, max_text), Style::default().fg(SILVER)),
+            Span::styled(
+                truncate(&turn.ai_text, max_text),
+                Style::default().fg(SILVER),
+            ),
         ]));
 
         // Proof status line
@@ -647,21 +714,38 @@ fn render_conversation_stream(frame: &mut Frame, area: Rect, state: &VmDashboard
             TurnProofStatus::Failed => (CROSS, AMBER),
         };
 
-        let time_str = turn.prove_time_ms.map(|t| {
-            if t > 1000 { format!("{:.1}s", t as f64 / 1000.0) } else { format!("{t}ms") }
-        }).unwrap_or_default();
+        let time_str = turn
+            .prove_time_ms
+            .map(|t| {
+                if t > 1000 {
+                    format!("{:.1}s", t as f64 / 1000.0)
+                } else {
+                    format!("{t}ms")
+                }
+            })
+            .unwrap_or_default();
 
-        let proof_id_short = turn.proof_id.as_deref()
+        let proof_id_short = turn
+            .proof_id
+            .as_deref()
             .map(|p| if p.len() > 14 { &p[..14] } else { p })
             .unwrap_or("...");
 
-        let commit_short = turn.commitment.as_deref()
+        let commit_short = turn
+            .commitment
+            .as_deref()
             .map(|c| if c.len() > 14 { &c[..14] } else { c })
             .unwrap_or("");
 
         lines.push(Line::from(vec![
-            Span::styled(format!("    {proof_icon} "), Style::default().fg(proof_color)),
-            Span::styled(format!("{} tokens", turn.num_tokens), Style::default().fg(SLATE)),
+            Span::styled(
+                format!("    {proof_icon} "),
+                Style::default().fg(proof_color),
+            ),
+            Span::styled(
+                format!("{} tokens", turn.num_tokens),
+                Style::default().fg(SLATE),
+            ),
             Span::styled(format!("  {proof_id_short}"), Style::default().fg(LILAC)),
             Span::styled(format!("  {time_str}"), Style::default().fg(EMERALD)),
             Span::styled(format!("  {commit_short}"), Style::default().fg(VIOLET)),
@@ -679,51 +763,82 @@ fn render_conversation_stream(frame: &mut Frame, area: Rect, state: &VmDashboard
 
     // Auto-scroll to show most recent
     let visible = area.height as usize;
-    let offset = if lines.len() > visible { lines.len() - visible } else { 0 };
+    let offset = if lines.len() > visible {
+        lines.len() - visible
+    } else {
+        0
+    };
     let visible_lines: Vec<Line> = lines.into_iter().skip(offset).collect();
 
-    frame.render_widget(Paragraph::new(visible_lines).wrap(Wrap { trim: false }), area);
+    frame.render_widget(
+        Paragraph::new(visible_lines).wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 // ── Footer ─────────────────────────────────────────────────────────
 
 fn render_onchain_panel(frame: &mut Frame, area: Rect, state: &VmDashboardState) {
     let title = Line::from(vec![
-        Span::styled(" ON-CHAIN ", Style::default().fg(BG).bg(VIOLET).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("  {} · {} verified", state.network, state.on_chain_txs), Style::default().fg(GHOST)),
+        Span::styled(
+            " ON-CHAIN ",
+            Style::default()
+                .fg(BG)
+                .bg(VIOLET)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  {} · {} verified", state.network, state.on_chain_txs),
+            Style::default().fg(GHOST),
+        ),
     ]);
 
     let mut lines = vec![title, Line::from("")];
 
     if let Some(ref tx) = state.last_tx_hash {
         let tx_short: String = if tx.len() > 20 {
-            format!("{}...{}", &tx[..10], &tx[tx.len()-8..])
+            format!("{}...{}", &tx[..10], &tx[tx.len() - 8..])
         } else {
             tx.clone()
         };
         lines.push(Line::from(vec![
-            Span::styled("  TX  ", Style::default().fg(LIME).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "  TX  ",
+                Style::default().fg(LIME).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(tx_short.clone(), Style::default().fg(CYAN)),
-            Span::styled(format!("  {} felts",
-                state.last_calldata_felts.unwrap_or(0)), Style::default().fg(GHOST)),
-            Span::styled(format!("  {:.1}s prove",
-                state.last_prove_time_secs.unwrap_or(0.0)), Style::default().fg(ORANGE)),
-            Span::styled(format!("  {:.1}s STARK",
-                state.last_recursive_time_secs.unwrap_or(0.0)), Style::default().fg(ORANGE)),
+            Span::styled(
+                format!("  {} felts", state.last_calldata_felts.unwrap_or(0)),
+                Style::default().fg(GHOST),
+            ),
+            Span::styled(
+                format!("  {:.1}s prove", state.last_prove_time_secs.unwrap_or(0.0)),
+                Style::default().fg(ORANGE),
+            ),
+            Span::styled(
+                format!(
+                    "  {:.1}s STARK",
+                    state.last_recursive_time_secs.unwrap_or(0.0)
+                ),
+                Style::default().fg(ORANGE),
+            ),
         ]));
 
         if let Some(ref model_id) = state.last_model_id {
             let mid_short = if model_id.len() > 16 {
-                format!("{}...{}", &model_id[..10], &model_id[model_id.len()-6..])
+                format!("{}...{}", &model_id[..10], &model_id[model_id.len() - 6..])
             } else {
                 model_id.clone()
             };
             lines.push(Line::from(vec![
-                Span::styled("  ID  ", Style::default().fg(VIOLET).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "  ID  ",
+                    Style::default().fg(VIOLET).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(mid_short, Style::default().fg(SLATE)),
                 if let Some(ref io) = state.last_io_commitment {
                     let io_short = if io.len() > 16 {
-                        format!("{}...{}", &io[..10], &io[io.len()-6..])
+                        format!("{}...{}", &io[..10], &io[io.len() - 6..])
                     } else {
                         io.clone()
                     };
@@ -740,10 +855,7 @@ fn render_onchain_panel(frame: &mut Frame, area: Rect, state: &VmDashboardState)
         )));
     }
 
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(BG)),
-        area,
-    );
+    frame.render_widget(Paragraph::new(lines).style(Style::default().bg(BG)), area);
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, state: &VmDashboardState) {
@@ -757,7 +869,11 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &VmDashboardState) {
 
     let uptime = format_uptime(state.uptime_secs);
     let contract_short = if state.contract.len() > 20 {
-        format!("{}…{}", &state.contract[..10], &state.contract[state.contract.len()-6..])
+        format!(
+            "{}…{}",
+            &state.contract[..10],
+            &state.contract[state.contract.len() - 6..]
+        )
     } else if state.contract.is_empty() {
         "no contract".into()
     } else {
@@ -766,15 +882,29 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &VmDashboardState) {
 
     let spans = vec![
         Span::styled(" ", Style::default()),
-        Span::styled(" ObelyZK VM ", Style::default().fg(BG).bg(LIME).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " ObelyZK VM ",
+            Style::default()
+                .fg(BG)
+                .bg(LIME)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("  ", Style::default()),
-        Span::styled(status_text, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            status_text,
+            Style::default()
+                .fg(status_color)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(format!("  {uptime}"), Style::default().fg(ORANGE)),
         Span::styled("  ", Style::default()),
         Span::styled(&contract_short, Style::default().fg(VIOLET)),
         Span::styled("  ", Style::default()),
         Span::styled(&state.network, Style::default().fg(SLATE)),
-        Span::styled(format!("  {} TXs", state.on_chain_txs), Style::default().fg(GHOST)),
+        Span::styled(
+            format!("  {} TXs", state.on_chain_txs),
+            Style::default().fg(GHOST),
+        ),
         Span::styled("    ", Style::default()),
         Span::styled("q", Style::default().fg(LIME)),
         Span::styled(" exit  ", Style::default().fg(GHOST)),

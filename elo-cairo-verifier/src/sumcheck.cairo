@@ -11,15 +11,14 @@
 //   Final: expected_sum = final_a_eval × final_b_eval
 
 use core::poseidon::poseidon_hash_span;
-use crate::field::{
-    QM31, qm31_add, qm31_mul, qm31_eq, qm31_zero, qm31_one, poly_eval_degree2,
-    pack_qm31_to_felt,
-};
 use crate::channel::{
-    PoseidonChannel, channel_default, channel_mix_u64, channel_mix_felt,
-    channel_mix_poly_coeffs, channel_draw_qm31,
+    PoseidonChannel, channel_default, channel_draw_qm31, channel_mix_felt, channel_mix_poly_coeffs,
+    channel_mix_u64,
 };
-use crate::types::{RoundPoly, BatchedMatMulProof, BatchedMatMulEntry};
+use crate::field::{
+    QM31, pack_qm31_to_felt, poly_eval_degree2, qm31_add, qm31_eq, qm31_mul, qm31_one, qm31_zero,
+};
+use crate::types::{BatchedMatMulEntry, BatchedMatMulProof, RoundPoly};
 
 /// Verify sumcheck rounds and return (is_valid, proof_hash, assignment).
 ///
@@ -74,7 +73,7 @@ pub fn verify_sumcheck_inner(
         expected_sum = poly_eval_degree2(poly.c0, poly.c1, poly.c2, challenge);
 
         round += 1;
-    };
+    }
 
     // Final check: expected_sum = f_A(assignment) × f_B(assignment)
     let product = qm31_mul(final_a_eval, final_b_eval);
@@ -89,19 +88,10 @@ pub fn verify_sumcheck_inner(
     // Compute proof hash for on-chain recording
     let proof_hash = poseidon_hash_span(
         array![
-            initial_digest,
-            num_rounds.into(),
-            claimed_sum.a.a.into(),
-            claimed_sum.a.b.into(),
-            claimed_sum.b.a.into(),
-            claimed_sum.b.b.into(),
-            final_a_eval.a.a.into(),
-            final_a_eval.a.b.into(),
-            final_a_eval.b.a.into(),
-            final_a_eval.b.b.into(),
-            final_b_eval.a.a.into(),
-            final_b_eval.a.b.into(),
-            final_b_eval.b.a.into(),
+            initial_digest, num_rounds.into(), claimed_sum.a.a.into(), claimed_sum.a.b.into(),
+            claimed_sum.b.a.into(), claimed_sum.b.b.into(), final_a_eval.a.a.into(),
+            final_a_eval.a.b.into(), final_a_eval.b.a.into(), final_a_eval.b.b.into(),
+            final_b_eval.a.a.into(), final_b_eval.a.b.into(), final_b_eval.b.a.into(),
             final_b_eval.b.b.into(),
         ]
             .span(),
@@ -134,9 +124,7 @@ pub fn check_round_sum(poly: RoundPoly, expected_sum: QM31) -> bool {
 ///   6. Final: current_sum = Σ λ^i · final_a_eval_i · final_b_eval_i
 ///
 /// Returns (is_valid, proof_hash).
-pub fn verify_batched_sumcheck(
-    proof: @BatchedMatMulProof,
-) -> (bool, felt252) {
+pub fn verify_batched_sumcheck(proof: @BatchedMatMulProof) -> (bool, felt252) {
     let k = *proof.k;
     let num_rounds = *proof.num_rounds;
     let entries = proof.entries;
@@ -172,7 +160,7 @@ pub fn verify_batched_sumcheck(
         channel_mix_felt(ref ch, *entry.a_commitment);
         channel_mix_felt(ref ch, *entry.b_commitment);
         i += 1;
-    };
+    }
 
     // Draw lambda
     let lambda = channel_draw_qm31(ref ch);
@@ -194,7 +182,7 @@ pub fn verify_batched_sumcheck(
         expected_combined = qm31_add(expected_combined, qm31_mul(lambda_pow, *entry.claimed_sum));
         lambda_pow = qm31_mul(lambda_pow, lambda);
         i += 1;
-    };
+    }
 
     if !qm31_eq(expected_combined, *proof.combined_claimed_sum) {
         return (false, 'COMBINED_SUM');
@@ -229,7 +217,7 @@ pub fn verify_batched_sumcheck(
         current_sum = poly_eval_degree2(poly.c0, poly.c1, poly.c2, challenge);
 
         round += 1;
-    };
+    }
 
     // ---- Step 6: Final check — current_sum = Σ λ^i · a_eval_i · b_eval_i ----
     let mut expected_final = qm31_zero();
@@ -244,7 +232,7 @@ pub fn verify_batched_sumcheck(
         expected_final = qm31_add(expected_final, qm31_mul(lambda_pow, ab));
         lambda_pow = qm31_mul(lambda_pow, lambda);
         i += 1;
-    };
+    }
 
     if !qm31_eq(current_sum, expected_final) {
         return (false, 'FINAL_EVAL');
@@ -253,13 +241,9 @@ pub fn verify_batched_sumcheck(
     // Compute proof hash for on-chain recording
     let proof_hash = poseidon_hash_span(
         array![
-            ch.digest,
-            num_rounds.into(),
-            num_entries.into(),
-            (*proof.combined_claimed_sum).a.a.into(),
-            (*proof.combined_claimed_sum).a.b.into(),
-            (*proof.combined_claimed_sum).b.a.into(),
-            (*proof.combined_claimed_sum).b.b.into(),
+            ch.digest, num_rounds.into(), num_entries.into(),
+            (*proof.combined_claimed_sum).a.a.into(), (*proof.combined_claimed_sum).a.b.into(),
+            (*proof.combined_claimed_sum).b.a.into(), (*proof.combined_claimed_sum).b.b.into(),
         ]
             .span(),
     );

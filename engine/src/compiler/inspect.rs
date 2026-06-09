@@ -197,7 +197,8 @@ pub fn summarize_graph(graph: &ComputationGraph, weights: &GraphWeights) -> Mode
             } => {
                 num_other += 1;
                 // Router: hidden_dim * num_experts, each expert FFN: 2 matmuls
-                let params = hidden_dim * num_experts + num_experts * hidden_dim * expert_ffn_dim * 2;
+                let params =
+                    hidden_dim * num_experts + num_experts * hidden_dim * expert_ffn_dim * 2;
                 (format!("MoE({num_experts}E top{top_k})"), params)
             }
         };

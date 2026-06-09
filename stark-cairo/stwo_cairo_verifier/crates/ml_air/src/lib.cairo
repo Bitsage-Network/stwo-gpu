@@ -12,29 +12,33 @@
 ///     channel_salt: Option<u64>,
 ///     activation_stark_proof: Option<ActivationStarkProof>,
 /// }
+///
+/// MLProofV2 {
+///     // Wider full-model layout. `verify_ml_v2` verifies the supported
+///     // subset and rejects every unsupported non-empty section.
+/// }
 /// ```
 pub mod claim;
-pub mod ml_air;
-pub mod sumcheck;
-pub mod mle;
 pub mod components;
-
+pub mod ml_air;
+pub mod mle;
+pub mod sumcheck;
+use claim::{
+    ActivationStarkProof, MLClaim, MLClaimLogSizesTrait, MLClaimMixTrait,
+    MLInteractionClaimMixTrait, MLProof, MLProofV2, MLVerificationOutput, UnifiedStarkProofV2,
+};
+use components::activation::ActivationLookupElements;
 use core::num::traits::Zero;
+use ml_air::MLAirNewImpl;
+use stwo_constraint_framework::LookupElementsTrait;
+use stwo_verifier_core::Hash;
 use stwo_verifier_core::channel::{Channel, ChannelTrait};
-use stwo_verifier_core::verifier::verify;
 use stwo_verifier_core::pcs::PcsConfigTrait;
 use stwo_verifier_core::pcs::verifier::{
     CommitmentSchemeVerifierImpl, CommitmentSchemeVerifierTrait, get_trace_lde_log_size,
 };
-use stwo_verifier_core::Hash;
-use stwo_constraint_framework::LookupElementsTrait;
-use claim::{
-    MLProof, MLClaim, MLClaimMixTrait, MLInteractionClaimMixTrait, ActivationStarkProof,
-    MLVerificationOutput, MLClaimLogSizesTrait,
-};
+use stwo_verifier_core::verifier::verify;
 use sumcheck::verify_matmul_sumcheck;
-use components::activation::ActivationLookupElements;
-use ml_air::MLAirNewImpl;
 
 /// Minimum security bits for activation STARK verification.
 const SECURITY_BITS: u32 = 96;
@@ -63,7 +67,7 @@ pub fn verify_ml(proof: MLProof) -> MLVerificationOutput {
     // Apply optional salt for rerandomization
     if let Option::Some(salt) = channel_salt {
         channel.mix_u64(salt);
-    };
+    }
 
     // Mix claim into channel
     claim.mix_into(ref channel);
@@ -76,7 +80,7 @@ pub fn verify_ml(proof: MLProof) -> MLVerificationOutput {
         let ok = verify_matmul_sumcheck(ref channel, matmul_proof);
         assert!(ok, "Matmul sumcheck {} verification failed", matmul_idx);
         matmul_idx += 1;
-    };
+    }
 
     // Verify activation STARK if present
     if let Option::Some(activation_proof) = activation_stark_proof {
@@ -92,6 +96,102 @@ pub fn verify_ml(proof: MLProof) -> MLVerificationOutput {
         num_matmuls: n_matmuls,
         verified: true,
     }
+}
+
+/// Verify the versioned wider ML proof layout.
+///
+/// This function deliberately fails closed. It verifies individual matmul
+/// sumchecks and activation-only unified STARKs. Any section without a full
+/// Cairo verifier is rejected while the proof is still deserialized, which
+/// prevents accidental "full-model" acceptance.
+pub fn verify_ml_v2(proof: MLProofV2) -> MLVerificationOutput {
+    let MLProofV2 {
+        claim,
+        matmul_proofs,
+        batched_matmul_proofs,
+        channel_salt,
+        unified_stark_proof,
+        add_claims,
+        mul_claims,
+        layernorm_claims,
+        embedding_claims,
+        attention_proofs,
+        tee_attestation_hash,
+    } = proof;
+
+    assert!(add_claims.len() == 0, "MLProofV2 add claims unsupported");
+    assert!(mul_claims.len() == 0, "MLProofV2 mul claims unsupported");
+    assert!(layernorm_claims.len() == 0, "MLProofV2 layernorm claims unsupported");
+    assert!(embedding_claims.len() == 0, "MLProofV2 embedding claims unsupported");
+    assert!(
+        batched_matmul_proofs.len() == 0,
+        "MLProofV2 batched matmul requires Poseidon transcript wiring",
+    );
+    assert!(attention_proofs.len() == 0, "MLProofV2 attention requires softmax STARK");
+    assert!(tee_attestation_hash.is_none(), "MLProofV2 TEE attestation not verified");
+
+    let mut channel: Channel = Default::default();
+
+    if let Option::Some(salt) = channel_salt {
+        channel.mix_u64(salt);
+    }
+
+    claim.mix_into(ref channel);
+
+    let mut num_verified_matmuls: u32 = 0;
+    let mut matmul_idx: u32 = 0;
+    while matmul_idx < matmul_proofs.len() {
+        let matmul_proof = matmul_proofs.at(matmul_idx);
+        let ok = verify_matmul_sumcheck(ref channel, matmul_proof);
+        assert!(ok, "Matmul sumcheck {} verification failed", matmul_idx);
+        num_verified_matmuls += 1;
+        matmul_idx += 1;
+    }
+
+    if let Option::Some(unified_proof) = unified_stark_proof {
+        verify_unified_stark_v2(ref channel, @claim, unified_proof);
+    }
+
+    MLVerificationOutput {
+        model_id: claim.model_id,
+        io_commitment: claim.io_commitment,
+        weight_commitment: claim.weight_commitment,
+        num_layers: claim.num_layers,
+        num_matmuls: num_verified_matmuls,
+        verified: true,
+    }
+}
+
+fn verify_unified_stark_v2(ref channel: Channel, claim: @MLClaim, proof: UnifiedStarkProofV2) {
+    let UnifiedStarkProofV2 {
+        activation_claims,
+        activation_interaction_claims,
+        add_claims,
+        mul_claims,
+        layernorm_claims,
+        layernorm_interaction_claims,
+        embedding_claims,
+        interaction_claim,
+        pcs_config,
+        interaction_pow,
+        stark_proof,
+    } = proof;
+
+    assert!(add_claims.len() == 0, "unified add AIR unsupported");
+    assert!(mul_claims.len() == 0, "unified mul AIR unsupported");
+    assert!(layernorm_claims.len() == 0, "unified layernorm AIR unsupported");
+    assert!(layernorm_interaction_claims.len() == 0, "unified layernorm LogUp unsupported");
+    assert!(embedding_claims.len() == 0, "unified embedding AIR unsupported");
+
+    let activation_proof = ActivationStarkProof {
+        activation_claims,
+        activation_interaction_claims,
+        interaction_claim,
+        pcs_config,
+        interaction_pow,
+        stark_proof,
+    };
+    verify_activation_stark(ref channel, claim, activation_proof);
 }
 
 /// Full STARK verification for activation LogUp proofs.
@@ -110,11 +210,7 @@ pub fn verify_ml(proof: MLProof) -> MLVerificationOutput {
 ///  11. Mix interaction claim, commit interaction trace
 ///  12. Construct MLAir
 ///  13. Call generic STARK verify
-fn verify_activation_stark(
-    ref channel: Channel,
-    claim: @MLClaim,
-    proof: ActivationStarkProof,
-) {
+fn verify_activation_stark(ref channel: Channel, claim: @MLClaim, proof: ActivationStarkProof) {
     let ActivationStarkProof {
         activation_claims,
         activation_interaction_claims,
@@ -142,7 +238,9 @@ fn verify_activation_stark(
         trace_commitment,
         interaction_trace_commitment,
         composition_commitment,
-    ] = commitments.unbox();
+    ] =
+        commitments
+        .unbox();
 
     // Step 4: Compute log_sizes per tree
     let log_sizes_arr = MLClaimLogSizesTrait::log_sizes(activation_claims.span());
@@ -153,22 +251,13 @@ fn verify_activation_stark(
     let log_blowup_factor = pcs_config.fri_config.log_blowup_factor;
 
     // Step 5: Commit preprocessed trace
-    commitment_scheme.commit(
-        preprocessed_commitment,
-        preprocessed_log_sizes,
-        ref channel,
-        log_blowup_factor,
-    );
+    commitment_scheme
+        .commit(preprocessed_commitment, preprocessed_log_sizes, ref channel, log_blowup_factor);
     // Mix claim after preprocessed commit (matches verify_cairo pattern)
     claim.mix_into(ref channel);
 
     // Step 6: Commit trace
-    commitment_scheme.commit(
-        trace_commitment,
-        trace_log_sizes,
-        ref channel,
-        log_blowup_factor,
-    );
+    commitment_scheme.commit(trace_commitment, trace_log_sizes, ref channel, log_blowup_factor);
 
     // Step 7: Verify interaction proof-of-work
     assert!(
@@ -192,12 +281,13 @@ fn verify_activation_stark(
     interaction_claim.mix_into(ref channel);
 
     // Step 11: Commit interaction trace
-    commitment_scheme.commit(
-        interaction_trace_commitment,
-        interaction_trace_log_sizes,
-        ref channel,
-        log_blowup_factor,
-    );
+    commitment_scheme
+        .commit(
+            interaction_trace_commitment,
+            interaction_trace_log_sizes,
+            ref channel,
+            log_blowup_factor,
+        );
 
     // Step 12: Construct MLAir with activation components
     let trace_lde_log_size = get_trace_lde_log_size(@commitment_scheme.trees);
@@ -214,21 +304,22 @@ fn verify_activation_stark(
 
     // Step 13: Call generic STARK verify
     verify(
-        ml_air,
-        ref channel,
         stark_proof,
-        commitment_scheme,
-        SECURITY_BITS,
+        ml_air,
+        composition_log_degree_bound,
         composition_commitment,
+        commitment_scheme,
+        ref channel,
+        SECURITY_BITS,
     );
 }
 
 #[cfg(test)]
 mod tests {
-    use core::num::traits::{Zero, One};
+    use core::num::traits::{One, Zero};
     use stwo_verifier_core::channel::{Channel, ChannelTrait};
     use stwo_verifier_core::fields::qm31::{QM31, qm31_const};
-    use super::claim::{MLProof, MLClaim, MatMulSumcheckProofOnChain, RoundPoly};
+    use super::claim::{MLClaim, MLProof, MatMulSumcheckProofOnChain, RoundPoly};
     use super::verify_ml;
 
     #[test]

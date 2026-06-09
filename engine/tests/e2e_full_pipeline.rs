@@ -452,10 +452,7 @@ fn test_e2e_prove_health_check_dry_run() {
 
     // 1. Build a 2-layer MLP: MatMul(4→4) + ReLU + MatMul(4→2)
     let mut builder = GraphBuilder::new((1, 4));
-    builder
-        .linear(4)
-        .activation(ActivationType::ReLU)
-        .linear(2);
+    builder.linear(4).activation(ActivationType::ReLU).linear(2);
     let graph = builder.build();
 
     let mut input = M31Matrix::new(1, 4);
@@ -490,8 +487,7 @@ fn test_e2e_prove_health_check_dry_run() {
     gkr.aggregated_binding = None;
 
     // 3. Serialize to v4 packed IO calldata
-    let circuit =
-        obelyzk::gkr::LayeredCircuit::from_graph(&graph).expect("circuit should compile");
+    let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&graph).expect("circuit should compile");
     let raw_io = obelyzk::cairo_serde::serialize_raw_io(&input, &agg_proof.execution.output);
     let model_id = FieldElement::from(0x42u64);
 
@@ -546,10 +542,7 @@ fn test_e2e_prove_health_check_dry_run() {
         corrupted[0] = FieldElement::ZERO;
         let corrupt_report = verify_proof_fast(&corrupted);
         // model_id check should fail
-        let model_check = corrupt_report
-            .checks
-            .iter()
-            .find(|c| c.name == "model_id");
+        let model_check = corrupt_report.checks.iter().find(|c| c.name == "model_id");
         assert!(
             model_check.is_some() && !model_check.unwrap().passed,
             "zeroed model_id should fail model_id check"
@@ -562,11 +555,7 @@ fn test_e2e_prove_health_check_dry_run() {
 
     // 7. Truncate calldata → tail sentinel or length check should fail
     {
-        let truncated: Vec<FieldElement> = calldata_felts
-            .iter()
-            .take(3)
-            .cloned()
-            .collect();
+        let truncated: Vec<FieldElement> = calldata_felts.iter().take(3).cloned().collect();
         let trunc_report = verify_proof_fast(&truncated);
         // With only 3 felts, io_header check should fail (not enough room)
         assert!(

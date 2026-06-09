@@ -5,7 +5,7 @@
 // Required env: KEYSTORE_PATH, KEYSTORE_PASSWORD, ACCOUNT_ADDRESS
 // Optional env: RECURSIVE_CONTRACT, STARKNET_RPC
 
-import { Account, RpcProvider, CallData, ec } from "starknet";
+import { Account, RpcProvider, CallData, ec, hash } from "starknet";
 import { keccak_256 } from "@noble/hashes/sha3";
 import { readFileSync } from "fs";
 import { scrypt as scryptCb } from "crypto";
@@ -37,6 +37,10 @@ function packQm31ToFelt252(limbs) {
   return "0x" + r.toString(16);
 }
 
+function hasStatementHash(value) {
+  return BigInt(value || "0x0") !== 0n;
+}
+
 async function decryptKeystore(path, password) {
   const ks = JSON.parse(readFileSync(path, "utf-8"));
   const c = ks.crypto;
@@ -65,12 +69,18 @@ async function main() {
 
   const raw = JSON.parse(readFileSync(proofPath, "utf-8"));
   const modelId = raw.model_id || raw.verify_calldata?.model_id || "0x1";
-  const ioCommitment = raw.io_commitment || "0x1";
   const recursive = raw.recursive_proof;
   if (!recursive?.calldata?.length) { console.error("No recursive_proof.calldata"); process.exit(1); }
   const calldata = recursive.calldata;
+  const ioCommitment = calldata[19] || raw.io_commitment || "0x1";
   const circuitHash = recursive.circuit_hash || packQm31ToFelt252(calldata.slice(0, 4));
   const weightSuperRoot = recursive.weight_super_root || packQm31ToFelt252(calldata.slice(8, 12));
+  const conversationStatementHash = raw.conversation_statement_hash || recursive.conversation_statement_hash || "0x0";
+  const statementVerifier = raw.statement_verifier || recursive.statement_verifier || process.env.STATEMENT_VERIFIER_CONTRACT || process.env.STWO_STATEMENT_VERIFIER || "0x0";
+  const statementProofHash = raw.statement_proof_hash || recursive.statement_proof_hash || process.env.STATEMENT_PROOF_HASH || "0x0";
+  const bindStatement = hasStatementHash(conversationStatementHash);
+  const bindStatementFact = bindStatement && hasStatementHash(statementVerifier);
+  const verifyEntrypoint = bindStatementFact ? "verify_recursive_with_statement_fact" : (bindStatement ? "verify_recursive_with_statement" : "verify_recursive");
 
   console.log("Contract:      " + CONTRACT);
   console.log("Account:       " + ADDR);
@@ -78,6 +88,9 @@ async function main() {
   console.log("IO Commitment: " + ioCommitment);
   console.log("Circuit Hash:  " + circuitHash);
   console.log("Weight Root:   " + weightSuperRoot);
+  console.log("Statement:     " + conversationStatementHash);
+  console.log("Stmt Verifier: " + statementVerifier);
+  console.log("Entrypoint:    " + verifyEntrypoint);
   console.log("Calldata:      " + calldata.length + " felts");
 
   // Step 1: register if needed
@@ -129,6 +142,32 @@ async function main() {
 
   // Step 2: verify_recursive
   const metadata = raw.metadata || {};
+  const verifyFields = {
+    model_id: modelId,
+    io_commitment: ioCommitment,
+    circuit_hash: circuitHash,
+    weight_super_root: weightSuperRoot,
+    n_layers: metadata.n_layers || 9,
+    n_matmuls: metadata.n_matmuls || 6,
+    hidden_size: metadata.hidden_size || 576,
+    num_transformer_blocks: metadata.num_transformer_blocks || 1,
+    policy_commitment: raw.policy_commitment || recursive.policy_commitment || "0x0",
+    trace_log_size: metadata.trace_log_size || recursive.log_size || 15,
+  };
+  const verifyCalldata = CallData.compile(bindStatementFact ? {
+    ...verifyFields,
+    expected_conversation_statement_hash: conversationStatementHash,
+    statement_verifier: statementVerifier,
+    expected_statement_proof_hash: statementProofHash,
+    stark_proof_data: calldata,
+  } : bindStatement ? {
+    ...verifyFields,
+    expected_conversation_statement_hash: conversationStatementHash,
+    stark_proof_data: calldata,
+  } : {
+    ...verifyFields,
+    stark_proof_data: calldata,
+  });
 
   // Pre-flight: simulate the call directly via RPC so we can see the real revert reason.
   if (process.env.SIMULATE_FIRST === "1") {
@@ -140,20 +179,8 @@ async function main() {
           jsonrpc: "2.0", id: 1, method: "starknet_call",
           params: [{
             contract_address: CONTRACT,
-            entry_point_selector: "0x10cce72c6a97f20e432264e466c8f2d1f344a5ba920ef93333c899d9011fe5a",
-            calldata: CallData.compile({
-              model_id: modelId,
-              io_commitment: ioCommitment,
-              circuit_hash: circuitHash,
-              weight_super_root: weightSuperRoot,
-              n_layers: metadata.n_layers || 9,
-              n_matmuls: metadata.n_matmuls || 6,
-              hidden_size: metadata.hidden_size || 576,
-              num_transformer_blocks: metadata.num_transformer_blocks || 1,
-              policy_commitment: raw.policy_commitment || recursive.policy_commitment || "0x0",
-              trace_log_size: metadata.trace_log_size || recursive.log_size || 11,
-              stark_proof_data: calldata,
-            }),
+            entry_point_selector: hash.getSelectorFromName(verifyEntrypoint),
+            calldata: verifyCalldata,
           }, "latest"]
         }),
       });
@@ -175,19 +202,6 @@ async function main() {
   }
 
   process.stdout.write("Submitting:    ");
-  const verifyCalldata = CallData.compile({
-    model_id: modelId,
-    io_commitment: ioCommitment,
-    circuit_hash: circuitHash,
-    weight_super_root: weightSuperRoot,
-    n_layers: metadata.n_layers || 9,
-    n_matmuls: metadata.n_matmuls || 6,
-    hidden_size: metadata.hidden_size || 576,
-    num_transformer_blocks: metadata.num_transformer_blocks || 1,
-    policy_commitment: raw.policy_commitment || recursive.policy_commitment || "0x0",
-    trace_log_size: metadata.trace_log_size || recursive.log_size || 15,
-    stark_proof_data: calldata,
-  });
 
   // Get nonce from a 'latest'-only RPC (PublicNode for big-calldata path), then submit.
   // starknet.js v7 default uses 'pending' which PublicNode rejects, so we set nonce manually.
@@ -205,7 +219,7 @@ async function main() {
   };
 
   const tx = await submitAccount.execute(
-    [{ contractAddress: CONTRACT, entrypoint: "verify_recursive", calldata: verifyCalldata }],
+    [{ contractAddress: CONTRACT, entrypoint: verifyEntrypoint, calldata: verifyCalldata }],
     { nonce: nonceHex, resourceBounds, skipValidate: true, version: 3, blockIdentifier: "latest" }
   );
   console.log("tx=" + tx.transaction_hash);

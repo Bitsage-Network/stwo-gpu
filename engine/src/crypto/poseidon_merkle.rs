@@ -318,9 +318,7 @@ impl PoseidonMerkleTree {
     pub(crate) fn all_layers_as_felts(&self) -> Vec<Vec<FieldElement>> {
         self.layers
             .iter()
-            .map(|layer| {
-                (0..layer.len()).map(|i| layer.at(i)).collect()
-            })
+            .map(|layer| (0..layer.len()).map(|i| layer.at(i)).collect())
             .collect()
     }
 

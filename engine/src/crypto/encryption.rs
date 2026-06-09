@@ -135,10 +135,7 @@ pub fn poseidon2_encrypt_siv(
 
 /// Decrypt a SIV ciphertext. Verifies MAC, then decrypts, then verifies the
 /// nonce matches `Hash(key, recovered_plaintext)`.
-pub fn poseidon2_decrypt_siv(
-    key: &[M31; RATE],
-    siv: &SivCiphertext,
-) -> Option<Vec<M31>> {
+pub fn poseidon2_decrypt_siv(key: &[M31; RATE], siv: &SivCiphertext) -> Option<Vec<M31>> {
     // Verify MAC before decryption
     let expected_mac = compute_mac(key, &siv.nonce, &siv.ciphertext);
     if !verify_mac(&expected_mac, &siv.mac) {
@@ -211,9 +208,9 @@ pub fn poseidon2_encrypt_checked(
         for (i, &pt) in chunk.iter().enumerate() {
             ciphertext.push(pt + ks[i]);
         }
-        counter = counter.checked_add(1).ok_or_else(|| {
-            EncryptError::MessageTooLarge(plaintext.len())
-        })?;
+        counter = counter
+            .checked_add(1)
+            .ok_or_else(|| EncryptError::MessageTooLarge(plaintext.len()))?;
     }
 
     Ok(ciphertext)
@@ -761,7 +758,10 @@ mod tests {
         let siv1 = poseidon2_encrypt_siv(&key, &pt1).expect("encrypt 1");
         let siv2 = poseidon2_encrypt_siv(&key, &pt2).expect("encrypt 2");
 
-        assert_ne!(siv1.nonce, siv2.nonce, "Different plaintext → different nonce");
+        assert_ne!(
+            siv1.nonce, siv2.nonce,
+            "Different plaintext → different nonce"
+        );
     }
 
     #[test]
@@ -772,7 +772,10 @@ mod tests {
         let mut siv = poseidon2_encrypt_siv(&key, &plaintext).expect("encrypt");
         siv.ciphertext[0] = siv.ciphertext[0] + M31::from_u32_unchecked(1);
 
-        assert!(poseidon2_decrypt_siv(&key, &siv).is_none(), "Tampered ciphertext must fail");
+        assert!(
+            poseidon2_decrypt_siv(&key, &siv).is_none(),
+            "Tampered ciphertext must fail"
+        );
     }
 
     #[test]
@@ -783,7 +786,10 @@ mod tests {
         let mut siv = poseidon2_encrypt_siv(&key, &plaintext).expect("encrypt");
         siv.mac[0] = siv.mac[0] + M31::from_u32_unchecked(1);
 
-        assert!(poseidon2_decrypt_siv(&key, &siv).is_none(), "Tampered MAC must fail");
+        assert!(
+            poseidon2_decrypt_siv(&key, &siv).is_none(),
+            "Tampered MAC must fail"
+        );
     }
 
     #[test]
@@ -793,7 +799,10 @@ mod tests {
         let plaintext: Vec<M31> = (1..=5).map(|i| M31::from_u32_unchecked(i)).collect();
 
         let siv = poseidon2_encrypt_siv(&key1, &plaintext).expect("encrypt");
-        assert!(poseidon2_decrypt_siv(&key2, &siv).is_none(), "Wrong key must fail");
+        assert!(
+            poseidon2_decrypt_siv(&key2, &siv).is_none(),
+            "Wrong key must fail"
+        );
     }
 
     #[test]
@@ -836,7 +845,9 @@ mod tests {
 
     #[test]
     fn test_key_usage_tracker_limit() {
-        let mut tracker = KeyUsageTracker { encryptions: MAX_ENCRYPTIONS_PER_KEY };
+        let mut tracker = KeyUsageTracker {
+            encryptions: MAX_ENCRYPTIONS_PER_KEY,
+        };
         let result = tracker.record_encryption();
         assert!(matches!(result, Err(EncryptError::KeyRotationNeeded(_))));
     }

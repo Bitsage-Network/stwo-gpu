@@ -8,8 +8,8 @@
 
 use stwo::core::fields::m31::M31;
 
-use crate::components::matmul::M31Matrix;
 use super::device::MetalDevice;
+use crate::components::matmul::M31Matrix;
 
 /// WGSL compute shader for M31 matrix multiplication.
 ///
@@ -97,7 +97,11 @@ pub fn gpu_matmul_m31_metal(a: &M31Matrix, b: &M31Matrix) -> M31Matrix {
     let m = a.rows;
     let k = a.cols;
     let n = b.cols;
-    assert_eq!(k, b.rows, "matmul dimension mismatch: A.cols={} != B.rows={}", k, b.rows);
+    assert_eq!(
+        k, b.rows,
+        "matmul dimension mismatch: A.cols={} != B.rows={}",
+        k, b.rows
+    );
 
     // Small matrices: CPU is faster due to GPU dispatch overhead
     if m * k * n < 4096 {
@@ -107,27 +111,33 @@ pub fn gpu_matmul_m31_metal(a: &M31Matrix, b: &M31Matrix) -> M31Matrix {
     let dev = MetalDevice::global();
 
     // Create shader module
-    let shader = dev.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("m31_matmul"),
-        source: wgpu::ShaderSource::Wgsl(MATMUL_SHADER.into()),
-    });
+    let shader = dev
+        .device
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("m31_matmul"),
+            source: wgpu::ShaderSource::Wgsl(MATMUL_SHADER.into()),
+        });
 
     // Create buffers
     let a_data: Vec<u32> = a.data.iter().map(|v| v.0).collect();
     let b_data: Vec<u32> = b.data.iter().map(|v| v.0).collect();
     let c_size = (m * n) as usize;
 
-    let a_buf = dev.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("a"),
-        contents: bytemuck::cast_slice(&a_data),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
+    let a_buf = dev
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("a"),
+            contents: bytemuck::cast_slice(&a_data),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
 
-    let b_buf = dev.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("b"),
-        contents: bytemuck::cast_slice(&b_data),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
+    let b_buf = dev
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("b"),
+            contents: bytemuck::cast_slice(&b_data),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
 
     let c_buf = dev.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("c"),
@@ -137,11 +147,13 @@ pub fn gpu_matmul_m31_metal(a: &M31Matrix, b: &M31Matrix) -> M31Matrix {
     });
 
     let dims = [m as u32, k as u32, n as u32, 0u32];
-    let dims_buf = dev.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("dims"),
-        contents: bytemuck::cast_slice(&dims),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
+    let dims_buf = dev
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("dims"),
+            contents: bytemuck::cast_slice(&dims),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
 
     // Staging buffer for readback
     let staging_buf = dev.device.create_buffer(&wgpu::BufferDescriptor {
@@ -152,82 +164,102 @@ pub fn gpu_matmul_m31_metal(a: &M31Matrix, b: &M31Matrix) -> M31Matrix {
     });
 
     // Bind group layout
-    let bind_group_layout = dev.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("matmul_layout"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+    let bind_group_layout = dev
+        .device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("matmul_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 3,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            },
-        ],
-    });
+            ],
+        });
 
     let bind_group = dev.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("matmul_bind"),
         layout: &bind_group_layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: a_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: b_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: c_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: dims_buf.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: a_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: b_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: c_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: dims_buf.as_entire_binding(),
+            },
         ],
     });
 
-    let pipeline_layout = dev.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("matmul_pipeline"),
-        bind_group_layouts: &[&bind_group_layout],
-        push_constant_ranges: &[],
-    });
+    let pipeline_layout = dev
+        .device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("matmul_pipeline"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
 
-    let pipeline = dev.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("matmul"),
-        layout: Some(&pipeline_layout),
-        module: &shader,
-        entry_point: Some("main"),
-        compilation_options: Default::default(),
-        cache: None,
-    });
+    let pipeline = dev
+        .device
+        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("matmul"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
 
     // Dispatch
-    let mut encoder = dev.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("matmul_encoder"),
-    });
+    let mut encoder = dev
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("matmul_encoder"),
+        });
 
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -279,13 +311,20 @@ mod tests {
     fn test_metal_matmul_small() {
         // 2x3 × 3x2 = 2x2
         let mut a = M31Matrix::new(2, 3);
-        a.set(0, 0, M31::from(1)); a.set(0, 1, M31::from(2)); a.set(0, 2, M31::from(3));
-        a.set(1, 0, M31::from(4)); a.set(1, 1, M31::from(5)); a.set(1, 2, M31::from(6));
+        a.set(0, 0, M31::from(1));
+        a.set(0, 1, M31::from(2));
+        a.set(0, 2, M31::from(3));
+        a.set(1, 0, M31::from(4));
+        a.set(1, 1, M31::from(5));
+        a.set(1, 2, M31::from(6));
 
         let mut b = M31Matrix::new(3, 2);
-        b.set(0, 0, M31::from(7)); b.set(0, 1, M31::from(8));
-        b.set(1, 0, M31::from(9)); b.set(1, 1, M31::from(10));
-        b.set(2, 0, M31::from(11)); b.set(2, 1, M31::from(12));
+        b.set(0, 0, M31::from(7));
+        b.set(0, 1, M31::from(8));
+        b.set(1, 0, M31::from(9));
+        b.set(1, 1, M31::from(10));
+        b.set(2, 0, M31::from(11));
+        b.set(2, 1, M31::from(12));
 
         // CPU reference
         let cpu_result = crate::components::matmul::matmul_m31(&a, &b);
@@ -298,7 +337,8 @@ mod tests {
         for i in 0..cpu_result.rows {
             for j in 0..cpu_result.cols {
                 assert_eq!(
-                    cpu_result.get(i, j), gpu_result.get(i, j),
+                    cpu_result.get(i, j),
+                    gpu_result.get(i, j),
                     "mismatch at ({i},{j})"
                 );
             }
@@ -332,7 +372,8 @@ mod tests {
         for i in 0..m {
             for j in 0..n {
                 assert_eq!(
-                    cpu_result.get(i, j), gpu_result.get(i, j),
+                    cpu_result.get(i, j),
+                    gpu_result.get(i, j),
                     "mismatch at ({i},{j})"
                 );
             }

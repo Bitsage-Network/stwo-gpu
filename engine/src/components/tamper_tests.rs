@@ -21,8 +21,14 @@ mod tests {
         // Verify cos/sin produce identical results every time (no f64 variance)
         use crate::components::integer_math::{cos_fixed, sin_fixed};
         let angles: Vec<u32> = (0..1000).map(|i| i * 4294967).collect(); // spread across [0, 2^32)
-        let results1: Vec<(i32, i32)> = angles.iter().map(|&a| (cos_fixed(a), sin_fixed(a))).collect();
-        let results2: Vec<(i32, i32)> = angles.iter().map(|&a| (cos_fixed(a), sin_fixed(a))).collect();
+        let results1: Vec<(i32, i32)> = angles
+            .iter()
+            .map(|&a| (cos_fixed(a), sin_fixed(a)))
+            .collect();
+        let results2: Vec<(i32, i32)> = angles
+            .iter()
+            .map(|&a| (cos_fixed(a), sin_fixed(a)))
+            .collect();
         assert_eq!(results1, results2, "cos/sin must be deterministic");
     }
 
@@ -44,7 +50,10 @@ mod tests {
         let thetas = precompute_rope_thetas(64, 10000.0);
         let (cos_off0, _) = build_rope_table_integer(4, 64, &thetas, 0);
         let (cos_off10, _) = build_rope_table_integer(4, 64, &thetas, 10);
-        assert_ne!(cos_off0, cos_off10, "different offsets must produce different tables");
+        assert_ne!(
+            cos_off0, cos_off10,
+            "different offsets must produce different tables"
+        );
     }
 
     // ── Activation Tamper Tests ──────────────────────────────────────────
@@ -56,9 +65,18 @@ mod tests {
         let gelu = PiecewiseLinearCoeffs::for_activation(ActivationType::GELU);
         let silu = PiecewiseLinearCoeffs::for_activation(ActivationType::SiLU);
         let sigmoid = PiecewiseLinearCoeffs::for_activation(ActivationType::Sigmoid);
-        assert_ne!(gelu.slopes, silu.slopes, "GELU and SiLU must have different slopes");
-        assert_ne!(gelu.slopes, sigmoid.slopes, "GELU and Sigmoid must have different slopes");
-        assert_ne!(silu.slopes, sigmoid.slopes, "SiLU and Sigmoid must have different slopes");
+        assert_ne!(
+            gelu.slopes, silu.slopes,
+            "GELU and SiLU must have different slopes"
+        );
+        assert_ne!(
+            gelu.slopes, sigmoid.slopes,
+            "GELU and Sigmoid must have different slopes"
+        );
+        assert_ne!(
+            silu.slopes, sigmoid.slopes,
+            "SiLU and Sigmoid must have different slopes"
+        );
     }
 
     #[test]
@@ -74,15 +92,20 @@ mod tests {
     #[test]
     fn test_activation_integer_matches_piecewise_at_boundaries() {
         // At segment boundaries, the piecewise evaluation must match the integer activation
-        use crate::components::activation::{ActivationType, PiecewiseLinearCoeffs, piecewise_linear_eval};
+        use crate::components::activation::{
+            piecewise_linear_eval, ActivationType, PiecewiseLinearCoeffs,
+        };
         use crate::components::integer_math::apply_activation_integer;
         let coeffs = PiecewiseLinearCoeffs::for_activation(ActivationType::SiLU);
         for seg in 0..coeffs.num_segments {
             let x_start = (seg as u32).wrapping_mul(coeffs.segment_width);
             let pw = piecewise_linear_eval(&coeffs, M31::from(x_start));
             let exact = apply_activation_integer(4, x_start); // SiLU = tag 4
-            assert_eq!(pw, M31::from(exact),
-                "SiLU boundary mismatch at segment {seg}, x={x_start}");
+            assert_eq!(
+                pw,
+                M31::from(exact),
+                "SiLU boundary mismatch at segment {seg}, x={x_start}"
+            );
         }
     }
 
@@ -95,17 +118,24 @@ mod tests {
         for d_k in [64, 80, 96, 128, 256] {
             let sqrt = {
                 let n = d_k as u64;
-                if n < 2 { n as u32 } else {
+                if n < 2 {
+                    n as u32
+                } else {
                     let mut x = 1u64 << (((64 - n.leading_zeros()) + 1) / 2);
                     loop {
                         let x1 = (x + n / x) / 2;
-                        if x1 >= x { break x as u32; }
+                        if x1 >= x {
+                            break x as u32;
+                        }
                         x = x1;
                     }
                 }
             };
             let expected = (d_k as f64).sqrt() as u32;
-            assert_eq!(sqrt, expected, "isqrt({d_k}) should be {expected}, got {sqrt}");
+            assert_eq!(
+                sqrt, expected,
+                "isqrt({d_k}) should be {expected}, got {sqrt}"
+            );
         }
     }
 
@@ -126,8 +156,11 @@ mod tests {
         // A malicious prover claiming the wrong expert should be caught
         use crate::components::topk::{select_top_k, verify_top_k, TopKSelection};
         let logits = vec![
-            M31::from(10u32), M31::from(90u32), M31::from(50u32),
-            M31::from(80u32), M31::from(30u32),
+            M31::from(10u32),
+            M31::from(90u32),
+            M31::from(50u32),
+            M31::from(80u32),
+            M31::from(30u32),
         ];
         // Correct top-2: indices 1 (90) and 3 (80)
         let correct = select_top_k(&logits, 2);
@@ -142,8 +175,10 @@ mod tests {
             num_experts: 5,
             top_k: 2,
         };
-        assert!(verify_top_k(&logits, &tampered).is_err(),
-            "tampered expert selection should be rejected");
+        assert!(
+            verify_top_k(&logits, &tampered).is_err(),
+            "tampered expert selection should be rejected"
+        );
     }
 
     #[test]
@@ -159,8 +194,10 @@ mod tests {
             num_experts: 3,
             top_k: 1,
         };
-        assert!(verify_top_k(&logits, &fabricated).is_err(),
-            "fabricated logit values should be rejected");
+        assert!(
+            verify_top_k(&logits, &fabricated).is_err(),
+            "fabricated logit values should be rejected"
+        );
     }
 
     // ── LayerNorm γ Tamper Tests ─────────────────────────────────────────
@@ -182,12 +219,25 @@ mod tests {
             ch.digest()
         }
 
-        let g1 = vec![M31::from(1u32), M31::from(2u32), M31::from(3u32), M31::from(4u32)];
-        let g2 = vec![M31::from(1u32), M31::from(2u32), M31::from(3u32), M31::from(5u32)]; // last element changed
+        let g1 = vec![
+            M31::from(1u32),
+            M31::from(2u32),
+            M31::from(3u32),
+            M31::from(4u32),
+        ];
+        let g2 = vec![
+            M31::from(1u32),
+            M31::from(2u32),
+            M31::from(3u32),
+            M31::from(5u32),
+        ]; // last element changed
 
         let c1 = gamma_commitment(&g1);
         let c2 = gamma_commitment(&g2);
-        assert_ne!(c1, c2, "different γ vectors must produce different commitments");
+        assert_ne!(
+            c1, c2,
+            "different γ vectors must produce different commitments"
+        );
     }
 
     #[test]
@@ -197,7 +247,12 @@ mod tests {
         let input = M31Matrix {
             rows: 1,
             cols: 4,
-            data: vec![M31::from(100u32), M31::from(200u32), M31::from(300u32), M31::from(400u32)],
+            data: vec![
+                M31::from(100u32),
+                M31::from(200u32),
+                M31::from(300u32),
+                M31::from(400u32),
+            ],
         };
         let ones = vec![M31::from(1u32); 4];
 

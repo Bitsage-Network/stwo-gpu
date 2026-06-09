@@ -7,8 +7,8 @@
 use crate::aggregation::{AggregatedModelProofOnChain, ForwardPassResult};
 use crate::compiler::graph::{ComputationGraph, GraphWeights};
 use crate::components::matmul::M31Matrix;
-use crate::weight_cache::SharedWeightCache;
 use crate::policy::PolicyConfig;
+use crate::weight_cache::SharedWeightCache;
 
 /// Prove from a captured forward pass result.
 ///
@@ -23,9 +23,8 @@ pub fn prove_from_forward_result(
     weight_cache: Option<&SharedWeightCache>,
     policy: Option<&PolicyConfig>,
 ) -> Result<AggregatedModelProofOnChain, ProverError> {
-    crate::aggregation::prove_from_forward_result(
-        graph, input, weights, fwd, weight_cache, policy,
-    ).map_err(|e| ProverError::ProvingFailed(format!("{e}")))
+    crate::aggregation::prove_from_forward_result(graph, input, weights, fwd, weight_cache, policy)
+        .map_err(|e| ProverError::ProvingFailed(format!("{e}")))
 }
 
 /// Errors from the VM prover.

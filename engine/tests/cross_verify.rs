@@ -281,10 +281,10 @@ fn test_cross_verify_mode4_aggregated_binding() {
     use obelyzk::crypto::poseidon_channel::PoseidonChannel;
     // commit_mle_root_only and evaluate_mle_at are exercised internally by
     // prove_aggregated_binding and verify_aggregated_binding respectively.
-    use stwo::core::fields::m31::M31;
     use obelyzk::compiler::graph::{GraphBuilder, GraphWeights};
     use obelyzk::gkr::{verify_gkr, LayeredCircuit, WeightOpeningTranscriptMode};
     use obelyzk::starknet::build_gkr_starknet_proof;
+    use stwo::core::fields::m31::M31;
 
     // Activate mode 4 aggregated oracle sumcheck for this test.
     let _binding_mode = EnvVarGuard::set("STWO_WEIGHT_BINDING", "aggregated");

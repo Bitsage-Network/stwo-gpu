@@ -11,6 +11,9 @@ poseidon252_verifier = ["stwo_verifier_core/poseidon252_verifier"]
 qm31_opcode = ["stwo_verifier_core/qm31_opcode"]
 blake_outputs_packing = ["stwo_verifier_core/blake_outputs_packing"]
 poseidon_outputs_packing = ["stwo_verifier_core/poseidon_outputs_packing"]
+# Production fixed-program verifier profile. This removes optional Cairo AIR
+# components that the conversation verifier executable must not use.
+conversation_pruned = []
 
 
 [tool.fmt]

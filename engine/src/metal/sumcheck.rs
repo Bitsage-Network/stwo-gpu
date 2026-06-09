@@ -126,11 +126,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 ///
 /// Returns (s0, s1, s2) — the partial sums at t=0, t=1, t=2.
 /// The CPU then interpolates the round polynomial coefficients.
-pub fn metal_sumcheck_round(
-    a_data: &[M31],
-    b_data: &[M31],
-    mid: usize,
-) -> (M31, M31, M31) {
+pub fn metal_sumcheck_round(a_data: &[M31], b_data: &[M31], mid: usize) -> (M31, M31, M31) {
     use wgpu::util::DeviceExt;
 
     if mid < 128 {
@@ -140,66 +136,143 @@ pub fn metal_sumcheck_round(
 
     let dev = MetalDevice::global();
 
-    let shader = dev.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("sumcheck_round"),
-        source: wgpu::ShaderSource::Wgsl(SUMCHECK_ROUND_SHADER.into()),
-    });
+    let shader = dev
+        .device
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("sumcheck_round"),
+            source: wgpu::ShaderSource::Wgsl(SUMCHECK_ROUND_SHADER.into()),
+        });
 
     let a_u32: Vec<u32> = a_data.iter().map(|v| v.0).collect();
     let b_u32: Vec<u32> = b_data.iter().map(|v| v.0).collect();
 
-    let a_buf = dev.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("a"), contents: bytemuck::cast_slice(&a_u32), usage: wgpu::BufferUsages::STORAGE,
-    });
-    let b_buf = dev.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("b"), contents: bytemuck::cast_slice(&b_u32), usage: wgpu::BufferUsages::STORAGE,
-    });
+    let a_buf = dev
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("a"),
+            contents: bytemuck::cast_slice(&a_u32),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+    let b_buf = dev
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("b"),
+            contents: bytemuck::cast_slice(&b_u32),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
 
     let out_size = mid * 3;
     let out_buf = dev.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("out"), size: (out_size * 4) as u64,
+        label: Some("out"),
+        size: (out_size * 4) as u64,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
 
     let params = [mid as u32, 0, 0, 0];
-    let params_buf = dev.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("params"), contents: bytemuck::cast_slice(&params), usage: wgpu::BufferUsages::UNIFORM,
-    });
+    let params_buf = dev
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("params"),
+            contents: bytemuck::cast_slice(&params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
 
     let staging = dev.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("staging"), size: (out_size * 4) as u64,
+        label: Some("staging"),
+        size: (out_size * 4) as u64,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
 
-    let bgl = dev.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: None,
-        entries: &[
-            wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
-            wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
-            wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
-            wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
-        ],
-    });
+    let bgl = dev
+        .device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
 
     let bg = dev.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: None, layout: &bgl,
+        label: None,
+        layout: &bgl,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: a_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: b_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: out_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: params_buf.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: a_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: b_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: out_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: params_buf.as_entire_binding(),
+            },
         ],
     });
 
-    let pl = dev.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: None, bind_group_layouts: &[&bgl], push_constant_ranges: &[],
-    });
-    let pipeline = dev.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: None, layout: Some(&pl), module: &shader, entry_point: Some("main"),
-        compilation_options: Default::default(), cache: None,
-    });
+    let pl = dev
+        .device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+    let pipeline = dev
+        .device
+        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: Some(&pl),
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
 
     let mut encoder = dev.device.create_command_encoder(&Default::default());
     {
@@ -213,7 +286,9 @@ pub fn metal_sumcheck_round(
 
     let slice = staging.slice(..);
     let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).unwrap(); });
+    slice.map_async(wgpu::MapMode::Read, move |r| {
+        tx.send(r).unwrap();
+    });
     dev.device.poll(wgpu::Maintain::Wait);
     rx.recv().unwrap().unwrap();
 
@@ -278,7 +353,9 @@ mod tests {
         // Large enough to dispatch to GPU (mid >= 128)
         let n = 512;
         let a: Vec<M31> = (0..n).map(|i| M31::from((i % 100 + 1) as u32)).collect();
-        let b: Vec<M31> = (0..n).map(|i| M31::from(((i * 3) % 100 + 1) as u32)).collect();
+        let b: Vec<M31> = (0..n)
+            .map(|i| M31::from(((i * 3) % 100 + 1) as u32))
+            .collect();
 
         let (gs0, gs1, gs2) = metal_sumcheck_round(&a, &b, n / 2);
         let (cs0, cs1, cs2) = cpu_sumcheck_round(&a, &b, n / 2);

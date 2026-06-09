@@ -253,7 +253,7 @@ pub fn group_columns_by_degree_bound(
         if *bound > max_bound {
             max_bound = *bound;
         }
-    };
+    }
 
     // Build result: for each degree bound 0..=max_bound, collect column indices.
     // Uses O(max_bound × n_columns) but both are small.
@@ -267,10 +267,10 @@ pub fn group_columns_by_degree_bound(
                 indices.append(col_index);
             }
             col_index += 1;
-        };
+        }
         res.append(indices.span());
         degree += 1;
-    };
+    }
     res.span()
 }
 

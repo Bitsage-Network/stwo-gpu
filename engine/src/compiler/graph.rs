@@ -131,7 +131,12 @@ impl GraphOp {
                 config.seq_len * config.num_pairs()
             }
             GraphOp::Identity { .. } => 0,
-            GraphOp::MoE { num_experts, top_k, hidden_dim, expert_ffn_dim } => {
+            GraphOp::MoE {
+                num_experts,
+                top_k,
+                hidden_dim,
+                expert_ffn_dim,
+            } => {
                 // Router MatMul + TopK selection + top_k expert FFNs + weighted sum
                 // Router: hidden_dim × num_experts
                 let router = hidden_dim * num_experts;
@@ -211,9 +216,9 @@ pub struct MoEWeightBank {
 /// Weight triple for a single MoE expert.
 #[derive(Clone, Debug)]
 pub struct MoEExpertWeights {
-    pub gate_proj: M31Matrix,  // w1 in Mixtral convention
-    pub up_proj: M31Matrix,    // w3
-    pub down_proj: M31Matrix,  // w2
+    pub gate_proj: M31Matrix, // w1 in Mixtral convention
+    pub up_proj: M31Matrix,   // w3
+    pub down_proj: M31Matrix, // w2
 }
 
 impl MoEWeightBank {
@@ -228,25 +233,43 @@ impl MoEWeightBank {
             let expert = &self.experts[expert_idx];
 
             // Replace gate_proj weight for this slot
-            if let Some(entry) = weights.weights.iter_mut().find(|(id, _)| *id == self.slot_gate_ids[slot]) {
+            if let Some(entry) = weights
+                .weights
+                .iter_mut()
+                .find(|(id, _)| *id == self.slot_gate_ids[slot])
+            {
                 entry.1 = expert.gate_proj.clone();
             } else {
-                weights.weights.push((self.slot_gate_ids[slot], expert.gate_proj.clone()));
+                weights
+                    .weights
+                    .push((self.slot_gate_ids[slot], expert.gate_proj.clone()));
             }
 
             // Replace down_proj weight
-            if let Some(entry) = weights.weights.iter_mut().find(|(id, _)| *id == self.slot_down_ids[slot]) {
+            if let Some(entry) = weights
+                .weights
+                .iter_mut()
+                .find(|(id, _)| *id == self.slot_down_ids[slot])
+            {
                 entry.1 = expert.down_proj.clone();
             } else {
-                weights.weights.push((self.slot_down_ids[slot], expert.down_proj.clone()));
+                weights
+                    .weights
+                    .push((self.slot_down_ids[slot], expert.down_proj.clone()));
             }
 
             // Replace up_proj as named weight on down_proj node
             let up_key = (self.slot_down_ids[slot], "up_proj".to_string());
-            if let Some(entry) = weights.named_weights.iter_mut().find(|(id, n, _)| *id == up_key.0 && n == &up_key.1) {
+            if let Some(entry) = weights
+                .named_weights
+                .iter_mut()
+                .find(|(id, n, _)| *id == up_key.0 && n == &up_key.1)
+            {
                 entry.2 = expert.up_proj.clone();
             } else {
-                weights.named_weights.push((up_key.0, up_key.1, expert.up_proj.clone()));
+                weights
+                    .named_weights
+                    .push((up_key.0, up_key.1, expert.up_proj.clone()));
             }
         }
     }
@@ -681,7 +704,11 @@ impl GraphBuilder {
     /// via the standard weight binding infrastructure.
     pub fn rms_norm_with_gamma(&mut self, gamma: &[M31]) -> &mut Self {
         let shape = self.current_output_shape();
-        assert_eq!(gamma.len(), shape.1, "γ vector length must match hidden dim");
+        assert_eq!(
+            gamma.len(),
+            shape.1,
+            "γ vector length must match hidden dim"
+        );
 
         // Step 1: RMSNorm (raw normalization)
         self.rms_norm();
@@ -690,11 +717,9 @@ impl GraphBuilder {
         // Step 2: Element-wise multiply by γ
         // We model γ as a constant input node, then Mul(norm_output, γ)
         let size = shape.0 * shape.1;
-        let gamma_node_id = self.graph.add_node(
-            GraphOp::Identity { size },
-            vec![],
-            shape,
-        );
+        let gamma_node_id = self
+            .graph
+            .add_node(GraphOp::Identity { size }, vec![], shape);
 
         let mul_id = self.graph.add_node(
             GraphOp::Mul { size },
@@ -860,9 +885,9 @@ impl GraphBuilder {
         let d_model = self.current_output_shape().1;
 
         // Linear chain: gate_proj → SiLU → down_proj
-        self.linear(d_ff);        // gate_proj: d_model → d_ff
+        self.linear(d_ff); // gate_proj: d_model → d_ff
         self.activation(act_type); // SiLU on gate output
-        self.linear(d_model);     // down_proj: d_ff → d_model
+        self.linear(d_model); // down_proj: d_ff → d_model
 
         self
     }
@@ -902,7 +927,12 @@ impl GraphBuilder {
         let inputs = self.last_node.map(|n| vec![n]).unwrap_or_default();
         let shape = self.current_output_shape();
         let topk_id = self.graph.add_node(
-            GraphOp::MoE { num_experts, top_k, hidden_dim: d_model, expert_ffn_dim: d_ff },
+            GraphOp::MoE {
+                num_experts,
+                top_k,
+                hidden_dim: d_model,
+                expert_ffn_dim: d_ff,
+            },
             inputs,
             (shape.0, top_k),
         );
@@ -935,8 +965,8 @@ impl GraphBuilder {
             let before = self.graph.nodes.len();
             self.gated_ffn(d_ff, act_type);
             // gated_ffn creates: gate_matmul, activation, down_matmul
-            slot_gate_ids.push(before);      // gate_proj node
-            slot_down_ids.push(before + 2);  // down_proj node
+            slot_gate_ids.push(before); // gate_proj node
+            slot_down_ids.push(before + 2); // down_proj node
         } else {
             // Multi-expert: K parallel FFN branches + accumulated sum
             // Expert 0: the "base" branch
@@ -1492,15 +1522,13 @@ mod tests {
 
         let mut graph = ComputationGraph::new((seq_len, d_model));
         graph.add_node(
-            GraphOp::MatMul { dims: (seq_len, d_model, d_model) },
+            GraphOp::MatMul {
+                dims: (seq_len, d_model, d_model),
+            },
             vec![],
             (seq_len, d_model),
         );
-        graph.add_node(
-            GraphOp::Attention { config },
-            vec![0],
-            (seq_len, d_model),
-        );
+        graph.add_node(GraphOp::Attention { config }, vec![0], (seq_len, d_model));
 
         let new_graph = graph.with_seq_len(4);
 
@@ -1543,7 +1571,11 @@ mod tests {
         let graph = builder.build();
 
         // Expected: Identity + gate_proj + SiLU + down_proj = 4 nodes
-        assert_eq!(graph.nodes.len(), 4, "identity + gated FFN should have 4 nodes");
+        assert_eq!(
+            graph.nodes.len(),
+            4,
+            "identity + gated FFN should have 4 nodes"
+        );
 
         assert!(matches!(&graph.nodes[0].op, GraphOp::Identity { .. }));
         match &graph.nodes[1].op {
@@ -1554,7 +1586,9 @@ mod tests {
             other => panic!("node 1 should be MatMul (gate_proj), got {:?}", other),
         }
         match &graph.nodes[2].op {
-            GraphOp::Activation { activation_type, .. } => {
+            GraphOp::Activation {
+                activation_type, ..
+            } => {
                 assert_eq!(*activation_type, ActivationType::SiLU);
             }
             other => panic!("node 2 should be Activation, got {:?}", other),
@@ -1583,7 +1617,11 @@ mod tests {
         let graph = builder.build();
 
         // 2 norms + 2 attention matmuls + 3 gated FFN = 7 nodes
-        assert_eq!(graph.nodes.len(), 7, "transformer block should have 7 nodes");
+        assert_eq!(
+            graph.nodes.len(),
+            7,
+            "transformer block should have 7 nodes"
+        );
         assert_eq!(graph.output_shape, (1, d));
     }
 
@@ -1606,24 +1644,46 @@ mod tests {
         //   9: Add (expert_0 + expert_1)
 
         // Should have: identity + router + topk + 2*(3 FFN nodes) + 1 Add = 10
-        assert!(graph.nodes.len() >= 9,
-            "MoE K=2 should have at least 9 nodes, got {}", graph.nodes.len());
-        assert_eq!(graph.output_shape, (1, d),
-            "MoE output should match input dim");
+        assert!(
+            graph.nodes.len() >= 9,
+            "MoE K=2 should have at least 9 nodes, got {}",
+            graph.nodes.len()
+        );
+        assert_eq!(
+            graph.output_shape,
+            (1, d),
+            "MoE output should match input dim"
+        );
 
         // Verify there's a MoE/TopK node
-        let has_moe = graph.nodes.iter().any(|n| matches!(n.op, GraphOp::MoE { .. }));
+        let has_moe = graph
+            .nodes
+            .iter()
+            .any(|n| matches!(n.op, GraphOp::MoE { .. }));
         assert!(has_moe, "graph should contain a MoE/TopK node");
 
         // Verify there's an Add node (weighted sum)
-        let add_count = graph.nodes.iter().filter(|n| matches!(n.op, GraphOp::Add { .. })).count();
-        assert!(add_count >= 1, "MoE K=2 should have at least 1 Add node for expert sum, got {add_count}");
+        let add_count = graph
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.op, GraphOp::Add { .. }))
+            .count();
+        assert!(
+            add_count >= 1,
+            "MoE K=2 should have at least 1 Add node for expert sum, got {add_count}"
+        );
 
         // Count gated FFN components (2 experts × 3 nodes each = 6 MatMul+Activation nodes)
-        let matmul_count = graph.nodes.iter().filter(|n| matches!(n.op, GraphOp::MatMul { .. })).count();
+        let matmul_count = graph
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.op, GraphOp::MatMul { .. }))
+            .count();
         // router(1) + 2 experts × (gate_proj + down_proj) = 1 + 4 = 5
-        assert!(matmul_count >= 5,
-            "MoE K=2 should have >= 5 MatMul nodes (1 router + 4 expert), got {matmul_count}");
+        assert!(
+            matmul_count >= 5,
+            "MoE K=2 should have >= 5 MatMul nodes (1 router + 4 expert), got {matmul_count}"
+        );
     }
 
     #[test]
@@ -1653,13 +1713,32 @@ mod tests {
         let mut weights = GraphWeights::new();
         for (idx, node) in graph.nodes.iter().enumerate() {
             if let GraphOp::MatMul { dims: (_m, k, n) } = &node.op {
-                let data: Vec<M31> = (0..k * n).map(|i| M31::from((i as u32 * 7 + 13) % 100)).collect();
-                weights.add_weight(idx, M31Matrix { rows: *k, cols: *n, data });
+                let data: Vec<M31> = (0..k * n)
+                    .map(|i| M31::from((i as u32 * 7 + 13) % 100))
+                    .collect();
+                weights.add_weight(
+                    idx,
+                    M31Matrix {
+                        rows: *k,
+                        cols: *n,
+                        data,
+                    },
+                );
 
                 // Add up_proj for gated FFN down_proj nodes
                 // (every 3rd MatMul after the router is a down_proj that needs up_proj)
-                let up_data: Vec<M31> = (0..k * n).map(|i| M31::from((i as u32 * 11 + 3) % 100)).collect();
-                weights.add_named_weight(idx, "up_proj", M31Matrix { rows: *k, cols: *n, data: up_data });
+                let up_data: Vec<M31> = (0..k * n)
+                    .map(|i| M31::from((i as u32 * 11 + 3) % 100))
+                    .collect();
+                weights.add_named_weight(
+                    idx,
+                    "up_proj",
+                    M31Matrix {
+                        rows: *k,
+                        cols: *n,
+                        data: up_data,
+                    },
+                );
             }
         }
 
@@ -1667,13 +1746,27 @@ mod tests {
         for (idx, node) in graph.nodes.iter().enumerate() {
             if matches!(node.op, GraphOp::RMSNorm { .. } | GraphOp::LayerNorm { .. }) {
                 let gamma: Vec<M31> = (0..d).map(|i| M31::from((i as u32 + 1) % 100)).collect();
-                weights.add_named_weight(idx, "gamma", M31Matrix { rows: 1, cols: d, data: gamma });
+                weights.add_named_weight(
+                    idx,
+                    "gamma",
+                    M31Matrix {
+                        rows: 1,
+                        cols: d,
+                        data: gamma,
+                    },
+                );
             }
         }
 
         // Create random input
-        let input_data: Vec<M31> = (0..d).map(|i| M31::from((i as u32 * 3 + 7) % 1000)).collect();
-        let input = M31Matrix { rows: 1, cols: d, data: input_data };
+        let input_data: Vec<M31> = (0..d)
+            .map(|i| M31::from((i as u32 * 3 + 7) % 1000))
+            .collect();
+        let input = M31Matrix {
+            rows: 1,
+            cols: d,
+            data: input_data,
+        };
 
         // Build MoE weight bank with 4 experts
         let mut expert_weights = Vec::new();
@@ -1714,12 +1807,16 @@ mod tests {
         assert_eq!(slot1_gate.cols, d_ff);
 
         // Verify expert 1 weights bound to slot 0
-        assert_eq!(slot0_gate.data[0], bank.experts[1].gate_proj.data[0],
-            "slot 0 should have expert 1's gate_proj");
+        assert_eq!(
+            slot0_gate.data[0], bank.experts[1].gate_proj.data[0],
+            "slot 0 should have expert 1's gate_proj"
+        );
 
         // Verify expert 3 weights bound to slot 1
-        assert_eq!(slot1_gate.data[0], bank.experts[3].gate_proj.data[0],
-            "slot 1 should have expert 3's gate_proj");
+        assert_eq!(
+            slot1_gate.data[0], bank.experts[3].gate_proj.data[0],
+            "slot 1 should have expert 3's gate_proj"
+        );
     }
 
     #[test]
@@ -1739,26 +1836,42 @@ mod tests {
         let circuit = LayeredCircuit::from_graph(&graph).unwrap();
 
         // Verify TopK layer exists in the circuit
-        let topk_layers: Vec<_> = circuit.layers.iter()
+        let topk_layers: Vec<_> = circuit
+            .layers
+            .iter()
             .filter(|l| matches!(l.layer_type, crate::gkr::circuit::LayerType::TopK { .. }))
             .collect();
 
-        assert!(!topk_layers.is_empty(), "Circuit should have at least one TopK layer");
+        assert!(
+            !topk_layers.is_empty(),
+            "Circuit should have at least one TopK layer"
+        );
 
         // Verify the TopK layer has correct parameters
-        if let crate::gkr::circuit::LayerType::TopK { num_experts, top_k } = &topk_layers[0].layer_type {
+        if let crate::gkr::circuit::LayerType::TopK { num_experts, top_k } =
+            &topk_layers[0].layer_type
+        {
             assert_eq!(*num_experts, 4, "num_experts should be 4");
             assert_eq!(*top_k, 2, "top_k should be 2");
         }
 
         // Count MatMul layers: router(1) + 2 experts × 2 matmuls = 5
-        let matmul_layers = circuit.layers.iter()
+        let matmul_layers = circuit
+            .layers
+            .iter()
             .filter(|l| matches!(l.layer_type, crate::gkr::circuit::LayerType::MatMul { .. }))
             .count();
-        assert!(matmul_layers >= 5, "Should have >= 5 MatMul layers, got {matmul_layers}");
+        assert!(
+            matmul_layers >= 5,
+            "Should have >= 5 MatMul layers, got {matmul_layers}"
+        );
 
-        eprintln!("MoE circuit: {} layers total, {} MatMul, {} TopK",
-            circuit.layers.len(), matmul_layers, topk_layers.len());
+        eprintln!(
+            "MoE circuit: {} layers total, {} MatMul, {} TopK",
+            circuit.layers.len(),
+            matmul_layers,
+            topk_layers.len()
+        );
     }
 
     #[test]
@@ -1772,8 +1885,15 @@ mod tests {
         let graph = builder.build();
 
         // No Add node needed for K=1
-        let add_count = graph.nodes.iter().filter(|n| matches!(n.op, GraphOp::Add { .. })).count();
-        assert_eq!(add_count, 0, "MoE K=1 should have no Add nodes, got {add_count}");
+        let add_count = graph
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.op, GraphOp::Add { .. }))
+            .count();
+        assert_eq!(
+            add_count, 0,
+            "MoE K=1 should have no Add nodes, got {add_count}"
+        );
         assert_eq!(graph.output_shape, (1, d));
     }
 }

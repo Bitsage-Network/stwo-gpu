@@ -23,17 +23,17 @@ use crate::vm31_merkle::{PackedDigest, poseidon2_m31_hash_packed};
 // Public inputs for a single deposit transaction
 #[derive(Drop, Copy, Serde)]
 pub struct DepositPublicInput {
-    pub commitment: PackedDigest,  // note commitment (8 M31)
-    pub amount_lo: u64,            // amount low limb (M31)
-    pub amount_hi: u64,            // amount high limb (M31)
-    pub asset_id: u64,             // asset identifier (M31)
+    pub commitment: PackedDigest, // note commitment (8 M31)
+    pub amount_lo: u64, // amount low limb (M31)
+    pub amount_hi: u64, // amount high limb (M31)
+    pub asset_id: u64 // asset identifier (M31)
 }
 
 // Public inputs for a single withdrawal transaction
 #[derive(Drop, Copy, Serde)]
 pub struct WithdrawPublicInput {
     pub merkle_root: PackedDigest, // Merkle tree root at time of withdraw
-    pub nullifier: PackedDigest,   // spend nullifier (8 M31)
+    pub nullifier: PackedDigest, // spend nullifier (8 M31)
     pub amount_lo: u64,
     pub amount_hi: u64,
     pub asset_id: u64,
@@ -44,11 +44,11 @@ pub struct WithdrawPublicInput {
 // Public inputs for a single spend (private transfer) transaction
 #[derive(Drop, Copy, Serde)]
 pub struct SpendPublicInput {
-    pub merkle_root: PackedDigest,        // Merkle root for input notes
-    pub nullifier_0: PackedDigest,        // nullifier for input note 0
-    pub nullifier_1: PackedDigest,        // nullifier for input note 1
+    pub merkle_root: PackedDigest, // Merkle root for input notes
+    pub nullifier_0: PackedDigest, // nullifier for input note 0
+    pub nullifier_1: PackedDigest, // nullifier for input note 1
     pub output_commitment_0: PackedDigest, // output note 0 commitment
-    pub output_commitment_1: PackedDigest, // output note 1 commitment
+    pub output_commitment_1: PackedDigest // output note 1 commitment
 }
 
 // All public inputs for a batch
@@ -65,7 +65,7 @@ pub struct VerifiedBatch {
     pub deposits: Array<DepositPublicInput>,
     pub withdrawals: Array<WithdrawPublicInput>,
     pub spends: Array<SpendPublicInput>,
-    pub batch_hash: PackedDigest,  // Poseidon2-M31 hash of all public inputs
+    pub batch_hash: PackedDigest // Poseidon2-M31 hash of all public inputs
 }
 
 // ============================================================================
@@ -77,8 +77,9 @@ pub struct VerifiedBatch {
 //
 // Layout:
 //   [n_deposits, for each deposit: commitment[8], amount_lo, amount_hi, asset_id,
-//    n_withdrawals, for each withdraw: merkle_root[8], nullifier[8], amount_lo, amount_hi, asset_id, withdrawal_binding[8],
-//    n_spends, for each spend: merkle_root[8], nullifier_0[8], nullifier_1[8], out_commit_0[8], out_commit_1[8]]
+//    n_withdrawals, for each withdraw: merkle_root[8], nullifier[8], amount_lo, amount_hi,
+//    asset_id, withdrawal_binding[8], n_spends, for each spend: merkle_root[8], nullifier_0[8],
+//    nullifier_1[8], out_commit_0[8], out_commit_1[8]]
 pub fn hash_batch_public_inputs(inputs: @BatchPublicInputs) -> PackedDigest {
     let mut data: Array<u64> = array![];
 
@@ -97,7 +98,7 @@ pub fn hash_batch_public_inputs(inputs: @BatchPublicInputs) -> PackedDigest {
         data.append(*dep.amount_hi);
         data.append(*dep.asset_id);
         i += 1;
-    };
+    }
 
     // Withdrawals
     let n_wit: u64 = inputs.withdrawals.len().into();
@@ -115,7 +116,7 @@ pub fn hash_batch_public_inputs(inputs: @BatchPublicInputs) -> PackedDigest {
         data.append(*wit.asset_id);
         append_packed_digest(ref data, wit.withdrawal_binding);
         i += 1;
-    };
+    }
 
     // Spends
     let n_spe: u64 = inputs.spends.len().into();
@@ -132,7 +133,7 @@ pub fn hash_batch_public_inputs(inputs: @BatchPublicInputs) -> PackedDigest {
         append_packed_digest(ref data, spe.output_commitment_0);
         append_packed_digest(ref data, spe.output_commitment_1);
         i += 1;
-    };
+    }
 
     poseidon2_m31_hash_packed(data.span())
 }
@@ -162,8 +163,7 @@ fn append_packed_digest(ref data: Array<u64>, digest: @PackedDigest) {
 // Both prover and verifier must call this before any tree commitments.
 // Any mismatch causes channel divergence → verification failure.
 pub fn mix_batch_hash_into_channel(
-    ref ch: crate::channel::PoseidonChannel,
-    batch_hash: PackedDigest,
+    ref ch: crate::channel::PoseidonChannel, batch_hash: PackedDigest,
 ) {
     crate::channel::channel_mix_felt(ref ch, batch_hash.lo);
     crate::channel::channel_mix_felt(ref ch, batch_hash.hi);
@@ -187,14 +187,10 @@ pub fn mix_batch_hash_into_channel(
 // Returns: VerifiedBatch if verification succeeds
 // Panics: if public input hash doesn't match the proof's committed hash
 pub fn verify_batch_public_inputs(
-    inputs: @BatchPublicInputs,
-    committed_batch_hash: PackedDigest,
+    inputs: @BatchPublicInputs, committed_batch_hash: PackedDigest,
 ) -> PackedDigest {
     let computed_hash = hash_batch_public_inputs(inputs);
-    assert!(
-        computed_hash == committed_batch_hash,
-        "VM31: batch public input hash mismatch"
-    );
+    assert!(computed_hash == committed_batch_hash, "VM31: batch public input hash mismatch");
     computed_hash
 }
 

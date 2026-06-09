@@ -9,13 +9,15 @@
 ///     3. Verifier draws challenge r_i from channel
 ///     4. Update: current_sum = p_i(r_i)
 ///   Final check: current_sum == final_a_eval × final_b_eval
-use core::num::traits::{Zero, One};
+use core::num::traits::{One, Zero};
 use stwo_verifier_core::channel::{Channel, ChannelTrait};
 use stwo_verifier_core::fields::qm31::QM31;
-use super::claim::{MatMulSumcheckProofOnChain, RoundPoly};
+use super::claim::{
+    AttentionProofOnChain, BatchedMatMulProofOnChain, MatMulSumcheckProofOnChain, RoundPoly,
+};
 
 /// Evaluate a round polynomial at a point: c0 + c1*x + c2*x^2.
-fn eval_round_poly(poly: @RoundPoly, x: QM31) -> QM31 {
+pub fn eval_round_poly(poly: @RoundPoly, x: QM31) -> QM31 {
     *poly.c0 + *poly.c1 * x + *poly.c2 * x * x
 }
 
@@ -23,10 +25,7 @@ fn eval_round_poly(poly: @RoundPoly, x: QM31) -> QM31 {
 ///
 /// Returns true if the proof is valid, false otherwise.
 /// Mixes the proof data into the channel for Fiat-Shamir binding.
-pub fn verify_matmul_sumcheck(
-    ref channel: Channel,
-    proof: @MatMulSumcheckProofOnChain,
-) -> bool {
+pub fn verify_matmul_sumcheck(ref channel: Channel, proof: @MatMulSumcheckProofOnChain) -> bool {
     let num_rounds = *proof.num_rounds;
     let claimed_sum = *proof.claimed_sum;
 
@@ -64,7 +63,7 @@ pub fn verify_matmul_sumcheck(
         current_sum = eval_round_poly(round_poly, challenge);
 
         round_idx += 1;
-    };
+    }
 
     // Final check: current_sum == final_a_eval × final_b_eval
     let final_product = *proof.final_a_eval * *proof.final_b_eval;
@@ -78,14 +77,71 @@ pub fn verify_matmul_sumcheck(
     true
 }
 
+/// Placeholder for batched matmul sumcheck verification.
+///
+/// Batched matmul proofs use the Rust custom Poseidon transcript over felt252
+/// commitments. The default STWO verifier channel in this crate is Blake-based,
+/// so V2 rejects batched proofs until exact Poseidon transcript wiring is added.
+pub fn verify_batched_matmul_sumcheck(proof: @BatchedMatMulProofOnChain) -> bool {
+    let _ = proof;
+    false
+}
+
+/// Verify the matmul subproofs inside an attention proof.
+///
+/// The current recursive serializer does not include the softmax STARK payload,
+/// so this function verifies only the serialized matmul subproofs and the caller
+/// must treat attention softmax as unsupported until that payload is added.
+pub fn verify_attention_matmul_subproofs(proof: @AttentionProofOnChain) -> bool {
+    if proof.score_proofs.len() != (*proof.num_heads).into() {
+        return false;
+    }
+    if proof.attn_v_proofs.len() != (*proof.num_heads).into() {
+        return false;
+    }
+
+    if !verify_standalone_matmul(proof.q_proof) {
+        return false;
+    }
+    if !verify_standalone_matmul(proof.k_proof) {
+        return false;
+    }
+    if !verify_standalone_matmul(proof.v_proof) {
+        return false;
+    }
+
+    let mut score_idx: u32 = 0;
+    while score_idx < proof.score_proofs.len() {
+        if !verify_standalone_matmul(proof.score_proofs.at(score_idx)) {
+            return false;
+        }
+        score_idx += 1;
+    }
+
+    let mut attn_v_idx: u32 = 0;
+    while attn_v_idx < proof.attn_v_proofs.len() {
+        if !verify_standalone_matmul(proof.attn_v_proofs.at(attn_v_idx)) {
+            return false;
+        }
+        attn_v_idx += 1;
+    }
+
+    verify_standalone_matmul(proof.output_proof)
+}
+
+fn verify_standalone_matmul(proof: @MatMulSumcheckProofOnChain) -> bool {
+    let mut channel: Channel = Default::default();
+    verify_matmul_sumcheck(ref channel, proof)
+}
+
 #[cfg(test)]
 mod tests {
-    use core::num::traits::{Zero, One};
+    use core::num::traits::{One, Zero};
     use stwo_verifier_core::channel::{Channel, ChannelTrait};
     use stwo_verifier_core::fields::qm31::{QM31, QM31Serde, qm31_const};
-    use super::{eval_round_poly, verify_matmul_sumcheck};
     use super::super::claim::{MatMulSumcheckProofOnChain, RoundPoly};
     use super::super::components::matmul::num_sumcheck_rounds;
+    use super::{eval_round_poly, verify_matmul_sumcheck};
 
     #[test]
     fn test_eval_round_poly_at_zero() {

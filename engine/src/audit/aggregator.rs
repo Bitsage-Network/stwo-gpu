@@ -113,8 +113,8 @@ impl MultiSessionAuditAggregator {
         let meta_file = std::fs::File::open(&meta_path).map_err(|e| {
             AuditError::LogError(format!("cannot open {}: {}", meta_path.display(), e))
         })?;
-        let meta: SessionMeta = serde_json::from_reader(meta_file)
-            .map_err(|e| AuditError::Serde(e.to_string()))?;
+        let meta: SessionMeta =
+            serde_json::from_reader(meta_file).map_err(|e| AuditError::Serde(e.to_string()))?;
 
         // Parse anchors from meta.json
         let meta_merkle_root = meta
@@ -216,7 +216,9 @@ impl MultiSessionAuditAggregator {
     /// them in sorted (alphabetical) order. Returns the number of sessions added.
     pub fn add_sessions_from_dir(&mut self, parent_dir: &Path) -> Result<usize, AuditError> {
         let mut dirs: Vec<PathBuf> = std::fs::read_dir(parent_dir)
-            .map_err(|e| AuditError::LogError(format!("cannot read {}: {e}", parent_dir.display())))?
+            .map_err(|e| {
+                AuditError::LogError(format!("cannot read {}: {e}", parent_dir.display()))
+            })?
             .filter_map(|r| r.ok())
             .map(|e| e.path())
             .filter(|p| p.is_dir() && p.join("meta.json").exists())
@@ -235,15 +237,22 @@ impl MultiSessionAuditAggregator {
     /// Generate an aggregated report across all sessions.
     pub fn generate_report(&self) -> Result<MultiSessionAuditReport, AuditError> {
         if self.sessions.is_empty() {
-            return Err(AuditError::EmptyWindow {
-                start: 0,
-                end: 0,
-            });
+            return Err(AuditError::EmptyWindow { start: 0, end: 0 });
         }
 
         let total_entries: usize = self.sessions.iter().map(|s| s.entry_count).sum();
-        let earliest = self.sessions.iter().map(|s| s.time_range.0).min().unwrap_or(0);
-        let latest = self.sessions.iter().map(|s| s.time_range.1).max().unwrap_or(0);
+        let earliest = self
+            .sessions
+            .iter()
+            .map(|s| s.time_range.0)
+            .min()
+            .unwrap_or(0);
+        let latest = self
+            .sessions
+            .iter()
+            .map(|s| s.time_range.1)
+            .max()
+            .unwrap_or(0);
 
         // Weighted average score
         let overall_score = {
@@ -382,7 +391,11 @@ mod tests {
             "last_entry_hash": if entries.is_empty() { None } else { Some(entries.last().unwrap().entry_hash.clone()) },
             "merkle_root": Some(digest_to_hex(&merkle.root())),
         });
-        std::fs::write(dir.join("meta.json"), serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+        std::fs::write(
+            dir.join("meta.json"),
+            serde_json::to_string_pretty(&meta).unwrap(),
+        )
+        .unwrap();
 
         // Create empty matrices.bin
         std::fs::write(dir.join("matrices.bin"), &[]).unwrap();

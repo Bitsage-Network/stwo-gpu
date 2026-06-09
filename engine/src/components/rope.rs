@@ -151,8 +151,12 @@ pub fn build_rope_table(config: &RoPEConfig) -> RoPETable {
     use crate::components::integer_math::{build_rope_table_integer, precompute_rope_thetas};
 
     let thetas = precompute_rope_thetas(config.head_dim, config.base);
-    let (cos_vals, sin_vals) =
-        build_rope_table_integer(config.max_seq_len, config.head_dim, &thetas, config.position_offset);
+    let (cos_vals, sin_vals) = build_rope_table_integer(
+        config.max_seq_len,
+        config.head_dim,
+        &thetas,
+        config.position_offset,
+    );
 
     RoPETable {
         cos_vals,
@@ -577,7 +581,8 @@ mod tests {
         // The rotated values for the row at absolute position 5 must match.
         for j in 0..head_dim {
             assert_eq!(
-                rot_offset.data[j], rot_full.data[5 * head_dim + j],
+                rot_offset.data[j],
+                rot_full.data[5 * head_dim + j],
                 "col {}: offset-rotated vs full-rotated mismatch",
                 j
             );

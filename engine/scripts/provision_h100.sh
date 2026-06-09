@@ -1,6 +1,6 @@
 #!/bin/bash
 # obelyzk.rs H100 Provisioning Script
-# Sets up the complete stack: Rust, CUDA, obelyzk engine, model, server
+# Sets up the stack: Rust, CUDA, obelyzk engine, prover, model, server
 #
 # Usage: curl -sSf https://raw.githubusercontent.com/Bitsage-Network/obelyzk.rs/main/engine/scripts/provision_h100.sh | bash
 # Or:    bash provision_h100.sh
@@ -84,6 +84,12 @@ cd "$REPO_DIR/engine"
 cargo build --release --bin obelyzk --features "server,server-stream,cuda-runtime,tui" 2>&1 | tail -5
 echo "  Binary: $(ls -lh target/release/obelyzk | awk '{print $5}')"
 
+echo ""
+echo "==> Building prove-model (release, CUDA)..."
+PROVER_FEATURES="std,gpu,onnx,safetensors,model-loading,cli,audit,cuda-runtime"
+cargo build --release --bin prove-model --features "$PROVER_FEATURES" 2>&1 | tail -5
+echo "  Binary: $(ls -lh target/release/prove-model | awk '{print $5}')"
+
 # ── Download model ───────────────────────────────────────────
 echo ""
 MODEL_DIR="$HOME/.obelyzk/models"
@@ -154,16 +160,17 @@ echo "║    obelyzk serve          # Start API server (port 8080)     ║"
 echo "║    obelyzk chat           # Interactive verified chat        ║"
 echo "║    obelyzk bench --tokens 64  # Throughput benchmark         ║"
 echo "║    obelyzk dashboard      # Live Cipher Noir TUI             ║"
+echo "║    ./scripts/download_model.sh qwen3.5-35b-a3b               ║"
+echo "║    bash scripts/run_h100_qwen35b_full.sh \\                   ║"
+echo "║      --model-dir '$MODEL_DIR/qwen3.5-35b-a3b' --layers all   ║"
 echo "║                                                               ║"
 echo "║  Service:                                                     ║"
 echo "║    sudo systemctl start obelyzk                              ║"
 echo "║    sudo systemctl status obelyzk                             ║"
 echo "║    journalctl -u obelyzk -f                                  ║"
 echo "║                                                               ║"
-echo "║  To download Qwen3-14B (16GB, for real benchmarks):          ║"
-echo "║    python3 -c \"from huggingface_hub import snapshot_download;║"
-echo "║    snapshot_download('Qwen/Qwen2.5-14B',                     ║"
-echo "║      local_dir='$MODEL_DIR/qwen3-14b')\"                     ║"
+echo "║  Current H100 benchmark target:                              ║"
+echo "║    Qwen/Qwen3.5-35B-A3B                                      ║"
 echo "║                                                               ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 

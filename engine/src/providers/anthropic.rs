@@ -64,13 +64,17 @@ impl AnthropicProvider {
         // to be replaced with native-tls certificate inspection)
         let cert_fingerprint = format!("sha256:anthropic-{}", self.model);
 
-        let response_bytes = resp.bytes().await
+        let response_bytes = resp
+            .bytes()
+            .await
             .map_err(|e| AnthropicError::RequestFailed(format!("read body: {e}")))?;
         let response_body = response_bytes.to_vec();
 
         if status_code >= 400 {
             let err_text = String::from_utf8_lossy(&response_body);
-            return Err(AnthropicError::ApiError(format!("{status_code}: {err_text}")));
+            return Err(AnthropicError::ApiError(format!(
+                "{status_code}: {err_text}"
+            )));
         }
 
         // Parse response
@@ -153,8 +157,12 @@ impl OpenAiProvider {
                 serde_json::json!({"role": &m.role, "content": &m.content})
             }).collect::<Vec<_>>(),
         });
-        if let Some(max) = max_tokens { body["max_tokens"] = serde_json::json!(max); }
-        if let Some(temp) = temperature { body["temperature"] = serde_json::json!(temp); }
+        if let Some(max) = max_tokens {
+            body["max_tokens"] = serde_json::json!(max);
+        }
+        if let Some(temp) = temperature {
+            body["temperature"] = serde_json::json!(temp);
+        }
 
         let request_body = serde_json::to_vec(&body)
             .map_err(|e| OpenAiProviderError::RequestFailed(format!("serialize: {e}")))?;
@@ -173,13 +181,17 @@ impl OpenAiProvider {
         let status_code = resp.status().as_u16();
         let cert_fingerprint = format!("sha256:openai-{}", self.model);
 
-        let response_bytes = resp.bytes().await
+        let response_bytes = resp
+            .bytes()
+            .await
             .map_err(|e| OpenAiProviderError::RequestFailed(format!("read: {e}")))?;
         let response_body = response_bytes.to_vec();
 
         if status_code >= 400 {
             let err_text = String::from_utf8_lossy(&response_body);
-            return Err(OpenAiProviderError::ApiError(format!("{status_code}: {err_text}")));
+            return Err(OpenAiProviderError::ApiError(format!(
+                "{status_code}: {err_text}"
+            )));
         }
 
         let json: serde_json::Value = serde_json::from_slice(&response_body)

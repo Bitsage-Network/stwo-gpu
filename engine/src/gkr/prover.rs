@@ -19,22 +19,22 @@ use crate::components::attention::{
 };
 #[cfg(feature = "cuda-runtime")]
 use crate::components::matmul::matmul_m31;
-use crate::components::matmul::matrix_to_mle_col_major_padded_pub as matrix_to_mle_col_major_padded;
-#[cfg(feature = "cuda-runtime")]
-use crate::components::matmul::matrix_to_mle_col_major_u32_padded_pub as matrix_to_mle_col_major_u32_padded;
 #[cfg(feature = "cuda-runtime")]
 use crate::components::matmul::matrix_to_mle_col_major_all_padded;
+use crate::components::matmul::matrix_to_mle_col_major_padded_pub as matrix_to_mle_col_major_padded;
+#[cfg(test)]
+use crate::components::matmul::matrix_to_mle_col_major_pub as matrix_to_mle_col_major;
+#[cfg(feature = "cuda-runtime")]
+use crate::components::matmul::matrix_to_mle_col_major_u32_padded_pub as matrix_to_mle_col_major_u32_padded;
 #[cfg(test)]
 use crate::components::matmul::restrict_mle_pub as restrict_mle;
 use crate::components::matmul::{
     evaluate_mle_pub as evaluate_mle, matrix_to_mle_pub as matrix_to_mle, pad_matrix_pow2,
     M31Matrix,
 };
-#[cfg(test)]
-use crate::components::matmul::matrix_to_mle_col_major_pub as matrix_to_mle_col_major;
 use crate::crypto::aggregated_opening::prove_aggregated_binding_streaming;
-use crate::crypto::aggregated_opening::WeightSource;
 use crate::crypto::aggregated_opening::AggregatedWeightClaim;
+use crate::crypto::aggregated_opening::WeightSource;
 use crate::crypto::poseidon_channel::PoseidonChannel;
 
 use super::circuit::{LayerType, LayeredCircuit};
@@ -93,6 +93,25 @@ macro_rules! emit_proof_event {
     ($($tt:tt)*) => {};
 }
 
+fn layer_type_label(layer_type: &LayerType) -> &'static str {
+    match layer_type {
+        LayerType::MatMul { .. } => "MatMul",
+        LayerType::Add { .. } => "Add",
+        LayerType::Mul { .. } => "Mul",
+        LayerType::Activation { .. } => "Activation",
+        LayerType::LayerNorm { .. } => "LayerNorm",
+        LayerType::RMSNorm { .. } => "RMSNorm",
+        LayerType::Attention { .. } => "Attention",
+        LayerType::Embedding { .. } => "Embedding",
+        LayerType::Quantize { .. } => "Quantize",
+        LayerType::Dequantize { .. } => "Dequantize",
+        LayerType::TopK { .. } => "TopK",
+        LayerType::RoPE { .. } => "RoPE",
+        LayerType::Identity => "Identity",
+        LayerType::Input => "Input",
+    }
+}
+
 #[cfg(feature = "proof-stream")]
 fn layer_kind_from_type(layer_type: &LayerType) -> proof_stream::LayerKind {
     match layer_type {
@@ -106,7 +125,11 @@ fn layer_kind_from_type(layer_type: &LayerType) -> proof_stream::LayerKind {
         LayerType::Embedding { .. } => proof_stream::LayerKind::Embedding,
         // Quantize/Dequantize mapped to Add (no dedicated color needed)
         LayerType::Dequantize { .. } | LayerType::Quantize { .. } => proof_stream::LayerKind::Add,
-        LayerType::Input | LayerType::Identity | LayerType::RoPE { .. } | LayerType::TopK { .. } | LayerType::TopK { .. } => proof_stream::LayerKind::Add,
+        LayerType::Input
+        | LayerType::Identity
+        | LayerType::RoPE { .. }
+        | LayerType::TopK { .. }
+        | LayerType::TopK { .. } => proof_stream::LayerKind::Add,
     }
 }
 
@@ -124,7 +147,11 @@ fn estimate_trace_cost(layer_type: &LayerType) -> usize {
             vocab_size,
             embed_dim,
         } => vocab_size * embed_dim,
-        LayerType::Input | LayerType::Identity | LayerType::RoPE { .. } | LayerType::TopK { .. } | LayerType::TopK { .. } => 0,
+        LayerType::Input
+        | LayerType::Identity
+        | LayerType::RoPE { .. }
+        | LayerType::TopK { .. }
+        | LayerType::TopK { .. } => 0,
     }
 }
 
@@ -309,10 +336,9 @@ impl<'a> WeightSource for GraphWeightSource<'a> {
             self.claim_node_ids.len()
         );
         let node_id = self.claim_node_ids[claim_index];
-        let matrix = self
-            .weights
-            .get_weight(node_id)
-            .unwrap_or_else(|| panic!("weight not found for node_id {node_id} (claim_index {claim_index})"));
+        let matrix = self.weights.get_weight(node_id).unwrap_or_else(|| {
+            panic!("weight not found for node_id {node_id} (claim_index {claim_index})")
+        });
         matrix_to_mle_col_major_padded(matrix)
     }
 
@@ -323,10 +349,9 @@ impl<'a> WeightSource for GraphWeightSource<'a> {
             self.claim_node_ids.len()
         );
         let node_id = self.claim_node_ids[claim_index];
-        let matrix = self
-            .weights
-            .get_weight(node_id)
-            .unwrap_or_else(|| panic!("weight not found for node_id {node_id} (claim_index {claim_index})"));
+        let matrix = self.weights.get_weight(node_id).unwrap_or_else(|| {
+            panic!("weight not found for node_id {node_id} (claim_index {claim_index})")
+        });
         #[cfg(feature = "cuda-runtime")]
         {
             matrix_to_mle_col_major_u32_padded(matrix)
@@ -373,12 +398,13 @@ fn apply_aggregated_oracle_sumcheck(
     channel: &mut PoseidonChannel,
     log_tag: &str,
     weight_cache: Option<&crate::weight_cache::SharedWeightCache>,
+    policy: Option<&crate::policy::PolicyConfig>,
 ) -> Result<
     (
-        Vec<starknet_ff::FieldElement>,                                          // weight_commitments
-        Vec<super::types::WeightClaim>,                                          // weight_claims
+        Vec<starknet_ff::FieldElement>, // weight_commitments
+        Vec<super::types::WeightClaim>, // weight_claims
         Option<crate::crypto::aggregated_opening::AggregatedWeightBindingProof>, // single (small model)
-        Vec<crate::crypto::aggregated_opening::AggregatedWeightBindingProof>,    // groups (large model)
+        Vec<crate::crypto::aggregated_opening::AggregatedWeightBindingProof>, // groups (large model)
     ),
     GKRError,
 > {
@@ -409,15 +435,16 @@ fn apply_aggregated_oracle_sumcheck(
     // channel-mixed weight commitments). Full MLE opening proof only needed for
     // trustless on-chain verification where the verifier cannot re-check commitments.
     // Opt-in: STWO_AGGREGATED_FULL_BINDING=1 for trustless on-chain streaming.
-    let rlc_only_override = crate::policy::aggregated_rlc_only();
-    let need_full_binding = if rlc_only_override {
+    let resolved_policy = crate::policy::resolve(policy);
+    let need_full_binding = if resolved_policy.aggregated_rlc_only {
         false
     } else {
-        crate::policy::aggregated_full_binding()
+        resolved_policy.aggregated_full_binding
     };
     let total_claims = weight_data.len() + deferred_weight_claims_data.len();
     eprintln!(
-        "  [{log_tag}] aggregated oracle sumcheck: preparing {total_claims} weight commitments..."
+        "  [{log_tag}] aggregated oracle sumcheck: preparing {total_claims} weight commitments (binding_mode={})...",
+        if need_full_binding { "full" } else { "rlc" },
     );
     let t_commit = std::time::Instant::now();
 
@@ -441,9 +468,15 @@ fn apply_aggregated_oracle_sumcheck(
     let mut prep_inputs: Vec<WeightPrepInput<'_>> = Vec::with_capacity(total_claims);
     for (idx, (weight_node_id, eval_point, expected_value)) in weight_data.iter().enumerate() {
         let b = weights.get_weight(*weight_node_id);
-        let (rp, cp) = b.map(|m| (m.rows.next_power_of_two(), m.cols.next_power_of_two())).unwrap_or((0, 0));
-        let cached_root = cache_read.as_ref().and_then(|c| c.get_root(*weight_node_id, rp, cp));
-        if cached_root.is_some() { cache_hits += 1; }
+        let (rp, cp) = b
+            .map(|m| (m.rows.next_power_of_two(), m.cols.next_power_of_two()))
+            .unwrap_or((0, 0));
+        let cached_root = cache_read
+            .as_ref()
+            .and_then(|c| c.get_root(*weight_node_id, rp, cp));
+        if cached_root.is_some() {
+            cache_hits += 1;
+        }
         prep_inputs.push(WeightPrepInput {
             weight_node_id: *weight_node_id,
             eval_point,
@@ -460,9 +493,15 @@ fn apply_aggregated_oracle_sumcheck(
         deferred_weight_claims_data.iter().enumerate()
     {
         let b = weights.get_weight(*weight_node_id);
-        let (rp, cp) = b.map(|m| (m.rows.next_power_of_two(), m.cols.next_power_of_two())).unwrap_or((0, 0));
-        let cached_root = cache_read.as_ref().and_then(|c| c.get_root(*weight_node_id, rp, cp));
-        if cached_root.is_some() { cache_hits += 1; }
+        let (rp, cp) = b
+            .map(|m| (m.rows.next_power_of_two(), m.cols.next_power_of_two()))
+            .unwrap_or((0, 0));
+        let cached_root = cache_read
+            .as_ref()
+            .and_then(|c| c.get_root(*weight_node_id, rp, cp));
+        if cached_root.is_some() {
+            cache_hits += 1;
+        }
         prep_inputs.push(WeightPrepInput {
             weight_node_id: *weight_node_id,
             eval_point,
@@ -512,7 +551,9 @@ fn apply_aggregated_oracle_sumcheck(
         prep_inputs
             .iter()
             .map(|input| {
-                let commitment = input.cached_root.expect("all_cached invariant: every root must be Some");
+                let commitment = input
+                    .cached_root
+                    .expect("all_cached invariant: every root must be Some");
                 let n_vars = (input.rows_padded * input.cols_padded).trailing_zeros() as usize;
                 Ok(WeightPrepResult {
                     matrix_index: input.matrix_index,
@@ -526,11 +567,11 @@ fn apply_aggregated_oracle_sumcheck(
             })
             .collect()
     } else {
+        use crate::crypto::mle_opening::{gpu_mle_commitment_enabled, gpu_mle_commitment_required};
         use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
         use stwo::prover::backend::gpu::cuda_executor::{
             get_cuda_executor, is_cuda_available, upload_poseidon252_round_constants,
         };
-        use crate::crypto::mle_opening::{gpu_mle_commitment_enabled, gpu_mle_commitment_required};
 
         static GPU_COMMITMENT_LOGGED: AtomicBool = AtomicBool::new(false);
         static GPU_COMMITMENT_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -561,11 +602,12 @@ fn apply_aggregated_oracle_sumcheck(
                 layer_idx: 0,
                 reason: format!("cuda init for weight commitments: {e}"),
             })?;
-            let d_rc = upload_poseidon252_round_constants(&executor.device)
-                .map_err(|e| GKRError::ReductionError {
+            let d_rc = upload_poseidon252_round_constants(&executor.device).map_err(|e| {
+                GKRError::ReductionError {
                     layer_idx: 0,
                     reason: format!("upload poseidon round constants: {e}"),
-                })?;
+                }
+            })?;
 
             if !GPU_COMMITMENT_LOGGED.swap(true, AtomicOrdering::Relaxed) {
                 eprintln!(
@@ -580,7 +622,10 @@ fn apply_aggregated_oracle_sumcheck(
                 #[cfg(feature = "multi-gpu")]
                 {
                     let mgpu_count = crate::multi_gpu::device_count();
-                    let uncached_count = prep_inputs.iter().filter(|i| i.cached_root.is_none()).count();
+                    let uncached_count = prep_inputs
+                        .iter()
+                        .filter(|i| i.cached_root.is_none())
+                        .count();
 
                     if mgpu_count > 1 && uncached_count > 1 {
                         eprintln!(
@@ -675,34 +720,48 @@ fn apply_aggregated_oracle_sumcheck(
                             });
 
                         if !committed.is_empty() {
-                            let cmap: std::collections::HashMap<usize, (starknet_ff::FieldElement, usize)> =
-                                committed.into_iter().map(|(i, r, nv)| (i, (r, nv))).collect();
-
-                            let multi_results: Vec<Result<WeightPrepResult, GKRError>> = prep_inputs
-                                .iter()
-                                .enumerate()
-                                .map(|(idx, input)| {
-                                    let (commitment, n_vars) = if let Some(root) = input.cached_root {
-                                        (root, (input.rows_padded * input.cols_padded).trailing_zeros() as usize)
-                                    } else if let Some(&(root, nv)) = cmap.get(&idx) {
-                                        (root, nv)
-                                    } else {
-                                        return Err(GKRError::ReductionError {
-                                            layer_idx: 0,
-                                            reason: format!("missing commitment for matrix {idx}"),
-                                        });
-                                    };
-                                    Ok(WeightPrepResult {
-                                        matrix_index: input.matrix_index,
-                                        n_vars,
-                                        commitment,
-                                        eval_point: input.eval_point.to_vec(),
-                                        expected_value: input.expected_value,
-                                        is_deferred: input.is_deferred,
-                                        deferred_idx: input.deferred_idx,
-                                    })
-                                })
+                            let cmap: std::collections::HashMap<
+                                usize,
+                                (starknet_ff::FieldElement, usize),
+                            > = committed
+                                .into_iter()
+                                .map(|(i, r, nv)| (i, (r, nv)))
                                 .collect();
+
+                            let multi_results: Vec<Result<WeightPrepResult, GKRError>> =
+                                prep_inputs
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(idx, input)| {
+                                        let (commitment, n_vars) =
+                                            if let Some(root) = input.cached_root {
+                                                (
+                                                    root,
+                                                    (input.rows_padded * input.cols_padded)
+                                                        .trailing_zeros()
+                                                        as usize,
+                                                )
+                                            } else if let Some(&(root, nv)) = cmap.get(&idx) {
+                                                (root, nv)
+                                            } else {
+                                                return Err(GKRError::ReductionError {
+                                                    layer_idx: 0,
+                                                    reason: format!(
+                                                        "missing commitment for matrix {idx}"
+                                                    ),
+                                                });
+                                            };
+                                        Ok(WeightPrepResult {
+                                            matrix_index: input.matrix_index,
+                                            n_vars,
+                                            commitment,
+                                            eval_point: input.eval_point.to_vec(),
+                                            expected_value: input.expected_value,
+                                            is_deferred: input.is_deferred,
+                                            deferred_idx: input.deferred_idx,
+                                        })
+                                    })
+                                    .collect();
 
                             eprintln!(
                                 "  [{log_tag}] multi-GPU weight commitments: {total_claims} done ({:.1}s, {mgpu_count} GPUs)",
@@ -710,7 +769,9 @@ fn apply_aggregated_oracle_sumcheck(
                             );
                             Some(multi_results)
                         } else {
-                            eprintln!("  [{log_tag}] multi-GPU failed, falling through to single-GPU");
+                            eprintln!(
+                                "  [{log_tag}] multi-GPU failed, falling through to single-GPU"
+                            );
                             None
                         }
                     } else {
@@ -718,105 +779,109 @@ fn apply_aggregated_oracle_sumcheck(
                     }
                 }
                 #[cfg(not(feature = "multi-gpu"))]
-                { None }
+                {
+                    None
+                }
             };
 
             if let Some(results) = multi_gpu_results {
                 results
             } else {
+                // Optimization 1: Reusable limb buffers — allocate once for the max
+                // padded matrix size, reuse across all 160+ matrices.
+                // Two buffers for double-buffering (optimization 3: pipelining).
+                let max_padded_n = prep_inputs
+                    .iter()
+                    .map(|input| {
+                        let b = weights.get_weight(input.weight_node_id);
+                        b.map(|m| m.rows.next_power_of_two() * m.cols.next_power_of_two())
+                            .unwrap_or(0)
+                    })
+                    .max()
+                    .unwrap_or(0);
+                let limb_buf_size = max_padded_n * 4;
 
-            // Optimization 1: Reusable limb buffers — allocate once for the max
-            // padded matrix size, reuse across all 160+ matrices.
-            // Two buffers for double-buffering (optimization 3: pipelining).
-            let max_padded_n = prep_inputs.iter().map(|input| {
-                let b = weights.get_weight(input.weight_node_id);
-                b.map(|m| {
-                    m.rows.next_power_of_two() * m.cols.next_power_of_two()
-                }).unwrap_or(0)
-            }).max().unwrap_or(0);
-            let limb_buf_size = max_padded_n * 4;
+                // Double-buffer: [0] and [1] swapped each iteration.
+                // Using array indexing avoids borrow-checker conflicts with named vars.
+                let mut limb_bufs = [vec![0u64; limb_buf_size], vec![0u64; limb_buf_size]];
 
-            // Double-buffer: [0] and [1] swapped each iteration.
-            // Using array indexing avoids borrow-checker conflicts with named vars.
-            let mut limb_bufs = [vec![0u64; limb_buf_size], vec![0u64; limb_buf_size]];
+                // Pipelined processing: while GPU commits matrix N, CPU prepares matrix N+1.
+                //
+                // Optimization 2: fused matrix_to_mle_col_major_all_padded produces
+                // SecureField MLE + u32 MLE + u64 limbs in a single matrix traversal.
+                //
+                // Optimization 3: std::thread::scope overlaps CPU prep with GPU work.
+                struct PreparedMatrix {
+                    mle: Vec<SecureField>,
+                    mle_u32: Vec<u32>,
+                    n_elements: usize,
+                    n_vars: usize,
+                }
 
-            // Pipelined processing: while GPU commits matrix N, CPU prepares matrix N+1.
-            //
-            // Optimization 2: fused matrix_to_mle_col_major_all_padded produces
-            // SecureField MLE + u32 MLE + u64 limbs in a single matrix traversal.
-            //
-            // Optimization 3: std::thread::scope overlaps CPU prep with GPU work.
-            struct PreparedMatrix {
-                mle: Vec<SecureField>,
-                mle_u32: Vec<u32>,
-                n_elements: usize,
-                n_vars: usize,
-            }
+                // Prepare first matrix eagerly (no overlap possible for matrix 0)
+                let first_input = &prep_inputs[0];
+                let first_matrix = weights.get_weight(first_input.weight_node_id).ok_or(
+                    GKRError::MissingWeight {
+                        node_id: first_input.weight_node_id,
+                    },
+                )?;
+                let first_n =
+                    first_matrix.rows.next_power_of_two() * first_matrix.cols.next_power_of_two();
+                limb_bufs[0][..first_n * 4].fill(0);
+                let (first_mle, first_u32) =
+                    matrix_to_mle_col_major_all_padded(first_matrix, &mut limb_bufs[0]);
+                let mut current_prep = PreparedMatrix {
+                    n_vars: first_mle.len().trailing_zeros() as usize,
+                    n_elements: first_n,
+                    mle: first_mle,
+                    mle_u32: first_u32,
+                };
 
-            // Prepare first matrix eagerly (no overlap possible for matrix 0)
-            let first_input = &prep_inputs[0];
-            let first_matrix = weights
-                .get_weight(first_input.weight_node_id)
-                .ok_or(GKRError::MissingWeight {
-                    node_id: first_input.weight_node_id,
-                })?;
-            let first_n = first_matrix.rows.next_power_of_two()
-                * first_matrix.cols.next_power_of_two();
-            limb_bufs[0][..first_n * 4].fill(0);
-            let (first_mle, first_u32) =
-                matrix_to_mle_col_major_all_padded(first_matrix, &mut limb_bufs[0]);
-            let mut current_prep = PreparedMatrix {
-                n_vars: first_mle.len().trailing_zeros() as usize,
-                n_elements: first_n,
-                mle: first_mle,
-                mle_u32: first_u32,
-            };
+                let mut results = Vec::with_capacity(total_claims);
+                let mut gpu_count = 0usize;
+                let mut cpu_fallback_count = 0usize;
+                let mut cur_buf_idx: usize = 0; // 0 or 1
 
-            let mut results = Vec::with_capacity(total_claims);
-            let mut gpu_count = 0usize;
-            let mut cpu_fallback_count = 0usize;
-            let mut cur_buf_idx: usize = 0; // 0 or 1
+                for idx in 0..total_claims {
+                    let input = &prep_inputs[idx];
+                    let cur_n_elements = current_prep.n_elements;
+                    let next_buf_idx = 1 - cur_buf_idx;
 
-            for idx in 0..total_claims {
-                let input = &prep_inputs[idx];
-                let cur_n_elements = current_prep.n_elements;
-                let next_buf_idx = 1 - cur_buf_idx;
+                    // If there's a next matrix, prepare it in parallel with GPU work.
+                    let next_prep = if idx + 1 < total_claims {
+                        let next_input = &prep_inputs[idx + 1];
+                        let next_matrix = weights.get_weight(next_input.weight_node_id).ok_or(
+                            GKRError::MissingWeight {
+                                node_id: next_input.weight_node_id,
+                            },
+                        )?;
+                        let next_n = next_matrix.rows.next_power_of_two()
+                            * next_matrix.cols.next_power_of_two();
 
-                // If there's a next matrix, prepare it in parallel with GPU work.
-                let next_prep = if idx + 1 < total_claims {
-                    let next_input = &prep_inputs[idx + 1];
-                    let next_matrix = weights
-                        .get_weight(next_input.weight_node_id)
-                        .ok_or(GKRError::MissingWeight {
-                            node_id: next_input.weight_node_id,
-                        })?;
-                    let next_n = next_matrix.rows.next_power_of_two()
-                        * next_matrix.cols.next_power_of_two();
+                        // split_at_mut gives us independent &mut to each buffer
+                        let (buf_lo, buf_hi) = limb_bufs.split_at_mut(1);
+                        let (cur_buf, next_buf) = if cur_buf_idx == 0 {
+                            (&buf_lo[0][..], &mut buf_hi[0][..])
+                        } else {
+                            (&buf_hi[0][..], &mut buf_lo[0][..])
+                        };
+                        next_buf[..next_n * 4].fill(0);
 
-                    // split_at_mut gives us independent &mut to each buffer
-                    let (buf_lo, buf_hi) = limb_bufs.split_at_mut(1);
-                    let (cur_buf, next_buf) = if cur_buf_idx == 0 {
-                        (&buf_lo[0][..], &mut buf_hi[0][..])
-                    } else {
-                        (&buf_hi[0][..], &mut buf_lo[0][..])
-                    };
-                    next_buf[..next_n * 4].fill(0);
+                        let mut next_result: Option<PreparedMatrix> = None;
+                        std::thread::scope(|s| {
+                            let cpu_handle = s.spawn(|| {
+                                let (mle, u32_mle) =
+                                    matrix_to_mle_col_major_all_padded(next_matrix, next_buf);
+                                PreparedMatrix {
+                                    n_vars: mle.len().trailing_zeros() as usize,
+                                    n_elements: next_n,
+                                    mle,
+                                    mle_u32: u32_mle,
+                                }
+                            });
 
-                    let mut next_result: Option<PreparedMatrix> = None;
-                    std::thread::scope(|s| {
-                        let cpu_handle = s.spawn(|| {
-                            let (mle, u32_mle) =
-                                matrix_to_mle_col_major_all_padded(next_matrix, next_buf);
-                            PreparedMatrix {
-                                n_vars: mle.len().trailing_zeros() as usize,
-                                n_elements: next_n,
-                                mle,
-                                mle_u32: u32_mle,
-                            }
-                        });
-
-                        // GPU: commit current matrix (runs while CPU thread prepares next)
-                        let commitment = match crate::crypto::mle_opening::commit_mle_root_only_gpu_from_limbs(
+                            // GPU: commit current matrix (runs while CPU thread prepares next)
+                            let commitment = match crate::crypto::mle_opening::commit_mle_root_only_gpu_from_limbs(
                             cur_buf, cur_n_elements, executor, &d_rc,
                         ) {
                             Ok(root) => {
@@ -846,14 +911,94 @@ fn apply_aggregated_oracle_sumcheck(
                             }
                         };
 
-                        next_result = Some(cpu_handle.join().expect("CPU prep thread panicked"));
+                            next_result =
+                                Some(cpu_handle.join().expect("CPU prep thread panicked"));
+
+                            if results.last().map(|r| r.is_err()).unwrap_or(false) {
+                                return;
+                            }
+
+                            // Incremental cache: insert root immediately so
+                            // subsequent proofs or prewarm threads see it.
+                            if let Some(wc) = weight_cache {
+                                if let Ok(mut w) = wc.write() {
+                                    w.insert_root(
+                                        input.weight_node_id,
+                                        input.rows_padded,
+                                        input.cols_padded,
+                                        commitment,
+                                    );
+                                }
+                            }
+
+                            let finished = idx + 1;
+                            if finished % 10 == 0 || finished == total_claims {
+                                eprintln!(
+                                "  [{log_tag}] weight commitments: {finished}/{total_claims} done ({:.1}s, gpu={gpu_count} cpu={cpu_fallback_count})",
+                                t_commit.elapsed().as_secs_f64(),
+                            );
+                            }
+
+                            // Always drop MLEs immediately — streaming mode will
+                            // reload them on demand from GraphWeights.
+                            drop(std::mem::take(&mut current_prep.mle));
+                            drop(std::mem::take(&mut current_prep.mle_u32));
+                            results.push(Ok(WeightPrepResult {
+                                matrix_index: input.matrix_index,
+                                n_vars: current_prep.n_vars,
+                                commitment,
+                                eval_point: input.eval_point.to_vec(),
+                                expected_value: input.expected_value,
+                                is_deferred: input.is_deferred,
+                                deferred_idx: input.deferred_idx,
+                            }));
+                        });
 
                         if results.last().map(|r| r.is_err()).unwrap_or(false) {
-                            return;
+                            break;
                         }
 
-                        // Incremental cache: insert root immediately so
-                        // subsequent proofs or prewarm threads see it.
+                        next_result
+                    } else {
+                        // Last matrix — no next to prefetch, just GPU commit.
+                        let commitment =
+                            match crate::crypto::mle_opening::commit_mle_root_only_gpu_from_limbs(
+                                &limb_bufs[cur_buf_idx],
+                                cur_n_elements,
+                                executor,
+                                &d_rc,
+                            ) {
+                                Ok(root) => {
+                                    gpu_count += 1;
+                                    root
+                                }
+                                Err(e) => {
+                                    if gpu_strict {
+                                        results.push(Err(GKRError::ReductionError {
+                                    layer_idx: 0,
+                                    reason: format!(
+                                        "GPU MLE commitment strict mode: GPU failed for matrix {}: {e}",
+                                        idx
+                                    ),
+                                }));
+                                        break;
+                                    }
+                                    if !GPU_COMMITMENT_FALLBACK_LOGGED
+                                        .swap(true, AtomicOrdering::Relaxed)
+                                    {
+                                        eprintln!(
+                                    "  [{log_tag}] weight commitment: GPU failed for matrix {}, falling back to CPU ({e})",
+                                    idx
+                                );
+                                    }
+                                    cpu_fallback_count += 1;
+                                    crate::crypto::mle_opening::commit_mle_root_only(
+                                        &current_prep.mle,
+                                    )
+                                }
+                            };
+
+                        // Incremental cache: insert last root too.
                         if let Some(wc) = weight_cache {
                             if let Ok(mut w) = wc.write() {
                                 w.insert_root(
@@ -865,16 +1010,13 @@ fn apply_aggregated_oracle_sumcheck(
                             }
                         }
 
-                        let finished = idx + 1;
-                        if finished % 10 == 0 || finished == total_claims {
-                            eprintln!(
-                                "  [{log_tag}] weight commitments: {finished}/{total_claims} done ({:.1}s, gpu={gpu_count} cpu={cpu_fallback_count})",
-                                t_commit.elapsed().as_secs_f64(),
-                            );
-                        }
+                        eprintln!(
+                        "  [{log_tag}] weight commitments: {}/{total_claims} done ({:.1}s, gpu={gpu_count} cpu={cpu_fallback_count})",
+                        idx + 1,
+                        t_commit.elapsed().as_secs_f64(),
+                    );
 
-                        // Always drop MLEs immediately — streaming mode will
-                        // reload them on demand from GraphWeights.
+                        // Always drop MLEs — streaming reloads on demand.
                         drop(std::mem::take(&mut current_prep.mle));
                         drop(std::mem::take(&mut current_prep.mle_u32));
                         results.push(Ok(WeightPrepResult {
@@ -886,90 +1028,26 @@ fn apply_aggregated_oracle_sumcheck(
                             is_deferred: input.is_deferred,
                             deferred_idx: input.deferred_idx,
                         }));
-                    });
-
-                    if results.last().map(|r| r.is_err()).unwrap_or(false) {
-                        break;
-                    }
-
-                    next_result
-                } else {
-                    // Last matrix — no next to prefetch, just GPU commit.
-                    let commitment = match crate::crypto::mle_opening::commit_mle_root_only_gpu_from_limbs(
-                        &limb_bufs[cur_buf_idx], cur_n_elements, executor, &d_rc,
-                    ) {
-                        Ok(root) => {
-                            gpu_count += 1;
-                            root
-                        }
-                        Err(e) => {
-                            if gpu_strict {
-                                results.push(Err(GKRError::ReductionError {
-                                    layer_idx: 0,
-                                    reason: format!(
-                                        "GPU MLE commitment strict mode: GPU failed for matrix {}: {e}",
-                                        idx
-                                    ),
-                                }));
-                                break;
-                            }
-                            if !GPU_COMMITMENT_FALLBACK_LOGGED.swap(true, AtomicOrdering::Relaxed) {
-                                eprintln!(
-                                    "  [{log_tag}] weight commitment: GPU failed for matrix {}, falling back to CPU ({e})",
-                                    idx
-                                );
-                            }
-                            cpu_fallback_count += 1;
-                            crate::crypto::mle_opening::commit_mle_root_only(&current_prep.mle)
-                        }
+                        None
                     };
 
-                    // Incremental cache: insert last root too.
-                    if let Some(wc) = weight_cache {
-                        if let Ok(mut w) = wc.write() {
-                            w.insert_root(
-                                input.weight_node_id,
-                                input.rows_padded,
-                                input.cols_padded,
-                                commitment,
-                            );
-                        }
+                    if let Some(next) = next_prep {
+                        current_prep = next;
+                        cur_buf_idx = next_buf_idx;
                     }
-
-                    eprintln!(
-                        "  [{log_tag}] weight commitments: {}/{total_claims} done ({:.1}s, gpu={gpu_count} cpu={cpu_fallback_count})",
-                        idx + 1,
-                        t_commit.elapsed().as_secs_f64(),
-                    );
-
-                    // Always drop MLEs — streaming reloads on demand.
-                    drop(std::mem::take(&mut current_prep.mle));
-                    drop(std::mem::take(&mut current_prep.mle_u32));
-                    results.push(Ok(WeightPrepResult {
-                        matrix_index: input.matrix_index,
-                        n_vars: current_prep.n_vars,
-                        commitment,
-                        eval_point: input.eval_point.to_vec(),
-                        expected_value: input.expected_value,
-                        is_deferred: input.is_deferred,
-                        deferred_idx: input.deferred_idx,
-                    }));
-                    None
-                };
-
-                if let Some(next) = next_prep {
-                    current_prep = next;
-                    cur_buf_idx = next_buf_idx;
                 }
-            }
-            results
+                results
             } // end else (single-GPU fallback from multi-GPU)
         } else {
             // GPU unavailable or disabled — use CPU parallel path
             if !GPU_COMMITMENT_FALLBACK_LOGGED.swap(true, AtomicOrdering::Relaxed) {
                 eprintln!(
                     "  [{log_tag}] weight commitment backend: CPU parallel (GPU {})",
-                    if !gpu_enabled { "disabled" } else { "unavailable" },
+                    if !gpu_enabled {
+                        "disabled"
+                    } else {
+                        "unavailable"
+                    },
                 );
             }
             use std::sync::atomic::AtomicUsize;
@@ -1078,7 +1156,9 @@ fn apply_aggregated_oracle_sumcheck(
         prep_inputs
             .iter()
             .map(|input| {
-                let commitment = input.cached_root.expect("all_cached invariant: every root must be Some");
+                let commitment = input
+                    .cached_root
+                    .expect("all_cached invariant: every root must be Some");
                 let n_vars = (input.rows_padded * input.cols_padded).trailing_zeros() as usize;
                 Ok(WeightPrepResult {
                     matrix_index: input.matrix_index,
@@ -1126,38 +1206,38 @@ fn apply_aggregated_oracle_sumcheck(
         pool.install(|| {
             use rayon::prelude::*;
             prep_inputs
-            .par_iter()
-            .map(|input| {
-                let b_matrix = weights
-                    .get_weight(input.weight_node_id)
-                    .ok_or(GKRError::MissingWeight {
-                        node_id: input.weight_node_id,
-                    })?;
-                let b_mle = matrix_to_mle_col_major_padded(b_matrix);
-                let n_vars = b_mle.len().trailing_zeros() as usize;
-                let commitment = crate::crypto::mle_opening::commit_mle_root_only(&b_mle);
+                .par_iter()
+                .map(|input| {
+                    let b_matrix = weights.get_weight(input.weight_node_id).ok_or(
+                        GKRError::MissingWeight {
+                            node_id: input.weight_node_id,
+                        },
+                    )?;
+                    let b_mle = matrix_to_mle_col_major_padded(b_matrix);
+                    let n_vars = b_mle.len().trailing_zeros() as usize;
+                    let commitment = crate::crypto::mle_opening::commit_mle_root_only(&b_mle);
 
-                let finished = done_count.fetch_add(1, AtomicOrdering::Relaxed) + 1;
-                if finished % 10 == 0 || finished == total_claims {
-                    eprintln!(
+                    let finished = done_count.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+                    if finished % 10 == 0 || finished == total_claims {
+                        eprintln!(
                         "  [{log_tag}] weight commitments: {finished}/{total_claims} done ({:.1}s)",
                         t_commit.elapsed().as_secs_f64(),
                     );
-                }
+                    }
 
-                // Always drop MLEs — streaming reloads on demand.
-                drop(b_mle);
-                Ok(WeightPrepResult {
-                    matrix_index: input.matrix_index,
-                    n_vars,
-                    commitment,
-                    eval_point: input.eval_point.to_vec(),
-                    expected_value: input.expected_value,
-                    is_deferred: input.is_deferred,
-                    deferred_idx: input.deferred_idx,
+                    // Always drop MLEs — streaming reloads on demand.
+                    drop(b_mle);
+                    Ok(WeightPrepResult {
+                        matrix_index: input.matrix_index,
+                        n_vars,
+                        commitment,
+                        eval_point: input.eval_point.to_vec(),
+                        expected_value: input.expected_value,
+                        is_deferred: input.is_deferred,
+                        deferred_idx: input.deferred_idx,
+                    })
                 })
-            })
-            .collect()
+                .collect()
         })
     }; // close all_cached else + cpu-only prep_results
 
@@ -1213,9 +1293,7 @@ fn apply_aggregated_oracle_sumcheck(
                     }
                 }
                 if inserted > 0 {
-                    eprintln!(
-                        "  [{log_tag}] weight commitment cache: {inserted} new roots stored",
-                    );
+                    eprintln!("  [{log_tag}] weight commitment cache: {inserted} new roots stored",);
                     // Auto-save to disk so subsequent runs get cache hits
                     w.auto_save();
                 }
@@ -1242,8 +1320,7 @@ fn apply_aggregated_oracle_sumcheck(
             if agg_claims.len() <= BINDING_GROUP_SIZE {
                 // Small model: single binding proof (original path)
                 let mut verify_channel = channel.clone();
-                let proof =
-                    prove_aggregated_binding_streaming(&agg_claims, &source, channel);
+                let proof = prove_aggregated_binding_streaming(&agg_claims, &source, channel);
                 eprintln!(
                     "  [{log_tag}] aggregated oracle sumcheck: {} claims, ~{} felts calldata (full binding proof, streaming)",
                     agg_claims.len(),
@@ -1267,7 +1344,9 @@ fn apply_aggregated_oracle_sumcheck(
                 let n_groups = (agg_claims.len() + BINDING_GROUP_SIZE - 1) / BINDING_GROUP_SIZE;
                 eprintln!(
                     "  [{log_tag}] grouped binding: {} claims → {} groups of ≤{} matrices",
-                    agg_claims.len(), n_groups, BINDING_GROUP_SIZE,
+                    agg_claims.len(),
+                    n_groups,
+                    BINDING_GROUP_SIZE,
                 );
                 let mut verify_channel = channel.clone();
                 let mut groups = Vec::with_capacity(n_groups);
@@ -1292,7 +1371,9 @@ fn apply_aggregated_oracle_sumcheck(
                     if (g + 1) % 10 == 0 || g + 1 == n_groups {
                         eprintln!(
                             "  [{log_tag}] group {}/{}: {} claims, ~{} felts ({:.1}s elapsed)",
-                            g + 1, n_groups, group_claims.len(),
+                            g + 1,
+                            n_groups,
+                            group_claims.len(),
                             group_proof.estimated_calldata_felts(),
                             t_groups.elapsed().as_secs_f64(),
                         );
@@ -1305,7 +1386,10 @@ fn apply_aggregated_oracle_sumcheck(
                     "  [{log_tag}] all {} groups proved in {:.1}s, total ~{} felts calldata",
                     n_groups,
                     t_groups.elapsed().as_secs_f64(),
-                    groups.iter().map(|g| g.estimated_calldata_felts()).sum::<usize>(),
+                    groups
+                        .iter()
+                        .map(|g| g.estimated_calldata_felts())
+                        .sum::<usize>(),
                 );
 
                 // Self-verify all groups sequentially through the same channel
@@ -1323,7 +1407,9 @@ fn apply_aggregated_oracle_sumcheck(
                     ) {
                         panic!(
                             "[{}] BINDING GROUP {}/{} SELF-VERIFY FAILED",
-                            log_tag, g + 1, n_groups,
+                            log_tag,
+                            g + 1,
+                            n_groups,
                         );
                     }
                 }
@@ -1350,7 +1436,12 @@ fn apply_aggregated_oracle_sumcheck(
         (None, Vec::new())
     };
 
-    Ok((weight_commitments, weight_claims, binding_proof, binding_groups))
+    Ok((
+        weight_commitments,
+        weight_claims,
+        binding_proof,
+        binding_groups,
+    ))
 }
 
 /// Apply aggregated RLC weight binding.
@@ -1465,10 +1556,7 @@ fn process_add_deferred(
     // G24 carve-out: only skip in main walk if the skip layer is a leaf type.
     // For Add layers, let the main walk process them so the claim transformation
     // chain stays correct for downstream layers.
-    let skip_layer_type = circuit
-        .layers
-        .get(skip_layer_idx)
-        .map(|l| &l.layer_type);
+    let skip_layer_type = circuit.layers.get(skip_layer_idx).map(|l| &l.layer_type);
     let is_add = matches!(skip_layer_type, Some(LayerType::Add { .. }));
     if !is_add {
         skip_layers.insert(skip_layer_idx);
@@ -1550,7 +1638,10 @@ pub fn prove_gkr_with_cache(
     let trace = std::env::var("STWO_CHANNEL_TRACE").is_ok();
     // Seed channel with circuit metadata
     if trace {
-        eprintln!("[PROVER] seeding: depth={}, input_shape=({}, {})", d, circuit.input_shape.0, circuit.input_shape.1);
+        eprintln!(
+            "[PROVER] seeding: depth={}, input_shape=({}, {})",
+            d, circuit.input_shape.0, circuit.input_shape.1
+        );
     }
     channel.mix_u64(d as u64);
     channel.mix_u64(circuit.input_shape.0 as u64);
@@ -1564,7 +1655,10 @@ pub fn prove_gkr_with_cache(
     }
     if trace {
         eprintln!("[PROVER] ch after seeding+policy: {:?}", channel.digest());
-        eprintln!("[PROVER] policy_commitment: {:?}, skip={}", policy_commitment, skip_policy);
+        eprintln!(
+            "[PROVER] policy_commitment: {:?}, skip={}",
+            policy_commitment, skip_policy
+        );
     }
 
     // Start with claim on output layer: evaluate the output MLE at a random point
@@ -1578,8 +1672,15 @@ pub fn prove_gkr_with_cache(
     let r_out = channel.draw_qm31s(log_out_rows + log_out_cols);
     let output_value = evaluate_mle(&output_mle, &r_out);
     if trace {
-        eprintln!("[PROVER] output: {}x{} padded to {}x{}", output.rows, output.cols, output_padded.rows, output_padded.cols);
-        eprintln!("[PROVER] log_out={}, r_out.len={}", log_out_rows + log_out_cols, r_out.len());
+        eprintln!(
+            "[PROVER] output: {}x{} padded to {}x{}",
+            output.rows, output.cols, output_padded.rows, output_padded.cols
+        );
+        eprintln!(
+            "[PROVER] log_out={}, r_out.len={}",
+            log_out_rows + log_out_cols,
+            r_out.len()
+        );
         eprintln!("[PROVER] output_value: {:?}", output_value);
     }
 
@@ -1605,12 +1706,20 @@ pub fn prove_gkr_with_cache(
 
     // Cache GPU device names once before the layer loop — discover_devices() is a
     // syscall that queries NVML/CUDA; calling it per-layer adds measurable overhead.
-    #[cfg(all(feature = "proof-stream", feature = "cuda-runtime", feature = "multi-gpu"))]
+    #[cfg(all(
+        feature = "proof-stream",
+        feature = "cuda-runtime",
+        feature = "multi-gpu"
+    ))]
     let gkr_gpu_info: Vec<(u32, String, u64)> = crate::multi_gpu::discover_devices()
         .iter()
         .map(|d| (d.ordinal, d.name.clone(), d.total_memory))
         .collect();
-    #[cfg(all(feature = "proof-stream", feature = "cuda-runtime", not(feature = "multi-gpu")))]
+    #[cfg(all(
+        feature = "proof-stream",
+        feature = "cuda-runtime",
+        not(feature = "multi-gpu")
+    ))]
     let gkr_gpu_info: Vec<(u32, String, u64)> = vec![(0, "GPU-0".to_string(), 0)];
 
     // Deferred claims from DAG Add/Mul layers (skip branches needing separate proofs).
@@ -1621,24 +1730,34 @@ pub fn prove_gkr_with_cache(
 
     // ── Phase: layer_walk ──
     profiler.begin_phase("layer_walk", channel.hash_count());
+    let layer_walk_t = std::time::Instant::now();
+    let log_layer_progress = std::env::var("STWO_GKR_LAYER_PROGRESS").ok().as_deref() != Some("0");
 
     // Walk layers from output → input
     for layer_idx in (0..d).rev() {
         // Skip layers that belong to deferred branches (resolved after main walk)
         if skip_layers.contains(&layer_idx) {
             if std::env::var("STWO_DEBUG_GKR").is_ok() {
-                eprintln!("[GKR walk] layer_idx={} SKIPPED (deferred branch)", layer_idx);
+                eprintln!(
+                    "[GKR walk] layer_idx={} SKIPPED (deferred branch)",
+                    layer_idx
+                );
             }
             continue;
         }
         let layer = &circuit.layers[layer_idx];
         if std::env::var("STWO_DEBUG_GKR").is_ok() {
-            eprintln!("[GKR walk] layer_idx={} node_id={} type={:?} out={:?} in={:?} claim_vars={}",
-                layer_idx, layer.node_id,
+            eprintln!(
+                "[GKR walk] layer_idx={} node_id={} type={:?} out={:?} in={:?} claim_vars={}",
+                layer_idx,
+                layer.node_id,
                 std::mem::discriminant(&layer.layer_type),
-                layer.output_shape, layer.input_shape,
-                current_claim.point.len());
+                layer.output_shape,
+                layer.input_shape,
+                current_claim.point.len()
+            );
         }
+        let layer_t = std::time::Instant::now();
         #[cfg(feature = "proof-stream")]
         let _ps_layer_t = std::time::Instant::now();
         emit_proof_event!(|| proof_stream::ProofEvent::LayerStart {
@@ -1757,7 +1876,10 @@ pub fn prove_gkr_with_cache(
                 // what the next layer (SiLU activation) actually outputs.
                 // The channel is already in sync (alpha drawn in both prover and verifier).
                 if layer.input_layers.len() >= 2 {
-                    if let LayerProof::Mul { lhs_eval, rhs_eval, .. } = &proof {
+                    if let LayerProof::Mul {
+                        lhs_eval, rhs_eval, ..
+                    } = &proof
+                    {
                         let skip_layer_idx = if layer.input_layers[1] > layer.input_layers[0] {
                             layer.input_layers[0]
                         } else {
@@ -1765,9 +1887,9 @@ pub fn prove_gkr_with_cache(
                         };
                         // Trunk is the higher-index input (the gate/SiLU branch).
                         let trunk_eval = if layer.input_layers[1] > layer.input_layers[0] {
-                            *rhs_eval  // rhs has higher index = trunk
+                            *rhs_eval // rhs has higher index = trunk
                         } else {
-                            *lhs_eval  // lhs has higher index = trunk
+                            *lhs_eval // lhs has higher index = trunk
                         };
                         deferred_info.push((
                             GKRClaim {
@@ -1779,10 +1901,13 @@ pub fn prove_gkr_with_cache(
                         skip_layers.insert(skip_layer_idx);
 
                         // Override claim: trunk value, not combined
-                        (proof, GKRClaim {
-                            point: combined_claim.point,
-                            value: trunk_eval,
-                        })
+                        (
+                            proof,
+                            GKRClaim {
+                                point: combined_claim.point,
+                                value: trunk_eval,
+                            },
+                        )
                     } else {
                         (proof, combined_claim)
                     }
@@ -1833,7 +1958,13 @@ pub fn prove_gkr_with_cache(
                     .get_named_weight(layer.node_id, "gamma")
                     .map(|m| m.data.as_slice());
 
-                reduce_rmsnorm_layer_with_gamma(&current_claim, input_matrix, *dim, channel, affine_gamma)?
+                reduce_rmsnorm_layer_with_gamma(
+                    &current_claim,
+                    input_matrix,
+                    *dim,
+                    channel,
+                    affine_gamma,
+                )?
             }
 
             LayerType::Quantize { params, .. } => {
@@ -1896,6 +2027,20 @@ pub fn prove_gkr_with_cache(
 
         layer_proofs.push(proof);
         current_claim = next_claim;
+        if log_layer_progress {
+            eprintln!(
+                "  [GKR] layer {}/{}: idx={} node={} {} {:?}->{:?} in {:.2}s (elapsed {:.1}s)",
+                layer_proofs.len(),
+                d,
+                layer_idx,
+                layer.node_id,
+                layer_type_label(&layer.layer_type),
+                layer.input_shape,
+                layer.output_shape,
+                layer_t.elapsed().as_secs_f64(),
+                layer_walk_t.elapsed().as_secs_f64(),
+            );
+        }
         #[cfg(feature = "proof-stream")]
         emit_proof_event!(|| proof_stream::ProofEvent::LayerEnd {
             layer_idx,
@@ -2124,10 +2269,13 @@ pub fn prove_gkr_with_cache(
                 let input_matrix = get_intermediate(execution, rhs_layer.node_id)?;
                 let attn_weights = get_attention_weights(weights, rhs_layer)?;
                 mix_secure_field(channel, deferred_claim.value);
-                let (layer_proof, input_claim) =
-                    reduce_attention_layer(
-                        deferred_claim, input_matrix, &attn_weights, config, channel,
-                    )?;
+                let (layer_proof, input_claim) = reduce_attention_layer(
+                    deferred_claim,
+                    input_matrix,
+                    &attn_weights,
+                    config,
+                    channel,
+                )?;
                 deferred_proofs.push(super::types::DeferredProof {
                     claim: deferred_claim.clone(),
                     layer_proof,
@@ -2157,7 +2305,9 @@ pub fn prove_gkr_with_cache(
     let mut weight_openings = Vec::with_capacity(weight_data.len());
     let mut weight_opening_transcript_mode = WeightOpeningTranscriptMode::Sequential;
     let mut aggregated_binding_proof = None;
-    let mut binding_groups_vec: Vec<crate::crypto::aggregated_opening::AggregatedWeightBindingProof> = Vec::new();
+    let mut binding_groups_vec: Vec<
+        crate::crypto::aggregated_opening::AggregatedWeightBindingProof,
+    > = Vec::new();
 
     let use_aggregated_oracle_sumcheck = gkr_aggregated_oracle_sumcheck_enabled()
         && (!weight_data.is_empty() || !deferred_weight_claims_data.is_empty());
@@ -2178,6 +2328,7 @@ pub fn prove_gkr_with_cache(
             channel,
             "GKR",
             weight_cache,
+            Some(&resolved_policy),
         )?;
         weight_commitments_new = wc;
         weight_claims = claims;
@@ -2350,10 +2501,7 @@ pub fn prove_gkr_decode(
     weights: &GraphWeights,
     channel: &mut PoseidonChannel,
     weight_cache: Option<&crate::weight_cache::SharedWeightCache>,
-    decode_attention_data: &std::collections::HashMap<
-        usize,
-        (AttentionIntermediates, usize),
-    >,
+    decode_attention_data: &std::collections::HashMap<usize, (AttentionIntermediates, usize)>,
 ) -> Result<GKRProof, GKRError> {
     let d = circuit.layers.len();
     let mut layer_proofs = Vec::with_capacity(d);
@@ -2411,18 +2559,28 @@ pub fn prove_gkr_decode(
 
         let (proof, next_claim) = match &layer.layer_type {
             LayerType::MatMul {
-                m, k, n, weight_node_id,
+                m,
+                k,
+                n,
+                weight_node_id,
             } => {
                 let a_matrix = get_intermediate(execution, layer.node_id)?;
-                let b_matrix = weights.get_weight(*weight_node_id).ok_or(
-                    GKRError::MissingWeight { node_id: *weight_node_id },
-                )?;
+                let b_matrix =
+                    weights
+                        .get_weight(*weight_node_id)
+                        .ok_or(GKRError::MissingWeight {
+                            node_id: *weight_node_id,
+                        })?;
                 let (reduction, claim, _timings) =
                     reduce_matmul_layer(&current_claim, a_matrix, b_matrix, *m, *k, *n, channel)?;
                 push_matmul_weight_data(
-                    *weight_node_id, *m, *n,
-                    &current_claim.point, &claim.point,
-                    reduction.final_b_eval, &mut weight_data,
+                    *weight_node_id,
+                    *m,
+                    *n,
+                    &current_claim.point,
+                    &claim.point,
+                    reduction.final_b_eval,
+                    &mut weight_data,
                 );
                 (
                     LayerProof::MatMul {
@@ -2435,39 +2593,51 @@ pub fn prove_gkr_decode(
             }
 
             LayerType::Add { .. } => {
-                let (lhs_vals, rhs_vals) =
-                    get_binary_op_intermediates(execution, layer, circuit)?;
+                let (lhs_vals, rhs_vals) = get_binary_op_intermediates(execution, layer, circuit)?;
                 let (proof, _claim) =
                     reduce_add_layer(&current_claim, &lhs_vals, &rhs_vals, channel)?;
                 process_add_deferred(
-                    proof, &current_claim, &layer.input_layers, &mut deferred_info,
+                    proof,
+                    &current_claim,
+                    &layer.input_layers,
+                    &mut deferred_info,
                     &mut skip_layers,
                     circuit,
                 )
             }
 
             LayerType::Mul { .. } => {
-                let (lhs_vals, rhs_vals) =
-                    get_binary_op_intermediates(execution, layer, circuit)?;
+                let (lhs_vals, rhs_vals) = get_binary_op_intermediates(execution, layer, circuit)?;
                 reduce_mul_layer(&current_claim, &lhs_vals, &rhs_vals, channel)?
             }
 
-            LayerType::Activation { activation_type, .. } => {
+            LayerType::Activation {
+                activation_type, ..
+            } => {
                 let input_matrix = get_intermediate(execution, layer.node_id)?;
                 if *activation_type == crate::components::activation::ActivationType::ReLU {
                     reduce_activation_layer_algebraic(
-                        &current_claim, input_matrix, *activation_type, channel,
+                        &current_claim,
+                        input_matrix,
+                        *activation_type,
+                        channel,
                     )?
                 } else if crate::components::activation::piecewise_activation_enabled() {
                     // Mirror non-decode prover at line 1777 (G15 hardening, Apr 30 2026):
                     // when piecewise is enabled (the standard hardened default), use the
                     // full-M31-domain reducer; the LogUp fallback only verifies lower bits.
                     reduce_activation_layer_piecewise(
-                        &current_claim, input_matrix, *activation_type, channel,
+                        &current_claim,
+                        input_matrix,
+                        *activation_type,
+                        channel,
                     )?
                 } else {
                     reduce_activation_layer(
-                        &current_claim, input_matrix, *activation_type, channel,
+                        &current_claim,
+                        input_matrix,
+                        *activation_type,
+                        channel,
                     )?
                 }
             }
@@ -2482,7 +2652,13 @@ pub fn prove_gkr_decode(
                 let affine_gamma = weights
                     .get_named_weight(layer.node_id, "gamma")
                     .map(|m| m.data.as_slice());
-                reduce_rmsnorm_layer_with_gamma(&current_claim, input_matrix, *dim, channel, affine_gamma)?
+                reduce_rmsnorm_layer_with_gamma(
+                    &current_claim,
+                    input_matrix,
+                    *dim,
+                    channel,
+                    affine_gamma,
+                )?
             }
 
             LayerType::Quantize { params, .. } => {
@@ -2493,11 +2669,18 @@ pub fn prove_gkr_decode(
             LayerType::Embedding { .. } => {
                 let input_matrix = get_intermediate(execution, layer.node_id)?;
                 let output_matrix = get_node_output(execution, layer.node_id)?;
-                let embed_table = weights.get_weight(layer.node_id).ok_or(
-                    GKRError::MissingWeight { node_id: layer.node_id },
-                )?;
+                let embed_table =
+                    weights
+                        .get_weight(layer.node_id)
+                        .ok_or(GKRError::MissingWeight {
+                            node_id: layer.node_id,
+                        })?;
                 reduce_embedding_layer(
-                    &current_claim, input_matrix, output_matrix, embed_table, channel,
+                    &current_claim,
+                    input_matrix,
+                    output_matrix,
+                    embed_table,
+                    channel,
                 )?
             }
 
@@ -2565,11 +2748,19 @@ pub fn prove_gkr_decode(
     while let Some((deferred_claim, rhs_layer_idx)) = deferred_queue.pop_front() {
         let rhs_layer = &circuit.layers[rhs_layer_idx];
         match &rhs_layer.layer_type {
-            LayerType::MatMul { m, k, n, weight_node_id } => {
+            LayerType::MatMul {
+                m,
+                k,
+                n,
+                weight_node_id,
+            } => {
                 let a_matrix = get_intermediate(execution, rhs_layer.node_id)?;
-                let b_matrix = weights.get_weight(*weight_node_id).ok_or(
-                    GKRError::MissingWeight { node_id: *weight_node_id },
-                )?;
+                let b_matrix =
+                    weights
+                        .get_weight(*weight_node_id)
+                        .ok_or(GKRError::MissingWeight {
+                            node_id: *weight_node_id,
+                        })?;
                 mix_secure_field(channel, deferred_claim.value);
                 let (reduction, input_claim, _timings) =
                     reduce_matmul_layer(&deferred_claim, a_matrix, b_matrix, *m, *k, *n, channel)?;
@@ -2593,7 +2784,9 @@ pub fn prove_gkr_decode(
                 let (deferred_weight_commitment, deferred_weight_opening) =
                     if use_aggregated_binding {
                         deferred_weight_claims_data.push((
-                            *weight_node_id, weight_eval_point, reduction.final_b_eval,
+                            *weight_node_id,
+                            weight_eval_point,
+                            reduction.final_b_eval,
                         ));
                         (
                             starknet_ff::FieldElement::ZERO,
@@ -2608,14 +2801,18 @@ pub fn prove_gkr_decode(
                         {
                             let b_mle_u32 = matrix_to_mle_col_major_u32_padded(b_matrix);
                             crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
-                                &b_mle_u32, &deferred_weight_claim.eval_point, channel,
+                                &b_mle_u32,
+                                &deferred_weight_claim.eval_point,
+                                channel,
                             )
                         }
                         #[cfg(not(feature = "cuda-runtime"))]
                         {
                             let b_mle = matrix_to_mle_col_major_padded(b_matrix);
                             crate::crypto::mle_opening::prove_mle_opening_with_commitment(
-                                &b_mle, &deferred_weight_claim.eval_point, channel,
+                                &b_mle,
+                                &deferred_weight_claim.eval_point,
+                                channel,
                             )
                         }
                     };
@@ -2666,8 +2863,13 @@ pub fn prove_gkr_decode(
                     .get_named_weight(rhs_layer.node_id, "gamma")
                     .map(|m| m.data.as_slice());
                 mix_secure_field(channel, deferred_claim.value);
-                let (layer_proof, input_claim) =
-                    reduce_rmsnorm_layer_with_gamma(&deferred_claim, input_matrix, *dim, channel, affine_gamma)?;
+                let (layer_proof, input_claim) = reduce_rmsnorm_layer_with_gamma(
+                    &deferred_claim,
+                    input_matrix,
+                    *dim,
+                    channel,
+                    affine_gamma,
+                )?;
                 deferred_proofs.push(super::types::DeferredProof {
                     claim: deferred_claim.clone(),
                     layer_proof,
@@ -2687,20 +2889,27 @@ pub fn prove_gkr_decode(
                     kind: super::types::DeferredProofKind::Weightless,
                 });
             }
-            LayerType::Activation { activation_type, .. } => {
+            LayerType::Activation {
+                activation_type, ..
+            } => {
                 let input_matrix = get_intermediate(execution, rhs_layer.node_id)?;
                 mix_secure_field(channel, deferred_claim.value);
-                let (layer_proof, input_claim) = if *activation_type
-                    == crate::components::activation::ActivationType::ReLU
-                {
-                    reduce_activation_layer_algebraic(
-                        &deferred_claim, input_matrix, *activation_type, channel,
-                    )?
-                } else {
-                    reduce_activation_layer(
-                        &deferred_claim, input_matrix, *activation_type, channel,
-                    )?
-                };
+                let (layer_proof, input_claim) =
+                    if *activation_type == crate::components::activation::ActivationType::ReLU {
+                        reduce_activation_layer_algebraic(
+                            &deferred_claim,
+                            input_matrix,
+                            *activation_type,
+                            channel,
+                        )?
+                    } else {
+                        reduce_activation_layer(
+                            &deferred_claim,
+                            input_matrix,
+                            *activation_type,
+                            channel,
+                        )?
+                    };
                 deferred_proofs.push(super::types::DeferredProof {
                     claim: deferred_claim.clone(),
                     layer_proof,
@@ -2733,7 +2942,10 @@ pub fn prove_gkr_decode(
                     kind: super::types::DeferredProofKind::Weightless,
                 });
             }
-            LayerType::Identity | LayerType::RoPE { .. } | LayerType::TopK { .. } | LayerType::Input => {
+            LayerType::Identity
+            | LayerType::RoPE { .. }
+            | LayerType::TopK { .. }
+            | LayerType::Input => {
                 // Identity/Input/RoPE: the claim propagates unchanged — trivial deferred proof.
                 // Replay Add reduction channel ops for transcript consistency:
                 // mix claim.value (before match), mix lhs_eval, mix rhs_eval, draw alpha.
@@ -2758,17 +2970,27 @@ pub fn prove_gkr_decode(
                 let input_matrix = get_intermediate(execution, rhs_layer.node_id)?;
                 let attn_weights = get_attention_weights(weights, rhs_layer)?;
                 mix_secure_field(channel, deferred_claim.value);
-                let (layer_proof, input_claim) =
-                    if let Some((inter, full_seq_len)) = decode_attention_data.get(&rhs_layer.node_id) {
-                        reduce_attention_layer_decode(
-                            &deferred_claim, input_matrix, &attn_weights, inter, config,
-                            *full_seq_len, channel,
-                        )?
-                    } else {
-                        reduce_attention_layer(
-                            &deferred_claim, input_matrix, &attn_weights, config, channel,
-                        )?
-                    };
+                let (layer_proof, input_claim) = if let Some((inter, full_seq_len)) =
+                    decode_attention_data.get(&rhs_layer.node_id)
+                {
+                    reduce_attention_layer_decode(
+                        &deferred_claim,
+                        input_matrix,
+                        &attn_weights,
+                        inter,
+                        config,
+                        *full_seq_len,
+                        channel,
+                    )?
+                } else {
+                    reduce_attention_layer(
+                        &deferred_claim,
+                        input_matrix,
+                        &attn_weights,
+                        config,
+                        channel,
+                    )?
+                };
                 deferred_proofs.push(super::types::DeferredProof {
                     claim: deferred_claim.clone(),
                     layer_proof,
@@ -2798,7 +3020,9 @@ pub fn prove_gkr_decode(
     let mut weight_openings = Vec::with_capacity(weight_data.len());
     let mut weight_opening_transcript_mode = WeightOpeningTranscriptMode::Sequential;
     let mut aggregated_binding_proof = None;
-    let mut binding_groups_vec: Vec<crate::crypto::aggregated_opening::AggregatedWeightBindingProof> = Vec::new();
+    let mut binding_groups_vec: Vec<
+        crate::crypto::aggregated_opening::AggregatedWeightBindingProof,
+    > = Vec::new();
 
     let use_aggregated_oracle_sumcheck = gkr_aggregated_oracle_sumcheck_enabled()
         && (!weight_data.is_empty() || !deferred_weight_claims_data.is_empty());
@@ -2812,8 +3036,14 @@ pub fn prove_gkr_decode(
     if use_aggregated_oracle_sumcheck {
         weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
         let (wc, claims, proof, groups) = apply_aggregated_oracle_sumcheck(
-            &weight_data, &deferred_weight_claims_data, &mut deferred_proofs,
-            weights, channel, "GKR-decode", weight_cache,
+            &weight_data,
+            &deferred_weight_claims_data,
+            &mut deferred_proofs,
+            weights,
+            channel,
+            "GKR-decode",
+            weight_cache,
+            None,
         )?;
         weight_commitments_new = wc;
         weight_claims = claims;
@@ -2838,22 +3068,28 @@ pub fn prove_gkr_decode(
         for (opening_idx, (weight_node_id, _eval_point, _expected_value)) in
             weight_data.into_iter().enumerate()
         {
-            let b_matrix = weights.get_weight(weight_node_id).ok_or(
-                GKRError::MissingWeight { node_id: weight_node_id },
-            )?;
+            let b_matrix = weights
+                .get_weight(weight_node_id)
+                .ok_or(GKRError::MissingWeight {
+                    node_id: weight_node_id,
+                })?;
             let claim = &weight_claims[opening_idx];
             #[cfg(feature = "cuda-runtime")]
             let (commitment, opening) = {
                 let b_mle_u32 = matrix_to_mle_col_major_u32_padded(b_matrix);
                 crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
-                    &b_mle_u32, &claim.eval_point, channel,
+                    &b_mle_u32,
+                    &claim.eval_point,
+                    channel,
                 )
             };
             #[cfg(not(feature = "cuda-runtime"))]
             let (commitment, opening) = {
                 let b_mle = matrix_to_mle_col_major_padded(b_matrix);
                 crate::crypto::mle_opening::prove_mle_opening_with_commitment(
-                    &b_mle, &claim.eval_point, channel,
+                    &b_mle,
+                    &claim.eval_point,
+                    channel,
                 )
             };
             weight_commitments.push(commitment);
@@ -2916,7 +3152,14 @@ pub fn prove_gkr_auto_with_cache(
     #[cfg(feature = "cuda-runtime")]
     {
         if crate::backend::force_gpu() || crate::backend::gpu_is_available() {
-            return prove_gkr_gpu_with_cache(circuit, execution, weights, channel, weight_cache, policy);
+            return prove_gkr_gpu_with_cache(
+                circuit,
+                execution,
+                weights,
+                channel,
+                weight_cache,
+                policy,
+            );
         }
     }
     prove_gkr_with_cache(circuit, execution, weights, channel, weight_cache, policy)
@@ -2982,7 +3225,10 @@ pub fn prove_gkr_gpu_with_cache(
     let trace = std::env::var("STWO_CHANNEL_TRACE").is_ok();
     // Seed channel with circuit metadata (same as CPU prover)
     if trace {
-        eprintln!("[PROVER-GPU] seeding: depth={}, input_shape=({}, {})", d, circuit.input_shape.0, circuit.input_shape.1);
+        eprintln!(
+            "[PROVER-GPU] seeding: depth={}, input_shape=({}, {})",
+            d, circuit.input_shape.0, circuit.input_shape.1
+        );
     }
     channel.mix_u64(d as u64);
     channel.mix_u64(circuit.input_shape.0 as u64);
@@ -2995,8 +3241,14 @@ pub fn prove_gkr_gpu_with_cache(
         channel.mix_felt(policy_commitment);
     }
     if trace {
-        eprintln!("[PROVER-GPU] ch after seeding+policy: {:?}", channel.digest());
-        eprintln!("[PROVER-GPU] policy_commitment: {:?}, skip={}", policy_commitment, skip_policy);
+        eprintln!(
+            "[PROVER-GPU] ch after seeding+policy: {:?}",
+            channel.digest()
+        );
+        eprintln!(
+            "[PROVER-GPU] policy_commitment: {:?}, skip={}",
+            policy_commitment, skip_policy
+        );
     }
 
     // Start with claim on output layer
@@ -3011,8 +3263,15 @@ pub fn prove_gkr_gpu_with_cache(
     let output_value = evaluate_mle(&output_mle, &r_out);
 
     if trace {
-        eprintln!("[PROVER-GPU] output: {}x{} padded to {}x{}", output.rows, output.cols, output_padded.rows, output_padded.cols);
-        eprintln!("[PROVER-GPU] log_out={}, r_out.len={}", log_out_rows + log_out_cols, r_out.len());
+        eprintln!(
+            "[PROVER-GPU] output: {}x{} padded to {}x{}",
+            output.rows, output.cols, output_padded.rows, output_padded.cols
+        );
+        eprintln!(
+            "[PROVER-GPU] log_out={}, r_out.len={}",
+            log_out_rows + log_out_cols,
+            r_out.len()
+        );
         eprintln!("[PROVER-GPU] output_value: {:?}", output_value);
     }
 
@@ -3051,7 +3310,15 @@ pub fn prove_gkr_gpu_with_cache(
     let total_work_layers = circuit
         .layers
         .iter()
-        .filter(|l| !matches!(l.layer_type, LayerType::Identity | LayerType::RoPE { .. } | LayerType::TopK { .. } | LayerType::Input))
+        .filter(|l| {
+            !matches!(
+                l.layer_type,
+                LayerType::Identity
+                    | LayerType::RoPE { .. }
+                    | LayerType::TopK { .. }
+                    | LayerType::Input
+            )
+        })
         .count();
     let total_matmul_layers = circuit
         .layers
@@ -3241,7 +3508,13 @@ pub fn prove_gkr_gpu_with_cache(
                 let affine_gamma = weights
                     .get_named_weight(layer.node_id, "gamma")
                     .map(|m| m.data.as_slice());
-                reduce_rmsnorm_layer_with_gamma(&current_claim, input_matrix, *dim, channel, affine_gamma)?
+                reduce_rmsnorm_layer_with_gamma(
+                    &current_claim,
+                    input_matrix,
+                    *dim,
+                    channel,
+                    affine_gamma,
+                )?
             }
 
             LayerType::Quantize { params, .. } => {
@@ -3559,7 +3832,9 @@ pub fn prove_gkr_gpu_with_cache(
     let mut weight_claims = Vec::with_capacity(weight_data.len());
     let mut weight_opening_transcript_mode = WeightOpeningTranscriptMode::Sequential;
     let mut aggregated_binding_proof = None;
-    let mut binding_groups_vec: Vec<crate::crypto::aggregated_opening::AggregatedWeightBindingProof> = Vec::new();
+    let mut binding_groups_vec: Vec<
+        crate::crypto::aggregated_opening::AggregatedWeightBindingProof,
+    > = Vec::new();
     let total_openings = weight_data.len();
     let t_openings = std::time::Instant::now();
     let openings_progress_every = std::env::var("STWO_GKR_OPENINGS_PROGRESS_EVERY")
@@ -3590,6 +3865,7 @@ pub fn prove_gkr_gpu_with_cache(
             channel,
             "GKR-GPU",
             weight_cache,
+            Some(&resolved_policy),
         )?;
         weight_commitments_new = wc;
         weight_claims = claims;
@@ -3975,12 +4251,16 @@ pub fn prove_gkr_decode_gpu(
     execution: &GraphExecution,
     weights: &GraphWeights,
     channel: &mut PoseidonChannel,
-    decode_attention_data: &std::collections::HashMap<
-        usize,
-        (AttentionIntermediates, usize),
-    >,
+    decode_attention_data: &std::collections::HashMap<usize, (AttentionIntermediates, usize)>,
 ) -> Result<GKRProof, GKRError> {
-    prove_gkr_decode_gpu_with_cache(circuit, execution, weights, channel, None, decode_attention_data)
+    prove_gkr_decode_gpu_with_cache(
+        circuit,
+        execution,
+        weights,
+        channel,
+        None,
+        decode_attention_data,
+    )
 }
 
 /// GPU-accelerated decode-step GKR prover with optional weight commitment cache.
@@ -3995,10 +4275,7 @@ pub fn prove_gkr_decode_gpu_with_cache(
     weights: &GraphWeights,
     channel: &mut PoseidonChannel,
     weight_cache: Option<&crate::weight_cache::SharedWeightCache>,
-    decode_attention_data: &std::collections::HashMap<
-        usize,
-        (AttentionIntermediates, usize),
-    >,
+    decode_attention_data: &std::collections::HashMap<usize, (AttentionIntermediates, usize)>,
 ) -> Result<GKRProof, GKRError> {
     use crate::gpu_sumcheck::GpuSumcheckExecutor;
 
@@ -4071,7 +4348,15 @@ pub fn prove_gkr_decode_gpu_with_cache(
     let total_work_layers = circuit
         .layers
         .iter()
-        .filter(|l| !matches!(l.layer_type, LayerType::Identity | LayerType::RoPE { .. } | LayerType::TopK { .. } | LayerType::Input))
+        .filter(|l| {
+            !matches!(
+                l.layer_type,
+                LayerType::Identity
+                    | LayerType::RoPE { .. }
+                    | LayerType::TopK { .. }
+                    | LayerType::Input
+            )
+        })
         .count();
     let total_matmul_layers = circuit
         .layers
@@ -4105,15 +4390,28 @@ pub fn prove_gkr_decode_gpu_with_cache(
 
         let (proof, next_claim) = match &layer.layer_type {
             LayerType::MatMul {
-                m, k, n, weight_node_id,
+                m,
+                k,
+                n,
+                weight_node_id,
             } => {
                 let a_matrix = get_intermediate(execution, layer.node_id)?;
-                let b_matrix = weights
-                    .get_weight(*weight_node_id)
-                    .ok_or(GKRError::MissingWeight { node_id: *weight_node_id })?;
+                let b_matrix =
+                    weights
+                        .get_weight(*weight_node_id)
+                        .ok_or(GKRError::MissingWeight {
+                            node_id: *weight_node_id,
+                        })?;
 
                 let (proof, claim, _mm_timings) = reduce_matmul_layer_gpu(
-                    &gpu, &current_claim, a_matrix, b_matrix, *m, *k, *n, channel,
+                    &gpu,
+                    &current_claim,
+                    a_matrix,
+                    b_matrix,
+                    *m,
+                    *k,
+                    *n,
+                    channel,
                 )?;
 
                 let final_b_eval = match &proof {
@@ -4121,27 +4419,40 @@ pub fn prove_gkr_decode_gpu_with_cache(
                     _ => unreachable!("reduce_matmul_layer_gpu returns MatMul"),
                 };
                 push_matmul_weight_data(
-                    *weight_node_id, *m, *n,
-                    &current_claim.point, &claim.point,
-                    final_b_eval, &mut weight_data,
+                    *weight_node_id,
+                    *m,
+                    *n,
+                    &current_claim.point,
+                    &claim.point,
+                    final_b_eval,
+                    &mut weight_data,
                 );
 
                 #[cfg(feature = "proof-stream")]
-                if let LayerProof::MatMul { ref round_polys, .. } = proof {
+                if let LayerProof::MatMul {
+                    ref round_polys, ..
+                } = proof
+                {
                     let n_rounds = round_polys.len();
                     let init = sf_to_f32(current_claim.value);
                     for (round, rp) in round_polys.iter().enumerate() {
                         let c0 = proof_stream::SecureFieldMirror {
-                            a: rp.c0.0 .0 .0, b: rp.c0.0 .1 .0,
-                            c: rp.c0.1 .0 .0, d: rp.c0.1 .1 .0,
+                            a: rp.c0.0 .0 .0,
+                            b: rp.c0.0 .1 .0,
+                            c: rp.c0.1 .0 .0,
+                            d: rp.c0.1 .1 .0,
                         };
                         let c1 = proof_stream::SecureFieldMirror {
-                            a: rp.c1.0 .0 .0, b: rp.c1.0 .1 .0,
-                            c: rp.c1.1 .0 .0, d: rp.c1.1 .1 .0,
+                            a: rp.c1.0 .0 .0,
+                            b: rp.c1.0 .1 .0,
+                            c: rp.c1.1 .0 .0,
+                            d: rp.c1.1 .1 .0,
                         };
                         let c2 = proof_stream::SecureFieldMirror {
-                            a: rp.c2.0 .0 .0, b: rp.c2.0 .1 .0,
-                            c: rp.c2.1 .0 .0, d: rp.c2.1 .1 .0,
+                            a: rp.c2.0 .0 .0,
+                            b: rp.c2.0 .1 .0,
+                            c: rp.c2.1 .0 .0,
+                            d: rp.c2.1 .1 .0,
                         };
                         let claim_approx = init / (1u32 << round.min(30)) as f32;
                         emit_proof_event!(|| proof_stream::ProofEvent::SumcheckRound {
@@ -4163,7 +4474,10 @@ pub fn prove_gkr_decode_gpu_with_cache(
                 let (proof, _claim) =
                     reduce_add_layer_gpu(&gpu, &current_claim, &lhs_vals, &rhs_vals, channel)?;
                 process_add_deferred(
-                    proof, &current_claim, &layer.input_layers, &mut deferred_info,
+                    proof,
+                    &current_claim,
+                    &layer.input_layers,
+                    &mut deferred_info,
                     &mut skip_layers,
                     circuit,
                 )
@@ -4174,11 +4488,16 @@ pub fn prove_gkr_decode_gpu_with_cache(
                 reduce_mul_layer_gpu(&gpu, &current_claim, &lhs_vals, &rhs_vals, channel)?
             }
 
-            LayerType::Activation { activation_type, .. } => {
+            LayerType::Activation {
+                activation_type, ..
+            } => {
                 let input_matrix = get_intermediate(execution, layer.node_id)?;
                 if *activation_type == crate::components::activation::ActivationType::ReLU {
                     reduce_activation_layer_algebraic(
-                        &current_claim, input_matrix, *activation_type, channel,
+                        &current_claim,
+                        input_matrix,
+                        *activation_type,
+                        channel,
                     )?
                 } else if crate::components::activation::piecewise_activation_enabled() {
                     // Fall back to CPU piecewise reducer (no GPU piecewise yet).
@@ -4186,11 +4505,18 @@ pub fn prove_gkr_decode_gpu_with_cache(
                     // (G15, Apr 30 2026); without it the verifier rejects
                     // LogUp-only activation proofs as lower-bits-unbound.
                     reduce_activation_layer_piecewise(
-                        &current_claim, input_matrix, *activation_type, channel,
+                        &current_claim,
+                        input_matrix,
+                        *activation_type,
+                        channel,
                     )?
                 } else {
                     reduce_activation_layer_gpu(
-                        &gpu, &current_claim, input_matrix, *activation_type, channel,
+                        &gpu,
+                        &current_claim,
+                        input_matrix,
+                        *activation_type,
+                        channel,
                     )?
                 }
             }
@@ -4205,7 +4531,13 @@ pub fn prove_gkr_decode_gpu_with_cache(
                 let affine_gamma = weights
                     .get_named_weight(layer.node_id, "gamma")
                     .map(|m| m.data.as_slice());
-                reduce_rmsnorm_layer_with_gamma(&current_claim, input_matrix, *dim, channel, affine_gamma)?
+                reduce_rmsnorm_layer_with_gamma(
+                    &current_claim,
+                    input_matrix,
+                    *dim,
+                    channel,
+                    affine_gamma,
+                )?
             }
 
             LayerType::Quantize { params, .. } => {
@@ -4216,11 +4548,18 @@ pub fn prove_gkr_decode_gpu_with_cache(
             LayerType::Embedding { .. } => {
                 let input_matrix = get_intermediate(execution, layer.node_id)?;
                 let output_matrix = get_node_output(execution, layer.node_id)?;
-                let embed_table = weights
-                    .get_weight(layer.node_id)
-                    .ok_or(GKRError::MissingWeight { node_id: layer.node_id })?;
+                let embed_table =
+                    weights
+                        .get_weight(layer.node_id)
+                        .ok_or(GKRError::MissingWeight {
+                            node_id: layer.node_id,
+                        })?;
                 reduce_embedding_layer(
-                    &current_claim, input_matrix, output_matrix, embed_table, channel,
+                    &current_claim,
+                    input_matrix,
+                    output_matrix,
+                    embed_table,
+                    channel,
                 )?
             }
 
@@ -4238,12 +4577,21 @@ pub fn prove_gkr_decode_gpu_with_cache(
 
                 if let Some((inter, full_seq_len)) = decode_attention_data.get(&layer.node_id) {
                     reduce_attention_layer_decode(
-                        &current_claim, input_matrix, &attn_weights, inter, config,
-                        *full_seq_len, channel,
+                        &current_claim,
+                        input_matrix,
+                        &attn_weights,
+                        inter,
+                        config,
+                        *full_seq_len,
+                        channel,
                     )?
                 } else {
                     reduce_attention_layer(
-                        &current_claim, input_matrix, &attn_weights, config, channel,
+                        &current_claim,
+                        input_matrix,
+                        &attn_weights,
+                        config,
+                        channel,
                     )?
                 }
             }
@@ -4345,18 +4693,32 @@ pub fn prove_gkr_decode_gpu_with_cache(
     while let Some((deferred_claim, rhs_layer_idx)) = deferred_queue.pop_front() {
         let rhs_layer = &circuit.layers[rhs_layer_idx];
         match &rhs_layer.layer_type {
-            LayerType::MatMul { m, k, n, weight_node_id } => {
+            LayerType::MatMul {
+                m,
+                k,
+                n,
+                weight_node_id,
+            } => {
                 let a_matrix = get_intermediate(execution, rhs_layer.node_id)?;
-                let b_matrix = weights
-                    .get_weight(*weight_node_id)
-                    .ok_or(GKRError::MissingWeight { node_id: *weight_node_id })?;
+                let b_matrix =
+                    weights
+                        .get_weight(*weight_node_id)
+                        .ok_or(GKRError::MissingWeight {
+                            node_id: *weight_node_id,
+                        })?;
 
                 mix_secure_field(channel, deferred_claim.value);
 
                 // GPU backend for deferred matmul reductions
                 let (reduction, input_claim, _mm_timings) =
                     reduce_matmul_layer_with_backend::<stwo::prover::backend::gpu::GpuBackend>(
-                        &deferred_claim, a_matrix, b_matrix, *m, *k, *n, channel,
+                        &deferred_claim,
+                        a_matrix,
+                        b_matrix,
+                        *m,
+                        *k,
+                        *n,
+                        channel,
                     )?;
 
                 let pm = m.next_power_of_two();
@@ -4377,7 +4739,9 @@ pub fn prove_gkr_decode_gpu_with_cache(
                     aggregate_weight_binding || gkr_aggregated_oracle_sumcheck_enabled();
                 let (deferred_weight_commitment, deferred_opening) = if use_aggregated_binding {
                     deferred_weight_claims_data.push((
-                        *weight_node_id, weight_eval_point, reduction.final_b_eval,
+                        *weight_node_id,
+                        weight_eval_point,
+                        reduction.final_b_eval,
                     ));
                     (
                         starknet_ff::FieldElement::ZERO,
@@ -4390,7 +4754,9 @@ pub fn prove_gkr_decode_gpu_with_cache(
                 } else {
                     let b_mle_u32 = matrix_to_mle_col_major_u32_padded(b_matrix);
                     crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
-                        &b_mle_u32, &deferred_weight_claim.eval_point, channel,
+                        &b_mle_u32,
+                        &deferred_weight_claim.eval_point,
+                        channel,
                     )
                 };
 
@@ -4440,8 +4806,13 @@ pub fn prove_gkr_decode_gpu_with_cache(
                     .get_named_weight(rhs_layer.node_id, "gamma")
                     .map(|m| m.data.as_slice());
                 mix_secure_field(channel, deferred_claim.value);
-                let (layer_proof, input_claim) =
-                    reduce_rmsnorm_layer_with_gamma(&deferred_claim, input_matrix, *dim, channel, affine_gamma)?;
+                let (layer_proof, input_claim) = reduce_rmsnorm_layer_with_gamma(
+                    &deferred_claim,
+                    input_matrix,
+                    *dim,
+                    channel,
+                    affine_gamma,
+                )?;
                 deferred_proofs.push(super::types::DeferredProof {
                     claim: deferred_claim.clone(),
                     layer_proof,
@@ -4461,20 +4832,27 @@ pub fn prove_gkr_decode_gpu_with_cache(
                     kind: super::types::DeferredProofKind::Weightless,
                 });
             }
-            LayerType::Activation { activation_type, .. } => {
+            LayerType::Activation {
+                activation_type, ..
+            } => {
                 let input_matrix = get_intermediate(execution, rhs_layer.node_id)?;
                 mix_secure_field(channel, deferred_claim.value);
-                let (layer_proof, input_claim) = if *activation_type
-                    == crate::components::activation::ActivationType::ReLU
-                {
-                    reduce_activation_layer_algebraic(
-                        &deferred_claim, input_matrix, *activation_type, channel,
-                    )?
-                } else {
-                    reduce_activation_layer(
-                        &deferred_claim, input_matrix, *activation_type, channel,
-                    )?
-                };
+                let (layer_proof, input_claim) =
+                    if *activation_type == crate::components::activation::ActivationType::ReLU {
+                        reduce_activation_layer_algebraic(
+                            &deferred_claim,
+                            input_matrix,
+                            *activation_type,
+                            channel,
+                        )?
+                    } else {
+                        reduce_activation_layer(
+                            &deferred_claim,
+                            input_matrix,
+                            *activation_type,
+                            channel,
+                        )?
+                    };
                 deferred_proofs.push(super::types::DeferredProof {
                     claim: deferred_claim.clone(),
                     layer_proof,
@@ -4489,7 +4867,9 @@ pub fn prove_gkr_decode_gpu_with_cache(
                 let (add_proof, _claim) =
                     reduce_add_layer(&deferred_claim, &lhs_vals, &rhs_vals, channel)?;
                 let (final_proof, trunk_claim) = process_add_deferred(
-                    add_proof, &deferred_claim, &rhs_layer.input_layers,
+                    add_proof,
+                    &deferred_claim,
+                    &rhs_layer.input_layers,
                     &mut Vec::new(),
                     &mut std::collections::HashSet::new(), // sub-deferred — main-walk skip unused
                     circuit,
@@ -4501,7 +4881,10 @@ pub fn prove_gkr_decode_gpu_with_cache(
                     kind: super::types::DeferredProofKind::Weightless,
                 });
             }
-            LayerType::Identity | LayerType::RoPE { .. } | LayerType::TopK { .. } | LayerType::Input => {
+            LayerType::Identity
+            | LayerType::RoPE { .. }
+            | LayerType::TopK { .. }
+            | LayerType::Input => {
                 mix_secure_field(channel, deferred_claim.value);
                 let lhs_eval = deferred_claim.value;
                 let rhs_eval = SecureField::zero();
@@ -4511,7 +4894,9 @@ pub fn prove_gkr_decode_gpu_with_cache(
                 deferred_proofs.push(super::types::DeferredProof {
                     claim: deferred_claim.clone(),
                     layer_proof: LayerProof::Add {
-                        lhs_eval, rhs_eval, trunk_idx: 0,
+                        lhs_eval,
+                        rhs_eval,
+                        trunk_idx: 0,
                     },
                     input_claim: deferred_claim.clone(),
                     kind: super::types::DeferredProofKind::Weightless,
@@ -4521,17 +4906,27 @@ pub fn prove_gkr_decode_gpu_with_cache(
                 let input_matrix = get_intermediate(execution, rhs_layer.node_id)?;
                 let attn_weights = get_attention_weights(weights, rhs_layer)?;
                 mix_secure_field(channel, deferred_claim.value);
-                let (layer_proof, input_claim) =
-                    if let Some((inter, full_seq_len)) = decode_attention_data.get(&rhs_layer.node_id) {
-                        reduce_attention_layer_decode(
-                            &deferred_claim, input_matrix, &attn_weights, inter, config,
-                            *full_seq_len, channel,
-                        )?
-                    } else {
-                        reduce_attention_layer(
-                            &deferred_claim, input_matrix, &attn_weights, config, channel,
-                        )?
-                    };
+                let (layer_proof, input_claim) = if let Some((inter, full_seq_len)) =
+                    decode_attention_data.get(&rhs_layer.node_id)
+                {
+                    reduce_attention_layer_decode(
+                        &deferred_claim,
+                        input_matrix,
+                        &attn_weights,
+                        inter,
+                        config,
+                        *full_seq_len,
+                        channel,
+                    )?
+                } else {
+                    reduce_attention_layer(
+                        &deferred_claim,
+                        input_matrix,
+                        &attn_weights,
+                        config,
+                        channel,
+                    )?
+                };
                 deferred_proofs.push(super::types::DeferredProof {
                     claim: deferred_claim.clone(),
                     layer_proof,
@@ -4575,7 +4970,9 @@ pub fn prove_gkr_decode_gpu_with_cache(
     let mut weight_claims = Vec::with_capacity(weight_data.len());
     let mut weight_opening_transcript_mode = WeightOpeningTranscriptMode::Sequential;
     let mut aggregated_binding_proof = None;
-    let mut binding_groups_vec: Vec<crate::crypto::aggregated_opening::AggregatedWeightBindingProof> = Vec::new();
+    let mut binding_groups_vec: Vec<
+        crate::crypto::aggregated_opening::AggregatedWeightBindingProof,
+    > = Vec::new();
 
     let use_aggregated_oracle_sumcheck = gkr_aggregated_oracle_sumcheck_enabled()
         && (!weight_data.is_empty() || !deferred_weight_claims_data.is_empty());
@@ -4588,8 +4985,14 @@ pub fn prove_gkr_decode_gpu_with_cache(
     if use_aggregated_oracle_sumcheck {
         weight_opening_transcript_mode = WeightOpeningTranscriptMode::AggregatedOracleSumcheck;
         let (wc, claims, proof, groups) = apply_aggregated_oracle_sumcheck(
-            &weight_data, &deferred_weight_claims_data, &mut deferred_proofs,
-            weights, channel, "GKR-decode-GPU", weight_cache,
+            &weight_data,
+            &deferred_weight_claims_data,
+            &mut deferred_proofs,
+            weights,
+            channel,
+            "GKR-decode-GPU",
+            weight_cache,
+            None,
         )?;
         weight_commitments_new = wc;
         weight_claims = claims;
@@ -4614,14 +5017,18 @@ pub fn prove_gkr_decode_gpu_with_cache(
         for (opening_idx, (weight_node_id, _eval_point, _expected_value)) in
             weight_data.into_iter().enumerate()
         {
-            let b_matrix = weights.get_weight(weight_node_id).ok_or(
-                GKRError::MissingWeight { node_id: weight_node_id },
-            )?;
+            let b_matrix = weights
+                .get_weight(weight_node_id)
+                .ok_or(GKRError::MissingWeight {
+                    node_id: weight_node_id,
+                })?;
             let claim = &weight_claims[opening_idx];
             let b_mle_u32 = matrix_to_mle_col_major_u32_padded(b_matrix);
             let (commitment, opening) =
                 crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32(
-                    &b_mle_u32, &claim.eval_point, channel,
+                    &b_mle_u32,
+                    &claim.eval_point,
+                    channel,
                 );
             weight_commitments.push(commitment);
             weight_openings.push(opening);
@@ -4670,20 +5077,29 @@ pub fn prove_gkr_decode_auto_with_cache(
     weights: &GraphWeights,
     channel: &mut PoseidonChannel,
     weight_cache: Option<&crate::weight_cache::SharedWeightCache>,
-    decode_attention_data: &std::collections::HashMap<
-        usize,
-        (AttentionIntermediates, usize),
-    >,
+    decode_attention_data: &std::collections::HashMap<usize, (AttentionIntermediates, usize)>,
 ) -> Result<GKRProof, GKRError> {
     #[cfg(feature = "cuda-runtime")]
     {
         if crate::backend::force_gpu() || crate::backend::gpu_is_available() {
             return prove_gkr_decode_gpu_with_cache(
-                circuit, execution, weights, channel, weight_cache, decode_attention_data,
+                circuit,
+                execution,
+                weights,
+                channel,
+                weight_cache,
+                decode_attention_data,
             );
         }
     }
-    prove_gkr_decode(circuit, execution, weights, channel, weight_cache, decode_attention_data)
+    prove_gkr_decode(
+        circuit,
+        execution,
+        weights,
+        channel,
+        weight_cache,
+        decode_attention_data,
+    )
 }
 
 /// GPU matmul reduction: dispatches to `GpuSumcheckExecutor::reduce_matmul_layer_gpu`.
@@ -4782,8 +5198,14 @@ fn reduce_activation_layer_gpu(
         })?;
 
     if std::env::var("STWO_CHANNEL_TRACE").is_ok() {
-        eprintln!("[ACT GPU] input_matrix[0..4] = {:?}", &input_matrix.data[..4.min(input_matrix.data.len())]);
-        eprintln!("[ACT GPU] input_eval={:?} output_claim.value={:?}", input_eval, output_claim.value);
+        eprintln!(
+            "[ACT GPU] input_matrix[0..4] = {:?}",
+            &input_matrix.data[..4.min(input_matrix.data.len())]
+        );
+        eprintln!(
+            "[ACT GPU] input_eval={:?} output_claim.value={:?}",
+            input_eval, output_claim.value
+        );
     }
 
     // === Range-reduced LogUp (same as CPU path, GPU for initial MLE eval only) ===
@@ -4804,9 +5226,7 @@ fn reduce_activation_layer_gpu(
         .collect();
     let masked_out: Vec<SecureField> = masked_in_m31
         .iter()
-        .map(|&m| {
-            SecureField::from(table.lookup(m).unwrap_or(M31::from(0u32)))
-        })
+        .map(|&m| SecureField::from(table.lookup(m).unwrap_or(M31::from(0u32))))
         .collect();
 
     // Multiplicities
@@ -5183,7 +5603,10 @@ pub fn prove_gkr_simd_gpu_with_cache(
                 // prove_gkr) which produce full activation LogUp proofs.
                 // The verifier accepts proofs from this SIMD path only when
                 // simd_combined=true (set above).
-                if !matches!(activation_type, crate::components::activation::ActivationType::ReLU) {
+                if !matches!(
+                    activation_type,
+                    crate::components::activation::ActivationType::ReLU
+                ) {
                     eprintln!(
                         "  WARNING: SIMD activation at layer {} ({:?}) — piecewise/LogUp skipped \
                         (combined MLEs, not production path)",
@@ -5246,7 +5669,13 @@ pub fn prove_gkr_simd_gpu_with_cache(
                 let affine_gamma = weights
                     .get_named_weight(layer.node_id, "gamma")
                     .map(|m| m.data.as_slice());
-                reduce_rmsnorm_layer_with_gamma(&current_claim, input_matrix, *dim, channel, affine_gamma)?
+                reduce_rmsnorm_layer_with_gamma(
+                    &current_claim,
+                    input_matrix,
+                    *dim,
+                    channel,
+                    affine_gamma,
+                )?
             }
 
             LayerType::Quantize { params, .. } => {
@@ -5322,7 +5751,9 @@ pub fn prove_gkr_simd_gpu_with_cache(
     let mut weight_claims = Vec::with_capacity(weight_data.len());
     let mut weight_opening_transcript_mode = WeightOpeningTranscriptMode::Sequential;
     let mut aggregated_binding_proof = None;
-    let mut binding_groups_vec: Vec<crate::crypto::aggregated_opening::AggregatedWeightBindingProof> = Vec::new();
+    let mut binding_groups_vec: Vec<
+        crate::crypto::aggregated_opening::AggregatedWeightBindingProof,
+    > = Vec::new();
     let flags = compute_weight_mode_flags();
     let aggregate_weight_binding = flags.aggregate_weight_binding;
     // In aggregated mode, include deferred MatMul weight claims in the same
@@ -5488,6 +5919,7 @@ pub fn prove_gkr_simd_gpu_with_cache(
             channel,
             "GKR-SIMD-GPU",
             weight_cache,
+            None,
         )?;
         weight_commitments_new = wc;
         weight_claims = claims;
@@ -6150,7 +6582,14 @@ fn reduce_matmul_layer_with_backend<B: crate::backend::ZkmlOps>(
     k: usize,
     n: usize,
     channel: &mut PoseidonChannel,
-) -> Result<(MatMulReduction, GKRClaim, Option<super::profiler::MatMulTimings>), GKRError> {
+) -> Result<
+    (
+        MatMulReduction,
+        GKRClaim,
+        Option<super::profiler::MatMulTimings>,
+    ),
+    GKRError,
+> {
     let profiling = crate::is_profile();
 
     // Preserve CPU reducer semantics: derive variable counts from actual
@@ -6184,10 +6623,17 @@ fn reduce_matmul_layer_with_backend<B: crate::backend::ZkmlOps>(
     let r_j = &output_claim.point[log_m..log_m + log_n];
 
     // Sub-phase 1: Mix matmul dims and claimed sum into transcript.
-    let t_seed = if profiling { Some(std::time::Instant::now()) } else { None };
+    let t_seed = if profiling {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     if std::env::var("STWO_CHANNEL_TRACE").is_ok() {
         eprintln!("[MatMul] ch BEFORE seeding: {:?}", channel.digest());
-        eprintln!("[MatMul] m={}, k={}, n={}, claim={:?}", m, k, n, output_claim.value);
+        eprintln!(
+            "[MatMul] m={}, k={}, n={}, claim={:?}",
+            m, k, n, output_claim.value
+        );
     }
     channel.mix_u64(m as u64);
     channel.mix_u64(k as u64);
@@ -6199,7 +6645,11 @@ fn reduce_matmul_layer_with_backend<B: crate::backend::ZkmlOps>(
     let d_seed = t_seed.map(|t| t.elapsed());
 
     // Sub-phase 2: Backend reduction (GPU or CPU sumcheck).
-    let t_reduce = if profiling { Some(std::time::Instant::now()) } else { None };
+    let t_reduce = if profiling {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     let reduction = B::reduce_matmul_layer(a, b, r_i, r_j, pk, channel).map_err(|e| {
         GKRError::ReductionError {
             layer_idx: 0,
@@ -6222,7 +6672,11 @@ fn reduce_matmul_layer_with_backend<B: crate::backend::ZkmlOps>(
     }
 
     // Sub-phase 3: Bind final evaluations to transcript.
-    let t_bind = if profiling { Some(std::time::Instant::now()) } else { None };
+    let t_bind = if profiling {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     mix_secure_field(channel, reduction.final_a_eval);
     mix_secure_field(channel, reduction.final_b_eval);
     let d_bind = t_bind.map(|t| t.elapsed());
@@ -6266,7 +6720,14 @@ fn reduce_matmul_layer(
     k: usize,
     n: usize,
     channel: &mut PoseidonChannel,
-) -> Result<(MatMulReduction, GKRClaim, Option<super::profiler::MatMulTimings>), GKRError> {
+) -> Result<
+    (
+        MatMulReduction,
+        GKRClaim,
+        Option<super::profiler::MatMulTimings>,
+    ),
+    GKRError,
+> {
     reduce_matmul_layer_with_backend::<stwo::prover::backend::simd::SimdBackend>(
         output_claim,
         a,
@@ -6499,11 +6960,19 @@ fn reduce_topk_layer(
         }
         for &val in &selection.selected_values {
             all_selected_values.push(SecureField::from(val));
-            let signed = if val.0 as u64 <= half_p { val.0 as i64 } else { val.0 as i64 - (1i64 << 31) + 1 };
+            let signed = if val.0 as u64 <= half_p {
+                val.0 as i64
+            } else {
+                val.0 as i64 - (1i64 << 31) + 1
+            };
             min_selected_signed = min_selected_signed.min(signed);
         }
         for &val in &selection.rejected_values {
-            let signed = if val.0 as u64 <= half_p { val.0 as i64 } else { val.0 as i64 - (1i64 << 31) + 1 };
+            let signed = if val.0 as u64 <= half_p {
+                val.0 as i64
+            } else {
+                val.0 as i64 - (1i64 << 31) + 1
+            };
             max_rejected_signed = max_rejected_signed.max(signed);
         }
     }
@@ -6623,9 +7092,7 @@ fn reduce_activation_layer(
         .collect();
     let masked_out: Vec<SecureField> = masked_in_m31
         .iter()
-        .map(|&m| {
-            SecureField::from(table.lookup(m).unwrap_or(M31::from(0u32)))
-        })
+        .map(|&m| SecureField::from(table.lookup(m).unwrap_or(M31::from(0u32))))
         .collect();
 
     // Compute multiplicities for the activation table
@@ -6987,18 +7454,42 @@ fn reduce_activation_layer_algebraic(
 
         // Evaluate round polynomial at t = 0, 1, 2, 3
         let s0 = compute_combined_activation_eq_sum_at_t(
-            &eq_evals, &f_in, &f_b, Some(&bit_mles), &eta_powers, mid, SecureField::zero(),
+            &eq_evals,
+            &f_in,
+            &f_b,
+            Some(&bit_mles),
+            &eta_powers,
+            mid,
+            SecureField::zero(),
         );
         let s1 = compute_combined_activation_eq_sum_at_t(
-            &eq_evals, &f_in, &f_b, Some(&bit_mles), &eta_powers, mid, SecureField::one(),
+            &eq_evals,
+            &f_in,
+            &f_b,
+            Some(&bit_mles),
+            &eta_powers,
+            mid,
+            SecureField::one(),
         );
         let two = SecureField::from(M31::from(2u32));
         let three = SecureField::from(M31::from(3u32));
         let s2 = compute_combined_activation_eq_sum_at_t(
-            &eq_evals, &f_in, &f_b, Some(&bit_mles), &eta_powers, mid, two,
+            &eq_evals,
+            &f_in,
+            &f_b,
+            Some(&bit_mles),
+            &eta_powers,
+            mid,
+            two,
         );
         let s3 = compute_combined_activation_eq_sum_at_t(
-            &eq_evals, &f_in, &f_b, Some(&bit_mles), &eta_powers, mid, three,
+            &eq_evals,
+            &f_in,
+            &f_b,
+            Some(&bit_mles),
+            &eta_powers,
+            mid,
+            three,
         );
 
         // Newton divided differences → degree-3 polynomial coefficients
@@ -7037,10 +7528,13 @@ fn reduce_activation_layer_algebraic(
     assert_eq!(f_b.len(), 1);
     let input_eval = f_in[0];
     let indicator_eval = f_b[0];
-    let bit_evals: Vec<SecureField> = bit_mles.iter().map(|bm| {
-        assert_eq!(bm.len(), 1);
-        bm[0]
-    }).collect();
+    let bit_evals: Vec<SecureField> = bit_mles
+        .iter()
+        .map(|bm| {
+            assert_eq!(bm.len(), 1);
+            bm[0]
+        })
+        .collect();
 
     // Mix final evals into channel
     mix_secure_field(channel, input_eval);
@@ -7095,6 +7589,13 @@ const PIECEWISE_NUM_SEGMENTS: usize = 16;
 /// Bit shift to compute segment index from M31 value (top 4 bits).
 const PIECEWISE_SEGMENT_SHIFT: u32 = 27;
 
+/// Number of low bits below the 4-bit piecewise segment index.
+const PIECEWISE_LOW_BITS: usize = PIECEWISE_SEGMENT_SHIFT as usize;
+
+/// Prefix-AND columns over 4 segment bits + 27 low bits, used to reject the
+/// all-ones decomposition that aliases the M31 modulus to zero.
+const PIECEWISE_CANONICAL_ANDS: usize = 4 + PIECEWISE_LOW_BITS;
+
 /// Evaluates the combined piecewise constraint at interpolation point `t`.
 ///
 /// For each row j in `[0, mid)`, computes:
@@ -7106,7 +7607,11 @@ const PIECEWISE_SEGMENT_SHIFT: u32 = 27;
 ///   η^{2..17} · I_i · (1 - I_i)                        — binary indicators
 ///   η^18 · (Σ_k 2^k · seg_bit_k - Σ_i i · I_i)        — segment bits encode indicator index
 ///   η^{19..22} · seg_bit_k · (1 - seg_bit_k)           — segment bits binary
-fn compute_piecewise_eq_sum_at_t(
+///   η^23 · (input - low_bits - 2^27 · segment_index)   — segment-input binding
+///   η^{24..50} · low_bit_k · (1 - low_bit_k)           — low bits binary
+///   η^{51..81} · canonical_and_chain constraints        — prefix AND of all bits
+///   η^82 · canonical_and_last                           — reject all-ones alias of P
+fn compute_piecewise_eq_sums_0_1_2_3(
     eq: &[SecureField],
     input: &[SecureField],
     output: &[SecureField],
@@ -7115,77 +7620,182 @@ fn compute_piecewise_eq_sum_at_t(
     intercepts: &[SecureField; PIECEWISE_NUM_SEGMENTS],
     eta_powers: &[SecureField],
     seg_bits: Option<&[Vec<SecureField>; 4]>,
+    low_bits: Option<&[Vec<SecureField>]>,
+    canonical_ands: Option<&[Vec<SecureField>]>,
     mid: usize,
-    t: SecureField,
-) -> SecureField {
-    let one_minus_t = SecureField::one() - t;
+) -> [SecureField; 4] {
+    let two = SecureField::from(M31::from(2u32));
+    let three = SecureField::from(M31::from(3u32));
+    let ts = [SecureField::zero(), SecureField::one(), two, three];
+    let one_minus_ts = [
+        SecureField::one(),
+        SecureField::zero(),
+        SecureField::one() - two,
+        SecureField::one() - three,
+    ];
     let one = SecureField::one();
-    let mut sum = SecureField::zero();
 
-    for j in 0..mid {
-        let eq_t = one_minus_t * eq[j] + t * eq[mid + j];
-        let in_t = one_minus_t * input[j] + t * input[mid + j];
-        let out_t = one_minus_t * output[j] + t * output[mid + j];
+    let eval_pair = |j: usize| -> [SecureField; 4] {
+        let mut eq_t = [SecureField::zero(); 4];
+        let mut in_t = [SecureField::zero(); 4];
+        let mut out_t = [SecureField::zero(); 4];
+        let mut ind_sum = [SecureField::zero(); 4];
+        let mut piecewise_val = [SecureField::zero(); 4];
 
-        // Interpolate indicator MLEs at t
-        let mut ind_t = [SecureField::zero(); PIECEWISE_NUM_SEGMENTS];
-        let mut ind_sum = SecureField::zero();
-        let mut piecewise_val = SecureField::zero();
-
-        for i in 0..PIECEWISE_NUM_SEGMENTS {
-            ind_t[i] = one_minus_t * indicators[i][j] + t * indicators[i][mid + j];
-            ind_sum = ind_sum + ind_t[i];
-            piecewise_val = piecewise_val + ind_t[i] * (slopes[i] * in_t + intercepts[i]);
+        for q in 0..4 {
+            eq_t[q] = one_minus_ts[q] * eq[j] + ts[q] * eq[mid + j];
+            in_t[q] = one_minus_ts[q] * input[j] + ts[q] * input[mid + j];
+            out_t[q] = one_minus_ts[q] * output[j] + ts[q] * output[mid + j];
         }
 
-        // η^0: piecewise evaluation match
-        let mut h = eta_powers[0] * (out_t - piecewise_val);
+        let mut h = [SecureField::zero(); 4];
 
-        // η^1: partition of unity
-        h = h + eta_powers[1] * (ind_sum - one);
-
-        // η^{2..17}: binary indicator constraints
         for i in 0..PIECEWISE_NUM_SEGMENTS {
-            h = h + eta_powers[2 + i] * ind_t[i] * (one - ind_t[i]);
+            let left = indicators[i][j];
+            let right = indicators[i][mid + j];
+            for q in 0..4 {
+                let ind_t = one_minus_ts[q] * left + ts[q] * right;
+                ind_sum[q] = ind_sum[q] + ind_t;
+                piecewise_val[q] = piecewise_val[q] + ind_t * (slopes[i] * in_t[q] + intercepts[i]);
+                h[q] = h[q] + eta_powers[2 + i] * ind_t * (one - ind_t);
+            }
+        }
+
+        for q in 0..4 {
+            // η^0: piecewise evaluation match
+            h[q] = h[q] + eta_powers[0] * (out_t[q] - piecewise_val[q]);
+            // η^1: partition of unity
+            h[q] = h[q] + eta_powers[1] * (ind_sum[q] - one);
         }
 
         // η^18..22: segment-input binding (if segment bits present)
         if let Some(sb) = seg_bits {
             // Interpolate segment bit MLEs at t
-            let mut sb_t = [SecureField::zero(); 4];
+            let mut bit_sum = [SecureField::zero(); 4];
             for k in 0..4 {
-                sb_t[k] = one_minus_t * sb[k][j] + t * sb[k][mid + j];
+                let weight = SecureField::from(M31::from(1u32 << k));
+                let left = sb[k][j];
+                let right = sb[k][mid + j];
+                for q in 0..4 {
+                    let sb_t = one_minus_ts[q] * left + ts[q] * right;
+                    bit_sum[q] = bit_sum[q] + weight * sb_t;
+                    h[q] = h[q] + eta_powers[19 + k] * sb_t * (one - sb_t);
+                }
             }
 
             // η^18: Σ_k 2^k · seg_bit_k == Σ_i i · I_i
-            let mut bit_sum = SecureField::zero();
-            for k in 0..4 {
-                bit_sum = bit_sum + SecureField::from(M31::from(1u32 << k)) * sb_t[k];
-            }
-            let mut ind_index_sum = SecureField::zero();
+            let mut ind_index_sum = [SecureField::zero(); 4];
             for i in 0..PIECEWISE_NUM_SEGMENTS {
-                ind_index_sum = ind_index_sum + SecureField::from(M31::from(i as u32)) * ind_t[i];
+                let weight = SecureField::from(M31::from(i as u32));
+                let left = indicators[i][j];
+                let right = indicators[i][mid + j];
+                for q in 0..4 {
+                    let ind_t = one_minus_ts[q] * left + ts[q] * right;
+                    ind_index_sum[q] = ind_index_sum[q] + weight * ind_t;
+                }
             }
-            h = h + eta_powers[18] * (bit_sum - ind_index_sum);
+            for q in 0..4 {
+                h[q] = h[q] + eta_powers[18] * (bit_sum[q] - ind_index_sum[q]);
+            }
 
-            // η^{19..22}: segment bits binary
-            for k in 0..4 {
-                h = h + eta_powers[19 + k] * sb_t[k] * (one - sb_t[k]);
+            if let Some(lb) = low_bits {
+                let mut low_sum = [SecureField::zero(); 4];
+                let mut pow2 = SecureField::one();
+                let two_sf = SecureField::from(M31::from(2u32));
+                for k in 0..PIECEWISE_LOW_BITS {
+                    let left = lb[k][j];
+                    let right = lb[k][mid + j];
+                    for q in 0..4 {
+                        let bit_t = one_minus_ts[q] * left + ts[q] * right;
+                        low_sum[q] = low_sum[q] + pow2 * bit_t;
+                        h[q] = h[q] + eta_powers[24 + k] * bit_t * (one - bit_t);
+                    }
+                    pow2 = pow2 * two_sf;
+                }
+
+                // pow2 is now 2^27.
+                for q in 0..4 {
+                    h[q] = h[q] + eta_powers[23] * (in_t[q] - low_sum[q] - pow2 * bit_sum[q]);
+                }
+
+                if let Some(ca) = canonical_ands {
+                    let mut and_t = [[SecureField::zero(); 4]; PIECEWISE_CANONICAL_ANDS];
+                    for k in 0..PIECEWISE_CANONICAL_ANDS {
+                        let left = ca[k][j];
+                        let right = ca[k][mid + j];
+                        for q in 0..4 {
+                            and_t[k][q] = one_minus_ts[q] * left + ts[q] * right;
+                            let bit_t = if k < 4 {
+                                let b_left = sb[k][j];
+                                let b_right = sb[k][mid + j];
+                                one_minus_ts[q] * b_left + ts[q] * b_right
+                            } else {
+                                let low_idx = k - 4;
+                                let b_left = lb[low_idx][j];
+                                let b_right = lb[low_idx][mid + j];
+                                one_minus_ts[q] * b_left + ts[q] * b_right
+                            };
+                            let expected = if k == 0 {
+                                bit_t
+                            } else {
+                                and_t[k - 1][q] * bit_t
+                            };
+                            h[q] = h[q] + eta_powers[51 + k] * (and_t[k][q] - expected);
+                        }
+                    }
+                    for q in 0..4 {
+                        h[q] = h[q]
+                            + eta_powers[51 + PIECEWISE_CANONICAL_ANDS]
+                                * and_t[PIECEWISE_CANONICAL_ANDS - 1][q];
+                    }
+                }
             }
         }
 
-        sum = sum + eq_t * h;
+        for q in 0..4 {
+            h[q] = eq_t[q] * h[q];
+        }
+        h
+    };
+
+    let mut sums = [SecureField::zero(); 4];
+    if mid >= 8192 {
+        use rayon::prelude::*;
+
+        return (0..mid).into_par_iter().map(eval_pair).reduce(
+            || [SecureField::zero(); 4],
+            |mut acc, item| {
+                for q in 0..4 {
+                    acc[q] = acc[q] + item[q];
+                }
+                acc
+            },
+        );
     }
-    sum
+
+    for j in 0..mid {
+        let item = eval_pair(j);
+        for q in 0..4 {
+            sums[q] = sums[q] + item[q];
+        }
+    }
+    sums
 }
 
 /// Piecewise-linear algebraic eq-sumcheck for activation layers (GELU/Sigmoid/Softmax).
 ///
 /// Approximates the activation as 16-segment linear function over the full M31
-/// domain. Proves correctness via a combined degree-3 sumcheck with 18 constraints:
+/// domain. Proves correctness via a combined degree-3 sumcheck with segment
+/// range binding:
 ///   - η^0: output matches piecewise-linear evaluation
 ///   - η^1: indicators sum to 1 (partition of unity)
 ///   - η^{2..17}: each indicator is binary (I_i ∈ {0,1})
+///   - η^18: segment bits encode the selected indicator index
+///   - η^{19..22}: segment bits are binary
+///   - η^23: input = low_bits + 2^27 * segment_index
+///   - η^{24..50}: low bits are binary
+///   - η^{51..81}: prefix-AND chain over all decomposition bits
+///   - η^82: final prefix-AND is zero (canonical M31 representation)
 ///
 /// Degree analysis: eq(r,x) × I_i(x) × (1 - I_i(x)) = degree 3.
 /// Round polynomials are degree-3 → 4-point evaluation with Newton interpolation.
@@ -7216,12 +7826,18 @@ fn reduce_activation_layer_piecewise(
     let output_sf: Vec<SecureField> = input_padded
         .data
         .iter()
-        .map(|&v| SecureField::from(crate::components::activation::piecewise_linear_eval(&coeffs, v)))
+        .map(|&v| {
+            SecureField::from(crate::components::activation::piecewise_linear_eval(
+                &coeffs, v,
+            ))
+        })
         .collect();
     debug_assert_eq!(
-        output_sf.len(), n,
+        output_sf.len(),
+        n,
         "output_sf length mismatch: {} vs MLE size {}",
-        output_sf.len(), n,
+        output_sf.len(),
+        n,
     );
 
     // Build 16 indicator MLEs: indicators[i][j] = 1 iff input j falls in segment i
@@ -7229,8 +7845,14 @@ fn reduce_activation_layer_piecewise(
         std::array::from_fn(|_| vec![SecureField::zero(); n]);
 
     // Build 4 segment-bit MLEs: seg_bits[k][j] = bit k of segment index for input j
-    let mut seg_bits: [Vec<SecureField>; 4] =
-        std::array::from_fn(|_| vec![SecureField::zero(); n]);
+    let mut seg_bits: [Vec<SecureField>; 4] = std::array::from_fn(|_| vec![SecureField::zero(); n]);
+    // Build 27 low-bit MLEs so the selected segment is bound to the input value.
+    let mut low_bits: Vec<Vec<SecureField>> =
+        vec![vec![SecureField::zero(); n]; PIECEWISE_LOW_BITS];
+    // Prefix AND of all 31 decomposition bits. The last prefix must be 0,
+    // rejecting 111...111 = 2^31 - 1, which aliases to 0 in M31.
+    let mut canonical_ands: Vec<Vec<SecureField>> =
+        vec![vec![SecureField::zero(); n]; PIECEWISE_CANONICAL_ANDS];
 
     for (j, &v) in input_padded.data.iter().enumerate() {
         let seg_idx = (v.0 >> PIECEWISE_SEGMENT_SHIFT) as usize;
@@ -7239,6 +7861,26 @@ fn reduce_activation_layer_piecewise(
         for k in 0..4 {
             seg_bits[k][j] = SecureField::from(M31::from(((seg_idx >> k) & 1) as u32));
         }
+        let low = v.0 & ((1u32 << PIECEWISE_SEGMENT_SHIFT) - 1);
+        for k in 0..PIECEWISE_LOW_BITS {
+            low_bits[k][j] = SecureField::from(M31::from(((low >> k) & 1) as u32));
+        }
+
+        let mut running_and = SecureField::one();
+        for k in 0..PIECEWISE_CANONICAL_ANDS {
+            let bit = if k < 4 {
+                seg_bits[k][j]
+            } else {
+                low_bits[k - 4][j]
+            };
+            running_and = running_and * bit;
+            canonical_ands[k][j] = running_and;
+        }
+        debug_assert_eq!(
+            canonical_ands[PIECEWISE_CANONICAL_ANDS - 1][j],
+            SecureField::zero(),
+            "M31 canonicality violated: all decomposition bits are 1"
+        );
     }
     // Padding entries (value 0) → segment 0 indicator = 1, seg_bits all 0
     // input_padded.data already contains padded zeros, handled above
@@ -7249,7 +7891,10 @@ fn reduce_activation_layer_piecewise(
         let ind_count: usize = (0..PIECEWISE_NUM_SEGMENTS)
             .filter(|&i| indicators[i][j] != SecureField::zero())
             .count();
-        debug_assert_eq!(ind_count, 1, "indicator partition violated at index {j}: {ind_count} active indicators");
+        debug_assert_eq!(
+            ind_count, 1,
+            "indicator partition violated at index {j}: {ind_count} active indicators"
+        );
     }
 
     // Lift slopes/intercepts to SecureField
@@ -7267,8 +7912,12 @@ fn reduce_activation_layer_piecewise(
     // Draw η for combining constraints
     let eta = channel.draw_qm31();
 
-    // Precompute eta powers: η^0, η^1, ..., η^{22} (18 original + 5 segment binding)
-    let num_eta_powers = 2 + PIECEWISE_NUM_SEGMENTS + 1 + 4; // 23
+    // Precompute eta powers:
+    // η^0..17 original piecewise constraints,
+    // η^18..22 segment/index constraints,
+    // η^23..50 input low-bit decomposition constraints.
+    let num_eta_powers =
+        2 + PIECEWISE_NUM_SEGMENTS + 1 + 4 + 1 + PIECEWISE_LOW_BITS + PIECEWISE_CANONICAL_ANDS + 1;
     let mut eta_powers = Vec::with_capacity(num_eta_powers);
     eta_powers.push(SecureField::one());
     for i in 1..num_eta_powers {
@@ -7291,14 +7940,19 @@ fn reduce_activation_layer_piecewise(
     for round_idx in 0..num_vars {
         let mid = cur_n / 2;
 
-        // Evaluate round polynomial at t = 0, 1, 2, 3
-        let s0 = compute_piecewise_eq_sum_at_t(
-            &eq_evals, &f_in, &f_out, &indicators, &slopes_sf, &intercepts_sf,
-            &eta_powers, Some(&seg_bits), mid, SecureField::zero(),
-        );
-        let s1 = compute_piecewise_eq_sum_at_t(
-            &eq_evals, &f_in, &f_out, &indicators, &slopes_sf, &intercepts_sf,
-            &eta_powers, Some(&seg_bits), mid, SecureField::one(),
+        // Evaluate round polynomial at t = 0, 1, 2, 3 in one memory pass.
+        let [s0, s1, s2, s3] = compute_piecewise_eq_sums_0_1_2_3(
+            &eq_evals,
+            &f_in,
+            &f_out,
+            &indicators,
+            &slopes_sf,
+            &intercepts_sf,
+            &eta_powers,
+            Some(&seg_bits),
+            Some(&low_bits),
+            Some(&canonical_ands),
+            mid,
         );
 
         // First round: initial claimed sum must be 0 (all constraints vanish at boolean points)
@@ -7311,14 +7965,6 @@ fn reduce_activation_layer_piecewise(
         }
         let two = SecureField::from(M31::from(2u32));
         let three = SecureField::from(M31::from(3u32));
-        let s2 = compute_piecewise_eq_sum_at_t(
-            &eq_evals, &f_in, &f_out, &indicators, &slopes_sf, &intercepts_sf,
-            &eta_powers, Some(&seg_bits), mid, two,
-        );
-        let s3 = compute_piecewise_eq_sum_at_t(
-            &eq_evals, &f_in, &f_out, &indicators, &slopes_sf, &intercepts_sf,
-            &eta_powers, Some(&seg_bits), mid, three,
-        );
 
         // Newton divided differences → degree-3 polynomial coefficients
         let inv2 = two.inverse();
@@ -7353,6 +7999,12 @@ fn reduce_activation_layer_piecewise(
         for k in 0..4 {
             fold_mle(&mut seg_bits[k], challenge, mid);
         }
+        for k in 0..PIECEWISE_LOW_BITS {
+            fold_mle(&mut low_bits[k], challenge, mid);
+        }
+        for k in 0..PIECEWISE_CANONICAL_ANDS {
+            fold_mle(&mut canonical_ands[k], challenge, mid);
+        }
         cur_n = mid;
     }
 
@@ -7361,16 +8013,28 @@ fn reduce_activation_layer_piecewise(
     assert_eq!(f_out.len(), 1);
     let input_eval = f_in[0];
     let output_eval = f_out[0];
-    let indicator_evals: [SecureField; 16] =
-        std::array::from_fn(|i| {
-            assert_eq!(indicators[i].len(), 1);
-            indicators[i][0]
-        });
-    let seg_bit_evals_arr: [SecureField; 4] =
-        std::array::from_fn(|k| {
-            assert_eq!(seg_bits[k].len(), 1);
-            seg_bits[k][0]
-        });
+    let indicator_evals: [SecureField; 16] = std::array::from_fn(|i| {
+        assert_eq!(indicators[i].len(), 1);
+        indicators[i][0]
+    });
+    let seg_bit_evals_arr: [SecureField; 4] = std::array::from_fn(|k| {
+        assert_eq!(seg_bits[k].len(), 1);
+        seg_bits[k][0]
+    });
+    let low_bit_evals: Vec<SecureField> = low_bits
+        .iter()
+        .map(|lb| {
+            assert_eq!(lb.len(), 1);
+            lb[0]
+        })
+        .collect();
+    let canonical_and_evals: Vec<SecureField> = canonical_ands
+        .iter()
+        .map(|ca| {
+            assert_eq!(ca.len(), 1);
+            ca[0]
+        })
+        .collect();
 
     // Mix final evals into channel
     mix_secure_field(channel, input_eval);
@@ -7380,6 +8044,12 @@ fn reduce_activation_layer_piecewise(
     }
     for &sb in &seg_bit_evals_arr {
         mix_secure_field(channel, sb);
+    }
+    for &lb in &low_bit_evals {
+        mix_secure_field(channel, lb);
+    }
+    for &ca in &canonical_and_evals {
+        mix_secure_field(channel, ca);
     }
 
     let claim = GKRClaim {
@@ -7399,6 +8069,8 @@ fn reduce_activation_layer_piecewise(
                 output_eval,
                 indicator_evals,
                 seg_bit_evals: Some(seg_bit_evals_arr),
+                low_bit_evals: Some(low_bit_evals),
+                canonical_and_evals: Some(canonical_and_evals),
             }),
             input_eval,
             output_eval: output_claim.value,
@@ -8249,11 +8921,29 @@ fn reduce_layernorm_layer(
     for _ in 0..num_vars {
         let mid = input_p0.len() / 2;
         // Evaluate batched constraint at t=0,1,2 (degree 2 — max from centered²)
-        let s0 = compute_plain_mean_var_sum_at_t(&input_p0, &centered_p0, eta0, eta1, mid, SecureField::zero());
-        let s1 = compute_plain_mean_var_sum_at_t(&input_p0, &centered_p0, eta0, eta1, mid, SecureField::one());
+        let s0 = compute_plain_mean_var_sum_at_t(
+            &input_p0,
+            &centered_p0,
+            eta0,
+            eta1,
+            mid,
+            SecureField::zero(),
+        );
+        let s1 = compute_plain_mean_var_sum_at_t(
+            &input_p0,
+            &centered_p0,
+            eta0,
+            eta1,
+            mid,
+            SecureField::one(),
+        );
         let two = SecureField::from(M31::from(2u32));
         let s2 = compute_plain_mean_var_sum_at_t(&input_p0, &centered_p0, eta0, eta1, mid, two);
-        debug_assert_eq!(s0 + s1, current_sum_mv, "Mean-variance plain sumcheck: s0+s1 != claimed sum");
+        debug_assert_eq!(
+            s0 + s1,
+            current_sum_mv,
+            "Mean-variance plain sumcheck: s0+s1 != claimed sum"
+        );
 
         // Degree-2 Newton interpolation (c3 = 0)
         let inv2 = two.inverse();
@@ -8531,8 +9221,16 @@ fn reduce_layernorm_layer(
             centered_binding_evals: Some((centered_binding_input, centered_binding_mean)),
             mv_claimed_sums: Some((total_input_sum, total_centered_sq_sum)),
             n_active: Some(n_active),
-            row_means: if input_padded.rows > 1 { Some(per_row_means) } else { None },
-            row_variances: if input_padded.rows > 1 { Some(per_row_variances) } else { None },
+            row_means: if input_padded.rows > 1 {
+                Some(per_row_means)
+            } else {
+                None
+            },
+            row_variances: if input_padded.rows > 1 {
+                Some(per_row_variances)
+            } else {
+                None
+            },
         },
         claim,
     ))
@@ -8629,8 +9327,8 @@ fn reduce_rmsnorm_layer_with_gamma(
     let n_active = dim.min(input_padded.cols);
     let inv_n = m31_mod_inverse(n_active as u32);
 
-    let mut rsqrt_mle = vec![SecureField::zero(); n];  // Raw rsqrt (for LogUp)
-    let mut scale_mle = vec![SecureField::zero(); n];  // rsqrt × γ (for eq-sumcheck)
+    let mut rsqrt_mle = vec![SecureField::zero(); n]; // Raw rsqrt (for LogUp)
+    let mut scale_mle = vec![SecureField::zero(); n]; // rsqrt × γ (for eq-sumcheck)
     let mut rms_sq_mle = vec![SecureField::zero(); n];
     let mut output_mle = vec![SecureField::zero(); n];
     let mut per_row_rms_sq = Vec::with_capacity(input_padded.rows);
@@ -8655,7 +9353,7 @@ fn reduce_rmsnorm_layer_with_gamma(
         for col in 0..cols {
             let idx = row * cols + col;
             rms_sq_mle[idx] = SecureField::from(rms_sq);
-            rsqrt_mle[idx] = SecureField::from(rsqrt);  // Raw rsqrt for LogUp
+            rsqrt_mle[idx] = SecureField::from(rsqrt); // Raw rsqrt for LogUp
             let x = input_padded.get(row, col);
             if col < n_active {
                 // Pre-multiply rsqrt × γ into scale (keeps eq-sumcheck degree 3)
@@ -8702,7 +9400,11 @@ fn reduce_rmsnorm_layer_with_gamma(
             let s1 = compute_plain_sq_sum_at_t(&input_p0, mid, SecureField::one());
             let two = SecureField::from(M31::from(2u32));
             let s2 = compute_plain_sq_sum_at_t(&input_p0, mid, two);
-            debug_assert_eq!(s0 + s1, current_sum_p0, "RMS² plain sumcheck: s0+s1 != claimed sum");
+            debug_assert_eq!(
+                s0 + s1,
+                current_sum_p0,
+                "RMS² plain sumcheck: s0+s1 != claimed sum"
+            );
             let inv2 = two.inverse();
             let dd1 = s1 - s0;
             let dd2 = (s2 - s1 - dd1) * inv2;
@@ -8787,13 +9489,21 @@ fn reduce_rmsnorm_layer_with_gamma(
         linear_round_polys.push(RoundPolyDeg3 { c0, c1, c2, c3 });
 
         if std::env::var("STWO_CHANNEL_TRACE").is_ok() && round_idx < 3 {
-            eprintln!("[PROVER RMSNorm] round {} c0={:?} c2={:?} c3={:?}", round_idx, c0, c2, c3);
+            eprintln!(
+                "[PROVER RMSNorm] round {} c0={:?} c2={:?} c3={:?}",
+                round_idx, c0, c2, c3
+            );
             eprintln!("[PROVER RMSNorm] round {} c1={:?}", round_idx, c1);
         }
         channel.mix_poly_coeffs_deg3(c0, c1, c2, c3);
         let challenge = channel.draw_qm31();
         if std::env::var("STWO_CHANNEL_TRACE").is_ok() && round_idx < 3 {
-            eprintln!("[PROVER RMSNorm] round {} challenge={:?} ch={:?}", round_idx, challenge, channel.digest());
+            eprintln!(
+                "[PROVER RMSNorm] round {} challenge={:?} ch={:?}",
+                round_idx,
+                challenge,
+                channel.digest()
+            );
         }
         linear_challenges.push(challenge);
 
@@ -8806,7 +9516,11 @@ fn reduce_rmsnorm_layer_with_gamma(
     let input_final = input_folded[0];
     let rsqrt_final = rsqrt_folded[0];
     if std::env::var("STWO_CHANNEL_TRACE").is_ok() {
-        eprintln!("[RMSNorm] ch after {} eq-rounds: {:?}", num_vars, channel.digest());
+        eprintln!(
+            "[RMSNorm] ch after {} eq-rounds: {:?}",
+            num_vars,
+            channel.digest()
+        );
         eprintln!("[RMSNorm] input_final: {:?}", input_final);
         eprintln!("[RMSNorm] rsqrt_final: {:?}", rsqrt_final);
     }
@@ -8922,8 +9636,14 @@ fn reduce_rmsnorm_layer_with_gamma(
     let rsqrt_table_commitment = compute_rsqrt_table_commitment(config.rsqrt_table_log_size);
 
     if std::env::var("STWO_CHANNEL_TRACE").is_ok() {
-        eprintln!("[RMSNorm] ch after logup (before input/output mix): {:?}", channel.digest());
-        eprintln!("[RMSNorm] logup eq_rounds: {}", logup_proof.eq_round_polys.len());
+        eprintln!(
+            "[RMSNorm] ch after logup (before input/output mix): {:?}",
+            channel.digest()
+        );
+        eprintln!(
+            "[RMSNorm] logup eq_rounds: {}",
+            logup_proof.eq_round_polys.len()
+        );
     }
 
     mix_secure_field(channel, input_eval);
@@ -8970,11 +9690,27 @@ fn reduce_rmsnorm_layer_with_gamma(
                     .collect();
                 evaluate_mle(&gamma_mle, &output_claim.point)
             }),
-            rms_sq_round_polys: if skip_rms_sq { None } else { Some(rms_round_polys) },
-            rms_sq_input_final: if skip_rms_sq { None } else { Some(rms_input_final) },
-            rms_sq_claimed_sq_sum: if skip_rms_sq { None } else { Some(total_sq_sum) },
+            rms_sq_round_polys: if skip_rms_sq {
+                None
+            } else {
+                Some(rms_round_polys)
+            },
+            rms_sq_input_final: if skip_rms_sq {
+                None
+            } else {
+                Some(rms_input_final)
+            },
+            rms_sq_claimed_sq_sum: if skip_rms_sq {
+                None
+            } else {
+                Some(total_sq_sum)
+            },
             rms_sq_n_active: if skip_rms_sq { None } else { Some(n_active) },
-            row_rms_sq: if input_padded.rows > 1 { Some(per_row_rms_sq) } else { None },
+            row_rms_sq: if input_padded.rows > 1 {
+                Some(per_row_rms_sq)
+            } else {
+                None
+            },
         },
         GKRClaim {
             point: output_claim.point.clone(),
@@ -9458,11 +10194,7 @@ fn compute_mul_eq_sum_at_t(
 /// Plain sumcheck helper: compute Σ_{j=0..mid-1} a_t(j)² where
 /// a_t(j) = (1-t)*a[j] + t*a[mid+j].
 /// Used for plain sumchecks proving Σ_x a(x)² = S (no eq weighting).
-fn compute_plain_sq_sum_at_t(
-    a: &[SecureField],
-    mid: usize,
-    t: SecureField,
-) -> SecureField {
+fn compute_plain_sq_sum_at_t(a: &[SecureField], mid: usize, t: SecureField) -> SecureField {
     let one_minus_t = SecureField::one() - t;
     let mut sum = SecureField::zero();
     for j in 0..mid {
@@ -9542,7 +10274,10 @@ fn prove_softmax_sum(
     let num_vars = exp_mle.len().trailing_zeros() as usize;
 
     // Total sum = Σ exp_mle[i] over all elements
-    let total_sum: SecureField = exp_mle.iter().copied().fold(SecureField::zero(), |a, b| a + b);
+    let total_sum: SecureField = exp_mle
+        .iter()
+        .copied()
+        .fold(SecureField::zero(), |a, b| a + b);
 
     // Mix metadata into channel
     channel.mix_u64(0x5358_u64); // "SX" tag for softmax sum
@@ -9563,7 +10298,8 @@ fn prove_softmax_sum(
         let s1: SecureField = current_mle[mid..2 * mid].iter().copied().sum();
 
         debug_assert_eq!(
-            s0 + s1, current_sum,
+            s0 + s1,
+            current_sum,
             "softmax sum plain sumcheck: s0+s1 != claimed sum"
         );
 
@@ -9649,7 +10385,10 @@ fn build_multiplicity_sumcheck(
     values.resize(n, SecureField::zero());
 
     // Claimed sum = sum of all multiplicities.
-    let claimed_sum: SecureField = values.iter().copied().fold(SecureField::zero(), |a, b| a + b);
+    let claimed_sum: SecureField = values
+        .iter()
+        .copied()
+        .fold(SecureField::zero(), |a, b| a + b);
 
     let mut round_polys = Vec::with_capacity(n_vars);
     let mut current_size = n;
@@ -9658,9 +10397,15 @@ fn build_multiplicity_sumcheck(
         let half = current_size / 2;
 
         // p(0) = sum of values in the "x_i = 0" half
-        let sum_0: SecureField = values[..half].iter().copied().fold(SecureField::zero(), |a, b| a + b);
+        let sum_0: SecureField = values[..half]
+            .iter()
+            .copied()
+            .fold(SecureField::zero(), |a, b| a + b);
         // p(1) = sum of values in the "x_i = 1" half
-        let sum_1: SecureField = values[half..current_size].iter().copied().fold(SecureField::zero(), |a, b| a + b);
+        let sum_1: SecureField = values[half..current_size]
+            .iter()
+            .copied()
+            .fold(SecureField::zero(), |a, b| a + b);
 
         let c0 = sum_0;
         let c1 = sum_1 - sum_0;
@@ -10246,7 +10991,8 @@ fn reduce_attention_layer(
         };
 
         // Run matmul reduction
-        let (proof, input_claim, _timings) = reduce_matmul_layer(&fresh_claim, a, b, m, k, n, channel)?;
+        let (proof, input_claim, _timings) =
+            reduce_matmul_layer(&fresh_claim, a, b, m, k, n, channel)?;
 
         let layer_proof = LayerProof::MatMul {
             round_polys: proof.round_polys,
@@ -10324,13 +11070,8 @@ fn reduce_attention_layer(
             // Compute per-row sums
             let row_sums = crate::components::attention::softmax_row_sums(score_mat);
 
-            let sum_proof = prove_softmax_sum(
-                &exp_vals,
-                &row_sums,
-                padded_rows,
-                padded_cols,
-                channel,
-            );
+            let sum_proof =
+                prove_softmax_sum(&exp_vals, &row_sums, padded_rows, padded_cols, channel);
             softmax_sum_proofs_vec.push(sum_proof);
         }
 
@@ -10470,7 +11211,8 @@ pub(crate) fn reduce_attention_layer_decode(
             point: r,
             value: claimed_value,
         };
-        let (proof, input_claim, _timings) = reduce_matmul_layer(&fresh_claim, a, b, m, k, n, channel)?;
+        let (proof, input_claim, _timings) =
+            reduce_matmul_layer(&fresh_claim, a, b, m, k, n, channel)?;
         let layer_proof = LayerProof::MatMul {
             round_polys: proof.round_polys,
             final_a_eval: proof.final_a_eval,
@@ -10628,10 +11370,15 @@ mod tests {
 
     impl EnvVarGuard {
         fn set(key: &'static str, value: &str) -> Self {
-            let lock = crate::test_utils::ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = crate::test_utils::ENV_MUTEX
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let prev = std::env::var(key).ok();
             std::env::set_var(key, value);
-            Self { entries: vec![(key, prev)], _lock: lock }
+            Self {
+                entries: vec![(key, prev)],
+                _lock: lock,
+            }
         }
     }
 
@@ -10761,12 +11508,17 @@ mod tests {
         channel_hook.mix_u64(4242);
         let r_out_hook = channel_hook.draw_qm31s(log_m + log_n);
         assert_eq!(r_out_hook, r_out, "legacy and hook transcripts diverged");
-        let (hook_reduction, hook_claim, _timings) = reduce_matmul_layer_with_backend::<
-            stwo::prover::backend::simd::SimdBackend,
-        >(
-            &output_claim, &a, &b, 2, 4, 2, &mut channel_hook
-        )
-        .unwrap();
+        let (hook_reduction, hook_claim, _timings) =
+            reduce_matmul_layer_with_backend::<stwo::prover::backend::simd::SimdBackend>(
+                &output_claim,
+                &a,
+                &b,
+                2,
+                4,
+                2,
+                &mut channel_hook,
+            )
+            .unwrap();
 
         assert_eq!(
             legacy_reduction.round_polys.len(),
@@ -10929,7 +11681,8 @@ mod tests {
             value: claimed,
         };
 
-        let (reduction, _, _timings) = reduce_matmul_layer(&claim, &a, &b, 2, 4, 2, &mut channel).unwrap();
+        let (reduction, _, _timings) =
+            reduce_matmul_layer(&claim, &a, &b, 2, 4, 2, &mut channel).unwrap();
 
         // Check first round: p(0) + p(1) should equal the claimed sum
         let rp0 = &reduction.round_polys[0];
@@ -11043,7 +11796,9 @@ mod tests {
                 assert_eq!(r_out_v, output_claim.point);
 
                 let softmax_proofs_ref = match &proof {
-                    LayerProof::Attention { softmax_sum_proofs, .. } => softmax_sum_proofs,
+                    LayerProof::Attention {
+                        softmax_sum_proofs, ..
+                    } => softmax_sum_proofs,
                     _ => unreachable!(),
                 };
                 let verified_claim = verify_attention_reduction_for_test(
@@ -11120,7 +11875,9 @@ mod tests {
                 let _ = verifier_channel.draw_qm31s(log_rows + log_cols);
 
                 let softmax_proofs_ref = match &proof {
-                    LayerProof::Attention { softmax_sum_proofs, .. } => softmax_sum_proofs,
+                    LayerProof::Attention {
+                        softmax_sum_proofs, ..
+                    } => softmax_sum_proofs,
                     _ => unreachable!(),
                 };
                 let verified_claim = verify_attention_reduction_for_test(
@@ -11455,18 +12212,14 @@ mod tests {
             value: output_value,
         };
 
-        let (proof, _) = reduce_attention_layer(
-            &output_claim,
-            &input,
-            &weights,
-            &config,
-            &mut ch,
-        )
-        .unwrap();
+        let (proof, _) =
+            reduce_attention_layer(&output_claim, &input, &weights, &config, &mut ch).unwrap();
 
         match &proof {
             LayerProof::Attention {
-                softmax_sum_proofs, num_heads, ..
+                softmax_sum_proofs,
+                num_heads,
+                ..
             } => {
                 assert_eq!(
                     softmax_sum_proofs.len(),
@@ -11479,17 +12232,14 @@ mod tests {
                         "head {} should have round polys",
                         h
                     );
-                    assert!(
-                        !sp.row_sums.is_empty(),
-                        "head {} should have row sums",
-                        h
-                    );
+                    assert!(!sp.row_sums.is_empty(), "head {} should have row sums", h);
                     // Row sums should be non-zero for active rows
                     for (r, &rs) in sp.row_sums.iter().enumerate() {
                         assert!(
                             rs.0 > 0,
                             "head {} row {} has zero sum_exp (should be > 0 for active rows)",
-                            h, r,
+                            h,
+                            r,
                         );
                     }
                 }
@@ -11544,7 +12294,9 @@ mod tests {
                 let _ = verifier_channel.draw_qm31s(log_rows + log_cols);
 
                 let softmax_proofs_ref = match &proof {
-                    LayerProof::Attention { softmax_sum_proofs, .. } => softmax_sum_proofs,
+                    LayerProof::Attention {
+                        softmax_sum_proofs, ..
+                    } => softmax_sum_proofs,
                     _ => unreachable!(),
                 };
                 let verified_claim = verify_attention_reduction_for_test(
@@ -11708,16 +12460,18 @@ mod tests {
     fn test_1c_rope_constraint_present_in_model() {
         // Phase 1C hardening: verify that a model with RoPE layers
         // compiles to LayerType::RoPE (not Identity) in the circuit.
-        use crate::gkr::circuit::{LayerType, LayeredCircuit};
         use crate::compiler::graph::{ComputationGraph, GraphBuilder, GraphOp};
         use crate::components::rope::RoPEConfig;
+        use crate::gkr::circuit::{LayerType, LayeredCircuit};
 
         let mut builder = GraphBuilder::new((4, 8));
         builder.linear(8);
         // Add RoPE node via graph operation
         let rope_config = RoPEConfig::new(4, 8);
         let rope_id = builder.graph.add_node(
-            GraphOp::RoPE { config: rope_config },
+            GraphOp::RoPE {
+                config: rope_config,
+            },
             vec![builder.last_node.unwrap()],
             (4, 8),
         );
@@ -11857,16 +12611,18 @@ mod tests {
         // Phase 1C hardening: verify RoPE layers in a full model graph
         // are compiled as LayerType::RoPE, not Identity, and that the
         // unified STARK includes RoPE in its component count.
-        use crate::gkr::circuit::{LayerType, LayeredCircuit};
         use crate::compiler::graph::GraphBuilder;
         use crate::components::rope::RoPEConfig;
+        use crate::gkr::circuit::{LayerType, LayeredCircuit};
 
         // Build: matmul → rope → matmul
         let mut builder = GraphBuilder::new((2, 4));
         builder.linear(4);
         let rope_config = RoPEConfig::new(2, 4);
         let rope_id = builder.graph.add_node(
-            crate::compiler::graph::GraphOp::RoPE { config: rope_config },
+            crate::compiler::graph::GraphOp::RoPE {
+                config: rope_config,
+            },
             vec![builder.last_node.unwrap()],
             (2, 4),
         );
@@ -11889,7 +12645,11 @@ mod tests {
             .collect();
 
         assert_eq!(rope_layers.len(), 1, "should have 1 RoPE layer");
-        assert_eq!(identity_layers.len(), 0, "should have 0 Identity layers (RoPE is not Identity)");
+        assert_eq!(
+            identity_layers.len(),
+            0,
+            "should have 0 Identity layers (RoPE is not Identity)"
+        );
     }
 
     // ===== SIMD Attention Test Helpers =====
@@ -12452,8 +13212,7 @@ mod tests {
 
             // Verify with CPU verifier (fresh channel)
             let mut verifier_channel = PoseidonChannel::new();
-            verify_gkr_with_weights(&circuit, &proof, &c, &weights, &mut verifier_channel)
-                .unwrap();
+            verify_gkr_with_weights(&circuit, &proof, &c, &weights, &mut verifier_channel).unwrap();
         }
 
         #[test]
@@ -12954,10 +13713,7 @@ mod tests {
                 expected.len(),
                 "length mismatch for {rows}x{cols}"
             );
-            assert_eq!(
-                scratch, expected,
-                "data mismatch for {rows}x{cols}"
-            );
+            assert_eq!(scratch, expected, "data mismatch for {rows}x{cols}");
         }
 
         // Verify buffer reuse: capacity should be >= the largest matrix seen
@@ -13009,7 +13765,10 @@ mod tests {
         prover_channel.mix_u64(0xAC71);
         let r = prover_channel.draw_qm31s(2); // 4 elements → 2 vars
         let claimed = evaluate_mle(
-            &output_mle.iter().map(|&v| SecureField::from(v)).collect::<Vec<_>>(),
+            &output_mle
+                .iter()
+                .map(|&v| SecureField::from(v))
+                .collect::<Vec<_>>(),
             &r,
         );
         let output_claim = GKRClaim {
@@ -13034,8 +13793,15 @@ mod tests {
             } => {
                 assert_eq!(ap.round_polys.len(), 2, "should have 2 sumcheck rounds");
                 // Phase B: bit_evals should be present with 30 entries
-                assert!(ap.bit_evals.is_some(), "Phase B bit_evals should be present");
-                assert_eq!(ap.bit_evals.as_ref().unwrap().len(), 30, "should have 30 bit evals");
+                assert!(
+                    ap.bit_evals.is_some(),
+                    "Phase B bit_evals should be present"
+                );
+                assert_eq!(
+                    ap.bit_evals.as_ref().unwrap().len(),
+                    30,
+                    "should have 30 bit evals"
+                );
             }
             _ => panic!("expected Activation proof with activation_proof"),
         }
@@ -13074,7 +13840,10 @@ mod tests {
                     result.err()
                 );
                 let verified_claim = result.unwrap();
-                assert_eq!(verified_claim.value, next_claim.value, "claim value mismatch");
+                assert_eq!(
+                    verified_claim.value, next_claim.value,
+                    "claim value mismatch"
+                );
             }
             _ => panic!("expected Activation proof"),
         }
@@ -13099,7 +13868,10 @@ mod tests {
         prover_channel.mix_u64(0xAC72);
         let r = prover_channel.draw_qm31s(2);
         let claimed = evaluate_mle(
-            &output_mle.iter().map(|&v| SecureField::from(v)).collect::<Vec<_>>(),
+            &output_mle
+                .iter()
+                .map(|&v| SecureField::from(v))
+                .collect::<Vec<_>>(),
             &r,
         );
         let output_claim = GKRClaim {
@@ -13121,7 +13893,10 @@ mod tests {
                 ..
             } => {
                 assert_eq!(ap.round_polys.len(), 2);
-                assert!(ap.bit_evals.is_some(), "Phase B bit_evals should be present");
+                assert!(
+                    ap.bit_evals.is_some(),
+                    "Phase B bit_evals should be present"
+                );
             }
             _ => panic!("expected Activation proof with activation_proof"),
         }
@@ -13152,7 +13927,10 @@ mod tests {
         prover_channel.mix_u64(0xAC73);
         let r = prover_channel.draw_qm31s(2);
         let claimed = evaluate_mle(
-            &output_mle.iter().map(|&v| SecureField::from(v)).collect::<Vec<_>>(),
+            &output_mle
+                .iter()
+                .map(|&v| SecureField::from(v))
+                .collect::<Vec<_>>(),
             &r,
         );
         let output_claim = GKRClaim {
@@ -13169,7 +13947,11 @@ mod tests {
         .unwrap();
 
         // All-zero output claim → output_claim.value should be 0
-        assert_eq!(output_claim.value, SecureField::zero(), "all-zero output should have zero claim");
+        assert_eq!(
+            output_claim.value,
+            SecureField::zero(),
+            "all-zero output should have zero claim"
+        );
 
         match &proof {
             LayerProof::Activation {
@@ -13209,7 +13991,10 @@ mod tests {
         prover_channel.mix_u64(0xAC74);
         let r = prover_channel.draw_qm31s(2);
         let claimed = evaluate_mle(
-            &output_mle.iter().map(|&v| SecureField::from(v)).collect::<Vec<_>>(),
+            &output_mle
+                .iter()
+                .map(|&v| SecureField::from(v))
+                .collect::<Vec<_>>(),
             &r,
         );
         let output_claim = GKRClaim {
@@ -13295,29 +14080,58 @@ mod tests {
         prover_channel.mix_u64(0xBB01);
         let r = prover_channel.draw_qm31s(2);
         let claimed = evaluate_mle(
-            &output_mle.iter().map(|&v| SecureField::from(v)).collect::<Vec<_>>(),
+            &output_mle
+                .iter()
+                .map(|&v| SecureField::from(v))
+                .collect::<Vec<_>>(),
             &r,
         );
-        let output_claim = GKRClaim { point: r, value: claimed };
+        let output_claim = GKRClaim {
+            point: r,
+            value: claimed,
+        };
 
         // Honest proof succeeds
         let (proof, _) = reduce_activation_layer_algebraic(
-            &output_claim, &input, ActivationType::ReLU, &mut prover_channel,
-        ).unwrap();
+            &output_claim,
+            &input,
+            ActivationType::ReLU,
+            &mut prover_channel,
+        )
+        .unwrap();
 
         // Verify honest proof passes
         let mut ver_ch = PoseidonChannel::new();
         ver_ch.mix_u64(0xBB01);
         let _ = ver_ch.draw_qm31s(2);
         match &proof {
-            LayerProof::Activation { activation_type, logup_proof, multiplicity_sumcheck,
-                activation_proof, input_eval, output_eval, table_commitment, .. } => {
+            LayerProof::Activation {
+                activation_type,
+                logup_proof,
+                multiplicity_sumcheck,
+                activation_proof,
+                input_eval,
+                output_eval,
+                table_commitment,
+                ..
+            } => {
                 let result = crate::gkr::verifier::verify_activation_reduction_for_test(
-                    &output_claim, *activation_type, logup_proof.as_ref(),
-                    multiplicity_sumcheck.as_ref(), activation_proof.as_ref(),
-                    *input_eval, *output_eval, *table_commitment, 0, &mut ver_ch,
+                    &output_claim,
+                    *activation_type,
+                    logup_proof.as_ref(),
+                    multiplicity_sumcheck.as_ref(),
+                    activation_proof.as_ref(),
+                    *input_eval,
+                    *output_eval,
+                    *table_commitment,
+                    0,
+                    &mut ver_ch,
                 );
-                assert!(result.is_ok(), "honest Phase B proof should verify: {:?}", result.err());
+                assert!(
+                    result.is_ok(),
+                    "honest Phase B proof should verify: {:?}",
+                    result.err()
+                );
             }
             _ => panic!("expected Activation proof"),
         }
@@ -13349,17 +14163,31 @@ mod tests {
         prover_channel.mix_u64(0xBB02);
         let r = prover_channel.draw_qm31s(2);
         let claimed = evaluate_mle(
-            &output_mle.iter().map(|&v| SecureField::from(v)).collect::<Vec<_>>(),
+            &output_mle
+                .iter()
+                .map(|&v| SecureField::from(v))
+                .collect::<Vec<_>>(),
             &r,
         );
-        let output_claim = GKRClaim { point: r, value: claimed };
+        let output_claim = GKRClaim {
+            point: r,
+            value: claimed,
+        };
 
         let (mut proof, _) = reduce_activation_layer_algebraic(
-            &output_claim, &input, ActivationType::ReLU, &mut prover_channel,
-        ).unwrap();
+            &output_claim,
+            &input,
+            ActivationType::ReLU,
+            &mut prover_channel,
+        )
+        .unwrap();
 
         // Tamper with bit_evals[15]
-        if let LayerProof::Activation { activation_proof: Some(ref mut ap), .. } = &mut proof {
+        if let LayerProof::Activation {
+            activation_proof: Some(ref mut ap),
+            ..
+        } = &mut proof
+        {
             if let Some(ref mut be) = ap.bit_evals {
                 be[15] = be[15] + SecureField::one();
             }
@@ -13370,14 +14198,32 @@ mod tests {
         ver_ch.mix_u64(0xBB02);
         let _ = ver_ch.draw_qm31s(2);
         match &proof {
-            LayerProof::Activation { activation_type, logup_proof, multiplicity_sumcheck,
-                activation_proof, input_eval, output_eval, table_commitment, .. } => {
+            LayerProof::Activation {
+                activation_type,
+                logup_proof,
+                multiplicity_sumcheck,
+                activation_proof,
+                input_eval,
+                output_eval,
+                table_commitment,
+                ..
+            } => {
                 let result = crate::gkr::verifier::verify_activation_reduction_for_test(
-                    &output_claim, *activation_type, logup_proof.as_ref(),
-                    multiplicity_sumcheck.as_ref(), activation_proof.as_ref(),
-                    *input_eval, *output_eval, *table_commitment, 0, &mut ver_ch,
+                    &output_claim,
+                    *activation_type,
+                    logup_proof.as_ref(),
+                    multiplicity_sumcheck.as_ref(),
+                    activation_proof.as_ref(),
+                    *input_eval,
+                    *output_eval,
+                    *table_commitment,
+                    0,
+                    &mut ver_ch,
                 );
-                assert!(result.is_err(), "tampered bit_eval should fail verification");
+                assert!(
+                    result.is_err(),
+                    "tampered bit_eval should fail verification"
+                );
             }
             _ => panic!("expected Activation proof"),
         }
@@ -13396,7 +14242,11 @@ mod tests {
         input.set(1, 1, M31::from(2000000000u32));
 
         let mut output = M31Matrix::new(2, 2);
-        for i in 0..2 { for j in 0..2 { output.set(i, j, M31::zero()); } }
+        for i in 0..2 {
+            for j in 0..2 {
+                output.set(i, j, M31::zero());
+            }
+        }
 
         let output_padded = pad_matrix_pow2(&output);
         let output_mle = matrix_to_mle(&output_padded);
@@ -13405,28 +14255,57 @@ mod tests {
         prover_channel.mix_u64(0xBB03);
         let r = prover_channel.draw_qm31s(2);
         let claimed = evaluate_mle(
-            &output_mle.iter().map(|&v| SecureField::from(v)).collect::<Vec<_>>(),
+            &output_mle
+                .iter()
+                .map(|&v| SecureField::from(v))
+                .collect::<Vec<_>>(),
             &r,
         );
-        let output_claim = GKRClaim { point: r, value: claimed };
+        let output_claim = GKRClaim {
+            point: r,
+            value: claimed,
+        };
 
         let (proof, _) = reduce_activation_layer_algebraic(
-            &output_claim, &input, ActivationType::ReLU, &mut prover_channel,
-        ).unwrap();
+            &output_claim,
+            &input,
+            ActivationType::ReLU,
+            &mut prover_channel,
+        )
+        .unwrap();
 
         // Verify
         let mut ver_ch = PoseidonChannel::new();
         ver_ch.mix_u64(0xBB03);
         let _ = ver_ch.draw_qm31s(2);
         match &proof {
-            LayerProof::Activation { activation_type, logup_proof, multiplicity_sumcheck,
-                activation_proof, input_eval, output_eval, table_commitment, .. } => {
+            LayerProof::Activation {
+                activation_type,
+                logup_proof,
+                multiplicity_sumcheck,
+                activation_proof,
+                input_eval,
+                output_eval,
+                table_commitment,
+                ..
+            } => {
                 let result = crate::gkr::verifier::verify_activation_reduction_for_test(
-                    &output_claim, *activation_type, logup_proof.as_ref(),
-                    multiplicity_sumcheck.as_ref(), activation_proof.as_ref(),
-                    *input_eval, *output_eval, *table_commitment, 0, &mut ver_ch,
+                    &output_claim,
+                    *activation_type,
+                    logup_proof.as_ref(),
+                    multiplicity_sumcheck.as_ref(),
+                    activation_proof.as_ref(),
+                    *input_eval,
+                    *output_eval,
+                    *table_commitment,
+                    0,
+                    &mut ver_ch,
                 );
-                assert!(result.is_ok(), "all-negative Phase B should verify: {:?}", result.err());
+                assert!(
+                    result.is_ok(),
+                    "all-negative Phase B should verify: {:?}",
+                    result.err()
+                );
             }
             _ => panic!("expected Activation proof"),
         }
@@ -13440,9 +14319,9 @@ mod tests {
         let half_p_plus_1: u32 = 1073741824; // 2^30
 
         let mut input = M31Matrix::new(2, 2);
-        input.set(0, 0, M31::from(half_p));       // boundary non-negative
+        input.set(0, 0, M31::from(half_p)); // boundary non-negative
         input.set(0, 1, M31::from(half_p_plus_1)); // boundary negative
-        input.set(1, 0, M31::from(0u32));          // zero (non-negative)
+        input.set(1, 0, M31::from(0u32)); // zero (non-negative)
         input.set(1, 1, M31::from(2147483646u32)); // P-1 (negative)
 
         let mut output = M31Matrix::new(2, 2);
@@ -13460,28 +14339,57 @@ mod tests {
         prover_channel.mix_u64(0xBB04);
         let r = prover_channel.draw_qm31s(2);
         let claimed = evaluate_mle(
-            &output_mle.iter().map(|&v| SecureField::from(v)).collect::<Vec<_>>(),
+            &output_mle
+                .iter()
+                .map(|&v| SecureField::from(v))
+                .collect::<Vec<_>>(),
             &r,
         );
-        let output_claim = GKRClaim { point: r, value: claimed };
+        let output_claim = GKRClaim {
+            point: r,
+            value: claimed,
+        };
 
         let (proof, _) = reduce_activation_layer_algebraic(
-            &output_claim, &input, ActivationType::ReLU, &mut prover_channel,
-        ).unwrap();
+            &output_claim,
+            &input,
+            ActivationType::ReLU,
+            &mut prover_channel,
+        )
+        .unwrap();
 
         // Verify
         let mut ver_ch = PoseidonChannel::new();
         ver_ch.mix_u64(0xBB04);
         let _ = ver_ch.draw_qm31s(2);
         match &proof {
-            LayerProof::Activation { activation_type, logup_proof, multiplicity_sumcheck,
-                activation_proof, input_eval, output_eval, table_commitment, .. } => {
+            LayerProof::Activation {
+                activation_type,
+                logup_proof,
+                multiplicity_sumcheck,
+                activation_proof,
+                input_eval,
+                output_eval,
+                table_commitment,
+                ..
+            } => {
                 let result = crate::gkr::verifier::verify_activation_reduction_for_test(
-                    &output_claim, *activation_type, logup_proof.as_ref(),
-                    multiplicity_sumcheck.as_ref(), activation_proof.as_ref(),
-                    *input_eval, *output_eval, *table_commitment, 0, &mut ver_ch,
+                    &output_claim,
+                    *activation_type,
+                    logup_proof.as_ref(),
+                    multiplicity_sumcheck.as_ref(),
+                    activation_proof.as_ref(),
+                    *input_eval,
+                    *output_eval,
+                    *table_commitment,
+                    0,
+                    &mut ver_ch,
                 );
-                assert!(result.is_ok(), "boundary Phase B should verify: {:?}", result.err());
+                assert!(
+                    result.is_ok(),
+                    "boundary Phase B should verify: {:?}",
+                    result.err()
+                );
             }
             _ => panic!("expected Activation proof"),
         }
@@ -13514,18 +14422,32 @@ mod tests {
         prover_channel.mix_u64(0xBB05);
         let r = prover_channel.draw_qm31s(2);
         let claimed = evaluate_mle(
-            &output_mle.iter().map(|&v| SecureField::from(v)).collect::<Vec<_>>(),
+            &output_mle
+                .iter()
+                .map(|&v| SecureField::from(v))
+                .collect::<Vec<_>>(),
             &r,
         );
-        let output_claim = GKRClaim { point: r, value: claimed };
+        let output_claim = GKRClaim {
+            point: r,
+            value: claimed,
+        };
 
         // Get a Phase B proof, then strip bit_evals to simulate Phase A-only
         let (mut proof, _) = reduce_activation_layer_algebraic(
-            &output_claim, &input, ActivationType::ReLU, &mut prover_channel,
-        ).unwrap();
+            &output_claim,
+            &input,
+            ActivationType::ReLU,
+            &mut prover_channel,
+        )
+        .unwrap();
 
         // Strip bit_evals to Phase A-only
-        if let LayerProof::Activation { activation_proof: Some(ref mut ap), .. } = &mut proof {
+        if let LayerProof::Activation {
+            activation_proof: Some(ref mut ap),
+            ..
+        } = &mut proof
+        {
             ap.bit_evals = None;
         }
 
@@ -13553,7 +14475,10 @@ mod tests {
         // the verifier code path for None exists and doesn't panic.
         // Since the Phase A formula is a subset of Phase B, this is covered
         // by the existing tests. Mark as passing.
-        assert!(true, "backward compat verified by existing Phase A tests with new verifier code");
+        assert!(
+            true,
+            "backward compat verified by existing Phase A tests with new verifier code"
+        );
     }
 
     // =========================================================================
@@ -13572,11 +14497,17 @@ mod tests {
         input.set(1, 1, M31::from(42u32));
 
         // Compute piecewise output
-        let coeffs = crate::components::activation::PiecewiseLinearCoeffs::for_activation(ActivationType::GELU);
+        let coeffs = crate::components::activation::PiecewiseLinearCoeffs::for_activation(
+            ActivationType::GELU,
+        );
         let mut output = M31Matrix::new(2, 2);
         for i in 0..2 {
             for j in 0..2 {
-                output.set(i, j, crate::components::activation::piecewise_linear_eval(&coeffs, input.get(i, j)));
+                output.set(
+                    i,
+                    j,
+                    crate::components::activation::piecewise_linear_eval(&coeffs, input.get(i, j)),
+                );
             }
         }
 
@@ -13587,20 +14518,41 @@ mod tests {
         prover_channel.mix_u64(0xAA01);
         let r = prover_channel.draw_qm31s(2);
         let claimed = evaluate_mle(
-            &output_mle.iter().map(|&v| SecureField::from(v)).collect::<Vec<_>>(),
+            &output_mle
+                .iter()
+                .map(|&v| SecureField::from(v))
+                .collect::<Vec<_>>(),
             &r,
         );
-        let output_claim = GKRClaim { point: r, value: claimed };
+        let output_claim = GKRClaim {
+            point: r,
+            value: claimed,
+        };
 
         let (proof, next_claim) = reduce_activation_layer_piecewise(
-            &output_claim, &input, ActivationType::GELU, &mut prover_channel,
-        ).expect("piecewise GELU proof should succeed");
+            &output_claim,
+            &input,
+            ActivationType::GELU,
+            &mut prover_channel,
+        )
+        .expect("piecewise GELU proof should succeed");
 
         // Check proof structure
         match &proof {
-            LayerProof::Activation { piecewise_proof: Some(pw), .. } => {
-                assert_eq!(pw.round_polys.len(), 2, "should have 2 sumcheck rounds for 4 elements");
-                assert_eq!(pw.indicator_evals.len(), 16, "should have 16 indicator evals");
+            LayerProof::Activation {
+                piecewise_proof: Some(pw),
+                ..
+            } => {
+                assert_eq!(
+                    pw.round_polys.len(),
+                    2,
+                    "should have 2 sumcheck rounds for 4 elements"
+                );
+                assert_eq!(
+                    pw.indicator_evals.len(),
+                    16,
+                    "should have 16 indicator evals"
+                );
             }
             _ => panic!("expected Activation proof with piecewise_proof"),
         }
@@ -13612,8 +14564,12 @@ mod tests {
 
         match &proof {
             LayerProof::Activation {
-                activation_type, input_eval, output_eval, table_commitment,
-                piecewise_proof, ..
+                activation_type,
+                input_eval,
+                output_eval,
+                table_commitment,
+                piecewise_proof,
+                ..
             } => {
                 let result = crate::gkr::verifier::verify_activation_reduction_for_test_piecewise(
                     &output_claim,
@@ -13624,9 +14580,16 @@ mod tests {
                     0,
                     &mut verifier_channel,
                 );
-                assert!(result.is_ok(), "piecewise GELU proof should verify: {:?}", result.err());
+                assert!(
+                    result.is_ok(),
+                    "piecewise GELU proof should verify: {:?}",
+                    result.err()
+                );
                 let verified_claim = result.unwrap();
-                assert_eq!(verified_claim.value, next_claim.value, "claim value mismatch");
+                assert_eq!(
+                    verified_claim.value, next_claim.value,
+                    "claim value mismatch"
+                );
             }
             _ => panic!("expected Activation proof"),
         }
@@ -13643,11 +14606,17 @@ mod tests {
         input.set(1, 0, M31::from(50000u32));
         input.set(1, 1, M31::from(7u32));
 
-        let coeffs = crate::components::activation::PiecewiseLinearCoeffs::for_activation(ActivationType::Sigmoid);
+        let coeffs = crate::components::activation::PiecewiseLinearCoeffs::for_activation(
+            ActivationType::Sigmoid,
+        );
         let mut output = M31Matrix::new(2, 2);
         for i in 0..2 {
             for j in 0..2 {
-                output.set(i, j, crate::components::activation::piecewise_linear_eval(&coeffs, input.get(i, j)));
+                output.set(
+                    i,
+                    j,
+                    crate::components::activation::piecewise_linear_eval(&coeffs, input.get(i, j)),
+                );
             }
         }
 
@@ -13658,14 +14627,24 @@ mod tests {
         prover_channel.mix_u64(0xAA02);
         let r = prover_channel.draw_qm31s(2);
         let claimed = evaluate_mle(
-            &output_mle.iter().map(|&v| SecureField::from(v)).collect::<Vec<_>>(),
+            &output_mle
+                .iter()
+                .map(|&v| SecureField::from(v))
+                .collect::<Vec<_>>(),
             &r,
         );
-        let output_claim = GKRClaim { point: r, value: claimed };
+        let output_claim = GKRClaim {
+            point: r,
+            value: claimed,
+        };
 
         let (proof, _) = reduce_activation_layer_piecewise(
-            &output_claim, &input, ActivationType::Sigmoid, &mut prover_channel,
-        ).expect("piecewise Sigmoid proof should succeed");
+            &output_claim,
+            &input,
+            ActivationType::Sigmoid,
+            &mut prover_channel,
+        )
+        .expect("piecewise Sigmoid proof should succeed");
 
         let mut verifier_channel = PoseidonChannel::new();
         verifier_channel.mix_u64(0xAA02);
@@ -13673,8 +14652,10 @@ mod tests {
 
         match &proof {
             LayerProof::Activation {
-                activation_type, input_eval,
-                piecewise_proof, ..
+                activation_type,
+                input_eval,
+                piecewise_proof,
+                ..
             } => {
                 let result = crate::gkr::verifier::verify_activation_reduction_for_test_piecewise(
                     &output_claim,
@@ -13685,7 +14666,11 @@ mod tests {
                     0,
                     &mut verifier_channel,
                 );
-                assert!(result.is_ok(), "piecewise Sigmoid proof should verify: {:?}", result.err());
+                assert!(
+                    result.is_ok(),
+                    "piecewise Sigmoid proof should verify: {:?}",
+                    result.err()
+                );
             }
             _ => panic!("expected Activation proof"),
         }
@@ -13702,11 +14687,17 @@ mod tests {
         input.set(1, 0, M31::from(900u32));
         input.set(1, 1, M31::from(1200u32));
 
-        let coeffs = crate::components::activation::PiecewiseLinearCoeffs::for_activation(ActivationType::Softmax);
+        let coeffs = crate::components::activation::PiecewiseLinearCoeffs::for_activation(
+            ActivationType::Softmax,
+        );
         let mut output = M31Matrix::new(2, 2);
         for i in 0..2 {
             for j in 0..2 {
-                output.set(i, j, crate::components::activation::piecewise_linear_eval(&coeffs, input.get(i, j)));
+                output.set(
+                    i,
+                    j,
+                    crate::components::activation::piecewise_linear_eval(&coeffs, input.get(i, j)),
+                );
             }
         }
 
@@ -13717,14 +14708,24 @@ mod tests {
         prover_channel.mix_u64(0xAA03);
         let r = prover_channel.draw_qm31s(2);
         let claimed = evaluate_mle(
-            &output_mle.iter().map(|&v| SecureField::from(v)).collect::<Vec<_>>(),
+            &output_mle
+                .iter()
+                .map(|&v| SecureField::from(v))
+                .collect::<Vec<_>>(),
             &r,
         );
-        let output_claim = GKRClaim { point: r, value: claimed };
+        let output_claim = GKRClaim {
+            point: r,
+            value: claimed,
+        };
 
         let (proof, _) = reduce_activation_layer_piecewise(
-            &output_claim, &input, ActivationType::Softmax, &mut prover_channel,
-        ).expect("piecewise Softmax proof should succeed");
+            &output_claim,
+            &input,
+            ActivationType::Softmax,
+            &mut prover_channel,
+        )
+        .expect("piecewise Softmax proof should succeed");
 
         let mut verifier_channel = PoseidonChannel::new();
         verifier_channel.mix_u64(0xAA03);
@@ -13732,8 +14733,10 @@ mod tests {
 
         match &proof {
             LayerProof::Activation {
-                activation_type, input_eval,
-                piecewise_proof, ..
+                activation_type,
+                input_eval,
+                piecewise_proof,
+                ..
             } => {
                 let result = crate::gkr::verifier::verify_activation_reduction_for_test_piecewise(
                     &output_claim,
@@ -13744,7 +14747,11 @@ mod tests {
                     0,
                     &mut verifier_channel,
                 );
-                assert!(result.is_ok(), "piecewise Softmax proof should verify: {:?}", result.err());
+                assert!(
+                    result.is_ok(),
+                    "piecewise Softmax proof should verify: {:?}",
+                    result.err()
+                );
             }
             _ => panic!("expected Activation proof"),
         }
@@ -13761,11 +14768,17 @@ mod tests {
         input.set(1, 0, M31::from(1000u32));
         input.set(1, 1, M31::from(42u32));
 
-        let coeffs = crate::components::activation::PiecewiseLinearCoeffs::for_activation(ActivationType::GELU);
+        let coeffs = crate::components::activation::PiecewiseLinearCoeffs::for_activation(
+            ActivationType::GELU,
+        );
         let mut output = M31Matrix::new(2, 2);
         for i in 0..2 {
             for j in 0..2 {
-                output.set(i, j, crate::components::activation::piecewise_linear_eval(&coeffs, input.get(i, j)));
+                output.set(
+                    i,
+                    j,
+                    crate::components::activation::piecewise_linear_eval(&coeffs, input.get(i, j)),
+                );
             }
         }
 
@@ -13776,17 +14789,31 @@ mod tests {
         prover_channel.mix_u64(0xAA04);
         let r = prover_channel.draw_qm31s(2);
         let claimed = evaluate_mle(
-            &output_mle.iter().map(|&v| SecureField::from(v)).collect::<Vec<_>>(),
+            &output_mle
+                .iter()
+                .map(|&v| SecureField::from(v))
+                .collect::<Vec<_>>(),
             &r,
         );
-        let output_claim = GKRClaim { point: r, value: claimed };
+        let output_claim = GKRClaim {
+            point: r,
+            value: claimed,
+        };
 
         let (mut proof, _) = reduce_activation_layer_piecewise(
-            &output_claim, &input, ActivationType::GELU, &mut prover_channel,
-        ).expect("proof should succeed");
+            &output_claim,
+            &input,
+            ActivationType::GELU,
+            &mut prover_channel,
+        )
+        .expect("proof should succeed");
 
         // Tamper with output_eval in the piecewise proof
-        if let LayerProof::Activation { piecewise_proof: Some(ref mut pw), .. } = &mut proof {
+        if let LayerProof::Activation {
+            piecewise_proof: Some(ref mut pw),
+            ..
+        } = &mut proof
+        {
             pw.output_eval = pw.output_eval + SecureField::one();
         }
 
@@ -13796,8 +14823,10 @@ mod tests {
 
         match &proof {
             LayerProof::Activation {
-                activation_type, input_eval,
-                piecewise_proof, ..
+                activation_type,
+                input_eval,
+                piecewise_proof,
+                ..
             } => {
                 let result = crate::gkr::verifier::verify_activation_reduction_for_test_piecewise(
                     &output_claim,
@@ -13825,11 +14854,17 @@ mod tests {
         input.set(1, 0, M31::from(1000u32));
         input.set(1, 1, M31::from(42u32));
 
-        let coeffs = crate::components::activation::PiecewiseLinearCoeffs::for_activation(ActivationType::GELU);
+        let coeffs = crate::components::activation::PiecewiseLinearCoeffs::for_activation(
+            ActivationType::GELU,
+        );
         let mut output = M31Matrix::new(2, 2);
         for i in 0..2 {
             for j in 0..2 {
-                output.set(i, j, crate::components::activation::piecewise_linear_eval(&coeffs, input.get(i, j)));
+                output.set(
+                    i,
+                    j,
+                    crate::components::activation::piecewise_linear_eval(&coeffs, input.get(i, j)),
+                );
             }
         }
 
@@ -13840,17 +14875,31 @@ mod tests {
         prover_channel.mix_u64(0xAA05);
         let r = prover_channel.draw_qm31s(2);
         let claimed = evaluate_mle(
-            &output_mle.iter().map(|&v| SecureField::from(v)).collect::<Vec<_>>(),
+            &output_mle
+                .iter()
+                .map(|&v| SecureField::from(v))
+                .collect::<Vec<_>>(),
             &r,
         );
-        let output_claim = GKRClaim { point: r, value: claimed };
+        let output_claim = GKRClaim {
+            point: r,
+            value: claimed,
+        };
 
         let (mut proof, _) = reduce_activation_layer_piecewise(
-            &output_claim, &input, ActivationType::GELU, &mut prover_channel,
-        ).expect("proof should succeed");
+            &output_claim,
+            &input,
+            ActivationType::GELU,
+            &mut prover_channel,
+        )
+        .expect("proof should succeed");
 
         // Tamper with indicator_evals[0]
-        if let LayerProof::Activation { piecewise_proof: Some(ref mut pw), .. } = &mut proof {
+        if let LayerProof::Activation {
+            piecewise_proof: Some(ref mut pw),
+            ..
+        } = &mut proof
+        {
             pw.indicator_evals[0] = pw.indicator_evals[0] + SecureField::one();
         }
 
@@ -13860,8 +14909,10 @@ mod tests {
 
         match &proof {
             LayerProof::Activation {
-                activation_type, input_eval,
-                piecewise_proof, ..
+                activation_type,
+                input_eval,
+                piecewise_proof,
+                ..
             } => {
                 let result = crate::gkr::verifier::verify_activation_reduction_for_test_piecewise(
                     &output_claim,
@@ -13872,7 +14923,192 @@ mod tests {
                     0,
                     &mut verifier_channel,
                 );
-                assert!(result.is_err(), "tampered indicator should fail verification");
+                assert!(
+                    result.is_err(),
+                    "tampered indicator should fail verification"
+                );
+            }
+            _ => panic!("expected Activation proof"),
+        }
+    }
+
+    #[test]
+    fn test_piecewise_tamper_low_bit_binding() {
+        use crate::components::activation::ActivationType;
+
+        let mut input = M31Matrix::new(2, 2);
+        input.set(0, 0, M31::from(100u32));
+        input.set(0, 1, M31::from(500u32));
+        input.set(1, 0, M31::from(1000u32));
+        input.set(1, 1, M31::from(42u32));
+
+        let coeffs = crate::components::activation::PiecewiseLinearCoeffs::for_activation(
+            ActivationType::GELU,
+        );
+        let mut output = M31Matrix::new(2, 2);
+        for i in 0..2 {
+            for j in 0..2 {
+                output.set(
+                    i,
+                    j,
+                    crate::components::activation::piecewise_linear_eval(&coeffs, input.get(i, j)),
+                );
+            }
+        }
+
+        let output_padded = pad_matrix_pow2(&output);
+        let output_mle = matrix_to_mle(&output_padded);
+
+        let mut prover_channel = PoseidonChannel::new();
+        prover_channel.mix_u64(0xAA06);
+        let r = prover_channel.draw_qm31s(2);
+        let claimed = evaluate_mle(
+            &output_mle
+                .iter()
+                .map(|&v| SecureField::from(v))
+                .collect::<Vec<_>>(),
+            &r,
+        );
+        let output_claim = GKRClaim {
+            point: r,
+            value: claimed,
+        };
+
+        let (mut proof, _) = reduce_activation_layer_piecewise(
+            &output_claim,
+            &input,
+            ActivationType::GELU,
+            &mut prover_channel,
+        )
+        .expect("proof should succeed");
+
+        if let LayerProof::Activation {
+            piecewise_proof: Some(ref mut pw),
+            ..
+        } = &mut proof
+        {
+            let low_bits = pw
+                .low_bit_evals
+                .as_mut()
+                .expect("piecewise proof must include low-bit binding");
+            low_bits[0] = low_bits[0] + SecureField::one();
+        }
+
+        let mut verifier_channel = PoseidonChannel::new();
+        verifier_channel.mix_u64(0xAA06);
+        let _r_v = verifier_channel.draw_qm31s(2);
+
+        match &proof {
+            LayerProof::Activation {
+                activation_type,
+                input_eval,
+                piecewise_proof,
+                ..
+            } => {
+                let result = crate::gkr::verifier::verify_activation_reduction_for_test_piecewise(
+                    &output_claim,
+                    *activation_type,
+                    piecewise_proof.as_ref(),
+                    *input_eval,
+                    4,
+                    0,
+                    &mut verifier_channel,
+                );
+                assert!(
+                    result.is_err(),
+                    "tampered low-bit binding should fail verification"
+                );
+            }
+            _ => panic!("expected Activation proof"),
+        }
+    }
+
+    #[test]
+    fn test_piecewise_tamper_canonicality_binding() {
+        use crate::components::activation::ActivationType;
+
+        let mut input = M31Matrix::new(2, 2);
+        input.set(0, 0, M31::from(100u32));
+        input.set(0, 1, M31::from(500u32));
+        input.set(1, 0, M31::from(1000u32));
+        input.set(1, 1, M31::from(42u32));
+
+        let coeffs = crate::components::activation::PiecewiseLinearCoeffs::for_activation(
+            ActivationType::GELU,
+        );
+        let mut output = M31Matrix::new(2, 2);
+        for i in 0..2 {
+            for j in 0..2 {
+                output.set(
+                    i,
+                    j,
+                    crate::components::activation::piecewise_linear_eval(&coeffs, input.get(i, j)),
+                );
+            }
+        }
+
+        let output_padded = pad_matrix_pow2(&output);
+        let output_mle = matrix_to_mle(&output_padded);
+
+        let mut prover_channel = PoseidonChannel::new();
+        prover_channel.mix_u64(0xAA07);
+        let r = prover_channel.draw_qm31s(2);
+        let claimed = evaluate_mle(
+            &output_mle
+                .iter()
+                .map(|&v| SecureField::from(v))
+                .collect::<Vec<_>>(),
+            &r,
+        );
+        let output_claim = GKRClaim {
+            point: r,
+            value: claimed,
+        };
+
+        let (mut proof, _) = reduce_activation_layer_piecewise(
+            &output_claim,
+            &input,
+            ActivationType::GELU,
+            &mut prover_channel,
+        )
+        .expect("proof should succeed");
+
+        if let LayerProof::Activation {
+            piecewise_proof: Some(ref mut pw),
+            ..
+        } = &mut proof
+        {
+            let canonical_ands = pw
+                .canonical_and_evals
+                .as_mut()
+                .expect("piecewise proof must include canonicality binding");
+            canonical_ands[0] = canonical_ands[0] + SecureField::one();
+        }
+
+        let mut verifier_channel = PoseidonChannel::new();
+        verifier_channel.mix_u64(0xAA07);
+        let _r_v = verifier_channel.draw_qm31s(2);
+
+        match &proof {
+            LayerProof::Activation {
+                activation_type,
+                input_eval,
+                piecewise_proof,
+                ..
+            } => {
+                let result = crate::gkr::verifier::verify_activation_reduction_for_test_piecewise(
+                    &output_claim,
+                    *activation_type,
+                    piecewise_proof.as_ref(),
+                    *input_eval,
+                    4,
+                    0,
+                    &mut verifier_channel,
+                );
+                assert!(
+                    result.is_err(),
+                    "tampered canonicality binding should fail verification"
+                );
             }
             _ => panic!("expected Activation proof"),
         }
@@ -13883,9 +15119,15 @@ mod tests {
         use crate::components::activation::ActivationType;
 
         // Verify coefficients are deterministic and non-trivial
-        let gelu_coeffs = crate::components::activation::PiecewiseLinearCoeffs::for_activation(ActivationType::GELU);
-        let sigmoid_coeffs = crate::components::activation::PiecewiseLinearCoeffs::for_activation(ActivationType::Sigmoid);
-        let softmax_coeffs = crate::components::activation::PiecewiseLinearCoeffs::for_activation(ActivationType::Softmax);
+        let gelu_coeffs = crate::components::activation::PiecewiseLinearCoeffs::for_activation(
+            ActivationType::GELU,
+        );
+        let sigmoid_coeffs = crate::components::activation::PiecewiseLinearCoeffs::for_activation(
+            ActivationType::Sigmoid,
+        );
+        let softmax_coeffs = crate::components::activation::PiecewiseLinearCoeffs::for_activation(
+            ActivationType::Softmax,
+        );
 
         // Segment width should be 2^27 (power-of-2 aligned with bit-shift dispatch)
         let expected_width = 1u32 << 27;
@@ -13894,16 +15136,24 @@ mod tests {
         assert_eq!(softmax_coeffs.segment_width, expected_width);
 
         // Different activations should produce different coefficients
-        assert_ne!(gelu_coeffs.slopes[0], sigmoid_coeffs.slopes[0],
-            "GELU and Sigmoid should have different coefficients");
+        assert_ne!(
+            gelu_coeffs.slopes[0], sigmoid_coeffs.slopes[0],
+            "GELU and Sigmoid should have different coefficients"
+        );
 
         // Recomputation should be deterministic
-        let gelu_coeffs2 = crate::components::activation::PiecewiseLinearCoeffs::for_activation(ActivationType::GELU);
+        let gelu_coeffs2 = crate::components::activation::PiecewiseLinearCoeffs::for_activation(
+            ActivationType::GELU,
+        );
         for i in 0..16 {
-            assert_eq!(gelu_coeffs.slopes[i], gelu_coeffs2.slopes[i],
-                "GELU coefficients should be deterministic");
-            assert_eq!(gelu_coeffs.intercepts[i], gelu_coeffs2.intercepts[i],
-                "GELU intercepts should be deterministic");
+            assert_eq!(
+                gelu_coeffs.slopes[i], gelu_coeffs2.slopes[i],
+                "GELU coefficients should be deterministic"
+            );
+            assert_eq!(
+                gelu_coeffs.intercepts[i], gelu_coeffs2.intercepts[i],
+                "GELU intercepts should be deterministic"
+            );
         }
     }
 
@@ -13916,8 +15166,8 @@ mod tests {
         let test_values = [
             M31::from(0u32),
             M31::from(100u32),
-            M31::from(134217727u32), // segment boundary area
-            M31::from(268435456u32), // segment 2
+            M31::from(134217727u32),  // segment boundary area
+            M31::from(268435456u32),  // segment 2
             M31::from(2147483646u32), // P-1, segment 15
         ];
 
@@ -13927,9 +15177,16 @@ mod tests {
             // Only indicator[seg_idx] should be 1
             for i in 0..16 {
                 let expected = if i == seg_idx { 1 } else { 0 };
-                let indicator = if i == seg_idx { M31::from(1u32) } else { M31::from(0u32) };
-                assert_eq!(indicator.0, expected,
-                    "indicator[{}] should be {} for val={}", i, expected, val.0);
+                let indicator = if i == seg_idx {
+                    M31::from(1u32)
+                } else {
+                    M31::from(0u32)
+                };
+                assert_eq!(
+                    indicator.0, expected,
+                    "indicator[{}] should be {} for val={}",
+                    i, expected, val.0
+                );
             }
         }
     }
@@ -13941,43 +15198,55 @@ mod tests {
         // Default (no env var): piecewise should be enabled
         {
             let _guard = EnvVarGuard::set("STWO_PIECEWISE_ACTIVATION", "1");
-            assert!(crate::components::activation::piecewise_activation_enabled(),
-                "should be enabled with '1' (default)");
+            assert!(
+                crate::components::activation::piecewise_activation_enabled(),
+                "should be enabled with '1' (default)"
+            );
         }
 
         // Opt-out: "0" disables piecewise
         {
             let _guard = EnvVarGuard::set("STWO_PIECEWISE_ACTIVATION", "0");
-            assert!(!crate::components::activation::piecewise_activation_enabled(),
-                "should be disabled with '0'");
+            assert!(
+                !crate::components::activation::piecewise_activation_enabled(),
+                "should be disabled with '0'"
+            );
         }
 
         // Opt-out: "false" disables piecewise
         {
             let _guard = EnvVarGuard::set("STWO_PIECEWISE_ACTIVATION", "false");
-            assert!(!crate::components::activation::piecewise_activation_enabled(),
-                "should be disabled with 'false'");
+            assert!(
+                !crate::components::activation::piecewise_activation_enabled(),
+                "should be disabled with 'false'"
+            );
         }
 
         // Opt-out: "no" disables piecewise
         {
             let _guard = EnvVarGuard::set("STWO_PIECEWISE_ACTIVATION", "no");
-            assert!(!crate::components::activation::piecewise_activation_enabled(),
-                "should be disabled with 'no'");
+            assert!(
+                !crate::components::activation::piecewise_activation_enabled(),
+                "should be disabled with 'no'"
+            );
         }
 
         // Opt-out: "off" disables piecewise
         {
             let _guard = EnvVarGuard::set("STWO_PIECEWISE_ACTIVATION", "off");
-            assert!(!crate::components::activation::piecewise_activation_enabled(),
-                "should be disabled with 'off'");
+            assert!(
+                !crate::components::activation::piecewise_activation_enabled(),
+                "should be disabled with 'off'"
+            );
         }
 
         // Explicit "true" keeps piecewise enabled
         {
             let _guard = EnvVarGuard::set("STWO_PIECEWISE_ACTIVATION", "true");
-            assert!(crate::components::activation::piecewise_activation_enabled(),
-                "should be enabled with 'true'");
+            assert!(
+                crate::components::activation::piecewise_activation_enabled(),
+                "should be enabled with 'true'"
+            );
         }
     }
 
@@ -13989,11 +15258,21 @@ mod tests {
         let input = M31Matrix {
             rows: 1,
             cols: dim,
-            data: vec![M31::from(100u32), M31::from(200u32), M31::from(300u32), M31::from(400u32)],
+            data: vec![
+                M31::from(100u32),
+                M31::from(200u32),
+                M31::from(300u32),
+                M31::from(400u32),
+            ],
         };
 
         // γ = [2, 3, 1, 4] — learned affine scale
-        let gamma = vec![M31::from(2u32), M31::from(3u32), M31::from(1u32), M31::from(4u32)];
+        let gamma = vec![
+            M31::from(2u32),
+            M31::from(3u32),
+            M31::from(1u32),
+            M31::from(4u32),
+        ];
 
         // Build output claim by computing expected output
         let padded = pad_matrix_pow2(&input);
@@ -14002,7 +15281,8 @@ mod tests {
 
         // Compute RMSNorm forward pass with gamma
         let config = crate::components::rmsnorm::RMSNormConfig::new(dim);
-        let rsqrt_table = crate::components::rmsnorm::build_rsqrt_table(config.rsqrt_table_log_size);
+        let rsqrt_table =
+            crate::components::rmsnorm::build_rsqrt_table(config.rsqrt_table_log_size);
         let n_active = dim.min(padded.cols);
         let inv_n = m31_mod_inverse(n_active as u32);
 
@@ -14032,22 +15312,36 @@ mod tests {
         // Create output claim
         let mut channel = PoseidonChannel::new();
         channel.mix_u64(0x7E57_u64);
-        let r: Vec<SecureField> = (0..num_vars)
-            .map(|_| channel.draw_qm31())
-            .collect();
+        let r: Vec<SecureField> = (0..num_vars).map(|_| channel.draw_qm31()).collect();
         let output_value = evaluate_mle(&output_mle, &r);
-        let output_claim = GKRClaim { point: r, value: output_value };
+        let output_claim = GKRClaim {
+            point: r,
+            value: output_value,
+        };
 
         // Prove with gamma
         let mut prove_channel = PoseidonChannel::new();
         prove_channel.mix_u64(0x7E57_u64);
         let (proof, _input_claim) = reduce_rmsnorm_layer_with_gamma(
-            &output_claim, &input, dim, &mut prove_channel, Some(&gamma),
-        ).expect("prove with gamma should succeed");
+            &output_claim,
+            &input,
+            dim,
+            &mut prove_channel,
+            Some(&gamma),
+        )
+        .expect("prove with gamma should succeed");
 
         // Verify gamma fields are populated
-        if let LayerProof::RMSNorm { gamma_commitment, gamma_eval, .. } = &proof {
-            assert!(gamma_commitment.is_some(), "gamma_commitment should be populated");
+        if let LayerProof::RMSNorm {
+            gamma_commitment,
+            gamma_eval,
+            ..
+        } = &proof
+        {
+            assert!(
+                gamma_commitment.is_some(),
+                "gamma_commitment should be populated"
+            );
             assert!(gamma_eval.is_some(), "gamma_eval should be populated");
         } else {
             panic!("Expected RMSNorm layer proof");
@@ -14061,7 +15355,12 @@ mod tests {
         let input = M31Matrix {
             rows: 1,
             cols: dim,
-            data: vec![M31::from(100u32), M31::from(200u32), M31::from(300u32), M31::from(400u32)],
+            data: vec![
+                M31::from(100u32),
+                M31::from(200u32),
+                M31::from(300u32),
+                M31::from(400u32),
+            ],
         };
 
         let padded = pad_matrix_pow2(&input);
@@ -14070,7 +15369,8 @@ mod tests {
 
         // Compute output without gamma
         let config = crate::components::rmsnorm::RMSNormConfig::new(dim);
-        let rsqrt_table = crate::components::rmsnorm::build_rsqrt_table(config.rsqrt_table_log_size);
+        let rsqrt_table =
+            crate::components::rmsnorm::build_rsqrt_table(config.rsqrt_table_log_size);
         let n_active = dim.min(padded.cols);
         let inv_n = m31_mod_inverse(n_active as u32);
         let mut output_mle = vec![SecureField::zero(); n];
@@ -14097,15 +15397,26 @@ mod tests {
         let mut channel = PoseidonChannel::new();
         let r: Vec<SecureField> = (0..num_vars).map(|_| channel.draw_qm31()).collect();
         let output_value = evaluate_mle(&output_mle, &r);
-        let output_claim = GKRClaim { point: r, value: output_value };
+        let output_claim = GKRClaim {
+            point: r,
+            value: output_value,
+        };
 
         let mut prove_channel = PoseidonChannel::new();
-        let (proof, _) = reduce_rmsnorm_layer_with_gamma(
-            &output_claim, &input, dim, &mut prove_channel, None,
-        ).expect("prove without gamma should succeed");
+        let (proof, _) =
+            reduce_rmsnorm_layer_with_gamma(&output_claim, &input, dim, &mut prove_channel, None)
+                .expect("prove without gamma should succeed");
 
-        if let LayerProof::RMSNorm { gamma_commitment, gamma_eval, .. } = &proof {
-            assert!(gamma_commitment.is_none(), "gamma_commitment should be None");
+        if let LayerProof::RMSNorm {
+            gamma_commitment,
+            gamma_eval,
+            ..
+        } = &proof
+        {
+            assert!(
+                gamma_commitment.is_none(),
+                "gamma_commitment should be None"
+            );
             assert!(gamma_eval.is_none(), "gamma_eval should be None");
         } else {
             panic!("Expected RMSNorm layer proof");

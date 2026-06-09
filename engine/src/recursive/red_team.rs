@@ -119,7 +119,15 @@ pub(crate) fn current_recursive_air(
         initial_digest_limbs: felt252_to_limbs(&FieldElement::ZERO),
         final_digest_limbs: felt252_to_limbs(&final_digest),
         hades_lookup: None,
+        draw_felt_lookup: None,
+        challenge_lookup: None,
         hades_enabled: false,
+        arithmetic_enabled: false,
+        n_arithmetic_rows: 0,
+        sumcheck_enabled: false,
+        n_sumcheck_rows: 0,
+        draw_enabled: false,
+        n_draw_rows: 0,
     }
 }
 

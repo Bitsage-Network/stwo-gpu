@@ -1,19 +1,16 @@
-use elo_cairo_verifier::field::{
-    qm31_new, qm31_zero, qm31_one, qm31_add, qm31_sub, qm31_mul,
-    qm31_eq, poly_eval_degree2, poly_eval_degree3,
-};
 use elo_cairo_verifier::channel::{
-    channel_default, channel_mix_u64, channel_mix_secure_field,
-    channel_mix_poly_coeffs, channel_mix_poly_coeffs_deg3, channel_draw_qm31,
-    channel_mix_felts,
+    channel_default, channel_draw_qm31, channel_mix_felts, channel_mix_poly_coeffs,
+    channel_mix_poly_coeffs_deg3, channel_mix_secure_field, channel_mix_u64,
 };
-use elo_cairo_verifier::types::{CompressedRoundPoly, CompressedGkrRoundPoly, GKRClaim};
-use elo_cairo_verifier::field::qm31_inverse;
+use elo_cairo_verifier::field::{
+    poly_eval_degree2, poly_eval_degree3, qm31_add, qm31_eq, qm31_inverse, qm31_mul, qm31_new,
+    qm31_one, qm31_sub, qm31_zero,
+};
 use elo_cairo_verifier::layer_verifiers::{
-    verify_add_layer, verify_mul_layer, verify_matmul_layer,
-    verify_activation_layer, verify_dequantize_layer,
-    verify_layernorm_layer, verify_rmsnorm_layer,
+    verify_activation_layer, verify_add_layer, verify_dequantize_layer, verify_layernorm_layer,
+    verify_matmul_layer, verify_mul_layer, verify_rmsnorm_layer,
 };
+use elo_cairo_verifier::types::{CompressedGkrRoundPoly, CompressedRoundPoly, GKRClaim};
 
 // ============================================================================
 // channel_mix_poly_coeffs_deg3 Tests
@@ -62,10 +59,7 @@ fn test_verify_add_layer_basic() {
     let rhs = qm31_new(20, 0, 0, 0);
     let output_value = qm31_add(lhs, rhs); // 30
 
-    let claim = GKRClaim {
-        point: array![qm31_new(42, 0, 0, 0)],
-        value: output_value,
-    };
+    let claim = GKRClaim { point: array![qm31_new(42, 0, 0, 0)], value: output_value };
 
     let mut ch = channel_default();
     channel_mix_u64(ref ch, 999); // pre-seed channel
@@ -83,8 +77,7 @@ fn test_verify_add_layer_general_qm31() {
     let output_value = qm31_add(lhs, rhs);
 
     let claim = GKRClaim {
-        point: array![qm31_new(7, 11, 13, 17), qm31_new(19, 23, 29, 31)],
-        value: output_value,
+        point: array![qm31_new(7, 11, 13, 17), qm31_new(19, 23, 29, 31)], value: output_value,
     };
 
     let mut ch = channel_default();
@@ -100,10 +93,7 @@ fn test_verify_add_layer_mismatch_panics() {
     let rhs = qm31_new(20, 0, 0, 0);
     let wrong_value = qm31_new(31, 0, 0, 0);
 
-    let claim = GKRClaim {
-        point: array![qm31_new(1, 0, 0, 0)],
-        value: wrong_value,
-    };
+    let claim = GKRClaim { point: array![qm31_new(1, 0, 0, 0)], value: wrong_value };
 
     let mut ch = channel_default();
     verify_add_layer(@claim, lhs, rhs, 0, ref ch);
@@ -114,19 +104,13 @@ fn test_verify_add_layer_deterministic() {
     let lhs = qm31_new(5, 10, 15, 20);
     let rhs = qm31_new(25, 30, 35, 40);
     let output_value = qm31_add(lhs, rhs);
-    let claim = GKRClaim {
-        point: array![qm31_new(1, 0, 0, 0)],
-        value: output_value,
-    };
+    let claim = GKRClaim { point: array![qm31_new(1, 0, 0, 0)], value: output_value };
 
     let mut ch1 = channel_default();
     channel_mix_u64(ref ch1, 42);
     let r1 = verify_add_layer(@claim, lhs, rhs, 0, ref ch1);
 
-    let claim2 = GKRClaim {
-        point: array![qm31_new(1, 0, 0, 0)],
-        value: output_value,
-    };
+    let claim2 = GKRClaim { point: array![qm31_new(1, 0, 0, 0)], value: output_value };
     let mut ch2 = channel_default();
     channel_mix_u64(ref ch2, 42);
     let r2 = verify_add_layer(@claim2, lhs, rhs, 0, ref ch2);
@@ -140,7 +124,7 @@ fn test_verify_add_layer_deterministic() {
 // ============================================================================
 
 #[test]
-    #[ignore] // lean build: stripped module
+#[ignore] // lean build: stripped module
 fn test_verify_mul_layer_single_var() {
     let r0 = qm31_new(3, 0, 0, 0);
     let one = qm31_one();
@@ -153,10 +137,7 @@ fn test_verify_mul_layer_single_var() {
     let eq_at_0 = qm31_sub(one, r0);
     let eq_at_1 = r0;
 
-    let v = qm31_add(
-        qm31_mul(eq_at_0, qm31_mul(a0, b0)),
-        qm31_mul(eq_at_1, qm31_mul(a1, b1)),
-    );
+    let v = qm31_add(qm31_mul(eq_at_0, qm31_mul(a0, b0)), qm31_mul(eq_at_1, qm31_mul(a1, b1)));
 
     let p_at_0 = qm31_mul(eq_at_0, qm31_mul(a0, b0));
     let p_at_1 = qm31_mul(eq_at_1, qm31_mul(a1, b1));
@@ -191,22 +172,13 @@ fn test_verify_mul_layer_single_var() {
     let rhs_eval = qm31_add(b0, qm31_mul(db, s0));
 
     // Build compressed round poly (c1 omitted — verifier reconstructs it)
-    let round_poly = CompressedGkrRoundPoly {
-        c0: c0, c2: c2, c3: c3,
-    };
+    let round_poly = CompressedGkrRoundPoly { c0: c0, c2: c2, c3: c3 };
 
-    let claim = GKRClaim {
-        point: array![r0],
-        value: v,
-    };
+    let claim = GKRClaim { point: array![r0], value: v };
 
     let mut verify_ch = channel_default();
     let result = verify_mul_layer(
-        @claim,
-        array![round_poly].span(),
-        lhs_eval,
-        rhs_eval,
-        ref verify_ch,
+        @claim, array![round_poly].span(), lhs_eval, rhs_eval, ref verify_ch,
     );
 
     assert!(result.point.len() == 1, "mul result point length");
@@ -214,30 +186,19 @@ fn test_verify_mul_layer_single_var() {
 
 #[test]
 #[should_panic(expected: "MUL_FINAL_MISMATCH")]
-    #[ignore] // lean build: stripped module
+#[ignore] // lean build: stripped module
 fn test_verify_mul_layer_bad_round_poly() {
     let v = qm31_new(100, 0, 0, 0);
-    let claim = GKRClaim {
-        point: array![qm31_new(3, 0, 0, 0)],
-        value: v,
-    };
+    let claim = GKRClaim { point: array![qm31_new(3, 0, 0, 0)], value: v };
 
     // Bad poly: c1 is reconstructed from v, so round sum always passes.
     // But final eval check will fail with wrong lhs/rhs.
     let bad_poly = CompressedGkrRoundPoly {
-        c0: qm31_new(10, 0, 0, 0),
-        c2: qm31_new(30, 0, 0, 0),
-        c3: qm31_new(40, 0, 0, 0),
+        c0: qm31_new(10, 0, 0, 0), c2: qm31_new(30, 0, 0, 0), c3: qm31_new(40, 0, 0, 0),
     };
 
     let mut ch = channel_default();
-    verify_mul_layer(
-        @claim,
-        array![bad_poly].span(),
-        qm31_zero(),
-        qm31_zero(),
-        ref ch,
-    );
+    verify_mul_layer(@claim, array![bad_poly].span(), qm31_zero(), qm31_zero(), ref ch);
 }
 
 // ============================================================================
@@ -250,20 +211,10 @@ fn test_verify_matmul_layer_1x1() {
     let b_val = qm31_new(11, 0, 0, 0);
     let c_val = qm31_mul(a_val, b_val);
 
-    let claim = GKRClaim {
-        point: array![],
-        value: c_val,
-    };
+    let claim = GKRClaim { point: array![], value: c_val };
 
     let mut ch = channel_default();
-    let result = verify_matmul_layer(
-        @claim,
-        array![].span(),
-        a_val,
-        b_val,
-        1, 1, 1,
-        ref ch,
-    );
+    let result = verify_matmul_layer(@claim, array![].span(), a_val, b_val, 1, 1, 1, ref ch);
 
     assert!(result.point.len() == 0, "1x1 point empty");
     assert!(qm31_eq(result.value, a_val), "1x1 value = a_val");
@@ -325,19 +276,11 @@ fn test_verify_matmul_layer_2x2() {
 
     // Build compressed proof (c1 omitted)
     let round_poly = CompressedRoundPoly { c0: c0, c2: c2 };
-    let claim = GKRClaim {
-        point: array![r_i, r_j],
-        value: claimed_sum,
-    };
+    let claim = GKRClaim { point: array![r_i, r_j], value: claimed_sum };
 
     let mut verify_ch = channel_default();
     let result = verify_matmul_layer(
-        @claim,
-        array![round_poly].span(),
-        final_a,
-        final_b,
-        2, 2, 2,
-        ref verify_ch,
+        @claim, array![round_poly].span(), final_a, final_b, 2, 2, 2, ref verify_ch,
     );
 
     assert!(result.point.len() == 2, "2x2 result point has 2 vars");
@@ -350,26 +293,15 @@ fn test_verify_matmul_layer_2x2() {
 fn test_verify_matmul_layer_bad_round_poly() {
     let claimed_sum = qm31_new(100, 0, 0, 0);
     let claim = GKRClaim {
-        point: array![qm31_new(1, 0, 0, 0), qm31_new(2, 0, 0, 0)],
-        value: claimed_sum,
+        point: array![qm31_new(1, 0, 0, 0), qm31_new(2, 0, 0, 0)], value: claimed_sum,
     };
 
     // With compressed polys, c1 is reconstructed so round sum always passes.
     // Bad final evals will trigger MATMUL_FINAL_MISMATCH.
-    let bad_poly = CompressedRoundPoly {
-        c0: qm31_new(10, 0, 0, 0),
-        c2: qm31_new(30, 0, 0, 0),
-    };
+    let bad_poly = CompressedRoundPoly { c0: qm31_new(10, 0, 0, 0), c2: qm31_new(30, 0, 0, 0) };
 
     let mut ch = channel_default();
-    verify_matmul_layer(
-        @claim,
-        array![bad_poly].span(),
-        qm31_zero(),
-        qm31_zero(),
-        2, 2, 2,
-        ref ch,
-    );
+    verify_matmul_layer(@claim, array![bad_poly].span(), qm31_zero(), qm31_zero(), 2, 2, 2, ref ch);
 }
 
 #[test]
@@ -377,29 +309,18 @@ fn test_verify_matmul_layer_bad_round_poly() {
 fn test_verify_matmul_layer_bad_final_eval() {
     let claimed_sum = qm31_new(100, 0, 0, 0);
     let claim = GKRClaim {
-        point: array![qm31_new(1, 0, 0, 0), qm31_new(2, 0, 0, 0)],
-        value: claimed_sum,
+        point: array![qm31_new(1, 0, 0, 0), qm31_new(2, 0, 0, 0)], value: claimed_sum,
     };
 
     // p(0) = c0 = 30, c1 reconstructed = 100 - 60 - 20 = 20
     // p(1) = 30+20+20 = 70, p(0)+p(1) = 100 = claimed -- passes by construction
-    let poly = CompressedRoundPoly {
-        c0: qm31_new(30, 0, 0, 0),
-        c2: qm31_new(20, 0, 0, 0),
-    };
+    let poly = CompressedRoundPoly { c0: qm31_new(30, 0, 0, 0), c2: qm31_new(20, 0, 0, 0) };
 
     let wrong_a = qm31_new(999, 0, 0, 0);
     let wrong_b = qm31_new(1, 0, 0, 0);
 
     let mut ch = channel_default();
-    verify_matmul_layer(
-        @claim,
-        array![poly].span(),
-        wrong_a,
-        wrong_b,
-        2, 2, 2,
-        ref ch,
-    );
+    verify_matmul_layer(@claim, array![poly].span(), wrong_a, wrong_b, 2, 2, 2, ref ch);
 }
 
 // ============================================================================
@@ -410,10 +331,7 @@ fn test_verify_matmul_layer_bad_final_eval() {
 fn test_add_layer_channel_state_changes() {
     let lhs = qm31_new(10, 0, 0, 0);
     let rhs = qm31_new(20, 0, 0, 0);
-    let claim = GKRClaim {
-        point: array![qm31_one()],
-        value: qm31_add(lhs, rhs),
-    };
+    let claim = GKRClaim { point: array![qm31_one()], value: qm31_add(lhs, rhs) };
 
     let mut ch = channel_default();
     let d0 = ch.digest;
@@ -425,10 +343,7 @@ fn test_add_layer_channel_state_changes() {
 fn test_matmul_layer_channel_state_changes() {
     let a = qm31_new(7, 0, 0, 0);
     let b = qm31_new(11, 0, 0, 0);
-    let claim = GKRClaim {
-        point: array![],
-        value: qm31_mul(a, b),
-    };
+    let claim = GKRClaim { point: array![], value: qm31_mul(a, b) };
 
     let mut ch = channel_default();
     let d0 = ch.digest;
@@ -446,10 +361,7 @@ fn test_verify_activation_layer_single_var() {
     let one = qm31_one();
     let zero = qm31_zero();
 
-    let output_claim = GKRClaim {
-        point: array![r0],
-        value: zero,
-    };
+    let output_claim = GKRClaim { point: array![r0], value: zero };
 
     let mut sim_ch = channel_default();
     channel_mix_u64(ref sim_ch, 0x4C4F47);
@@ -491,7 +403,12 @@ fn test_verify_activation_layer_single_var() {
         final_in_eval,
         final_out_eval,
         claimed_sum,
-        false, 0, array![].span(), array![].span(), qm31_zero(), qm31_zero(),
+        false,
+        0,
+        array![].span(),
+        array![].span(),
+        qm31_zero(),
+        qm31_zero(),
         input_eval,
         output_eval,
         ref ch,
@@ -505,17 +422,12 @@ fn test_verify_activation_layer_single_var() {
 #[test]
 #[should_panic(expected: "LOGUP_FINAL_MISMATCH")]
 fn test_verify_activation_layer_bad_round_poly() {
-    let output_claim = GKRClaim {
-        point: array![qm31_new(5, 0, 0, 0)],
-        value: qm31_zero(),
-    };
+    let output_claim = GKRClaim { point: array![qm31_new(5, 0, 0, 0)], value: qm31_zero() };
 
     // With compressed polys, c1 is reconstructed so round sum always passes.
     // Final eval check will fail.
     let bad_poly = CompressedGkrRoundPoly {
-        c0: qm31_new(10, 0, 0, 0),
-        c2: qm31_new(30, 0, 0, 0),
-        c3: qm31_new(40, 0, 0, 0),
+        c0: qm31_new(10, 0, 0, 0), c2: qm31_new(30, 0, 0, 0), c3: qm31_new(40, 0, 0, 0),
     };
 
     let mut ch = channel_default();
@@ -527,7 +439,12 @@ fn test_verify_activation_layer_bad_round_poly() {
         qm31_zero(),
         qm31_zero(),
         qm31_one(),
-        false, 0, array![].span(), array![].span(), qm31_zero(), qm31_zero(),
+        false,
+        0,
+        array![].span(),
+        array![].span(),
+        qm31_zero(),
+        qm31_zero(),
         qm31_zero(),
         qm31_zero(),
         ref ch,
@@ -539,10 +456,7 @@ fn test_activation_channel_state_changes() {
     let one = qm31_one();
     let zero = qm31_zero();
 
-    let output_claim = GKRClaim {
-        point: array![zero],
-        value: zero,
-    };
+    let output_claim = GKRClaim { point: array![zero], value: zero };
 
     let neg_one = qm31_sub(zero, one);
     // Compressed round poly (c1 omitted)
@@ -565,11 +479,21 @@ fn test_activation_channel_state_changes() {
     let mut ch = channel_default();
     let d0 = ch.digest;
     let _result = verify_activation_layer(
-        @output_claim, 1,
+        @output_claim,
+        1,
         array![round_poly].span(),
-        final_w_eval, zero, zero, claimed_sum,
-        false, 0, array![].span(), array![].span(), qm31_zero(), qm31_zero(),
-        qm31_new(1, 0, 0, 0), qm31_new(2, 0, 0, 0),
+        final_w_eval,
+        zero,
+        zero,
+        claimed_sum,
+        false,
+        0,
+        array![].span(),
+        array![].span(),
+        qm31_zero(),
+        qm31_zero(),
+        qm31_new(1, 0, 0, 0),
+        qm31_new(2, 0, 0, 0),
         ref ch,
     );
     assert!(ch.digest != d0, "activation changes channel state");
@@ -580,16 +504,13 @@ fn test_activation_channel_state_changes() {
 // ============================================================================
 
 #[test]
-    #[ignore] // lean build: stripped module
+#[ignore] // lean build: stripped module
 fn test_verify_dequantize_layer_single_var() {
     let r0 = qm31_new(3, 0, 0, 0);
     let one = qm31_one();
     let zero = qm31_zero();
 
-    let output_claim = GKRClaim {
-        point: array![r0],
-        value: zero,
-    };
+    let output_claim = GKRClaim { point: array![r0], value: zero };
 
     let mut sim_ch = channel_default();
     channel_mix_u64(ref sim_ch, 0x4445514C4F47);
@@ -615,11 +536,21 @@ fn test_verify_dequantize_layer_single_var() {
 
     let mut ch = channel_default();
     let result = verify_dequantize_layer(
-        @output_claim, bits,
+        @output_claim,
+        bits,
         array![round_poly].span(),
-        final_w_eval, zero, zero, claimed_sum,
-        false, 0, array![].span(), array![].span(), qm31_zero(), qm31_zero(),
-        qm31_new(10, 0, 0, 0), qm31_new(20, 0, 0, 0),
+        final_w_eval,
+        zero,
+        zero,
+        claimed_sum,
+        false,
+        0,
+        array![].span(),
+        array![].span(),
+        qm31_zero(),
+        qm31_zero(),
+        qm31_new(10, 0, 0, 0),
+        qm31_new(20, 0, 0, 0),
         ref ch,
     );
 
@@ -628,7 +559,7 @@ fn test_verify_dequantize_layer_single_var() {
 }
 
 #[test]
-    #[ignore] // lean build: stripped module
+#[ignore] // lean build: stripped module
 fn test_dequantize_differs_from_activation_transcript() {
     let zero = qm31_zero();
     let one = qm31_one();
@@ -651,11 +582,21 @@ fn test_dequantize_differs_from_activation_transcript() {
 
     let mut ch1 = channel_default();
     let _r1 = verify_activation_layer(
-        @output_claim, 1,
+        @output_claim,
+        1,
         array![round_poly].span(),
-        w1, zero, zero, one,
-        false, 0, array![].span(), array![].span(), qm31_zero(), qm31_zero(),
-        zero, zero,
+        w1,
+        zero,
+        zero,
+        one,
+        false,
+        0,
+        array![].span(),
+        array![].span(),
+        qm31_zero(),
+        qm31_zero(),
+        zero,
+        zero,
         ref ch1,
     );
 
@@ -674,11 +615,21 @@ fn test_dequantize_differs_from_activation_transcript() {
 
     let mut ch2 = channel_default();
     let _r2 = verify_dequantize_layer(
-        @output_claim2, 8,
+        @output_claim2,
+        8,
         array![round_poly2].span(),
-        w2, zero, zero, one,
-        false, 0, array![].span(), array![].span(), qm31_zero(), qm31_zero(),
-        zero, zero,
+        w2,
+        zero,
+        zero,
+        one,
+        false,
+        0,
+        array![].span(),
+        array![].span(),
+        qm31_zero(),
+        qm31_zero(),
+        zero,
+        zero,
         ref ch2,
     );
 
@@ -690,7 +641,7 @@ fn test_dequantize_differs_from_activation_transcript() {
 // ============================================================================
 
 #[test]
-    #[ignore] // lean build: stripped module
+#[ignore] // lean build: stripped module
 fn test_verify_layernorm_layer_part1_only() {
     let r0 = qm31_new(3, 0, 0, 0);
     let one = qm31_one();
@@ -748,13 +699,24 @@ fn test_verify_layernorm_layer_part1_only() {
     let result = verify_layernorm_layer(
         @output_claim,
         array![round_poly].span(),
-        centered_final, rsqrt_final,
-        mean_eval, rsqrt_eval,
+        centered_final,
+        rsqrt_final,
+        mean_eval,
+        rsqrt_eval,
         false,
         empty_logup_polys.span(),
-        zero, zero, zero, zero,
-        false, 0, array![].span(), array![].span(), qm31_zero(), qm31_zero(),
-        input_eval, output_eval,
+        zero,
+        zero,
+        zero,
+        zero,
+        false,
+        0,
+        array![].span(),
+        array![].span(),
+        qm31_zero(),
+        qm31_zero(),
+        input_eval,
+        output_eval,
         ref ch,
     );
 
@@ -765,22 +727,19 @@ fn test_verify_layernorm_layer_part1_only() {
 
 #[test]
 #[should_panic(expected: "LINEAR_FINAL_MISMATCH")]
-    #[ignore] // lean build: stripped module
+#[ignore] // lean build: stripped module
 fn test_verify_layernorm_layer_bad_linear_poly() {
     let _one = qm31_one();
     let zero = qm31_zero();
 
     let output_claim = GKRClaim {
-        point: array![qm31_new(1, 0, 0, 0)],
-        value: qm31_new(100, 0, 0, 0),
+        point: array![qm31_new(1, 0, 0, 0)], value: qm31_new(100, 0, 0, 0),
     };
 
     // With compressed polys, c1 reconstructed so round sum passes.
     // Final eval check will fail with zero lhs/rhs finals.
     let bad_poly = CompressedGkrRoundPoly {
-        c0: qm31_new(10, 0, 0, 0),
-        c2: qm31_new(30, 0, 0, 0),
-        c3: qm31_new(40, 0, 0, 0),
+        c0: qm31_new(10, 0, 0, 0), c2: qm31_new(30, 0, 0, 0), c3: qm31_new(40, 0, 0, 0),
     };
 
     let empty: Array<CompressedGkrRoundPoly> = array![];
@@ -789,10 +748,24 @@ fn test_verify_layernorm_layer_bad_linear_poly() {
     verify_layernorm_layer(
         @output_claim,
         array![bad_poly].span(),
-        zero, zero, zero, zero,
-        false, empty.span(), zero, zero, zero, zero,
-        false, 0, array![].span(), array![].span(), qm31_zero(), qm31_zero(),
-        zero, zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        false,
+        empty.span(),
+        zero,
+        zero,
+        zero,
+        zero,
+        false,
+        0,
+        array![].span(),
+        array![].span(),
+        qm31_zero(),
+        qm31_zero(),
+        zero,
+        zero,
         ref ch,
     );
 }
@@ -816,8 +789,7 @@ fn test_verify_rmsnorm_layer_part1_only() {
     let eq_at_1 = r0;
 
     let output_value = qm31_add(
-        qm31_mul(eq_at_0, qm31_mul(in_0, rs_0)),
-        qm31_mul(eq_at_1, qm31_mul(in_1, rs_1)),
+        qm31_mul(eq_at_0, qm31_mul(in_0, rs_0)), qm31_mul(eq_at_1, qm31_mul(in_1, rs_1)),
     );
 
     let output_claim = GKRClaim { point: array![r0], value: output_value };
@@ -857,12 +829,24 @@ fn test_verify_rmsnorm_layer_part1_only() {
     let result = verify_rmsnorm_layer(
         @output_claim,
         array![round_poly].span(),
-        input_final, rsqrt_final,
-        rms_sq_eval, rsqrt_eval,
+        input_final,
+        rsqrt_final,
+        rms_sq_eval,
+        rsqrt_eval,
         false,
-        empty.span(), zero, zero, zero, zero,
-        false, 0, array![].span(), array![].span(), qm31_zero(), qm31_zero(),
-        qm31_new(100, 0, 0, 0), qm31_new(200, 0, 0, 0),
+        empty.span(),
+        zero,
+        zero,
+        zero,
+        zero,
+        false,
+        0,
+        array![].span(),
+        array![].span(),
+        qm31_zero(),
+        qm31_zero(),
+        qm31_new(100, 0, 0, 0),
+        qm31_new(200, 0, 0, 0),
         ref ch,
     );
 
@@ -871,7 +855,7 @@ fn test_verify_rmsnorm_layer_part1_only() {
 }
 
 #[test]
-    #[ignore] // lean build: stripped module
+#[ignore] // lean build: stripped module
 fn test_layernorm_rmsnorm_different_tags() {
     let zero = qm31_zero();
     let one = qm31_one();
@@ -902,11 +886,25 @@ fn test_layernorm_rmsnorm_different_tags() {
     let mut ch1 = channel_default();
     let _r1 = verify_layernorm_layer(
         @claim1,
-        array![poly1].span(), centered_final1, rsqrt_final1,
-        zero, zero,
-        false, empty1.span(), zero, zero, zero, zero,
-        false, 0, array![].span(), array![].span(), qm31_zero(), qm31_zero(),
-        zero, zero,
+        array![poly1].span(),
+        centered_final1,
+        rsqrt_final1,
+        zero,
+        zero,
+        false,
+        empty1.span(),
+        zero,
+        zero,
+        zero,
+        zero,
+        false,
+        0,
+        array![].span(),
+        array![].span(),
+        qm31_zero(),
+        qm31_zero(),
+        zero,
+        zero,
         ref ch1,
     );
 
@@ -916,11 +914,25 @@ fn test_layernorm_rmsnorm_different_tags() {
     let mut ch2 = channel_default();
     let _r2 = verify_rmsnorm_layer(
         @claim2,
-        array![poly2].span(), one, one,
-        zero, zero,
-        false, empty2.span(), zero, zero, zero, zero,
-        false, 0, array![].span(), array![].span(), qm31_zero(), qm31_zero(),
-        zero, zero,
+        array![poly2].span(),
+        one,
+        one,
+        zero,
+        zero,
+        false,
+        empty2.span(),
+        zero,
+        zero,
+        zero,
+        zero,
+        false,
+        0,
+        array![].span(),
+        array![].span(),
+        qm31_zero(),
+        qm31_zero(),
+        zero,
+        zero,
         ref ch2,
     );
 
@@ -933,16 +945,13 @@ fn test_verify_rmsnorm_layer_bad_linear_poly() {
     let zero = qm31_zero();
 
     let output_claim = GKRClaim {
-        point: array![qm31_new(1, 0, 0, 0)],
-        value: qm31_new(50, 0, 0, 0),
+        point: array![qm31_new(1, 0, 0, 0)], value: qm31_new(50, 0, 0, 0),
     };
 
     // With compressed polys, round sum passes by construction.
     // Final eval check will fail.
     let bad_poly = CompressedGkrRoundPoly {
-        c0: qm31_new(5, 0, 0, 0),
-        c2: qm31_new(15, 0, 0, 0),
-        c3: qm31_new(20, 0, 0, 0),
+        c0: qm31_new(5, 0, 0, 0), c2: qm31_new(15, 0, 0, 0), c3: qm31_new(20, 0, 0, 0),
     };
 
     let empty: Array<CompressedGkrRoundPoly> = array![];
@@ -950,10 +959,24 @@ fn test_verify_rmsnorm_layer_bad_linear_poly() {
     verify_rmsnorm_layer(
         @output_claim,
         array![bad_poly].span(),
-        zero, zero, zero, zero,
-        false, empty.span(), zero, zero, zero, zero,
-        false, 0, array![].span(), array![].span(), qm31_zero(), qm31_zero(),
-        zero, zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        false,
+        empty.span(),
+        zero,
+        zero,
+        zero,
+        zero,
+        false,
+        0,
+        array![].span(),
+        array![].span(),
+        qm31_zero(),
+        qm31_zero(),
+        zero,
+        zero,
         ref ch,
     );
 }
@@ -964,31 +987,20 @@ fn test_verify_rmsnorm_layer_bad_linear_poly() {
 
 #[test]
 #[should_panic(expected: "MUL_FINAL_MISMATCH")]
-    #[ignore] // lean build: stripped module
+#[ignore] // lean build: stripped module
 fn test_verify_mul_layer_bad_final_eval() {
     let v = qm31_new(20, 0, 0, 0);
     let r0 = qm31_new(1, 0, 0, 0);
-    let claim = GKRClaim {
-        point: array![r0],
-        value: v,
-    };
+    let claim = GKRClaim { point: array![r0], value: v };
 
     // Compressed poly (c1 omitted). c1 reconstructed = 20 - 2*5 - 5 - 0 = 5
     let poly = CompressedGkrRoundPoly {
-        c0: qm31_new(5, 0, 0, 0),
-        c2: qm31_new(5, 0, 0, 0),
-        c3: qm31_zero(),
+        c0: qm31_new(5, 0, 0, 0), c2: qm31_new(5, 0, 0, 0), c3: qm31_zero(),
     };
 
     let wrong_lhs = qm31_new(999, 0, 0, 0);
     let wrong_rhs = qm31_new(1, 0, 0, 0);
 
     let mut ch = channel_default();
-    verify_mul_layer(
-        @claim,
-        array![poly].span(),
-        wrong_lhs,
-        wrong_rhs,
-        ref ch,
-    );
+    verify_mul_layer(@claim, array![poly].span(), wrong_lhs, wrong_rhs, ref ch);
 }

@@ -12,7 +12,8 @@
 
 use starknet::ContractAddress;
 
-// ─── Types ──────────────────────────────────────────────────────────────────
+// ─── Types
+// ──────────────────────────────────────────────────────────────────
 
 #[derive(Drop, Copy, Serde, starknet::Store)]
 pub struct ViewKeyDelegation {
@@ -30,7 +31,8 @@ pub struct ViewKeyDelegation {
     pub is_active: bool,
 }
 
-// ─── Events ─────────────────────────────────────────────────────────────────
+// ─── Events
+// ─────────────────────────────────────────────────────────────────
 
 #[derive(Drop, starknet::Event)]
 pub struct ViewKeyDelegated {
@@ -49,7 +51,8 @@ pub struct ViewKeyRevoked {
     pub delegate: ContractAddress,
 }
 
-// ─── Interface ──────────────────────────────────────────────────────────────
+// ─── Interface
+// ──────────────────────────────────────────────────────────────
 
 #[starknet::interface]
 pub trait IViewKeyDelegation<TContractState> {
@@ -65,28 +68,18 @@ pub trait IViewKeyDelegation<TContractState> {
     );
 
     /// Revoke a previously delegated view key.
-    fn revoke_view_key(
-        ref self: TContractState,
-        delegate: ContractAddress,
-    );
+    fn revoke_view_key(ref self: TContractState, delegate: ContractAddress);
 
     /// Check if a delegate has an active view key from an owner.
     fn has_view_key(
-        self: @TContractState,
-        owner: ContractAddress,
-        delegate: ContractAddress,
+        self: @TContractState, owner: ContractAddress, delegate: ContractAddress,
     ) -> bool;
 
     /// Get the encrypted view key for a delegate.
     fn get_view_key(
-        self: @TContractState,
-        owner: ContractAddress,
-        delegate: ContractAddress,
+        self: @TContractState, owner: ContractAddress, delegate: ContractAddress,
     ) -> felt252;
 
     /// Get the number of active view key delegations from an owner.
-    fn get_delegation_count(
-        self: @TContractState,
-        owner: ContractAddress,
-    ) -> u32;
+    fn get_delegation_count(self: @TContractState, owner: ContractAddress) -> u32;
 }

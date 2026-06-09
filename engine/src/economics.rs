@@ -23,8 +23,8 @@
 //!
 //! **Amortized cost: $1-3 per million inferences.**
 
-use stwo::core::fields::m31::M31;
 use starknet_ff::FieldElement;
+use stwo::core::fields::m31::M31;
 
 /// Configuration for the Commit/Sample/Prove protocol.
 #[derive(Debug, Clone)]
@@ -151,10 +151,8 @@ impl CommitmentChain {
         let mut commitment = InferenceCommitment::new(model_id, io_commitment, timestamp, seq);
 
         // Chain: new_head = H(old_head, commitment_hash)
-        self.chain_head = starknet_crypto::poseidon_hash_many(&[
-            self.chain_head,
-            commitment.commitment_hash,
-        ]);
+        self.chain_head =
+            starknet_crypto::poseidon_hash_many(&[self.chain_head, commitment.commitment_hash]);
         self.length += 1;
 
         // Sampling: deterministic from chain_head (verifiable by anyone)
@@ -165,8 +163,14 @@ impl CommitmentChain {
         ]);
         let sample_bytes = sample_hash.to_bytes_be();
         let sample_val = u64::from_be_bytes([
-            sample_bytes[24], sample_bytes[25], sample_bytes[26], sample_bytes[27],
-            sample_bytes[28], sample_bytes[29], sample_bytes[30], sample_bytes[31],
+            sample_bytes[24],
+            sample_bytes[25],
+            sample_bytes[26],
+            sample_bytes[27],
+            sample_bytes[28],
+            sample_bytes[29],
+            sample_bytes[30],
+            sample_bytes[31],
         ]);
         let threshold = (self.policy.sample_rate * 10000.0) as u64;
         if sample_val % 10000 < threshold {
@@ -270,7 +274,10 @@ mod tests {
         // Tamper: modify one commitment hash
         let original = chain.commitments[50].commitment_hash;
         chain.commitments[50].commitment_hash = FieldElement::from(0xDEAD_u64);
-        assert!(!chain.verify_chain(), "tampered chain must fail verification");
+        assert!(
+            !chain.verify_chain(),
+            "tampered chain must fail verification"
+        );
         chain.commitments[50].commitment_hash = original; // restore
     }
 
@@ -289,7 +296,10 @@ mod tests {
 
         let sampled = chain.sampled_indices.len();
         // With 5% rate and 10000 inferences, expect ~500 sampled (±100)
-        eprintln!("Sampled: {sampled} / 10000 ({:.1}%)", sampled as f64 / 100.0);
+        eprintln!(
+            "Sampled: {sampled} / 10000 ({:.1}%)",
+            sampled as f64 / 100.0
+        );
         assert!(sampled > 300, "too few sampled: {sampled}");
         assert!(sampled < 800, "too many sampled: {sampled}");
     }
@@ -310,10 +320,14 @@ mod tests {
             chain2.commit(model_id, FieldElement::from(i as u64), i * 100);
         }
 
-        assert_eq!(chain1.sampled_indices, chain2.sampled_indices,
-            "same inputs must produce same sampling decisions");
-        assert_eq!(chain1.chain_head, chain2.chain_head,
-            "same inputs must produce same chain head");
+        assert_eq!(
+            chain1.sampled_indices, chain2.sampled_indices,
+            "same inputs must produce same sampling decisions"
+        );
+        assert_eq!(
+            chain1.chain_head, chain2.chain_head,
+            "same inputs must produce same chain head"
+        );
     }
 
     #[test]

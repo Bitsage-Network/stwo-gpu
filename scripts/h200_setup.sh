@@ -19,7 +19,7 @@
 #   curl -sSL https://raw.githubusercontent.com/Bitsage-Network/stwo-ml/main/scripts/h200_setup.sh | bash
 #
 #   Or with options:
-#   bash scripts/h200_setup.sh --model Qwen/Qwen3-14B
+#   bash scripts/h200_setup.sh --model Qwen/Qwen3.5-35B-A3B
 #   bash scripts/h200_setup.sh --model meta-llama/Llama-3-8B
 #   bash scripts/h200_setup.sh --skip-model --skip-deps  # Rebuild only
 #
@@ -32,7 +32,7 @@ set -euo pipefail
 REPO_URL="https://github.com/Bitsage-Network/stwo-ml.git"
 BRANCH="${BRANCH:-main}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/stwo-ml}"
-MODEL_HF="${MODEL_HF:-Qwen/Qwen3-14B}"
+MODEL_HF="${MODEL_HF:-Qwen/Qwen3.5-35B-A3B}"
 MODEL_DIR="${MODEL_DIR:-}"   # auto-derived from MODEL_HF if not set
 
 SKIP_MODEL=false
@@ -53,7 +53,7 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --model HF_ID   HuggingFace model (default: Qwen/Qwen3-14B)"
+            echo "  --model HF_ID   HuggingFace model (default: Qwen/Qwen3.5-35B-A3B)"
             echo "  --model-dir DIR Where to store model weights (auto-derived from model)"
             echo "  --skip-model    Skip downloading model weights"
             echo "  --skip-build    Skip building Rust binaries"
@@ -62,7 +62,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --install-dir   Where to clone repo (default: ~/stwo-ml)"
             echo ""
             echo "Examples:"
-            echo "  $0                                          # Default: Qwen3-14B"
+            echo "  $0                                          # Default: Qwen3.5-35B-A3B"
             echo "  $0 --model meta-llama/Llama-3-8B            # Use LLaMA"
             echo "  $0 --model mistralai/Mistral-7B-v0.3        # Use Mistral"
             exit 0 ;;
@@ -72,7 +72,7 @@ done
 
 # Auto-derive MODEL_DIR from HuggingFace model ID if not explicitly set
 if [ -z "$MODEL_DIR" ]; then
-    # Use the model name part (after /) lowercased, e.g. Qwen/Qwen3-14B → qwen3-14b
+    # Use the model name part (after /) lowercased, e.g. Qwen/Qwen3.5-35B-A3B → qwen3.5-35b-a3b
     MODEL_SLUG=$(echo "${MODEL_HF}" | awk -F'/' '{print $NF}' | tr '[:upper:]' '[:lower:]')
     MODEL_DIR="$HOME/models/${MODEL_SLUG}"
 fi

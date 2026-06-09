@@ -17,12 +17,12 @@
 
 #[cfg(feature = "cuda-runtime")]
 use crate::crypto::mle_opening::prove_mle_opening_with_commitment_qm31_u32;
-#[cfg(feature = "cuda-runtime")]
-use crate::gpu_sumcheck::{GpuMleFoldSession, GpuSumcheckExecutor};
 use crate::crypto::mle_opening::{
     evaluate_mle_at, mle_n_queries, prove_mle_opening, verify_mle_opening, MleOpeningProof,
 };
-use crate::crypto::poseidon_channel::PoseidonChannel;
+use crate::crypto::poseidon_channel::{PoseidonChannel, VerifierChannel};
+#[cfg(feature = "cuda-runtime")]
+use crate::gpu_sumcheck::{GpuMleFoldSession, GpuSumcheckExecutor};
 
 use num_traits::Zero;
 use starknet_crypto::poseidon_hash;
@@ -392,7 +392,7 @@ fn eval_unified_oracle(
 }
 
 /// Compute β weights from Fiat-Shamir channel.
-fn draw_beta_weights(channel: &mut PoseidonChannel, n_claims: usize) -> Vec<SecureField> {
+fn draw_beta_weights<C: VerifierChannel>(channel: &mut C, n_claims: usize) -> Vec<SecureField> {
     let rho = channel.draw_qm31();
     let mut betas = Vec::with_capacity(n_claims);
     let mut rho_pow = SecureField::from(M31::from(1));
@@ -409,12 +409,12 @@ fn draw_beta_weights(channel: &mut PoseidonChannel, n_claims: usize) -> Vec<Secu
 ///
 /// Returns (round_polys, challenge_point) where challenge_point is the final
 /// evaluation point after all rounds.
-fn mismatch_sumcheck(
+fn mismatch_sumcheck<C: VerifierChannel>(
     claims: &[AggregatedWeightClaim],
     weight_mles: &[&[SecureField]],
     config: &AggregatedBindingConfig,
     betas: &[SecureField],
-    channel: &mut PoseidonChannel,
+    channel: &mut C,
 ) -> (
     Vec<(SecureField, SecureField, SecureField)>,
     Vec<SecureField>,
@@ -972,14 +972,17 @@ fn eval_unified_oracle_3way_gpu(
                             if let Err(e) =
                                 executor.mle_fold_session_step_in_place(&mut session, challenge)
                             {
-                                eprintln!("[GPU] 3way prefix fold error: {e:?}, falling back to CPU");
+                                eprintln!(
+                                    "[GPU] 3way prefix fold error: {e:?}, falling back to CPU"
+                                );
                                 for k in 0..3 {
                                     if sel_weights[k] == SecureField::zero() {
                                         continue;
                                     }
                                     let lt = &locals[k][config.n_max - n_vars..];
                                     let mle = source.get_mle(i);
-                                    results[k] = results[k] + sel_weights[k] * evaluate_mle_at(&mle, lt);
+                                    results[k] =
+                                        results[k] + sel_weights[k] * evaluate_mle_at(&mle, lt);
                                 }
                                 break;
                             }
@@ -1005,7 +1008,8 @@ fn eval_unified_oracle_3way_gpu(
                                         eprintln!("[GPU] clone_fold_session error: {e:?}");
                                         let lt = &locals[k][config.n_max - n_vars..];
                                         let mle = source.get_mle(i);
-                                        results[k] = results[k] + sel_weights[k] * evaluate_mle_at(&mle, lt);
+                                        results[k] =
+                                            results[k] + sel_weights[k] * evaluate_mle_at(&mle, lt);
                                         continue;
                                     }
                                 }
@@ -1016,20 +1020,22 @@ fn eval_unified_oracle_3way_gpu(
                                         eprintln!("[GPU] clone_fold_session error: {e:?}");
                                         let lt = &locals[k][config.n_max - n_vars..];
                                         let mle = source.get_mle(i);
-                                        results[k] = results[k] + sel_weights[k] * evaluate_mle_at(&mle, lt);
+                                        results[k] =
+                                            results[k] + sel_weights[k] * evaluate_mle_at(&mle, lt);
                                         continue;
                                     }
                                 }
                             };
 
                             // Fold branch variable
-                            if let Err(e) = executor
-                                .mle_fold_session_step_in_place(&mut fork, branch_values[k])
+                            if let Err(e) =
+                                executor.mle_fold_session_step_in_place(&mut fork, branch_values[k])
                             {
                                 eprintln!("[GPU] branch fold error: {e:?}");
                                 let lt = &locals[k][config.n_max - n_vars..];
                                 let mle = source.get_mle(i);
-                                results[k] = results[k] + sel_weights[k] * evaluate_mle_at(&mle, lt);
+                                results[k] =
+                                    results[k] + sel_weights[k] * evaluate_mle_at(&mle, lt);
                                 continue;
                             }
 
@@ -1042,7 +1048,8 @@ fn eval_unified_oracle_3way_gpu(
                                     eprintln!("[GPU] finish_fold error: {e:?}");
                                     let lt = &locals[k][config.n_max - n_vars..];
                                     let mle = source.get_mle(i);
-                                    results[k] = results[k] + sel_weights[k] * evaluate_mle_at(&mle, lt);
+                                    results[k] =
+                                        results[k] + sel_weights[k] * evaluate_mle_at(&mle, lt);
                                 }
                             }
                         }
@@ -1326,8 +1333,7 @@ fn eval_round_3way_gpu(
                     let local = &eval_pts[ci][k][config.selector_bits..];
                     let local_truncated = &local[config.n_max - n_vars..];
                     let w_val = evaluate_mle_at(&mle, local_truncated);
-                    oracle_accum[ci][k] =
-                        oracle_accum[ci][k] + claim_sel_weights[ci][k] * w_val;
+                    oracle_accum[ci][k] = oracle_accum[ci][k] + claim_sel_weights[ci][k] * w_val;
                 }
             }
         } else {
@@ -1340,8 +1346,8 @@ fn eval_round_3way_gpu(
                 let branch_global = round;
                 let branch_in_selector = branch_global < config.selector_bits;
                 let local_offset = config.n_max - n_vars;
-                let branch_in_padding = !branch_in_selector
-                    && (branch_global - config.selector_bits) < local_offset;
+                let branch_in_padding =
+                    !branch_in_selector && (branch_global - config.selector_bits) < local_offset;
 
                 if branch_in_selector || branch_in_padding {
                     // MLE eval is identical for all 3 t-values; only weights differ
@@ -1369,23 +1375,23 @@ fn eval_round_3way_gpu(
                     }
                 } else {
                     // Branch is in real local vars — 3-way fork
-                    let local_branch_pos =
-                        (branch_global - config.selector_bits) - local_offset;
+                    let local_branch_pos = (branch_global - config.selector_bits) - local_offset;
 
                     let prefix_session = match executor.clone_fold_session(base_session) {
                         Ok(mut f) => {
                             let prefix = &local_truncated[..local_branch_pos];
                             let mut ok = true;
                             for &ch in prefix.iter() {
-                                if executor
-                                    .mle_fold_session_step_in_place(&mut f, ch)
-                                    .is_err()
-                                {
+                                if executor.mle_fold_session_step_in_place(&mut f, ch).is_err() {
                                     ok = false;
                                     break;
                                 }
                             }
-                            if ok { Some(f) } else { None }
+                            if ok {
+                                Some(f)
+                            } else {
+                                None
+                            }
                         }
                         Err(_) => None,
                     };
@@ -1393,12 +1399,9 @@ fn eval_round_3way_gpu(
                     if let Some(ref ps) = prefix_session {
                         let suffix = &local_truncated[local_branch_pos + 1..];
                         let branch_values = [
-                            eval_pts[ci][0]
-                                [config.selector_bits + local_offset + local_branch_pos],
-                            eval_pts[ci][1]
-                                [config.selector_bits + local_offset + local_branch_pos],
-                            eval_pts[ci][2]
-                                [config.selector_bits + local_offset + local_branch_pos],
+                            eval_pts[ci][0][config.selector_bits + local_offset + local_branch_pos],
+                            eval_pts[ci][1][config.selector_bits + local_offset + local_branch_pos],
+                            eval_pts[ci][2][config.selector_bits + local_offset + local_branch_pos],
                         ];
 
                         for k in 0..3 {
@@ -1408,10 +1411,7 @@ fn eval_round_3way_gpu(
                             let w_val = match executor.clone_fold_session(ps) {
                                 Ok(mut fork) => {
                                     let step_ok = executor
-                                        .mle_fold_session_step_in_place(
-                                            &mut fork,
-                                            branch_values[k],
-                                        )
+                                        .mle_fold_session_step_in_place(&mut fork, branch_values[k])
                                         .is_ok();
                                     if step_ok {
                                         executor
@@ -1424,15 +1424,15 @@ fn eval_round_3way_gpu(
                                             })
                                     } else {
                                         let mle = source.get_mle(mat_idx);
-                                        let lt_k = &eval_pts[ci][k]
-                                            [config.selector_bits + local_offset..];
+                                        let lt_k =
+                                            &eval_pts[ci][k][config.selector_bits + local_offset..];
                                         evaluate_mle_at(&mle, lt_k)
                                     }
                                 }
                                 Err(_) => {
                                     let mle = source.get_mle(mat_idx);
-                                    let lt_k = &eval_pts[ci][k]
-                                        [config.selector_bits + local_offset..];
+                                    let lt_k =
+                                        &eval_pts[ci][k][config.selector_bits + local_offset..];
                                     evaluate_mle_at(&mle, lt_k)
                                 }
                             };
@@ -1446,8 +1446,7 @@ fn eval_round_3way_gpu(
                             if claim_sel_weights[ci][k] == SecureField::zero() {
                                 continue;
                             }
-                            let lt_k =
-                                &eval_pts[ci][k][config.selector_bits + local_offset..];
+                            let lt_k = &eval_pts[ci][k][config.selector_bits + local_offset..];
                             let w_val = evaluate_mle_at(&mle, lt_k);
                             oracle_accum[ci][k] =
                                 oracle_accum[ci][k] + claim_sel_weights[ci][k] * w_val;
@@ -1667,14 +1666,18 @@ pub fn prove_aggregated_binding_streaming(
         Ok(executor) => {
             eprintln!("[GPU] Using GPU-accelerated aggregated binding sumcheck");
             mismatch_sumcheck_streaming_gpu(
-                claims, source, &claim_n_vars, &config, &betas, channel, &executor,
+                claims,
+                source,
+                &claim_n_vars,
+                &config,
+                &betas,
+                channel,
+                &executor,
             )
         }
         Err(e) => {
             eprintln!("[GPU] Executor init failed ({e:?}), falling back to CPU sumcheck");
-            mismatch_sumcheck_streaming(
-                claims, source, &claim_n_vars, &config, &betas, channel,
-            )
+            mismatch_sumcheck_streaming(claims, source, &claim_n_vars, &config, &betas, channel)
         }
     };
 
@@ -1771,10 +1774,10 @@ pub fn prove_aggregated_binding_streaming(
 ///
 /// # Returns
 /// `true` if verification passes.
-pub fn verify_aggregated_binding(
+pub fn verify_aggregated_binding<C: VerifierChannel>(
     proof: &AggregatedWeightBindingProof,
     claims: &[AggregatedWeightClaim],
-    channel: &mut PoseidonChannel,
+    channel: &mut C,
 ) -> bool {
     if claims.is_empty() {
         return false;
@@ -1865,12 +1868,7 @@ pub fn verify_aggregated_binding(
             let n_vars = claim.local_n_vars;
             let local_truncated = &local[config.n_max - n_vars..];
 
-            if !verify_mle_opening(
-                claim.commitment,
-                &pm_openings[i],
-                local_truncated,
-                channel,
-            ) {
+            if !verify_mle_opening(claim.commitment, &pm_openings[i], local_truncated, channel) {
                 eprintln!("[verify_aggregated_binding] FAIL: per-matrix opening {i} failed (n_vars={n_vars}, commitment={:?})", claim.commitment);
                 return false;
             }
@@ -2527,8 +2525,7 @@ mod tests {
         // Streaming proof (uses SliceWeightSource for backward compat)
         let mut ch2 = PoseidonChannel::new();
         ch2.mix_u64(77);
-        let proof_streaming =
-            prove_aggregated_binding_streaming(&claims, &source, &mut ch2);
+        let proof_streaming = prove_aggregated_binding_streaming(&claims, &source, &mut ch2);
 
         // Field-by-field comparison
         assert_eq!(
@@ -2565,8 +2562,7 @@ mod tests {
 
         let mut ch2 = PoseidonChannel::new();
         ch2.mix_u64(321);
-        let proof_streaming =
-            prove_aggregated_binding_streaming(&claims, &source, &mut ch2);
+        let proof_streaming = prove_aggregated_binding_streaming(&claims, &source, &mut ch2);
 
         assert_eq!(
             proof_direct.sumcheck_round_polys, proof_streaming.sumcheck_round_polys,
@@ -2590,7 +2586,10 @@ mod tests {
         let claims = vec![claim0, claim1, claim2];
 
         let mle_refs: Vec<&[SecureField]> = vec![&mle0, &mle1, &mle2];
-        let mles_u32: Vec<Vec<u32>> = mle_refs.iter().map(|m| securefield_mle_to_u32_aos(m)).collect();
+        let mles_u32: Vec<Vec<u32>> = mle_refs
+            .iter()
+            .map(|m| securefield_mle_to_u32_aos(m))
+            .collect();
         let u32_refs: Vec<&[u32]> = mles_u32.iter().map(|m| m.as_slice()).collect();
         let source = make_slice_source(&mle_refs, &u32_refs);
 
@@ -2655,7 +2654,10 @@ mod tests {
             }
 
             let got = compute_selector_weight(matrix_idx, &selector, &config);
-            assert_eq!(got, expected, "selector weight mismatch at index {matrix_idx}");
+            assert_eq!(
+                got, expected,
+                "selector weight mismatch at index {matrix_idx}"
+            );
         }
     }
 
@@ -2788,7 +2790,10 @@ mod tests {
         let claim_n_vars: Vec<usize> = claims.iter().map(|c| c.local_n_vars).collect();
 
         let mle_refs: Vec<&[SecureField]> = vec![&mle0, &mle1, &mle2];
-        let mles_u32: Vec<Vec<u32>> = mle_refs.iter().map(|m| securefield_mle_to_u32_aos(m)).collect();
+        let mles_u32: Vec<Vec<u32>> = mle_refs
+            .iter()
+            .map(|m| securefield_mle_to_u32_aos(m))
+            .collect();
         let u32_refs: Vec<&[u32]> = mles_u32.iter().map(|m| m.as_slice()).collect();
         let source = make_slice_source(&mle_refs, &u32_refs);
 
@@ -2807,7 +2812,12 @@ mod tests {
 
         // 3. Mismatch sumcheck (CPU)
         let (round_polys, challenge_point) = mismatch_sumcheck_streaming(
-            &claims, &source, &claim_n_vars, &config, &betas, &mut prover_ch,
+            &claims,
+            &source,
+            &claim_n_vars,
+            &config,
+            &betas,
+            &mut prover_ch,
         );
 
         // 4. Per-matrix openings
@@ -2860,15 +2870,15 @@ mod tests {
     fn test_per_matrix_openings_tampered_eval_fails() {
         let mle0 = random_mle(6);
         let mle1 = random_mle(7);
-        let claims: Vec<AggregatedWeightClaim> = vec![
-            make_claim(0, &mle0),
-            make_claim(1, &mle1),
-        ];
+        let claims: Vec<AggregatedWeightClaim> = vec![make_claim(0, &mle0), make_claim(1, &mle1)];
         let config = AggregatedBindingConfig::from_claims(&claims);
         let claim_n_vars: Vec<usize> = claims.iter().map(|c| c.local_n_vars).collect();
 
         let mle_refs: Vec<&[SecureField]> = vec![&mle0, &mle1];
-        let mles_u32: Vec<Vec<u32>> = mle_refs.iter().map(|m| securefield_mle_to_u32_aos(m)).collect();
+        let mles_u32: Vec<Vec<u32>> = mle_refs
+            .iter()
+            .map(|m| securefield_mle_to_u32_aos(m))
+            .collect();
         let u32_refs: Vec<&[u32]> = mles_u32.iter().map(|m| m.as_slice()).collect();
         let source = make_slice_source(&mle_refs, &u32_refs);
 
@@ -2881,7 +2891,12 @@ mod tests {
         prover_ch.mix_felt(super_root.root);
         let betas = draw_beta_weights(&mut prover_ch, claims.len());
         let (round_polys, challenge_point) = mismatch_sumcheck_streaming(
-            &claims, &source, &claim_n_vars, &config, &betas, &mut prover_ch,
+            &claims,
+            &source,
+            &claim_n_vars,
+            &config,
+            &betas,
+            &mut prover_ch,
         );
 
         let selector = &challenge_point[..config.selector_bits];

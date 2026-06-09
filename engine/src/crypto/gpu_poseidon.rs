@@ -50,11 +50,19 @@ impl GpuPoseidonChannel {
         let ptx = cudarc::nvrtc::compile_ptx(kernel_src)
             .map_err(|e| GpuPoseidonError::KernelCompile(format!("{e:?}")))?;
 
-        device.load_ptx(ptx, "poseidon", &["poseidon_permute_kernel", "poseidon_mix_draw_kernel"])
+        device
+            .load_ptx(
+                ptx,
+                "poseidon",
+                &["poseidon_permute_kernel", "poseidon_mix_draw_kernel"],
+            )
             .map_err(|e| GpuPoseidonError::KernelCompile(format!("{e:?}")))?;
 
-        let poseidon_fn = device.get_func("poseidon", "poseidon_permute_kernel")
-            .ok_or_else(|| GpuPoseidonError::KernelCompile("poseidon_permute_kernel not found".into()))?;
+        let poseidon_fn = device
+            .get_func("poseidon", "poseidon_permute_kernel")
+            .ok_or_else(|| {
+                GpuPoseidonError::KernelCompile("poseidon_permute_kernel not found".into())
+            })?;
 
         // Increase GPU thread stack size for deep felt252 arithmetic in Hades
         // Default is 1KB; Poseidon needs large stack for 99 rounds of felt252_mul → felt252_pow7
@@ -70,12 +78,14 @@ impl GpuPoseidonChannel {
 
         // Upload round constants
         let (rc_u32, _n_rounds, _n_per_round) = poseidon_constants::get_round_constants_u32();
-        let d_round_constants = device.htod_sync_copy(&rc_u32)
+        let d_round_constants = device
+            .htod_sync_copy(&rc_u32)
             .map_err(|e| GpuPoseidonError::Memory(format!("upload round constants: {e:?}")))?;
 
         // Upload channel state
         let state_u32 = cpu_channel.to_gpu_state();
-        let d_state = device.htod_sync_copy(&state_u32)
+        let d_state = device
+            .htod_sync_copy(&state_u32)
             .map_err(|e| GpuPoseidonError::Memory(format!("upload state: {e:?}")))?;
 
         Ok(Self {
@@ -93,20 +103,23 @@ impl GpuPoseidonChannel {
     /// Modifies state in-place.
     pub fn permute_gpu(&mut self) -> Result<(), GpuPoseidonError> {
         unsafe {
-            self.poseidon_fn.clone().launch(
-                LaunchConfig {
-                    grid_dim: (1, 1, 1),
-                    block_dim: (1, 1, 1), // Single thread — Poseidon is sequential
-                    shared_mem_bytes: 0,
-                },
-                (
-                    &mut self.d_state,
-                    &self.d_round_constants,
-                    4u32,  // n_full_first (first half of 8 full rounds)
-                    83u32, // n_partial
-                    4u32,  // n_full_last (second half of 8 full rounds)
-                ),
-            ).map_err(|e| GpuPoseidonError::Kernel(format!("permute: {e:?}")))?;
+            self.poseidon_fn
+                .clone()
+                .launch(
+                    LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (1, 1, 1), // Single thread — Poseidon is sequential
+                        shared_mem_bytes: 0,
+                    },
+                    (
+                        &mut self.d_state,
+                        &self.d_round_constants,
+                        4u32,  // n_full_first (first half of 8 full rounds)
+                        83u32, // n_partial
+                        4u32,  // n_full_last (second half of 8 full rounds)
+                    ),
+                )
+                .map_err(|e| GpuPoseidonError::Kernel(format!("permute: {e:?}")))?;
         }
         self.hash_count += 1;
         Ok(())
@@ -138,29 +151,35 @@ impl GpuPoseidonChannel {
         let mut s0 = [0u32; 4];
         let mut s1 = [0u32; 4];
         let mut s2 = [0u32; 4];
-        self.device.dtoh_sync_copy_into(d_s0, &mut s0)
+        self.device
+            .dtoh_sync_copy_into(d_s0, &mut s0)
             .map_err(|e| GpuPoseidonError::Memory(format!("download s0: {e:?}")))?;
-        self.device.dtoh_sync_copy_into(d_s1, &mut s1)
+        self.device
+            .dtoh_sync_copy_into(d_s1, &mut s1)
             .map_err(|e| GpuPoseidonError::Memory(format!("download s1: {e:?}")))?;
-        self.device.dtoh_sync_copy_into(d_s2, &mut s2)
+        self.device
+            .dtoh_sync_copy_into(d_s2, &mut s2)
             .map_err(|e| GpuPoseidonError::Memory(format!("download s2: {e:?}")))?;
 
         // Pack 12 M31 values into felt252 on CPU (fast, <1μs)
         use stwo::core::fields::m31::M31;
-        let m31s: Vec<M31> = [s0, s1, s2].iter()
+        let m31s: Vec<M31> = [s0, s1, s2]
+            .iter()
             .flat_map(|q| q.iter().map(|&v| M31::from(v)))
             .collect();
         let packed = crate::crypto::poseidon_channel::pack_m31s(&m31s);
 
         // Download current digest from GPU state
         let mut state_buf = vec![0u32; 11];
-        self.device.dtoh_sync_copy_into(&self.d_state, &mut state_buf)
+        self.device
+            .dtoh_sync_copy_into(&self.d_state, &mut state_buf)
             .map_err(|e| GpuPoseidonError::Memory(format!("download state: {e:?}")))?;
 
         // Build mix permutation state: [digest, packed, 2]
         let digest_words = &state_buf[0..8];
         let packed_words = crate::crypto::poseidon_constants::felt_to_u32(&packed);
-        let two_words = crate::crypto::poseidon_constants::felt_to_u32(&starknet_ff::FieldElement::TWO);
+        let two_words =
+            crate::crypto::poseidon_constants::felt_to_u32(&starknet_ff::FieldElement::TWO);
 
         let mut perm_state = vec![0u32; 24]; // 3 × 8 u32
         perm_state[0..8].copy_from_slice(digest_words);
@@ -168,25 +187,36 @@ impl GpuPoseidonChannel {
         perm_state[16..24].copy_from_slice(&two_words);
 
         // Upload and permute on GPU
-        let mut d_perm = self.device.htod_sync_copy(&perm_state)
+        let mut d_perm = self
+            .device
+            .htod_sync_copy(&perm_state)
             .map_err(|e| GpuPoseidonError::Memory(format!("upload mix state: {e:?}")))?;
 
         unsafe {
-            self.poseidon_fn.clone().launch(
-                LaunchConfig { grid_dim: (1,1,1), block_dim: (1,1,1), shared_mem_bytes: 0 },
-                (&mut d_perm, &self.d_round_constants, 4u32, 83u32, 4u32),
-            ).map_err(|e| GpuPoseidonError::Kernel(format!("mix permute: {e:?}")))?;
+            self.poseidon_fn
+                .clone()
+                .launch(
+                    LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (1, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    (&mut d_perm, &self.d_round_constants, 4u32, 83u32, 4u32),
+                )
+                .map_err(|e| GpuPoseidonError::Kernel(format!("mix permute: {e:?}")))?;
         }
 
         // Download new digest (first 8 u32 of permuted state)
         let mut perm_result = vec![0u32; 24];
-        self.device.dtoh_sync_copy_into(&d_perm, &mut perm_result)
+        self.device
+            .dtoh_sync_copy_into(&d_perm, &mut perm_result)
             .map_err(|e| GpuPoseidonError::Memory(format!("download mix result: {e:?}")))?;
         let new_digest = &perm_result[0..8];
 
         // Step 2: DRAW — [new_digest, n_draws, 3] → permute → extract QM31
         let n_draws = 0u32; // reset after mix
-        let three_words = crate::crypto::poseidon_constants::felt_to_u32(&starknet_ff::FieldElement::THREE);
+        let three_words =
+            crate::crypto::poseidon_constants::felt_to_u32(&starknet_ff::FieldElement::THREE);
         let mut draw_ndraws = [0u32; 8];
         draw_ndraws[0] = n_draws;
 
@@ -195,19 +225,29 @@ impl GpuPoseidonChannel {
         draw_state[8..16].copy_from_slice(&draw_ndraws);
         draw_state[16..24].copy_from_slice(&three_words);
 
-        let mut d_draw = self.device.htod_sync_copy(&draw_state)
+        let mut d_draw = self
+            .device
+            .htod_sync_copy(&draw_state)
             .map_err(|e| GpuPoseidonError::Memory(format!("upload draw state: {e:?}")))?;
 
         unsafe {
-            self.poseidon_fn.clone().launch(
-                LaunchConfig { grid_dim: (1,1,1), block_dim: (1,1,1), shared_mem_bytes: 0 },
-                (&mut d_draw, &self.d_round_constants, 4u32, 83u32, 4u32),
-            ).map_err(|e| GpuPoseidonError::Kernel(format!("draw permute: {e:?}")))?;
+            self.poseidon_fn
+                .clone()
+                .launch(
+                    LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (1, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    (&mut d_draw, &self.d_round_constants, 4u32, 83u32, 4u32),
+                )
+                .map_err(|e| GpuPoseidonError::Kernel(format!("draw permute: {e:?}")))?;
         }
 
         // Download drawn state and extract QM31
         let mut draw_result = vec![0u32; 24];
-        self.device.dtoh_sync_copy_into(&d_draw, &mut draw_result)
+        self.device
+            .dtoh_sync_copy_into(&d_draw, &mut draw_result)
             .map_err(|e| GpuPoseidonError::Memory(format!("download draw result: {e:?}")))?;
 
         // Extract 4 M31 values from state[0] (first 8 u32 = felt252)
@@ -222,7 +262,8 @@ impl GpuPoseidonChannel {
                 bytes[offset + 2] = (word >> 8) as u8;
                 bytes[offset + 3] = word as u8;
             }
-            starknet_ff::FieldElement::from_bytes_be(&bytes).unwrap_or(starknet_ff::FieldElement::ZERO)
+            starknet_ff::FieldElement::from_bytes_be(&bytes)
+                .unwrap_or(starknet_ff::FieldElement::ZERO)
         };
 
         // Extract 4 M31 values (same logic as CPU draw_qm31)
@@ -230,7 +271,9 @@ impl GpuPoseidonChannel {
         let challenge_u32: Vec<u32> = m31_values.iter().map(|m| m.0).collect();
 
         // Upload challenge to GPU
-        let d_challenge = self.device.htod_sync_copy(&challenge_u32)
+        let d_challenge = self
+            .device
+            .htod_sync_copy(&challenge_u32)
             .map_err(|e| GpuPoseidonError::Memory(format!("upload challenge: {e:?}")))?;
 
         // Update GPU state: new digest + n_draws=1
@@ -239,7 +282,9 @@ impl GpuPoseidonChannel {
         new_state[8] = 1; // n_draws after 1 draw
         new_state[9] = 0;
         new_state[10] = 0;
-        self.d_state = self.device.htod_sync_copy(&new_state)
+        self.d_state = self
+            .device
+            .htod_sync_copy(&new_state)
             .map_err(|e| GpuPoseidonError::Memory(format!("upload new state: {e:?}")))?;
 
         self.hash_count += 2;
@@ -249,7 +294,8 @@ impl GpuPoseidonChannel {
     /// Download GPU state back to CPU channel.
     pub fn into_cpu(self) -> Result<PoseidonChannel, GpuPoseidonError> {
         let mut state_u32 = vec![0u32; 11];
-        self.device.dtoh_sync_copy_into(&self.d_state, &mut state_u32)
+        self.device
+            .dtoh_sync_copy_into(&self.d_state, &mut state_u32)
             .map_err(|e| GpuPoseidonError::Memory(format!("download state: {e:?}")))?;
 
         Ok(PoseidonChannel::from_gpu_state(&state_u32, self.hash_count))

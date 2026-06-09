@@ -4,8 +4,8 @@
 //! All tests run on SimdBackend by default; `cuda-runtime` tests
 //! exercise real GPU acceleration.
 
-use stwo::core::fields::m31::M31;
 use obelyzk::prelude::*;
+use stwo::core::fields::m31::M31;
 
 use obelyzk::aggregation::compute_io_commitment;
 use obelyzk::aggregation::{

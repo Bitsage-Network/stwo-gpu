@@ -1,13 +1,18 @@
 //! # Recursive STARK Composition (Phase 4A)
 //!
-//! Compresses the GKR proof (~112K felts, 18 TXs) into a constant-size STARK
-//! proof (~500 felts, 1 TX) by proving "I verified the GKR proof and it passed."
+//! Target architecture: compress the GKR proof into a constant-size STARK proof
+//! by proving "I verified the GKR proof and it passed."
+//!
+//! Current production guardrail: recursive proving refuses to emit this proof
+//! unless the instrumented witness reaches the same final Fiat-Shamir digest as
+//! the production verifier. This prevents partial verifier traces from being
+//! marketed or deployed as full STARK-in-STARK recursion.
 //!
 //! ## Architecture
 //!
 //! ```text
 //! prove_model()          →  GKR Proof (112K felts)
-//! generate_witness()     →  Verifier execution trace (every Poseidon call + QM31 op)
+//! generate_witness()     →  Verifier execution trace
 //! prove_recursive()      →  STARK proof (~500 felts)
 //! verify_recursive()     →  accept/reject (Rust pre-flight)
 //! On-chain (1 TX)        →  stwo-cairo-verifier verifies the STARK
@@ -15,10 +20,9 @@
 //!
 //! ## Key Design Principle
 //!
-//! The GKR verifier is refactored into a generic function parameterized over the
-//! channel type. Both production verification (`PoseidonChannel`) and witness
-//! generation (`InstrumentedChannel`) call the same code path, guaranteeing
-//! Fiat-Shamir transcript consistency.
+//! The next required refactor is to make the GKR verifier generic over the
+//! channel type so production verification (`PoseidonChannel`) and witness
+//! generation (`InstrumentedChannel`) call the same code path.
 //!
 //! ## See Also
 //!
@@ -43,10 +47,11 @@ pub use air::{
 };
 pub use prover::{
     export_hades_pairs_cairo_args, prove_recursive, prove_recursive_with_policy,
+    prove_recursive_with_policy_and_io_felt, prove_recursive_with_policy_io_and_statement,
     verify_hades_perms_offline, RecursiveError,
 };
 pub use types::{GkrVerifierWitness, RecursiveProof, RecursivePublicInputs, WitnessOp};
-pub use verifier::verify_recursive;
+pub use verifier::{verify_recursive, verify_recursive_with_io_felt};
 pub use witness::{generate_witness, InstrumentedChannel};
 
 // ── Test-only PcsConfig downgrade ────────────────────────────────────────────

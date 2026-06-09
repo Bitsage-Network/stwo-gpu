@@ -13,24 +13,20 @@
 /// This eliminates Stage 2 (46.8s Cairo VM execution) entirely.
 
 use core::num::traits::Zero;
-use stwo_verifier_core::verifier::Air;
+use stwo_constraint_framework::{LookupElements, LookupElementsTrait};
+use stwo_verifier_core::channel::{Channel, ChannelTrait};
 use stwo_verifier_core::circle::CirclePoint;
 use stwo_verifier_core::fields::Invertible;
 use stwo_verifier_core::fields::m31::m31;
 use stwo_verifier_core::fields::qm31::{QM31, QM31Serde, QM31Trait};
-use stwo_verifier_core::poly::circle::{CanonicCosetImpl, CanonicCosetTrait};
-use stwo_verifier_core::utils::pow2;
-use stwo_verifier_core::{ColumnSpan, TreeSpan};
-use stwo_verifier_core::channel::{Channel, ChannelTrait};
-use stwo_verifier_core::verifier::verify;
-use stwo_verifier_core::pcs::PcsConfig;
-use stwo_verifier_core::pcs::PcsConfigTrait;
 use stwo_verifier_core::pcs::verifier::{
     CommitmentSchemeVerifierImpl, CommitmentSchemeVerifierTrait, get_trace_lde_log_size,
 };
-use stwo_verifier_core::Hash;
-use stwo_verifier_core::verifier::StarkProof;
-use stwo_constraint_framework::{LookupElements, LookupElementsTrait};
+use stwo_verifier_core::pcs::{PcsConfig, PcsConfigTrait};
+use stwo_verifier_core::poly::circle::{CanonicCosetImpl, CanonicCosetTrait};
+use stwo_verifier_core::utils::pow2;
+use stwo_verifier_core::verifier::{Air, StarkProof, verify};
+use stwo_verifier_core::{ColumnSpan, Hash, TreeSpan};
 
 // ============================================================================
 // Claim Types
@@ -164,11 +160,17 @@ pub type EmbeddingLookupElements = LookupElements<3>;
 // ============================================================================
 
 fn dummy_lookup_elements_2() -> LookupElements<2> {
-    LookupElements { z: Zero::zero(), alpha: Zero::zero(), alpha_powers: array![Zero::zero(), Zero::zero()] }
+    LookupElements {
+        z: Zero::zero(), alpha: Zero::zero(), alpha_powers: array![Zero::zero(), Zero::zero()],
+    }
 }
 
 fn dummy_lookup_elements_3() -> LookupElements<3> {
-    LookupElements { z: Zero::zero(), alpha: Zero::zero(), alpha_powers: array![Zero::zero(), Zero::zero(), Zero::zero()] }
+    LookupElements {
+        z: Zero::zero(),
+        alpha: Zero::zero(),
+        alpha_powers: array![Zero::zero(), Zero::zero(), Zero::zero()],
+    }
 }
 
 // ============================================================================
@@ -228,8 +230,10 @@ pub fn evaluate_activation_constraints_at_point(
     let column_size = m31(pow2(log_size));
 
     // Pop 3 trace columns: [input, output, multiplicity]
-    let [col_input, col_output, col_mult]: [Span<QM31>; 3] =
-        (*trace_mask_values.multi_pop_front().unwrap()).unbox();
+    let [col_input, col_output, col_mult]: [Span<QM31>; 3] = (*trace_mask_values
+        .multi_pop_front()
+        .unwrap())
+        .unbox();
     let [input_val]: [QM31; 1] = (*col_input.try_into().unwrap()).unbox();
     let [output_val]: [QM31; 1] = (*col_output.try_into().unwrap()).unbox();
     let [mult_val]: [QM31; 1] = (*col_mult.try_into().unwrap()).unbox();
@@ -239,8 +243,10 @@ pub fn evaluate_activation_constraints_at_point(
     let denom = component.lookup_elements.combine_qm31([type_tag, input_val, output_val]);
 
     // Pop 4 interaction trace columns (LogUp cumulative sum as QM31 partial evals)
-    let [t2c0, t2c1, t2c2, t2c3]: [Span<QM31>; 4] =
-        (*interaction_trace_mask_values.multi_pop_front().unwrap()).unbox();
+    let [t2c0, t2c1, t2c2, t2c3]: [Span<QM31>; 4] = (*interaction_trace_mask_values
+        .multi_pop_front()
+        .unwrap())
+        .unbox();
     let [t2c0_prev, t2c0_curr]: [QM31; 2] = (*t2c0.try_into().unwrap()).unbox();
     let [t2c1_prev, t2c1_curr]: [QM31; 2] = (*t2c1.try_into().unwrap()).unbox();
     let [t2c2_prev, t2c2_curr]: [QM31; 2] = (*t2c2.try_into().unwrap()).unbox();
@@ -271,8 +277,10 @@ pub fn evaluate_add_constraints_at_point(
     let trace_domain = CanonicCosetImpl::new(log_size);
     let domain_vanishing_eval_inv = trace_domain.eval_vanishing(point).inverse();
 
-    let [col_lhs, col_rhs, col_output]: [Span<QM31>; 3] =
-        (*trace_mask_values.multi_pop_front().unwrap()).unbox();
+    let [col_lhs, col_rhs, col_output]: [Span<QM31>; 3] = (*trace_mask_values
+        .multi_pop_front()
+        .unwrap())
+        .unbox();
     let [lhs]: [QM31; 1] = (*col_lhs.try_into().unwrap()).unbox();
     let [rhs]: [QM31; 1] = (*col_rhs.try_into().unwrap()).unbox();
     let [output]: [QM31; 1] = (*col_output.try_into().unwrap()).unbox();
@@ -294,8 +302,10 @@ pub fn evaluate_mul_constraints_at_point(
     let trace_domain = CanonicCosetImpl::new(log_size);
     let domain_vanishing_eval_inv = trace_domain.eval_vanishing(point).inverse();
 
-    let [col_lhs, col_rhs, col_output]: [Span<QM31>; 3] =
-        (*trace_mask_values.multi_pop_front().unwrap()).unbox();
+    let [col_lhs, col_rhs, col_output]: [Span<QM31>; 3] = (*trace_mask_values
+        .multi_pop_front()
+        .unwrap())
+        .unbox();
     let [lhs]: [QM31; 1] = (*col_lhs.try_into().unwrap()).unbox();
     let [rhs]: [QM31; 1] = (*col_rhs.try_into().unwrap()).unbox();
     let [output]: [QM31; 1] = (*col_output.try_into().unwrap()).unbox();
@@ -325,7 +335,10 @@ pub fn evaluate_layernorm_constraints_at_point(
 
     // Pop 6 trace columns: [input, mean, variance, rsqrt_val, output, multiplicity]
     let [col_input, col_mean, col_variance, col_rsqrt, col_output, col_mult]: [Span<QM31>; 6] =
-        (*trace_mask_values.multi_pop_front().unwrap()).unbox();
+        (*trace_mask_values
+        .multi_pop_front()
+        .unwrap())
+        .unbox();
     let [input_val]: [QM31; 1] = (*col_input.try_into().unwrap()).unbox();
     let [mean_val]: [QM31; 1] = (*col_mean.try_into().unwrap()).unbox();
     let [variance_val]: [QM31; 1] = (*col_variance.try_into().unwrap()).unbox();
@@ -342,8 +355,10 @@ pub fn evaluate_layernorm_constraints_at_point(
     let denom = component.lookup_elements.combine_qm31([variance_val, rsqrt_val]);
 
     // Pop 4 interaction trace columns
-    let [t2c0, t2c1, t2c2, t2c3]: [Span<QM31>; 4] =
-        (*interaction_trace_mask_values.multi_pop_front().unwrap()).unbox();
+    let [t2c0, t2c1, t2c2, t2c3]: [Span<QM31>; 4] = (*interaction_trace_mask_values
+        .multi_pop_front()
+        .unwrap())
+        .unbox();
     let [t2c0_prev, t2c0_curr]: [QM31; 2] = (*t2c0.try_into().unwrap()).unbox();
     let [t2c1_prev, t2c1_curr]: [QM31; 2] = (*t2c1.try_into().unwrap()).unbox();
     let [t2c2_prev, t2c2_curr]: [QM31; 2] = (*t2c2.try_into().unwrap()).unbox();
@@ -380,8 +395,10 @@ pub fn evaluate_embedding_constraints_at_point(
     let column_size = m31(pow2(log_size));
 
     // Pop 4 trace columns: [trace_token, trace_col, trace_value, multiplicity]
-    let [col_token, col_col, col_value, col_mult]: [Span<QM31>; 4] =
-        (*trace_mask_values.multi_pop_front().unwrap()).unbox();
+    let [col_token, col_col, col_value, col_mult]: [Span<QM31>; 4] = (*trace_mask_values
+        .multi_pop_front()
+        .unwrap())
+        .unbox();
     let [token_val]: [QM31; 1] = (*col_token.try_into().unwrap()).unbox();
     let [col_val]: [QM31; 1] = (*col_col.try_into().unwrap()).unbox();
     let [value_val]: [QM31; 1] = (*col_value.try_into().unwrap()).unbox();
@@ -391,8 +408,10 @@ pub fn evaluate_embedding_constraints_at_point(
     let denom = component.lookup_elements.combine_qm31([token_val, col_val, value_val]);
 
     // Pop 4 interaction trace columns
-    let [t2c0, t2c1, t2c2, t2c3]: [Span<QM31>; 4] =
-        (*interaction_trace_mask_values.multi_pop_front().unwrap()).unbox();
+    let [t2c0, t2c1, t2c2, t2c3]: [Span<QM31>; 4] = (*interaction_trace_mask_values
+        .multi_pop_front()
+        .unwrap())
+        .unbox();
     let [t2c0_prev, t2c0_curr]: [QM31; 2] = (*t2c0.try_into().unwrap()).unbox();
     let [t2c1_prev, t2c1_curr]: [QM31; 2] = (*t2c1.try_into().unwrap()).unbox();
     let [t2c2_prev, t2c2_curr]: [QM31; 2] = (*t2c2.try_into().unwrap()).unbox();
@@ -423,15 +442,9 @@ pub fn evaluate_embedding_constraints_at_point(
 ///   Tree 0 (preprocessed): activation tables → layernorm tables → embedding tables
 ///   Tree 1 (trace): activation → add → mul → layernorm → embedding
 ///   Tree 2 (interaction): activation logup → layernorm logup → embedding logup
-pub fn compute_activation_log_sizes(
-    activation_claims: Span<ActivationClaim>,
-) -> Array<Array<u32>> {
+pub fn compute_activation_log_sizes(activation_claims: Span<ActivationClaim>) -> Array<Array<u32>> {
     compute_unified_log_sizes(
-        activation_claims,
-        array![].span(),
-        array![].span(),
-        array![].span(),
-        array![].span(),
+        activation_claims, array![].span(), array![].span(), array![].span(), array![].span(),
     )
 }
 
@@ -454,7 +467,7 @@ pub fn compute_unified_log_sizes(
         preprocessed_sizes.append(ls);
         preprocessed_sizes.append(ls);
         i += 1;
-    };
+    }
     // LayerNorm: 2 columns per layer
     i = 0;
     while i < layernorm_claims.len() {
@@ -462,7 +475,7 @@ pub fn compute_unified_log_sizes(
         preprocessed_sizes.append(ls);
         preprocessed_sizes.append(ls);
         i += 1;
-    };
+    }
     // Embedding: 3 columns per layer
     i = 0;
     while i < embedding_claims.len() {
@@ -471,7 +484,7 @@ pub fn compute_unified_log_sizes(
         preprocessed_sizes.append(ls);
         preprocessed_sizes.append(ls);
         i += 1;
-    };
+    }
 
     // --- Tree 1 (trace) ---
     // Activation: 3 columns per layer
@@ -482,7 +495,7 @@ pub fn compute_unified_log_sizes(
         trace_sizes.append(ls);
         trace_sizes.append(ls);
         i += 1;
-    };
+    }
     // Add: 3 columns per layer
     i = 0;
     while i < add_claims.len() {
@@ -491,7 +504,7 @@ pub fn compute_unified_log_sizes(
         trace_sizes.append(ls);
         trace_sizes.append(ls);
         i += 1;
-    };
+    }
     // Mul: 3 columns per layer
     i = 0;
     while i < mul_claims.len() {
@@ -500,7 +513,7 @@ pub fn compute_unified_log_sizes(
         trace_sizes.append(ls);
         trace_sizes.append(ls);
         i += 1;
-    };
+    }
     // LayerNorm: 6 columns per layer
     i = 0;
     while i < layernorm_claims.len() {
@@ -509,9 +522,9 @@ pub fn compute_unified_log_sizes(
         while c < N_LAYERNORM_TRACE_COLUMNS {
             trace_sizes.append(ls);
             c += 1;
-        };
+        }
         i += 1;
-    };
+    }
     // Embedding: 4 columns per layer
     i = 0;
     while i < embedding_claims.len() {
@@ -520,9 +533,9 @@ pub fn compute_unified_log_sizes(
         while c < N_EMBEDDING_TRACE_COLUMNS {
             trace_sizes.append(ls);
             c += 1;
-        };
+        }
         i += 1;
-    };
+    }
 
     // --- Tree 2 (interaction) ---
     // Activation: 4 QM31 partial eval columns per layer
@@ -534,7 +547,7 @@ pub fn compute_unified_log_sizes(
         interaction_sizes.append(ls);
         interaction_sizes.append(ls);
         i += 1;
-    };
+    }
     // LayerNorm: 4 QM31 partial eval columns per layer
     i = 0;
     while i < layernorm_claims.len() {
@@ -544,7 +557,7 @@ pub fn compute_unified_log_sizes(
         interaction_sizes.append(ls);
         interaction_sizes.append(ls);
         i += 1;
-    };
+    }
     // Embedding: 4 QM31 partial eval columns per layer
     i = 0;
     while i < embedding_claims.len() {
@@ -554,7 +567,7 @@ pub fn compute_unified_log_sizes(
         interaction_sizes.append(ls);
         interaction_sizes.append(ls);
         i += 1;
-    };
+    }
 
     array![preprocessed_sizes, trace_sizes, interaction_sizes]
 }
@@ -606,21 +619,21 @@ pub impl MLAirNewImpl of MLAirNewTrait {
                     },
                 );
             i += 1;
-        };
+        }
 
         let mut add_components: Array<ElementwiseAddComponent> = array![];
         i = 0;
         while i < add_claims.len() {
             add_components.append(ElementwiseAddComponent { claim: *add_claims.at(i) });
             i += 1;
-        };
+        }
 
         let mut mul_components: Array<ElementwiseMulComponent> = array![];
         i = 0;
         while i < mul_claims.len() {
             mul_components.append(ElementwiseMulComponent { claim: *mul_claims.at(i) });
             i += 1;
-        };
+        }
 
         let mut layernorm_components: Array<LayerNormComponent> = array![];
         i = 0;
@@ -634,7 +647,7 @@ pub impl MLAirNewImpl of MLAirNewTrait {
                     },
                 );
             i += 1;
-        };
+        }
 
         let mut embedding_components: Array<EmbeddingComponent> = array![];
         i = 0;
@@ -647,7 +660,7 @@ pub impl MLAirNewImpl of MLAirNewTrait {
                     },
                 );
             i += 1;
-        };
+        }
 
         MLAir {
             claim: *claim,
@@ -682,7 +695,10 @@ pub impl MLAirAirImpl of Air<MLAir> {
             mut interaction_trace_mask_values,
             _composition_trace_mask_values,
         ]: [ColumnSpan<Span<QM31>>; 4] =
-            (*mask_values.try_into().unwrap()).unbox();
+            (*mask_values
+            .try_into()
+            .unwrap())
+            .unbox();
 
         // 1. Evaluate activation constraints (LogUp)
         let mut idx: u32 = 0;
@@ -696,33 +712,25 @@ pub impl MLAirAirImpl of Air<MLAir> {
                 point,
             );
             idx += 1;
-        };
+        }
 
         // 2. Evaluate Add constraints (pure AIR)
         idx = 0;
         while idx < self.add_components.len() {
             evaluate_add_constraints_at_point(
-                self.add_components.at(idx),
-                ref sum,
-                ref trace_mask_values,
-                random_coeff,
-                point,
+                self.add_components.at(idx), ref sum, ref trace_mask_values, random_coeff, point,
             );
             idx += 1;
-        };
+        }
 
         // 3. Evaluate Mul constraints (pure AIR)
         idx = 0;
         while idx < self.mul_components.len() {
             evaluate_mul_constraints_at_point(
-                self.mul_components.at(idx),
-                ref sum,
-                ref trace_mask_values,
-                random_coeff,
-                point,
+                self.mul_components.at(idx), ref sum, ref trace_mask_values, random_coeff, point,
             );
             idx += 1;
-        };
+        }
 
         // 4. Evaluate LayerNorm constraints (algebraic + LogUp)
         idx = 0;
@@ -736,7 +744,7 @@ pub impl MLAirAirImpl of Air<MLAir> {
                 point,
             );
             idx += 1;
-        };
+        }
 
         // 5. Evaluate Embedding constraints (LogUp)
         idx = 0;
@@ -752,7 +760,7 @@ pub impl MLAirAirImpl of Air<MLAir> {
                 emb_claimed_sum,
             );
             idx += 1;
-        };
+        }
 
         sum
     }
@@ -785,11 +793,7 @@ const INTERACTION_POW_BITS: u32 = 0;
 /// Follows the 13-step pattern from verify_cairo, extended for all component types.
 /// Draws interaction elements in Rust prover order:
 ///   activation (N=3) → layernorm (N=2) → embedding (N=3)
-pub fn verify_unified_stark(
-    ref channel: Channel,
-    claim: @MLClaim,
-    proof: UnifiedStarkProof,
-) {
+pub fn verify_unified_stark(ref channel: Channel, claim: @MLClaim, proof: UnifiedStarkProof) {
     let UnifiedStarkProof {
         activation_claims,
         activation_interaction_claims,
@@ -822,7 +826,9 @@ pub fn verify_unified_stark(
         trace_commitment,
         interaction_trace_commitment,
         composition_commitment,
-    ] = commitments.unbox();
+    ] =
+        commitments
+        .unbox();
 
     // Step 4: Compute log_sizes per tree (all component types)
     let log_sizes_arr = compute_unified_log_sizes(
@@ -839,21 +845,12 @@ pub fn verify_unified_stark(
     let log_blowup_factor = pcs_config.fri_config.log_blowup_factor;
 
     // Step 5: Commit preprocessed trace
-    commitment_scheme.commit(
-        preprocessed_commitment,
-        preprocessed_log_sizes,
-        ref channel,
-        log_blowup_factor,
-    );
+    commitment_scheme
+        .commit(preprocessed_commitment, preprocessed_log_sizes, ref channel, log_blowup_factor);
     mix_ml_claim_into_channel(claim, ref channel);
 
     // Step 6: Commit trace
-    commitment_scheme.commit(
-        trace_commitment,
-        trace_log_sizes,
-        ref channel,
-        log_blowup_factor,
-    );
+    commitment_scheme.commit(trace_commitment, trace_log_sizes, ref channel, log_blowup_factor);
 
     // Step 7: Verify interaction proof-of-work
     assert!(
@@ -890,10 +887,7 @@ pub fn verify_unified_stark(
     };
 
     // Step 9: Verify LogUp sum — total across all LogUp components must be zero
-    assert!(
-        interaction_claim.activation_claimed_sum.is_zero(),
-        "Invalid LogUp sum: must be zero",
-    );
+    assert!(interaction_claim.activation_claimed_sum.is_zero(), "Invalid LogUp sum: must be zero");
 
     // Step 10: Mix interaction claim into channel
     mix_interaction_claim_into_channel(@interaction_claim, ref channel);
@@ -901,12 +895,13 @@ pub fn verify_unified_stark(
     // Step 11: Commit interaction trace — only when LogUp components exist.
     // Matches Rust verifier: `if has_logup { commitment_scheme.commit(proof.commitments[2], ...) }`
     if has_logup {
-        commitment_scheme.commit(
-            interaction_trace_commitment,
-            interaction_trace_log_sizes,
-            ref channel,
-            log_blowup_factor,
-        );
+        commitment_scheme
+            .commit(
+                interaction_trace_commitment,
+                interaction_trace_log_sizes,
+                ref channel,
+                log_blowup_factor,
+            );
     }
 
     // Step 12: Construct MLAir with ALL component types
@@ -922,7 +917,7 @@ pub fn verify_unified_stark(
     while eidx < embedding_claims.len() {
         embedding_claimed_sums.append(Zero::zero());
         eidx += 1;
-    };
+    }
 
     let ml_air = MLAirNewImpl::new(
         claim,
@@ -942,21 +937,12 @@ pub fn verify_unified_stark(
 
     // Step 13: Call generic STARK verify
     verify(
-        ml_air,
-        ref channel,
-        stark_proof,
-        commitment_scheme,
-        SECURITY_BITS,
-        composition_commitment,
+        ml_air, ref channel, stark_proof, commitment_scheme, SECURITY_BITS, composition_commitment,
     );
 }
 
 /// Backward-compatible wrapper: verify activation-only STARK proof.
 /// Kept for existing tests that use the old ActivationStarkProof name.
-pub fn verify_activation_stark(
-    ref channel: Channel,
-    claim: @MLClaim,
-    proof: UnifiedStarkProof,
-) {
+pub fn verify_activation_stark(ref channel: Channel, claim: @MLClaim, proof: UnifiedStarkProof) {
     verify_unified_stark(ref channel, claim, proof);
 }

@@ -84,13 +84,21 @@ pub fn encode_transaction(tx: &TransactionFeatures) -> M31Matrix {
     idx += 1;
     input.set(0, idx, M31::from(tx.target_flags.has_source as u32));
     idx += 1;
-    input.set(0, idx, M31::from(tx.target_flags.interaction_count.min(0x7FFF_FFFF)));
+    input.set(
+        0,
+        idx,
+        M31::from(tx.target_flags.interaction_count.min(0x7FFF_FFFF)),
+    );
     idx += 1;
 
     // Features 33-36: Value features
     input.set(0, idx, M31::from(tx.value_features.log2_value));
     idx += 1;
-    input.set(0, idx, M31::from(tx.value_features.value_balance_ratio.min(100_000)));
+    input.set(
+        0,
+        idx,
+        M31::from(tx.value_features.value_balance_ratio.min(100_000)),
+    );
     idx += 1;
     input.set(0, idx, M31::from(tx.value_features.is_max_approval as u32));
     idx += 1;
@@ -108,9 +116,17 @@ pub fn encode_transaction(tx: &TransactionFeatures) -> M31Matrix {
     idx += 1;
 
     // Features 41-44: Behavioral features
-    input.set(0, idx, M31::from(tx.behavioral.tx_frequency.min(0x7FFF_FFFF)));
+    input.set(
+        0,
+        idx,
+        M31::from(tx.behavioral.tx_frequency.min(0x7FFF_FFFF)),
+    );
     idx += 1;
-    input.set(0, idx, M31::from(tx.behavioral.unique_targets_24h.min(0x7FFF_FFFF)));
+    input.set(
+        0,
+        idx,
+        M31::from(tx.behavioral.unique_targets_24h.min(0x7FFF_FFFF)),
+    );
     idx += 1;
     input.set(0, idx, M31::from(tx.behavioral.avg_value_24h & 0x7FFF_FFFF));
     idx += 1;
@@ -192,7 +208,11 @@ mod tests {
         let encoded = encode_transaction(&tx);
         // Features 48-63 should be zero (padding)
         for i in NUM_FEATURES..INPUT_DIM {
-            assert_eq!(encoded.data[i], M31::from(0u32), "padding at index {i} should be zero");
+            assert_eq!(
+                encoded.data[i],
+                M31::from(0u32),
+                "padding at index {i} should be zero"
+            );
         }
     }
 

@@ -256,10 +256,7 @@ pub fn compute_io_commitment(input: &M31Matrix, output: &M31Matrix) -> FieldElem
 /// Each input/output pair gets its own IO commitment, then all are hashed
 /// together with the batch size. This allows per-input verification while
 /// binding the entire batch.
-pub fn compute_batch_io_commitment(
-    inputs: &[M31Matrix],
-    outputs: &[M31Matrix],
-) -> FieldElement {
+pub fn compute_batch_io_commitment(inputs: &[M31Matrix], outputs: &[M31Matrix]) -> FieldElement {
     assert_eq!(inputs.len(), outputs.len(), "batch size mismatch");
     let mut hash_inputs = Vec::with_capacity(1 + inputs.len());
     hash_inputs.push(FieldElement::from(inputs.len() as u64));
@@ -348,10 +345,7 @@ impl IncrementalKVCommitment {
                 let leaf = Self::hash_kv_position_from_cache(cache, pos);
                 tree.push(leaf);
             }
-            layers.insert(
-                layer_id,
-                IncrementalLayerKVCommitment { tree },
-            );
+            layers.insert(layer_id, IncrementalLayerKVCommitment { tree });
         }
         Self { layers }
     }
@@ -404,21 +398,15 @@ impl IncrementalKVCommitment {
         cache: &crate::components::attention::KVCache,
         pos: usize,
     ) -> FieldElement {
-        let mut leaf_inputs = Vec::with_capacity(
-            2 + cache.num_kv_heads * cache.d_k * 2,
-        );
+        let mut leaf_inputs = Vec::with_capacity(2 + cache.num_kv_heads * cache.d_k * 2);
         leaf_inputs.push(FieldElement::from(0x4B56_u64));
         leaf_inputs.push(FieldElement::from(pos as u64));
         for h in 0..cache.num_kv_heads {
             for col in 0..cache.d_k {
-                leaf_inputs.push(FieldElement::from(
-                    cache.k_cache[h].get(pos, col).0 as u64,
-                ));
+                leaf_inputs.push(FieldElement::from(cache.k_cache[h].get(pos, col).0 as u64));
             }
             for col in 0..cache.d_k {
-                leaf_inputs.push(FieldElement::from(
-                    cache.v_cache[h].get(pos, col).0 as u64,
-                ));
+                leaf_inputs.push(FieldElement::from(cache.v_cache[h].get(pos, col).0 as u64));
             }
         }
         starknet_crypto::poseidon_hash_many(&leaf_inputs)
@@ -1654,184 +1642,255 @@ where
     // Compute all 8 trace types concurrently using rayon::join tree.
     // tree_builder.extend_evals() must be called in the original column
     // order, so we collect results first and extend sequentially.
-    type SimdEvals = Vec<CircleEvaluation<SimdBackend, BaseField, stwo::prover::poly::BitReversedOrder>>;
+    type SimdEvals =
+        Vec<CircleEvaluation<SimdBackend, BaseField, stwo::prover::poly::BitReversedOrder>>;
 
     let (
         ((act_result, add_result), (mul_result, ln_result)),
         ((rms_result, emb_result), (q_result, dq_result)),
     ) = rayon::join(
-        || rayon::join(
-            || rayon::join(
-                // 1. Activation traces
-                || -> (Vec<SimdEvals>, Vec<Vec<M31>>) {
-                    let mut evals_all = Vec::with_capacity(activation_layers.len());
-                    let mut mults_all = Vec::with_capacity(activation_layers.len());
-                    for layer in &activation_layers {
-                        let layer_size = 1usize << layer.log_size;
-                        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-                        let pad_input = layer.table.inputs[0];
-                        let pad_output = layer.table.outputs[0];
-                        let padding_count = layer_size.saturating_sub(layer.inputs.len());
-                        let mut mults = compute_multiplicities(&layer.inputs, &layer.table);
-                        if padding_count > 0 {
-                            mults[0] += M31::from(padding_count as u32);
-                        }
-                        let (trace_in, trace_out, mult_col) = build_trace_columns::<SimdBackend>(
-                            &layer.inputs, &layer.outputs, &mults, pad_input, pad_output, layer_size,
-                        );
-                        evals_all.push(vec![
-                            CircleEvaluation::new(layer_domain, trace_in),
-                            CircleEvaluation::new(layer_domain, trace_out),
-                            CircleEvaluation::new(layer_domain, mult_col),
-                        ]);
-                        mults_all.push(mults);
-                    }
-                    (evals_all, mults_all)
+        || {
+            rayon::join(
+                || {
+                    rayon::join(
+                        // 1. Activation traces
+                        || -> (Vec<SimdEvals>, Vec<Vec<M31>>) {
+                            let mut evals_all = Vec::with_capacity(activation_layers.len());
+                            let mut mults_all = Vec::with_capacity(activation_layers.len());
+                            for layer in &activation_layers {
+                                let layer_size = 1usize << layer.log_size;
+                                let layer_domain =
+                                    CanonicCoset::new(layer.log_size).circle_domain();
+                                let pad_input = layer.table.inputs[0];
+                                let pad_output = layer.table.outputs[0];
+                                let padding_count = layer_size.saturating_sub(layer.inputs.len());
+                                let mut mults = compute_multiplicities(&layer.inputs, &layer.table);
+                                if padding_count > 0 {
+                                    mults[0] += M31::from(padding_count as u32);
+                                }
+                                let (trace_in, trace_out, mult_col) =
+                                    build_trace_columns::<SimdBackend>(
+                                        &layer.inputs,
+                                        &layer.outputs,
+                                        &mults,
+                                        pad_input,
+                                        pad_output,
+                                        layer_size,
+                                    );
+                                evals_all.push(vec![
+                                    CircleEvaluation::new(layer_domain, trace_in),
+                                    CircleEvaluation::new(layer_domain, trace_out),
+                                    CircleEvaluation::new(layer_domain, mult_col),
+                                ]);
+                                mults_all.push(mults);
+                            }
+                            (evals_all, mults_all)
+                        },
+                        // 2. Add traces
+                        || -> Vec<SimdEvals> {
+                            add_layers
+                                .iter()
+                                .map(|layer| {
+                                    let layer_size = 1usize << layer.log_size;
+                                    let layer_domain =
+                                        CanonicCoset::new(layer.log_size).circle_domain();
+                                    let (lhs_col, rhs_col, out_col) =
+                                        build_elementwise_trace_columns::<SimdBackend>(
+                                            &layer.lhs,
+                                            &layer.rhs,
+                                            &layer.output,
+                                            layer_size,
+                                        );
+                                    vec![
+                                        CircleEvaluation::new(layer_domain, lhs_col),
+                                        CircleEvaluation::new(layer_domain, rhs_col),
+                                        CircleEvaluation::new(layer_domain, out_col),
+                                    ]
+                                })
+                                .collect()
+                        },
+                    )
                 },
-                // 2. Add traces
-                || -> Vec<SimdEvals> {
-                    add_layers.iter().map(|layer| {
-                        let layer_size = 1usize << layer.log_size;
-                        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-                        let (lhs_col, rhs_col, out_col) = build_elementwise_trace_columns::<SimdBackend>(
-                            &layer.lhs, &layer.rhs, &layer.output, layer_size,
-                        );
-                        vec![
-                            CircleEvaluation::new(layer_domain, lhs_col),
-                            CircleEvaluation::new(layer_domain, rhs_col),
-                            CircleEvaluation::new(layer_domain, out_col),
-                        ]
-                    }).collect()
+                || {
+                    rayon::join(
+                        // 3. Mul traces
+                        || -> Vec<SimdEvals> {
+                            mul_layers
+                                .iter()
+                                .map(|layer| {
+                                    let layer_size = 1usize << layer.log_size;
+                                    let layer_domain =
+                                        CanonicCoset::new(layer.log_size).circle_domain();
+                                    let (lhs_col, rhs_col, out_col) =
+                                        build_elementwise_trace_columns::<SimdBackend>(
+                                            &layer.lhs,
+                                            &layer.rhs,
+                                            &layer.output,
+                                            layer_size,
+                                        );
+                                    vec![
+                                        CircleEvaluation::new(layer_domain, lhs_col),
+                                        CircleEvaluation::new(layer_domain, rhs_col),
+                                        CircleEvaluation::new(layer_domain, out_col),
+                                    ]
+                                })
+                                .collect()
+                        },
+                        // 4. LayerNorm traces
+                        || -> (Vec<SimdEvals>, Vec<Vec<M31>>) {
+                            let mut evals_all = Vec::with_capacity(layernorm_layers.len());
+                            let mut mults_all = Vec::with_capacity(layernorm_layers.len());
+                            for layer in &layernorm_layers {
+                                let layer_size = 1usize << layer.log_size;
+                                let padding = layer_size.saturating_sub(layer.variances.len());
+                                let mut mults =
+                                    compute_multiplicities(&layer.variances, &layer.rsqrt_table);
+                                if padding > 0 {
+                                    mults[0] += M31::from(padding as u32);
+                                }
+                                let cols = build_layernorm_trace_columns::<SimdBackend>(
+                                    &layer.inputs,
+                                    &layer.means,
+                                    &layer.variances,
+                                    &layer.rsqrt_vals,
+                                    &layer.outputs,
+                                    &mults,
+                                    &layer.rsqrt_table,
+                                    layer_size,
+                                );
+                                evals_all.push(cols);
+                                mults_all.push(mults);
+                            }
+                            (evals_all, mults_all)
+                        },
+                    )
                 },
-            ),
-            || rayon::join(
-                // 3. Mul traces
-                || -> Vec<SimdEvals> {
-                    mul_layers.iter().map(|layer| {
-                        let layer_size = 1usize << layer.log_size;
-                        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-                        let (lhs_col, rhs_col, out_col) = build_elementwise_trace_columns::<SimdBackend>(
-                            &layer.lhs, &layer.rhs, &layer.output, layer_size,
-                        );
-                        vec![
-                            CircleEvaluation::new(layer_domain, lhs_col),
-                            CircleEvaluation::new(layer_domain, rhs_col),
-                            CircleEvaluation::new(layer_domain, out_col),
-                        ]
-                    }).collect()
+            )
+        },
+        || {
+            rayon::join(
+                || {
+                    rayon::join(
+                        // 5. RMSNorm traces
+                        || -> (Vec<SimdEvals>, Vec<Vec<M31>>) {
+                            let mut evals_all = Vec::with_capacity(rmsnorm_layers.len());
+                            let mut mults_all = Vec::with_capacity(rmsnorm_layers.len());
+                            for layer in &rmsnorm_layers {
+                                let layer_size = 1usize << layer.log_size;
+                                let padding = layer_size.saturating_sub(layer.rms_sq_vals.len());
+                                let mut mults =
+                                    compute_multiplicities(&layer.rms_sq_vals, &layer.rsqrt_table);
+                                if padding > 0 {
+                                    mults[0] += M31::from(padding as u32);
+                                }
+                                let cols = build_rmsnorm_trace_columns::<SimdBackend>(
+                                    &layer.inputs,
+                                    &layer.rms_sq_vals,
+                                    &layer.rsqrt_vals,
+                                    &layer.outputs,
+                                    &mults,
+                                    &layer.rsqrt_table,
+                                    layer_size,
+                                );
+                                evals_all.push(cols);
+                                mults_all.push(mults);
+                            }
+                            (evals_all, mults_all)
+                        },
+                        // 6. Embedding traces
+                        || -> Vec<SimdEvals> {
+                            embedding_layers
+                                .iter()
+                                .map(|layer| {
+                                    let layer_size = 1usize << layer.log_size;
+                                    let layer_domain =
+                                        CanonicCoset::new(layer.log_size).circle_domain();
+                                    build_embedding_trace_columns::<SimdBackend>(
+                                        &layer.token_ids,
+                                        &layer.col_indices,
+                                        &layer.values,
+                                        &layer.multiplicities,
+                                        layer_size,
+                                        layer_domain,
+                                    )
+                                })
+                                .collect()
+                        },
+                    )
                 },
-                // 4. LayerNorm traces
-                || -> (Vec<SimdEvals>, Vec<Vec<M31>>) {
-                    let mut evals_all = Vec::with_capacity(layernorm_layers.len());
-                    let mut mults_all = Vec::with_capacity(layernorm_layers.len());
-                    for layer in &layernorm_layers {
-                        let layer_size = 1usize << layer.log_size;
-                        let padding = layer_size.saturating_sub(layer.variances.len());
-                        let mut mults = compute_multiplicities(&layer.variances, &layer.rsqrt_table);
-                        if padding > 0 {
-                            mults[0] += M31::from(padding as u32);
-                        }
-                        let cols = build_layernorm_trace_columns::<SimdBackend>(
-                            &layer.inputs, &layer.means, &layer.variances,
-                            &layer.rsqrt_vals, &layer.outputs, &mults,
-                            &layer.rsqrt_table, layer_size,
-                        );
-                        evals_all.push(cols);
-                        mults_all.push(mults);
-                    }
-                    (evals_all, mults_all)
+                || {
+                    rayon::join(
+                        // 7. Quantize traces
+                        || -> (Vec<SimdEvals>, Vec<Vec<M31>>) {
+                            let mut evals_all = Vec::with_capacity(quantize_layers.len());
+                            let mut mults_all = Vec::with_capacity(quantize_layers.len());
+                            for layer in &quantize_layers {
+                                let table =
+                                    build_quantize_table(&layer.params, &layer.input_values);
+                                let layer_size = 1usize << layer.log_size;
+                                let layer_domain =
+                                    CanonicCoset::new(layer.log_size).circle_domain();
+                                let pad_input = table.inputs[0];
+                                let pad_output = table.outputs[0];
+                                let padding_count =
+                                    layer_size.saturating_sub(layer.input_values.len());
+                                let mut mults = layer.multiplicities.clone();
+                                if padding_count > 0 {
+                                    mults[0] += M31::from(padding_count as u32);
+                                }
+                                let simd_evals = build_quantize_trace_columns_2d::<SimdBackend>(
+                                    &layer.input_values,
+                                    &layer.values,
+                                    &mults,
+                                    pad_input,
+                                    pad_output,
+                                    layer_size,
+                                    layer_domain,
+                                );
+                                evals_all.push(simd_evals);
+                                mults_all.push(mults);
+                            }
+                            (evals_all, mults_all)
+                        },
+                        // 8. Dequantize traces
+                        || -> (Vec<SimdEvals>, Vec<Vec<M31>>) {
+                            let mut evals_all = Vec::with_capacity(dequantize_layers.len());
+                            let mut mults_all = Vec::with_capacity(dequantize_layers.len());
+                            for layer in &dequantize_layers {
+                                let table = build_dequantize_table(&layer.params);
+                                let layer_size = 1usize << layer.log_size;
+                                let layer_domain =
+                                    CanonicCoset::new(layer.log_size).circle_domain();
+                                let pad_input = table.inputs[0];
+                                let pad_output = table.outputs[0];
+                                let padding_count =
+                                    layer_size.saturating_sub(layer.input_values.len());
+                                let mut mults = layer.multiplicities.clone();
+                                if padding_count > 0 {
+                                    mults[0] += M31::from(padding_count as u32);
+                                }
+                                let (trace_in, trace_out, mult_col) =
+                                    build_trace_columns::<SimdBackend>(
+                                        &layer.input_values,
+                                        &layer.output_values,
+                                        &mults,
+                                        pad_input,
+                                        pad_output,
+                                        layer_size,
+                                    );
+                                evals_all.push(vec![
+                                    CircleEvaluation::new(layer_domain, trace_in),
+                                    CircleEvaluation::new(layer_domain, trace_out),
+                                    CircleEvaluation::new(layer_domain, mult_col),
+                                ]);
+                                mults_all.push(mults);
+                            }
+                            (evals_all, mults_all)
+                        },
+                    )
                 },
-            ),
-        ),
-        || rayon::join(
-            || rayon::join(
-                // 5. RMSNorm traces
-                || -> (Vec<SimdEvals>, Vec<Vec<M31>>) {
-                    let mut evals_all = Vec::with_capacity(rmsnorm_layers.len());
-                    let mut mults_all = Vec::with_capacity(rmsnorm_layers.len());
-                    for layer in &rmsnorm_layers {
-                        let layer_size = 1usize << layer.log_size;
-                        let padding = layer_size.saturating_sub(layer.rms_sq_vals.len());
-                        let mut mults = compute_multiplicities(&layer.rms_sq_vals, &layer.rsqrt_table);
-                        if padding > 0 {
-                            mults[0] += M31::from(padding as u32);
-                        }
-                        let cols = build_rmsnorm_trace_columns::<SimdBackend>(
-                            &layer.inputs, &layer.rms_sq_vals, &layer.rsqrt_vals,
-                            &layer.outputs, &mults, &layer.rsqrt_table, layer_size,
-                        );
-                        evals_all.push(cols);
-                        mults_all.push(mults);
-                    }
-                    (evals_all, mults_all)
-                },
-                // 6. Embedding traces
-                || -> Vec<SimdEvals> {
-                    embedding_layers.iter().map(|layer| {
-                        let layer_size = 1usize << layer.log_size;
-                        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-                        build_embedding_trace_columns::<SimdBackend>(
-                            &layer.token_ids, &layer.col_indices, &layer.values,
-                            &layer.multiplicities, layer_size, layer_domain,
-                        )
-                    }).collect()
-                },
-            ),
-            || rayon::join(
-                // 7. Quantize traces
-                || -> (Vec<SimdEvals>, Vec<Vec<M31>>) {
-                    let mut evals_all = Vec::with_capacity(quantize_layers.len());
-                    let mut mults_all = Vec::with_capacity(quantize_layers.len());
-                    for layer in &quantize_layers {
-                        let table = build_quantize_table(&layer.params, &layer.input_values);
-                        let layer_size = 1usize << layer.log_size;
-                        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-                        let pad_input = table.inputs[0];
-                        let pad_output = table.outputs[0];
-                        let padding_count = layer_size.saturating_sub(layer.input_values.len());
-                        let mut mults = layer.multiplicities.clone();
-                        if padding_count > 0 {
-                            mults[0] += M31::from(padding_count as u32);
-                        }
-                        let simd_evals = build_quantize_trace_columns_2d::<SimdBackend>(
-                            &layer.input_values, &layer.values, &mults,
-                            pad_input, pad_output, layer_size, layer_domain,
-                        );
-                        evals_all.push(simd_evals);
-                        mults_all.push(mults);
-                    }
-                    (evals_all, mults_all)
-                },
-                // 8. Dequantize traces
-                || -> (Vec<SimdEvals>, Vec<Vec<M31>>) {
-                    let mut evals_all = Vec::with_capacity(dequantize_layers.len());
-                    let mut mults_all = Vec::with_capacity(dequantize_layers.len());
-                    for layer in &dequantize_layers {
-                        let table = build_dequantize_table(&layer.params);
-                        let layer_size = 1usize << layer.log_size;
-                        let layer_domain = CanonicCoset::new(layer.log_size).circle_domain();
-                        let pad_input = table.inputs[0];
-                        let pad_output = table.outputs[0];
-                        let padding_count = layer_size.saturating_sub(layer.input_values.len());
-                        let mut mults = layer.multiplicities.clone();
-                        if padding_count > 0 {
-                            mults[0] += M31::from(padding_count as u32);
-                        }
-                        let (trace_in, trace_out, mult_col) = build_trace_columns::<SimdBackend>(
-                            &layer.input_values, &layer.output_values, &mults,
-                            pad_input, pad_output, layer_size,
-                        );
-                        evals_all.push(vec![
-                            CircleEvaluation::new(layer_domain, trace_in),
-                            CircleEvaluation::new(layer_domain, trace_out),
-                            CircleEvaluation::new(layer_domain, mult_col),
-                        ]);
-                        mults_all.push(mults);
-                    }
-                    (evals_all, mults_all)
-                },
-            ),
-        ),
+            )
+        },
     );
 
     // Unpack results
@@ -3766,7 +3825,6 @@ where
     })
 }
 
-
 /// Prove with auto GPU dispatch for on-chain format.
 ///
 /// Uses `GpuBackend` when CUDA is available, otherwise `SimdBackend`.
@@ -3880,7 +3938,9 @@ pub fn prove_model_aggregated_onchain_auto_cached(
     {
         let gpu_available = crate::backend::gpu_is_available();
         if gpu_available {
-            return prove_model_aggregated_onchain_gpu_cached(graph, input, weights, _cache, policy);
+            return prove_model_aggregated_onchain_gpu_cached(
+                graph, input, weights, _cache, policy,
+            );
         }
     }
 
@@ -4095,7 +4155,8 @@ pub fn execute_forward_pass_fast(
 
     let topo = graph.topological_order();
     let mut current = input.clone();
-    let mut node_outputs: std::collections::HashMap<usize, M31Matrix> = std::collections::HashMap::new();
+    let mut node_outputs: std::collections::HashMap<usize, M31Matrix> =
+        std::collections::HashMap::new();
 
     for &node_id in &topo {
         let node = &graph.nodes[node_id];
@@ -4110,7 +4171,9 @@ pub fn execute_forward_pass_fast(
             GraphOp::MatMul { .. } => {
                 let weight = weights
                     .get_weight(node.id)
-                    .ok_or(AggregationError::ModelError(ModelError::MissingWeight(node.id)))?;
+                    .ok_or(AggregationError::ModelError(ModelError::MissingWeight(
+                        node.id,
+                    )))?;
 
                 // Handle gated FFN: down_proj has a named "up_proj" weight.
                 // Pattern: gate_out (current) was SiLU'd; up_out = ffn_input × W_up;
@@ -4118,7 +4181,9 @@ pub fn execute_forward_pass_fast(
                 if let Some(up_weight) = weights.get_named_weight(node.id, "up_proj") {
                     // The FFN input is the norm output — find it by walking back inputs.
                     // Use the first input's node output as ffn_input (the norm layer output).
-                    let ffn_input = node.inputs.first()
+                    let ffn_input = node
+                        .inputs
+                        .first()
                         .and_then(|&id| {
                             // Walk up to find a node whose output has the right cols for up_proj
                             // The SiLU feeds into this node, so we need the SiLU's input's input
@@ -4129,7 +4194,9 @@ pub fn execute_forward_pass_fast(
                                         return Some(out.clone());
                                     }
                                 }
-                                if let Some(&prev) = graph.nodes.get(search).and_then(|n| n.inputs.first()) {
+                                if let Some(&prev) =
+                                    graph.nodes.get(search).and_then(|n| n.inputs.first())
+                                {
                                     search = prev;
                                 } else {
                                     break;
@@ -4147,11 +4214,17 @@ pub fn execute_forward_pass_fast(
 
                     // gate * up element-wise (dimensions must match)
                     if current.data.len() == up_out.data.len() {
-                        let data: Vec<_> = current.data.iter()
+                        let data: Vec<_> = current
+                            .data
+                            .iter()
                             .zip(up_out.data.iter())
                             .map(|(&g, &u)| g * u)
                             .collect();
-                        current = M31Matrix { rows: current.rows, cols: current.cols, data };
+                        current = M31Matrix {
+                            rows: current.rows,
+                            cols: current.cols,
+                            data,
+                        };
                     }
                 }
 
@@ -4182,40 +4255,69 @@ pub fn execute_forward_pass_fast(
                     node_outputs.insert(node_id, current.clone());
                 }
             }
-            GraphOp::Activation { activation_type, .. } => {
+            GraphOp::Activation {
+                activation_type, ..
+            } => {
                 let f = activation_type.as_fn();
                 let output = M31Matrix {
-                    rows: current.rows, cols: current.cols,
+                    rows: current.rows,
+                    cols: current.cols,
                     data: current.data.iter().map(|&v| f(v)).collect(),
                 };
                 node_outputs.insert(node_id, output.clone());
                 current = output;
             }
             GraphOp::Add { .. } => {
-                let rhs = node.inputs.get(1)
+                let rhs = node
+                    .inputs
+                    .get(1)
                     .and_then(|&id| node_outputs.get(&id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
-                let lhs = node.inputs.first()
+                let lhs = node
+                    .inputs
+                    .first()
                     .and_then(|&id| node_outputs.get(&id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
-                let data: Vec<_> = lhs.data.iter().zip(rhs.data.iter()).map(|(&a, &b)| a + b).collect();
-                let output = M31Matrix { rows: lhs.rows, cols: lhs.cols, data };
+                let data: Vec<_> = lhs
+                    .data
+                    .iter()
+                    .zip(rhs.data.iter())
+                    .map(|(&a, &b)| a + b)
+                    .collect();
+                let output = M31Matrix {
+                    rows: lhs.rows,
+                    cols: lhs.cols,
+                    data,
+                };
                 node_outputs.insert(node_id, output.clone());
                 current = output;
             }
             GraphOp::Mul { .. } => {
-                let rhs = node.inputs.get(1)
+                let rhs = node
+                    .inputs
+                    .get(1)
                     .and_then(|&id| node_outputs.get(&id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
-                let lhs = node.inputs.first()
+                let lhs = node
+                    .inputs
+                    .first()
                     .and_then(|&id| node_outputs.get(&id))
                     .cloned()
                     .unwrap_or_else(|| current.clone());
-                let data: Vec<_> = lhs.data.iter().zip(rhs.data.iter()).map(|(&a, &b)| a * b).collect();
-                let output = M31Matrix { rows: lhs.rows, cols: lhs.cols, data };
+                let data: Vec<_> = lhs
+                    .data
+                    .iter()
+                    .zip(rhs.data.iter())
+                    .map(|(&a, &b)| a * b)
+                    .collect();
+                let output = M31Matrix {
+                    rows: lhs.rows,
+                    cols: lhs.cols,
+                    data,
+                };
                 node_outputs.insert(node_id, output.clone());
                 current = output;
             }
@@ -4278,11 +4380,16 @@ pub fn prove_from_forward_result(
     crate::policy::apply_to_env(&resolved_policy);
 
     // ── Phase 2: GKR Proof ──────────────────────────────────────────
-    eprintln!("Phase 2/3: GKR proof ({} intermediates)...", fwd.intermediates.len());
+    eprintln!(
+        "Phase 2/3: GKR proof ({} intermediates)...",
+        fwd.intermediates.len()
+    );
 
     // Build GraphExecution for the GKR prover (HashMap-based)
     let gkr_execution = crate::compiler::graph::GraphExecution {
-        intermediates: fwd.intermediates.iter()
+        intermediates: fwd
+            .intermediates
+            .iter()
             .cloned()
             .collect::<std::collections::HashMap<usize, M31Matrix>>(),
         node_outputs: fwd.node_outputs.clone(),
@@ -4300,34 +4407,54 @@ pub fn prove_from_forward_result(
     gkr_channel.mix_felt(policy_commitment);
 
     let gkr_proof = crate::gkr::prove_gkr_auto_with_cache(
-        &circuit, &gkr_execution, weights, &mut gkr_channel,
-        weight_cache, Some(&resolved_policy),
-    ).map_err(|e| AggregationError::ProvingError(format!("GKR: {e}")))?;
+        &circuit,
+        &gkr_execution,
+        weights,
+        &mut gkr_channel,
+        weight_cache,
+        Some(&resolved_policy),
+    )
+    .map_err(|e| AggregationError::ProvingError(format!("GKR: {e}")))?;
 
     // ── Phase 2b: Attention Proofs ──────────────────────────────────
-    let attention_proofs: Vec<(usize, crate::components::attention::AttentionProofOnChain)> =
-        fwd.attention_layers.iter().filter_map(|layer| {
+    let attention_proofs: Vec<(usize, crate::components::attention::AttentionProofOnChain)> = fwd
+        .attention_layers
+        .iter()
+        .filter_map(|layer| {
             let proof = if let Some(ref inter) = layer.cached_intermediates {
                 crate::components::attention::prove_attention_cached_from_intermediates(
-                    &layer.input, &layer.weights, &layer.config, inter,
-                ).ok()
+                    &layer.input,
+                    &layer.weights,
+                    &layer.config,
+                    inter,
+                )
+                .ok()
             } else {
                 crate::components::attention::prove_attention_onchain(
-                    &layer.input, &layer.weights, &layer.config, layer.config.causal,
-                ).ok()
+                    &layer.input,
+                    &layer.weights,
+                    &layer.config,
+                    layer.config.causal,
+                )
+                .ok()
             };
             proof.map(|p| (layer.node_id, p))
-        }).collect();
+        })
+        .collect();
 
     // ── Phase 2c: Commitments ───────────────────────────────────────
-    let layer_chain_commitment = compute_layer_chain_commitment(input, &fwd.intermediates, &fwd.output);
-    let layernorm_mean_var_commitments: Vec<_> = fwd.layernorm_layers.iter()
+    let layer_chain_commitment =
+        compute_layer_chain_commitment(input, &fwd.intermediates, &fwd.output);
+    let layernorm_mean_var_commitments: Vec<_> = fwd
+        .layernorm_layers
+        .iter()
         .map(|l| compute_layernorm_mean_var_commitment(&l.means, &l.variances))
         .collect();
     let quantize_params_commitment = compute_quantize_params_commitment(&fwd.quantize_layers);
 
     // ── Phase 3: Unified STARK ──────────────────────────────────────
-    eprintln!("Phase 3/3: Unified STARK ({} activation, {} norm, {} embed)...",
+    eprintln!(
+        "Phase 3/3: Unified STARK ({} activation, {} norm, {} embed)...",
         fwd.activation_layers.len(),
         fwd.layernorm_layers.len() + fwd.rmsnorm_layers.len(),
         fwd.embedding_layers.len(),
@@ -4473,15 +4600,40 @@ pub fn prove_model_pure_gkr_auto_with_cache(
     weight_cache: Option<&crate::weight_cache::SharedWeightCache>,
     policy: Option<&crate::policy::PolicyConfig>,
 ) -> Result<AggregatedModelProofOnChain, AggregationError> {
+    if graph.input_shape.0 != input.rows {
+        let graph_for_input = graph.with_seq_len(input.rows);
+        return prove_model_pure_gkr_auto_with_cache(
+            &graph_for_input,
+            input,
+            weights,
+            weight_cache,
+            policy,
+        );
+    }
+
     #[cfg(feature = "cuda-runtime")]
     {
         if crate::backend::gpu_is_available() {
             return prove_model_pure_gkr_inner::<stwo::prover::backend::gpu::GpuBackend>(
-                graph, input, weights, weight_cache, None, policy, None,
+                graph,
+                input,
+                weights,
+                weight_cache,
+                None,
+                policy,
+                None,
             );
         }
     }
-    prove_model_pure_gkr_inner::<SimdBackend>(graph, input, weights, weight_cache, None, policy, None)
+    prove_model_pure_gkr_inner::<SimdBackend>(
+        graph,
+        input,
+        weights,
+        weight_cache,
+        None,
+        policy,
+        None,
+    )
 }
 
 /// Prove a prefill batch (seq_len >= 1) with KV-cache support.
@@ -4513,11 +4665,25 @@ pub fn prove_model_pure_gkr_prefill_with_cache(
     {
         if crate::backend::gpu_is_available() {
             return prove_model_pure_gkr_inner::<stwo::prover::backend::gpu::GpuBackend>(
-                graph, input, weights, weight_cache, Some(kv_cache), policy, None,
+                graph,
+                input,
+                weights,
+                weight_cache,
+                Some(kv_cache),
+                policy,
+                None,
             );
         }
     }
-    prove_model_pure_gkr_inner::<SimdBackend>(graph, input, weights, weight_cache, Some(kv_cache), policy, None)
+    prove_model_pure_gkr_inner::<SimdBackend>(
+        graph,
+        input,
+        weights,
+        weight_cache,
+        Some(kv_cache),
+        policy,
+        None,
+    )
 }
 
 /// Streaming prefill: split a long prompt into chunks and prove each independently.
@@ -4540,9 +4706,10 @@ pub fn prove_model_pure_gkr_prefill_chunked(
     assert!(chunk_size > 0, "chunk_size must be > 0");
     let total_rows = input.rows;
     let cols = input.cols;
-    let weight_cache: crate::weight_cache::SharedWeightCache = std::sync::Arc::new(
-        std::sync::RwLock::new(crate::weight_cache::WeightCommitmentCache::new("prefill_chunked")),
-    );
+    let weight_cache: crate::weight_cache::SharedWeightCache =
+        std::sync::Arc::new(std::sync::RwLock::new(
+            crate::weight_cache::WeightCommitmentCache::new("prefill_chunked"),
+        ));
 
     let mut proofs = Vec::new();
     let mut offset = 0usize;
@@ -4552,9 +4719,9 @@ pub fn prove_model_pure_gkr_prefill_chunked(
 
         // Extract input sub-matrix [offset..offset+chunk_rows, :]
         let mut chunk_input = M31Matrix::new(chunk_rows, cols);
-        chunk_input.data.copy_from_slice(
-            &input.data[offset * cols..(offset + chunk_rows) * cols],
-        );
+        chunk_input
+            .data
+            .copy_from_slice(&input.data[offset * cols..(offset + chunk_rows) * cols]);
 
         eprintln!(
             "=== Prefill chunk [{}/{}] rows {}..{} ===",
@@ -4740,31 +4907,46 @@ where
     let mut rope_layers: Vec<RoPELayerData> = Vec::new();
 
     // For MoE models: clone weights so we can dynamically bind expert weights per token.
-    let has_moe = graph.nodes.iter().any(|n| matches!(n.op, GraphOp::MoE { .. }));
+    let has_moe = graph
+        .nodes
+        .iter()
+        .any(|n| matches!(n.op, GraphOp::MoE { .. }));
     let mut moe_weights = if has_moe { Some(weights.clone()) } else { None };
 
     // Pre-upload weights to GPU for the forward pass (stays resident)
     #[cfg(feature = "cuda-runtime")]
-    let gpu_forward = if crate::backend::gpu_is_available() && std::env::var("OBELYZK_GPU_FORWARD").ok().as_deref() != Some("0") {
+    let gpu_forward = if crate::backend::gpu_is_available()
+        && std::env::var("OBELYZK_GPU_FORWARD").ok().as_deref() != Some("0")
+    {
         match crate::gpu_forward::GpuForwardExecutor::new() {
-            Ok(exec) => {
-                match exec.upload_weights(weights) {
-                    Ok(gw) => {
-                        eprintln!("  [gpu-forward] Weights pre-uploaded to GPU ({} matrices)", gw.len());
-                        Some((exec, gw))
-                    }
-                    Err(e) => { eprintln!("  [gpu-forward] Weight upload failed: {e}, falling back to CPU"); None }
+            Ok(exec) => match exec.upload_weights(weights) {
+                Ok(gw) => {
+                    eprintln!(
+                        "  [gpu-forward] Weights pre-uploaded to GPU ({} matrices)",
+                        gw.len()
+                    );
+                    Some((exec, gw))
                 }
+                Err(e) => {
+                    eprintln!("  [gpu-forward] Weight upload failed: {e}, falling back to CPU");
+                    None
+                }
+            },
+            Err(e) => {
+                eprintln!("  [gpu-forward] Init failed: {e}, falling back to CPU");
+                None
             }
-            Err(e) => { eprintln!("  [gpu-forward] Init failed: {e}, falling back to CPU"); None }
         }
-    } else { None };
+    } else {
+        None
+    };
 
     // GPU-resident current tensor (when GPU forward is active)
     #[cfg(feature = "cuda-runtime")]
     let mut gpu_current: Option<crate::gpu_forward::GpuTensor> = None;
     #[cfg(feature = "cuda-runtime")]
-    let mut gpu_node_outputs: std::collections::HashMap<usize, crate::gpu_forward::GpuTensor> = std::collections::HashMap::new();
+    let mut gpu_node_outputs: std::collections::HashMap<usize, crate::gpu_forward::GpuTensor> =
+        std::collections::HashMap::new();
 
     // Upload initial input to GPU if GPU forward is active
     #[cfg(feature = "cuda-runtime")]
@@ -4814,10 +4996,14 @@ where
 
                 // Gated FFN: if this node has an "up_proj" named weight, compute
                 // gate * up before the down_proj MatMul.
-                if let Some(up_weight) = active_w.get_named_weight(node.id, "up_proj")
-                    .or_else(|| weights.get_named_weight(node.id, "up_proj")) {
+                if let Some(up_weight) = active_w
+                    .get_named_weight(node.id, "up_proj")
+                    .or_else(|| weights.get_named_weight(node.id, "up_proj"))
+                {
                     let gate_proj_node_id = if node.id >= 2 { node.id - 2 } else { 0 };
-                    let ffn_input = intermediates.iter().rev()
+                    let ffn_input = intermediates
+                        .iter()
+                        .rev()
                         .find(|(id, _)| *id == gate_proj_node_id)
                         .map(|(_, m)| m.clone())
                         .unwrap_or_else(|| current.clone());
@@ -4833,22 +5019,40 @@ where
                                     if let Some(ref g_cur) = gpu_current {
                                         if let Ok(g_hidden) = exec.mul(g_cur, &g_up_out) {
                                             // Download hidden to CPU for intermediates
-                                            let hidden_cpu = exec.download(&g_hidden).unwrap_or_else(|_| {
-                                                // Fallback
-                                                let data: Vec<M31> = current.data.iter().zip(matmul_m31(&ffn_input, up_weight).data.iter()).map(|(&g, &u)| g * u).collect();
-                                                M31Matrix { rows: current.rows, cols: current.cols, data }
-                                            });
+                                            let hidden_cpu =
+                                                exec.download(&g_hidden).unwrap_or_else(|_| {
+                                                    // Fallback
+                                                    let data: Vec<M31> = current
+                                                        .data
+                                                        .iter()
+                                                        .zip(
+                                                            matmul_m31(&ffn_input, up_weight)
+                                                                .data
+                                                                .iter(),
+                                                        )
+                                                        .map(|(&g, &u)| g * u)
+                                                        .collect();
+                                                    M31Matrix {
+                                                        rows: current.rows,
+                                                        cols: current.cols,
+                                                        data,
+                                                    }
+                                                });
                                             gpu_current = Some(g_hidden);
                                             current = hidden_cpu;
                                             // Skip CPU path
                                             matmul_m31(&ffn_input, up_weight) // dummy, not used
                                         } else {
-                                            crate::gpu_sumcheck::gpu_matmul_m31_full(&ffn_input, up_weight)
-                                                .unwrap_or_else(|_| matmul_m31(&ffn_input, up_weight))
+                                            crate::gpu_sumcheck::gpu_matmul_m31_full(
+                                                &ffn_input, up_weight,
+                                            )
+                                            .unwrap_or_else(|_| matmul_m31(&ffn_input, up_weight))
                                         }
                                     } else {
-                                        crate::gpu_sumcheck::gpu_matmul_m31_full(&ffn_input, up_weight)
-                                            .unwrap_or_else(|_| matmul_m31(&ffn_input, up_weight))
+                                        crate::gpu_sumcheck::gpu_matmul_m31_full(
+                                            &ffn_input, up_weight,
+                                        )
+                                        .unwrap_or_else(|_| matmul_m31(&ffn_input, up_weight))
                                     }
                                 } else {
                                     crate::gpu_sumcheck::gpu_matmul_m31_full(&ffn_input, up_weight)
@@ -4874,38 +5078,62 @@ where
                     if gpu_forward.is_none() || gpu_current.is_none() {
                         assert_eq!(current.rows, up_output.rows, "gate*up row mismatch");
                         assert_eq!(current.cols, up_output.cols, "gate*up col mismatch");
-                        let hidden_data: Vec<M31> = current.data.iter()
+                        let hidden_data: Vec<M31> = current
+                            .data
+                            .iter()
                             .zip(up_output.data.iter())
                             .map(|(&g, &u)| g * u)
                             .collect();
-                        current = M31Matrix { rows: current.rows, cols: current.cols, data: hidden_data };
+                        current = M31Matrix {
+                            rows: current.rows,
+                            cols: current.cols,
+                            data: hidden_data,
+                        };
                     }
                     #[cfg(not(feature = "cuda-runtime"))]
                     {
                         assert_eq!(current.rows, up_output.rows, "gate*up row mismatch");
                         assert_eq!(current.cols, up_output.cols, "gate*up col mismatch");
-                        let hidden_data: Vec<M31> = current.data.iter()
+                        let hidden_data: Vec<M31> = current
+                            .data
+                            .iter()
                             .zip(up_output.data.iter())
                             .map(|(&g, &u)| g * u)
                             .collect();
-                        current = M31Matrix { rows: current.rows, cols: current.cols, data: hidden_data };
+                        current = M31Matrix {
+                            rows: current.rows,
+                            cols: current.cols,
+                            data: hidden_data,
+                        };
                     }
 
                     eprintln!(
                         "  [{}/{}] Node {} MatMul {}x{}x{} — gated FFN (gate*up applied)",
-                        step + 1, total_nodes, node.id, m, k, n,
+                        step + 1,
+                        total_nodes,
+                        node.id,
+                        m,
+                        k,
+                        n,
                     );
                 } else {
                     eprintln!(
                         "  [{}/{}] Node {} MatMul {}x{}x{} — forward only (GKR deferred)",
-                        step + 1, total_nodes, node.id, m, k, n,
+                        step + 1,
+                        total_nodes,
+                        node.id,
+                        m,
+                        k,
+                        n,
                     );
                 }
 
                 // Compute the actual down_proj (or regular matmul)
                 // GPU path: use GpuForwardExecutor for on-device matmul
                 #[cfg(feature = "cuda-runtime")]
-                let output = if let (Some((ref exec, ref gpu_weights)), Some(ref g_cur)) = (&gpu_forward, &gpu_current) {
+                let output = if let (Some((ref exec, ref gpu_weights)), Some(ref g_cur)) =
+                    (&gpu_forward, &gpu_current)
+                {
                     // Use pre-uploaded weight if available, otherwise upload on the fly
                     let g_weight = if let Some(gw) = gpu_weights.get(&node.id) {
                         // Can't move out of HashMap — re-upload (TODO: Arc/Rc for zero-copy)
@@ -4916,7 +5144,9 @@ where
 
                     if let Some(gw) = g_weight {
                         if let Ok(g_out) = exec.matmul(g_cur, &gw) {
-                            let cpu_out = exec.download(&g_out).unwrap_or_else(|_| matmul_m31(&current, weight));
+                            let cpu_out = exec
+                                .download(&g_out)
+                                .unwrap_or_else(|_| matmul_m31(&current, weight));
                             // Store GPU output for next node
                             gpu_node_outputs.insert(node_id, g_out);
                             cpu_out
@@ -4939,12 +5169,17 @@ where
                 if std::env::var("STWO_CHANNEL_TRACE").is_ok() && step < 8 {
                     let cpu_ref = matmul_m31(&current, weight);
                     let n_total = output.data.len();
-                    let mismatches: usize = output.data.iter().zip(cpu_ref.data.iter())
+                    let mismatches: usize = output
+                        .data
+                        .iter()
+                        .zip(cpu_ref.data.iter())
                         .filter(|(g, c)| g != c)
                         .count();
                     if mismatches > 0 {
-                        eprintln!("[FWD VALIDATE] Node {} MatMul {}x{}x{}: {} / {} mismatches",
-                            node.id, m, k, n, mismatches, n_total);
+                        eprintln!(
+                            "[FWD VALIDATE] Node {} MatMul {}x{}x{}: {} / {} mismatches",
+                            node.id, m, k, n, mismatches, n_total
+                        );
                         // Show first few mismatches
                         for (i, (g, c)) in output.data.iter().zip(cpu_ref.data.iter()).enumerate() {
                             if g != c && i < 4 {
@@ -4952,7 +5187,10 @@ where
                             }
                         }
                     } else {
-                        eprintln!("[FWD VALIDATE] Node {} MatMul {}x{}x{}: MATCH ✓", node.id, m, k, n);
+                        eprintln!(
+                            "[FWD VALIDATE] Node {} MatMul {}x{}x{}: MATCH ✓",
+                            node.id, m, k, n
+                        );
                     }
                 }
 
@@ -5171,10 +5409,24 @@ where
                     };
                     let (inter, cached_inter) = if let Some(ref mut kvc) = kv_cache {
                         let layer_cache = kvc.get_or_create(node.id, attn_config);
-                        let i = attention_forward_cached(&current, &attn_weights, attn_config, layer_cache, attn_config.causal);
+                        let i = attention_forward_cached(
+                            &current,
+                            &attn_weights,
+                            attn_config,
+                            layer_cache,
+                            attn_config.causal,
+                        );
                         (i.clone(), Some(i))
                     } else {
-                        (attention_forward(&current, &attn_weights, attn_config, attn_config.causal), None)
+                        (
+                            attention_forward(
+                                &current,
+                                &attn_weights,
+                                attn_config,
+                                attn_config.causal,
+                            ),
+                            None,
+                        )
                     };
                     attention_layers.push(AttentionLayerData {
                         node_id: node.id,
@@ -5301,10 +5553,7 @@ where
                 // (i.e. number of tokens already in KV-cache). RoPE runs BEFORE
                 // attention in the graph, so cached_len is still the count of
                 // previously-cached tokens, giving the correct offset.
-                let rope_offset = kv_cache
-                    .as_ref()
-                    .map(|kvc| kvc.cached_len())
-                    .unwrap_or(0);
+                let rope_offset = kv_cache.as_ref().map(|kvc| kvc.cached_len()).unwrap_or(0);
                 let mut rope_cfg = *config;
                 // Ensure table covers offset + current seq_len
                 if rope_offset + current.rows > rope_cfg.max_seq_len {
@@ -5356,7 +5605,13 @@ where
                 outer_profiler.record_forward_op("other", _op_start.elapsed());
             }
 
-            GraphOp::Conv2D { in_channels, out_channels, kernel_size, stride, padding } => {
+            GraphOp::Conv2D {
+                in_channels,
+                out_channels,
+                kernel_size,
+                stride,
+                padding,
+            } => {
                 let kernel = weights
                     .get_weight(node.id)
                     .ok_or(ModelError::MissingWeight(node.id))?;
@@ -5367,12 +5622,18 @@ where
                     stride: *stride,
                     padding: *padding,
                     input_h: current.rows,
-                    input_w: if *in_channels > 0 { current.cols / in_channels } else { current.cols },
+                    input_w: if *in_channels > 0 {
+                        current.cols / in_channels
+                    } else {
+                        current.cols
+                    },
                 };
-                let (im2col_mat, _kernel_mat, output) =
-                    crate::components::conv2d::conv2d_forward(
-                        &current.data, &kernel.data, &config, *out_channels,
-                    );
+                let (im2col_mat, _kernel_mat, output) = crate::components::conv2d::conv2d_forward(
+                    &current.data,
+                    &kernel.data,
+                    &config,
+                    *out_channels,
+                );
 
                 // Store im2col output as intermediate (GKR MatMul proves im2col × kernel)
                 intermediates.push((node.id, im2col_mat));
@@ -5381,7 +5642,9 @@ where
                 outer_profiler.record_forward_op("conv2d", _op_start.elapsed());
             }
 
-            GraphOp::MoE { num_experts, top_k, .. } => {
+            GraphOp::MoE {
+                num_experts, top_k, ..
+            } => {
                 // MoE TopK: input is router logits from preceding MatMul.
                 // 1. Select top-K experts per token
                 // 2. Bind selected expert weights into template slots
@@ -5389,7 +5652,8 @@ where
                 intermediates.push((node.id, current.clone()));
 
                 // Run TopK selection on router logits (first row = first token)
-                let selection = crate::components::topk::select_top_k(&current.data[..current.cols], *top_k);
+                let selection =
+                    crate::components::topk::select_top_k(&current.data[..current.cols], *top_k);
 
                 // Bind selected expert weights into template slots
                 if let (Some(ref mut mw), Some(banks)) = (&mut moe_weights, moe_banks) {
@@ -5397,7 +5661,10 @@ where
                     for (_, bank) in banks.iter() {
                         if bank.router_node_id == router_id {
                             bank.bind_experts(&selection.selected_indices, mw);
-                            eprintln!("    [MoE] bound experts {:?} for router node {}", selection.selected_indices, router_id);
+                            eprintln!(
+                                "    [MoE] bound experts {:?} for router node {}",
+                                selection.selected_indices, router_id
+                            );
                             break;
                         }
                     }
@@ -5498,7 +5765,10 @@ where
         LAST_FORWARD_RESULT.with(|cell| {
             *cell.borrow_mut() = Some(fwd);
         });
-        eprintln!("  [trace-only] ForwardPassResult captured ({} intermediates)", intermediates.len());
+        eprintln!(
+            "  [trace-only] ForwardPassResult captured ({} intermediates)",
+            intermediates.len()
+        );
     }
 
     // Phase 2: GKR proof (replaces per-matmul sumcheck)
@@ -5549,7 +5819,8 @@ where
                 // Split the merged execution into per-block executions
                 let block_boundaries = graph.find_block_boundaries();
                 let n_blocks = simd_config.num_blocks;
-                let mut block_executions: Vec<crate::compiler::graph::GraphExecution> = Vec::with_capacity(n_blocks);
+                let mut block_executions: Vec<crate::compiler::graph::GraphExecution> =
+                    Vec::with_capacity(n_blocks);
 
                 for block_idx in 0..n_blocks {
                     if block_idx < block_boundaries.len() {
@@ -5578,26 +5849,61 @@ where
 
                 if block_executions.len() == n_blocks {
                     crate::gkr::prove_gkr_simd_gpu_with_cache(
-                        &circuit, &block_executions, weights, &mut gkr_channel, weight_cache,
-                    ).map_err(|e| AggregationError::ProvingError(format!("GKR SIMD GPU proving: {e}")))?
+                        &circuit,
+                        &block_executions,
+                        weights,
+                        &mut gkr_channel,
+                        weight_cache,
+                    )
+                    .map_err(|e| {
+                        AggregationError::ProvingError(format!("GKR SIMD GPU proving: {e}"))
+                    })?
                 } else {
                     eprintln!("  [SIMD] Block split failed ({} vs expected {}), falling back to standard GKR",
                         block_executions.len(), n_blocks);
-                    crate::gkr::prove_gkr_gpu_with_cache(&circuit, &gkr_execution, weights, &mut gkr_channel, weight_cache, Some(&resolved_policy))
-                        .map_err(|e| AggregationError::ProvingError(format!("GKR GPU proving: {e}")))?
+                    crate::gkr::prove_gkr_gpu_with_cache(
+                        &circuit,
+                        &gkr_execution,
+                        weights,
+                        &mut gkr_channel,
+                        weight_cache,
+                        Some(&resolved_policy),
+                    )
+                    .map_err(|e| AggregationError::ProvingError(format!("GKR GPU proving: {e}")))?
                 }
             } else if gpu_active {
-                crate::gkr::prove_gkr_gpu_with_cache(&circuit, &gkr_execution, weights, &mut gkr_channel, weight_cache, Some(&resolved_policy))
-                    .map_err(|e| AggregationError::ProvingError(format!("GKR GPU proving: {e}")))?
+                crate::gkr::prove_gkr_gpu_with_cache(
+                    &circuit,
+                    &gkr_execution,
+                    weights,
+                    &mut gkr_channel,
+                    weight_cache,
+                    Some(&resolved_policy),
+                )
+                .map_err(|e| AggregationError::ProvingError(format!("GKR GPU proving: {e}")))?
             } else {
-                crate::gkr::prove_gkr_with_cache(&circuit, &gkr_execution, weights, &mut gkr_channel, weight_cache, Some(&resolved_policy))
-                    .map_err(|e| AggregationError::ProvingError(format!("GKR proving: {e}")))?
+                crate::gkr::prove_gkr_with_cache(
+                    &circuit,
+                    &gkr_execution,
+                    weights,
+                    &mut gkr_channel,
+                    weight_cache,
+                    Some(&resolved_policy),
+                )
+                .map_err(|e| AggregationError::ProvingError(format!("GKR proving: {e}")))?
             }
         }
         #[cfg(not(feature = "cuda-runtime"))]
         {
-            crate::gkr::prove_gkr_with_cache(&circuit, &gkr_execution, weights, &mut gkr_channel, weight_cache, Some(&resolved_policy))
-                .map_err(|e| AggregationError::ProvingError(format!("GKR proving: {e}")))?
+            crate::gkr::prove_gkr_with_cache(
+                &circuit,
+                &gkr_execution,
+                weights,
+                &mut gkr_channel,
+                weight_cache,
+                Some(&resolved_policy),
+            )
+            .map_err(|e| AggregationError::ProvingError(format!("GKR proving: {e}")))?
         }
     };
 
@@ -5625,9 +5931,8 @@ where
     outer_profiler.begin_phase("attention_proofs", 0);
     // Capture KV commitment before parallel attention proving so each attention
     // proof can bind to the cache state without needing mutable access.
-    let attn_kv_commitment: Option<starknet_ff::FieldElement> = kv_cache
-        .as_ref()
-        .map(|kvc| kvc.super_commitment());
+    let attn_kv_commitment: Option<starknet_ff::FieldElement> =
+        kv_cache.as_ref().map(|kvc| kvc.super_commitment());
     let attn_results: Vec<Result<(usize, AttentionProofOnChain, std::time::Duration, bool), AggregationError>> =
         attention_layers
             .par_iter()
@@ -5962,8 +6267,7 @@ pub fn prove_model_pure_gkr_decode_step_incremental(
     let mut current = input.clone();
 
     // Store pre-computed AttentionIntermediates for decode GKR walk
-    let mut decode_attention_data: HashMap<usize, (AttentionIntermediates, usize)> =
-        HashMap::new();
+    let mut decode_attention_data: HashMap<usize, (AttentionIntermediates, usize)> = HashMap::new();
 
     let topo = graph.topological_order();
     eprintln!("Phase 1/2: Forward pass ({} nodes, decode)...", topo.len());
@@ -6024,7 +6328,9 @@ pub fn prove_model_pure_gkr_decode_step_incremental(
                     node_outputs.insert(node.id, current.clone());
                 }
             }
-            GraphOp::Activation { activation_type, .. } => {
+            GraphOp::Activation {
+                activation_type, ..
+            } => {
                 let f = activation_type.as_fn();
                 let output_data: Vec<M31> = current.data.iter().map(|&x| (*f)(x)).collect();
                 let out = M31Matrix {
@@ -6303,10 +6609,17 @@ impl StreamingProofPipeline {
     ///
     /// Returns `Some(ProvenChunk)` if the buffer reached `chunk_size` and
     /// a proof was generated. Returns `None` if the token was buffered.
-    pub fn push_token(&mut self, token_hidden: Vec<M31>) -> Result<Option<ProvenChunk>, AggregationError> {
-        assert_eq!(token_hidden.len(), self.hidden_dim,
+    pub fn push_token(
+        &mut self,
+        token_hidden: Vec<M31>,
+    ) -> Result<Option<ProvenChunk>, AggregationError> {
+        assert_eq!(
+            token_hidden.len(),
+            self.hidden_dim,
             "token hidden dim {} != expected {}",
-            token_hidden.len(), self.hidden_dim);
+            token_hidden.len(),
+            self.hidden_dim
+        );
 
         self.token_buffer.push(token_hidden);
 
@@ -6321,7 +6634,10 @@ impl StreamingProofPipeline {
     /// Push multiple tokens at once.
     ///
     /// Returns proven chunks for each full chunk_size batch.
-    pub fn push_tokens(&mut self, tokens: Vec<Vec<M31>>) -> Result<Vec<ProvenChunk>, AggregationError> {
+    pub fn push_tokens(
+        &mut self,
+        tokens: Vec<Vec<M31>>,
+    ) -> Result<Vec<ProvenChunk>, AggregationError> {
         let mut chunks = Vec::new();
         for token in tokens {
             if let Some(chunk) = self.push_token(token)? {
@@ -6416,7 +6732,11 @@ impl StreamingProofPipeline {
                 rmsnorm_claims: Vec::new(),
                 execution: GraphExecution {
                     intermediates: Vec::new(),
-                    output: M31Matrix { rows: 0, cols: 0, data: Vec::new() },
+                    output: M31Matrix {
+                        rows: 0,
+                        cols: 0,
+                        data: Vec::new(),
+                    },
                 },
                 activation_claims: Vec::new(),
                 attention_proofs: Vec::new(),
@@ -9985,10 +10305,16 @@ mod tests {
 
     impl EnvVarGuard {
         fn set(key: &'static str, value: &str) -> Self {
-            let lock = crate::test_utils::ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = crate::test_utils::ENV_MUTEX
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let prev = std::env::var(key).ok();
             std::env::set_var(key, value);
-            Self { key, prev, _lock: lock }
+            Self {
+                key,
+                prev,
+                _lock: lock,
+            }
         }
     }
 
@@ -10029,6 +10355,38 @@ mod tests {
         assert!(proof.unified_stark.is_none());
         assert_eq!(proof.matmul_proofs.len(), 1);
         assert_eq!(proof.num_proven_layers(), 1);
+    }
+
+    #[test]
+    fn test_pure_gkr_resizes_graph_for_multirow_input() {
+        let _guard = EnvVarGuard::set("STWO_AGGREGATED_RLC_ONLY", "1");
+
+        let mut builder = GraphBuilder::new((1, 4));
+        builder.linear(2);
+        let graph = builder.build();
+
+        let mut input = M31Matrix::new(3, 4);
+        for i in 0..3 {
+            for j in 0..4 {
+                input.set(i, j, M31::from((i * 4 + j + 1) as u32));
+            }
+        }
+
+        let mut weights = GraphWeights::new();
+        let mut w = M31Matrix::new(4, 2);
+        for i in 0..4 {
+            for j in 0..2 {
+                w.set(i, j, M31::from((i * 2 + j + 1) as u32));
+            }
+        }
+        weights.add_weight(0, w);
+
+        let proof = prove_model_pure_gkr_auto_with_cache(&graph, &input, &weights, None, None)
+            .expect("pure GKR should dimension graph from the captured input rows");
+
+        assert_eq!(proof.execution.output.rows, 3);
+        assert_eq!(proof.execution.output.cols, 2);
+        assert!(proof.gkr_proof.is_some());
     }
 
     #[test]
@@ -12024,7 +12382,11 @@ mod tests {
             proof.unified_stark.is_none(),
             "unified STARK should be skipped (GKR covers RMSNorm natively)"
         );
-        assert_eq!(proof.rmsnorm_claims.len(), 1, "1 RMSNorm layer claim from GKR path");
+        assert_eq!(
+            proof.rmsnorm_claims.len(),
+            1,
+            "1 RMSNorm layer claim from GKR path"
+        );
     }
 
     #[test]
@@ -12076,7 +12438,11 @@ mod tests {
             proof.unified_stark.is_none(),
             "unified STARK should be skipped (GKR covers RMSNorm natively)"
         );
-        assert_eq!(proof.rmsnorm_claims.len(), 2, "2 RMSNorm layer claims from GKR path");
+        assert_eq!(
+            proof.rmsnorm_claims.len(),
+            2,
+            "2 RMSNorm layer claims from GKR path"
+        );
     }
 
     #[test]
@@ -12107,11 +12473,7 @@ mod tests {
         let config = RMSNormConfig::new(dim);
         let table = crate::components::rmsnorm::build_rsqrt_table(config.rsqrt_table_log_size);
         for &v in &rn.rms_sq_vals {
-            assert!(
-                table.lookup(v).is_some(),
-                "rms_sq={:?} not in table",
-                v
-            );
+            assert!(table.lookup(v).is_some(), "rms_sq={:?} not in table", v);
         }
     }
 
@@ -12578,7 +12940,9 @@ mod tests {
         };
         let mut graph = ComputationGraph::new((seq_len, d_model));
         let mm_id = graph.add_node(
-            GraphOp::MatMul { dims: (seq_len, d_model, d_model) },
+            GraphOp::MatMul {
+                dims: (seq_len, d_model, d_model),
+            },
             vec![],
             (seq_len, d_model),
         );
@@ -12608,10 +12972,16 @@ mod tests {
 
         let mut kv_cache = ModelKVCache::new();
         let result = prove_model_pure_gkr_prefill(&graph, &input, &weights, &mut kv_cache);
-        assert!(result.is_ok(), "prefill 2-token proving should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "prefill 2-token proving should succeed: {:?}",
+            result.err()
+        );
 
         // KV-cache should have entries for the attention layer
-        let layer_cache = kv_cache.get(attn_id).expect("attention layer should have cache");
+        let layer_cache = kv_cache
+            .get(attn_id)
+            .expect("attention layer should have cache");
         assert_eq!(layer_cache.len(), seq_len);
     }
 
@@ -12660,8 +13030,7 @@ mod tests {
         let mut model_cache = ModelKVCache::new();
         let layer_cache = model_cache.get_or_create(0, &config);
         assert_eq!(layer_cache.len(), 0);
-        let _ =
-            attention_forward_cached(&prefill_input, &attn_weights, &config, layer_cache, true);
+        let _ = attention_forward_cached(&prefill_input, &attn_weights, &config, layer_cache, true);
         assert_eq!(model_cache.cached_len(), 3);
     }
 
@@ -12687,12 +13056,27 @@ mod tests {
 
         // Profile JSON should have been stored
         let json = crate::gkr::profiler::take_profile_json();
-        assert!(json.is_some(), "profile JSON should be stored when STWO_PROFILE=1");
+        assert!(
+            json.is_some(),
+            "profile JSON should be stored when STWO_PROFILE=1"
+        );
         let json = json.unwrap();
-        assert!(json.contains("\"forward_pass\""), "JSON should contain forward_pass phase");
-        assert!(json.contains("\"gkr_proof\""), "JSON should contain gkr_proof phase");
-        assert!(json.contains("\"forward_pass_ops\""), "JSON should contain forward_pass_ops");
-        assert!(json.contains("\"total_elapsed_ms\""), "JSON should contain total_elapsed_ms");
+        assert!(
+            json.contains("\"forward_pass\""),
+            "JSON should contain forward_pass phase"
+        );
+        assert!(
+            json.contains("\"gkr_proof\""),
+            "JSON should contain gkr_proof phase"
+        );
+        assert!(
+            json.contains("\"forward_pass_ops\""),
+            "JSON should contain forward_pass_ops"
+        );
+        assert!(
+            json.contains("\"total_elapsed_ms\""),
+            "JSON should contain total_elapsed_ms"
+        );
     }
 
     #[test]
@@ -12737,8 +13121,8 @@ mod tests {
         // Verify that prefill proving with seq_len > 1 uses cached attention
         // intermediates (no double-append to KV-cache) and produces a valid proof.
         use crate::components::attention::{
-            attention_forward_cached, prove_attention_cached_from_intermediates,
-            AttentionWeights, KVCache, MultiHeadAttentionConfig,
+            attention_forward_cached, prove_attention_cached_from_intermediates, AttentionWeights,
+            KVCache, MultiHeadAttentionConfig,
         };
 
         let d_model = 8;
@@ -12761,19 +13145,14 @@ mod tests {
         let mut cache = KVCache::new(&config);
 
         // Phase 1: forward pass populates cache and returns intermediates
-        let intermediates =
-            attention_forward_cached(&input, &weights, &config, &mut cache, true);
+        let intermediates = attention_forward_cached(&input, &weights, &config, &mut cache, true);
         assert_eq!(cache.len(), seq_len);
         assert_eq!(intermediates.final_output.rows, seq_len);
 
         // Phase 2b: prove from stored intermediates — cache is NOT touched
         let cache_len_before = cache.len();
-        let result = prove_attention_cached_from_intermediates(
-            &input,
-            &weights,
-            &config,
-            &intermediates,
-        );
+        let result =
+            prove_attention_cached_from_intermediates(&input, &weights, &config, &intermediates);
         assert!(
             result.is_ok(),
             "prove_attention_cached_from_intermediates should succeed: {:?}",
@@ -12842,7 +13221,9 @@ mod tests {
 
         let mut graph = ComputationGraph::new((seq_len, d_model));
         let mm_id = graph.add_node(
-            GraphOp::MatMul { dims: (seq_len, d_model, d_model) },
+            GraphOp::MatMul {
+                dims: (seq_len, d_model, d_model),
+            },
             vec![],
             (seq_len, d_model),
         );
@@ -12869,11 +13250,19 @@ mod tests {
         weights.add_weight(attn_id + 4, wo);
 
         let result = prove_model_pure_gkr(&graph, &input, &weights);
-        assert!(result.is_ok(), "parallel attention proving should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "parallel attention proving should succeed: {:?}",
+            result.err()
+        );
 
         let proof = result.unwrap();
         // Attention proof should be present
-        assert_eq!(proof.attention_proofs.len(), 1, "should have 1 attention proof");
+        assert_eq!(
+            proof.attention_proofs.len(),
+            1,
+            "should have 1 attention proof"
+        );
         assert_eq!(proof.attention_proofs[0].0, attn_id, "node_id should match");
     }
 
@@ -12895,7 +13284,9 @@ mod tests {
 
         let mut graph = ComputationGraph::new((seq_len, d_model));
         let mm_id = graph.add_node(
-            GraphOp::MatMul { dims: (seq_len, d_model, d_model) },
+            GraphOp::MatMul {
+                dims: (seq_len, d_model, d_model),
+            },
             vec![],
             (seq_len, d_model),
         );
@@ -12924,15 +13315,26 @@ mod tests {
         let mut kv_cache = ModelKVCache::new();
         let chunk_size = 4;
         let result = prove_model_pure_gkr_prefill_chunked(
-            &graph, &input, &weights, &mut kv_cache, chunk_size, None,
+            &graph,
+            &input,
+            &weights,
+            &mut kv_cache,
+            chunk_size,
+            None,
         );
-        assert!(result.is_ok(), "chunked prefill should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "chunked prefill should succeed: {:?}",
+            result.err()
+        );
 
         let proofs = result.unwrap();
         assert_eq!(proofs.len(), 2, "8 tokens / 4 chunk_size = 2 proofs");
 
         // KV-cache should contain entries from both chunks
-        let layer_cache = kv_cache.get(attn_id).expect("attention layer should have cache");
+        let layer_cache = kv_cache
+            .get(attn_id)
+            .expect("attention layer should have cache");
         assert_eq!(layer_cache.len(), 8, "KV-cache should have all 8 tokens");
     }
 
@@ -12954,7 +13356,9 @@ mod tests {
         };
         let mut graph = ComputationGraph::new((seq_len, d_model));
         let mm_id = graph.add_node(
-            GraphOp::MatMul { dims: (seq_len, d_model, d_model) },
+            GraphOp::MatMul {
+                dims: (seq_len, d_model, d_model),
+            },
             vec![],
             (seq_len, d_model),
         );
@@ -13012,7 +13416,9 @@ mod tests {
         };
         let mut graph = ComputationGraph::new((seq_len, d_model));
         let mm_id = graph.add_node(
-            GraphOp::MatMul { dims: (seq_len, d_model, d_model) },
+            GraphOp::MatMul {
+                dims: (seq_len, d_model, d_model),
+            },
             vec![],
             (seq_len, d_model),
         );
@@ -13041,7 +13447,12 @@ mod tests {
         let mut kv_cache = ModelKVCache::new();
         let chunk_size = 4;
         let proofs = prove_model_pure_gkr_prefill_chunked(
-            &graph, &input, &weights, &mut kv_cache, chunk_size, None,
+            &graph,
+            &input,
+            &weights,
+            &mut kv_cache,
+            chunk_size,
+            None,
         )
         .expect("chunked prefill should succeed");
 
@@ -13157,10 +13568,20 @@ mod tests {
 
         // Step 2: Decode 1 token
         let decode_input = make_test_matrix(1, d_model);
-        let decode_proof =
-            prove_model_pure_gkr_decode_step(&graph, &decode_input, &weights, &mut kv_cache, None, None)
-                .expect("decode step should succeed");
-        assert_eq!(kv_cache.cached_len(), 3, "cache should grow to 3 after decode");
+        let decode_proof = prove_model_pure_gkr_decode_step(
+            &graph,
+            &decode_input,
+            &weights,
+            &mut kv_cache,
+            None,
+            None,
+        )
+        .expect("decode step should succeed");
+        assert_eq!(
+            kv_cache.cached_len(),
+            3,
+            "cache should grow to 3 after decode"
+        );
 
         // Decode proof must carry KV commitment
         assert!(
@@ -13169,8 +13590,7 @@ mod tests {
         );
         // prev should link to the prefill commitment
         assert_eq!(
-            decode_proof.prev_kv_cache_commitment,
-            prefill_proof.kv_cache_commitment,
+            decode_proof.prev_kv_cache_commitment, prefill_proof.kv_cache_commitment,
             "decode prev must link to prefill commitment"
         );
     }
@@ -13191,9 +13611,15 @@ mod tests {
 
         // Decode 3 tokens as a sequence
         let tokens: Vec<M31Matrix> = (0..3).map(|_| make_test_matrix(1, d_model)).collect();
-        let decode_proofs =
-            prove_model_pure_gkr_decode_sequence(&graph, &tokens, &weights, &mut kv_cache, None, None)
-                .expect("decode sequence should succeed");
+        let decode_proofs = prove_model_pure_gkr_decode_sequence(
+            &graph,
+            &tokens,
+            &weights,
+            &mut kv_cache,
+            None,
+            None,
+        )
+        .expect("decode sequence should succeed");
 
         assert_eq!(decode_proofs.len(), 3, "should produce 3 decode proofs");
         assert_eq!(
@@ -13337,7 +13763,11 @@ mod tests {
                 rmsnorm_claims: Vec::new(),
                 execution: GraphExecution {
                     intermediates: Vec::new(),
-                    output: M31Matrix { rows: 0, cols: 0, data: Vec::new() },
+                    output: M31Matrix {
+                        rows: 0,
+                        cols: 0,
+                        data: Vec::new(),
+                    },
                 },
                 activation_claims: Vec::new(),
                 attention_proofs: Vec::new(),
@@ -13362,7 +13792,9 @@ mod tests {
             prove_time_ms: 15000, // 15 seconds
         };
         let throughput = chunk.throughput_tok_per_sec();
-        assert!((throughput - 66.67).abs() < 1.0,
-            "1000 tokens / 15s should be ~66.67 tok/s, got {throughput:.2}");
+        assert!(
+            (throughput - 66.67).abs() < 1.0,
+            "1000 tokens / 15s should be ~66.67 tok/s, got {throughput:.2}"
+        );
     }
 }

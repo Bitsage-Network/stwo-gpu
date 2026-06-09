@@ -17,7 +17,7 @@
 
 use stwo::core::fields::m31::M31;
 
-use super::model::{load_weights_from_arrays, ClassifierModel, build_classifier_graph};
+use super::model::{build_classifier_graph, load_weights_from_arrays, ClassifierModel};
 use super::types::ClassifierError;
 
 /// Metadata for a trained weight set.
@@ -123,7 +123,9 @@ fn compute_weight_commitment(layer0: &[u32], layer2: &[u32], layer4: &[u32]) -> 
     // In production, this should use the same Poseidon hash as the prover.
     let mut hash: u64 = 0x0BE1_2026_CAFE;
     for &w in layer0.iter().chain(layer2.iter()).chain(layer4.iter()) {
-        hash = hash.wrapping_mul(6364136223846793005).wrapping_add(w as u64);
+        hash = hash
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(w as u64);
     }
     hash
 }

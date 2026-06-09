@@ -153,6 +153,16 @@ pub fn silu_f32(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
+pub fn softplus_f32(x: f32) -> f32 {
+    if x > 20.0 {
+        x
+    } else if x < -20.0 {
+        x.exp()
+    } else {
+        (1.0 + x.exp()).ln()
+    }
+}
+
 /// Numerically stable softmax over a row.
 ///
 /// Subtracts max for stability, then exp + normalize.
@@ -176,6 +186,7 @@ pub fn apply_activation_f32(matrix: &F32Matrix, act_type: ActivationType) -> F32
         ActivationType::GELU => gelu_f32,
         ActivationType::Sigmoid => sigmoid_f32,
         ActivationType::SiLU => silu_f32,
+        ActivationType::Softplus => softplus_f32,
         ActivationType::Softmax => {
             // For softmax, apply row-wise
             let mut result = F32Matrix::new(matrix.rows, matrix.cols);

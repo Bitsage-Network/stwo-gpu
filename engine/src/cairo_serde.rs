@@ -116,13 +116,17 @@ pub(crate) fn serialize_qm31_packed(val: SecureField, output: &mut Vec<FieldElem
 /// Pack two QM31 values into a single felt252 (248 bits, no sentinel).
 /// Layout: [a.a.a(31) | a.a.b(31) | a.b.a(31) | a.b.b(31) | b.a.a(31) | b.a.b(31) | b.b.a(31) | b.b.b(31)]
 /// Uses the same Horner-style packing as Cairo's pack_qm31_pair_to_felt.
-pub(crate) fn serialize_qm31_pair_packed(a: SecureField, b: SecureField, output: &mut Vec<FieldElement>) {
-    use stwo::core::fields::qm31::QM31;
+pub(crate) fn serialize_qm31_pair_packed(
+    a: SecureField,
+    b: SecureField,
+    output: &mut Vec<FieldElement>,
+) {
     use stwo::core::fields::cm31::CM31;
+    use stwo::core::fields::qm31::QM31;
     let QM31(CM31(a0, a1), CM31(a2, a3)) = a;
     let QM31(CM31(b0, b1), CM31(b2, b3)) = b;
     let shift = FieldElement::from(1u64 << 31); // 2^31
-    // Horner: result = a0 * 2^217 + a1 * 2^186 + ... + b3
+                                                // Horner: result = a0 * 2^217 + a1 * 2^186 + ... + b3
     let mut result = FieldElement::from(a0.0 as u64);
     result = result * shift + FieldElement::from(a1.0 as u64);
     result = result * shift + FieldElement::from(a2.0 as u64);
@@ -136,8 +140,8 @@ pub(crate) fn serialize_qm31_pair_packed(a: SecureField, b: SecureField, output:
 
 /// Unpack two QM31 values from a single double-packed felt252.
 pub(crate) fn deserialize_qm31_pair_packed(fe: FieldElement) -> (SecureField, SecureField) {
-    use stwo::core::fields::qm31::QM31;
     use stwo::core::fields::cm31::CM31;
+    use stwo::core::fields::qm31::QM31;
     let m31s = crate::crypto::poseidon_channel::unpack_m31s(fe, 8);
     let a = QM31(CM31(m31s[0], m31s[1]), CM31(m31s[2], m31s[3]));
     let b = QM31(CM31(m31s[4], m31s[5]), CM31(m31s[6], m31s[7]));
@@ -531,9 +535,226 @@ fn serialize_attention_proof_onchain(
     serialize_matmul_for_recursive(&proof.output_proof, output);
 }
 
-/// Serialize an ML proof for the recursive Cairo verifier.
+/// Serialize an ML proof for the current Cairo `MLProof` verifier schema.
 ///
-/// Output format matches Cairo's `MLProof { claim, matmul_proofs, channel_salt, unified_stark_proof }`:
+/// This is the production-safe serializer for `obelysk_ml_air::verify_ml`.
+/// It deliberately rejects proof sections that the current Cairo verifier does
+/// not deserialize or verify yet, rather than emitting a wider witness that
+/// would be misread by Cairo.
+pub fn serialize_ml_proof_v1_for_recursive(
+    proof: &AggregatedModelProofOnChain,
+    metadata: &MLClaimMetadata,
+    channel_salt: Option<u64>,
+) -> Result<Vec<FieldElement>, String> {
+    validate_ml_proof_v1_supported(proof)?;
+
+    let mut output = Vec::new();
+
+    // 1. MLClaim
+    output.push(metadata.model_id);
+    serialize_u32(metadata.num_layers, &mut output);
+    output.push(FieldElement::from(metadata.activation_type as u64));
+    output.push(metadata.io_commitment);
+    output.push(metadata.weight_commitment);
+
+    // 2. matmul_proofs: Array<MatMulSumcheckProofOnChain>
+    serialize_u32(proof.matmul_proofs.len() as u32, &mut output);
+    for (_layer_idx, matmul) in &proof.matmul_proofs {
+        serialize_matmul_for_recursive(matmul, &mut output);
+    }
+
+    // 3. channel_salt: Option<u64>
+    match channel_salt {
+        None => serialize_u32(0, &mut output),
+        Some(salt) => {
+            serialize_u32(1, &mut output);
+            serialize_u64(salt, &mut output);
+        }
+    }
+
+    // 4. activation_stark_proof: Option<ActivationStarkProof>
+    match &proof.unified_stark {
+        None => serialize_u32(0, &mut output),
+        Some(stark_proof) => {
+            serialize_u32(1, &mut output);
+            serialize_activation_stark_proof_v1(
+                stark_proof,
+                &proof.activation_claims,
+                metadata.activation_type,
+                &mut output,
+            );
+        }
+    }
+
+    Ok(output)
+}
+
+/// Serialize an ML proof for the Cairo `MLProofV2` verifier schema.
+///
+/// V2 accepts the wider recursive layout and currently verifies:
+/// - individual matmul sumchecks,
+/// - batched matmul sumchecks,
+/// - activation-only unified STARK proofs.
+///
+/// It rejects every section that the Cairo V2 verifier still fails closed on.
+pub fn serialize_ml_proof_v2_for_recursive(
+    proof: &AggregatedModelProofOnChain,
+    metadata: &MLClaimMetadata,
+    channel_salt: Option<u64>,
+) -> Result<Vec<FieldElement>, String> {
+    validate_ml_proof_v2_supported(proof, metadata)?;
+    Ok(serialize_ml_proof_for_recursive(
+        proof,
+        metadata,
+        channel_salt,
+    ))
+}
+
+fn validate_ml_proof_v1_supported(proof: &AggregatedModelProofOnChain) -> Result<(), String> {
+    let mut unsupported = Vec::new();
+    if !proof.batched_matmul_proofs.is_empty() {
+        unsupported.push("batched_matmul_proofs");
+    }
+    if !proof.add_claims.is_empty() {
+        unsupported.push("add_claims");
+    }
+    if !proof.mul_claims.is_empty() {
+        unsupported.push("mul_claims");
+    }
+    if !proof.layernorm_claims.is_empty() {
+        unsupported.push("layernorm_claims");
+    }
+    if !proof.rmsnorm_claims.is_empty() {
+        unsupported.push("rmsnorm_claims");
+    }
+    if !proof.embedding_claims.is_empty() {
+        unsupported.push("embedding_claims");
+    }
+    if !proof.quantize_claims.is_empty() {
+        unsupported.push("quantize_claims");
+    }
+    if !proof.dequantize_claims.is_empty() {
+        unsupported.push("dequantize_claims");
+    }
+    if !proof.attention_proofs.is_empty() {
+        unsupported.push("attention_proofs");
+    }
+    if !proof.tiled_matmul_proofs.is_empty() {
+        unsupported.push("tiled_matmul_proofs");
+    }
+    if !unsupported.is_empty() {
+        return Err(format!(
+            "current Cairo MLProof v1 verifier cannot deserialize/verify {}; use MLProofV2 work before recursive proving this model",
+            unsupported.join(", ")
+        ));
+    }
+    if proof.unified_stark.is_none() && !proof.activation_claims.is_empty() {
+        return Err(
+            "activation_claims require activation_stark_proof in current Cairo MLProof v1"
+                .to_string(),
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_ml_proof_v2_supported(
+    proof: &AggregatedModelProofOnChain,
+    metadata: &MLClaimMetadata,
+) -> Result<(), String> {
+    let mut unsupported = Vec::new();
+    if !proof.batched_matmul_proofs.is_empty() {
+        unsupported.push("batched_matmul_proofs");
+    }
+    if !proof.add_claims.is_empty() {
+        unsupported.push("add_claims");
+    }
+    if !proof.mul_claims.is_empty() {
+        unsupported.push("mul_claims");
+    }
+    if !proof.layernorm_claims.is_empty() {
+        unsupported.push("layernorm_claims");
+    }
+    if !proof.rmsnorm_claims.is_empty() {
+        unsupported.push("rmsnorm_claims");
+    }
+    if !proof.embedding_claims.is_empty() {
+        unsupported.push("embedding_claims");
+    }
+    if !proof.quantize_claims.is_empty() {
+        unsupported.push("quantize_claims");
+    }
+    if !proof.dequantize_claims.is_empty() {
+        unsupported.push("dequantize_claims");
+    }
+    if !proof.attention_proofs.is_empty() {
+        unsupported.push("attention_proofs_without_softmax_stark");
+    }
+    if !proof.tiled_matmul_proofs.is_empty() {
+        unsupported.push("tiled_matmul_proofs");
+    }
+    if metadata
+        .tee_attestation_hash
+        .is_some_and(|hash| hash != FieldElement::ZERO)
+    {
+        unsupported.push("tee_attestation_hash");
+    }
+    if !unsupported.is_empty() {
+        return Err(format!(
+            "current Cairo MLProofV2 verifier cannot fully verify {}; keep these proofs off the recursive path until their Cairo verifier sections are implemented",
+            unsupported.join(", ")
+        ));
+    }
+    if proof.unified_stark.is_none() && !proof.activation_claims.is_empty() {
+        return Err(
+            "activation_claims require unified_stark_proof in current Cairo MLProofV2".to_string(),
+        );
+    }
+
+    Ok(())
+}
+
+fn serialize_activation_stark_proof_v1(
+    stark_proof: &Blake2sProof,
+    activation_claims: &[LayerClaim],
+    activation_type: u8,
+    output: &mut Vec<FieldElement>,
+) {
+    // ActivationStarkProof.activation_claims
+    let serde_claims: Vec<ActivationClaimForSerde> = activation_claims
+        .iter()
+        .map(|c| ActivationClaimForSerde::from_layer_claim(c, activation_type))
+        .collect();
+    serialize_span(&serde_claims, serialize_activation_claim, output);
+
+    // ActivationStarkProof.activation_interaction_claims
+    serialize_u32(activation_claims.len() as u32, output);
+    for claim in activation_claims {
+        serialize_interaction_claim(claim.claimed_sum, output);
+    }
+
+    // ActivationStarkProof.interaction_claim
+    let total_sum: SecureField = activation_claims
+        .iter()
+        .map(|c| c.claimed_sum)
+        .fold(SecureField::default(), |acc, s| acc + s);
+    serialize_ml_interaction_claim(total_sum, output);
+
+    // ActivationStarkProof.pcs_config, interaction_pow, stark_proof
+    serialize_pcs_config(&stark_proof.0.config, output);
+    serialize_u64(0, output);
+    serialize_commitment_scheme_proof(&stark_proof.0, output);
+}
+
+/// Serialize an ML proof in the legacy superset layout previously emitted by
+/// this crate. This is retained for compatibility with existing artifacts, but
+/// does not match the current Cairo `MLProof` schema in `obelysk_ml_air`.
+///
+/// New recursive verifier witnesses should use
+/// `serialize_ml_proof_v2_for_recursive`, which validates the exact fail-closed
+/// subset currently accepted by Cairo.
+///
+/// Legacy output format:
 ///
 /// 1. MLClaim: model_id, num_layers, activation_type, io_commitment, weight_commitment
 /// 2. matmul_proofs: Array<MatMulSumcheckProofOnChain> (10-field version, no MLE openings)
@@ -1245,8 +1466,11 @@ fn serialize_activation_product_proof(
 ///     input_eval (QM31: 4 felts)
 ///     output_eval (QM31: 4 felts)
 ///     [indicator_eval] × 16 (QM31: 4 felts each)
+///     has_seg_bits (u32: 0 or 1), [seg_bit_eval] × 4 if present
+///     has_low_bits (u32: 0 or 1), [low_bit_eval] × 27 if present
+///     has_canonical_ands (u32: 0 or 1), [canonical_and_eval] × 31 if present
 ///
-/// Total: ~60 felts per activation layer (vs ~336 for LogUp).
+/// Total with full canonical segment binding: ~143 felts per activation layer.
 fn serialize_piecewise_proof(
     proof: &Option<crate::gkr::types::PiecewiseAlgebraicProof>,
     output: &mut Vec<FieldElement>,
@@ -1289,6 +1513,36 @@ fn serialize_piecewise_proof(
                             serialize_qm31_packed(sb, output);
                         } else {
                             serialize_qm31(sb, output);
+                        }
+                    }
+                }
+                None => serialize_u32(0, output),
+            }
+            // Full segment-input binding: 27 low-bit evals
+            match &p.low_bit_evals {
+                Some(lbe) => {
+                    serialize_u32(1, output);
+                    serialize_u32(lbe.len() as u32, output);
+                    for &lb in lbe {
+                        if packed {
+                            serialize_qm31_packed(lb, output);
+                        } else {
+                            serialize_qm31(lb, output);
+                        }
+                    }
+                }
+                None => serialize_u32(0, output),
+            }
+            // Canonicality chain: excludes the all-ones decomposition of M31::ZERO.
+            match &p.canonical_and_evals {
+                Some(cae) => {
+                    serialize_u32(1, output);
+                    serialize_u32(cae.len() as u32, output);
+                    for &ca in cae {
+                        if packed {
+                            serialize_qm31_packed(ca, output);
+                        } else {
+                            serialize_qm31(ca, output);
                         }
                     }
                 }
@@ -1463,13 +1717,17 @@ pub fn serialize_gkr_model_proof(proof: &crate::gkr::GKRProof, output: &mut Vec<
                 // Multiplicity sumcheck
                 serialize_multiplicity_sumcheck(multiplicity_sumcheck, output);
                 // var_eval (for verifier, not channel-mixed)
-                if let Some(ve) = var_eval { serialize_qm31(*ve, output); }
+                if let Some(ve) = var_eval {
+                    serialize_qm31(*ve, output);
+                }
                 // Per-row means for multi-row binding
                 match row_means {
                     Some(rm) => {
                         serialize_u32(1, output);
                         serialize_u32(rm.len() as u32, output);
-                        for m in rm { serialize_u32(m.0, output); }
+                        for m in rm {
+                            serialize_u32(m.0, output);
+                        }
                     }
                     None => serialize_u32(0, output),
                 }
@@ -1478,7 +1736,9 @@ pub fn serialize_gkr_model_proof(proof: &crate::gkr::GKRProof, output: &mut Vec<
                     Some(rv) => {
                         serialize_u32(1, output);
                         serialize_u32(rv.len() as u32, output);
-                        for v in rv { serialize_u32(v.0, output); }
+                        for v in rv {
+                            serialize_u32(v.0, output);
+                        }
                     }
                     None => serialize_u32(0, output),
                 }
@@ -1721,20 +1981,30 @@ pub fn serialize_gkr_model_proof(proof: &crate::gkr::GKRProof, output: &mut Vec<
                     Some(rr) => {
                         serialize_u32(1, output);
                         serialize_u32(rr.len() as u32, output);
-                        for v in rr { serialize_u32(v.0, output); }
+                        for v in rr {
+                            serialize_u32(v.0, output);
+                        }
                     }
                     None => serialize_u32(0, output),
                 }
             }
             LayerProof::TopK {
-                num_experts, top_k, selected_indices, selected_values,
-                threshold_gap, logits_commitment,
+                num_experts,
+                top_k,
+                selected_indices,
+                selected_values,
+                threshold_gap,
+                logits_commitment,
             } => {
                 serialize_u32(12, output); // tag: TopK
                 serialize_u32(*num_experts as u32, output);
                 serialize_u32(*top_k as u32, output);
-                for &idx in selected_indices { serialize_u32(idx, output); }
-                for &val in selected_values { serialize_qm31(val, output); }
+                for &idx in selected_indices {
+                    serialize_u32(idx, output);
+                }
+                for &val in selected_values {
+                    serialize_qm31(val, output);
+                }
                 serialize_qm31(*threshold_gap, output);
                 output.push(*logits_commitment);
             }
@@ -1784,7 +2054,12 @@ fn serialize_attention_sub_proofs(
 ) {
     use crate::gkr::types::LayerProof;
     for sub in sub_proofs {
-        if let LayerProof::MatMul { round_polys, final_a_eval, final_b_eval } = sub {
+        if let LayerProof::MatMul {
+            round_polys,
+            final_a_eval,
+            final_b_eval,
+        } = sub
+        {
             serialize_u32(0, output); // MatMul tag
             serialize_u32(round_polys.len() as u32, output);
             for rp in round_polys {
@@ -1804,7 +2079,10 @@ fn serialize_attention_sub_proofs(
                 serialize_qm31(*final_b_eval, output);
             }
         } else {
-            panic!("attention sub-proof must be MatMul, got: {:?}", std::mem::discriminant(sub));
+            panic!(
+                "attention sub-proof must be MatMul, got: {:?}",
+                std::mem::discriminant(sub)
+            );
         }
     }
 }
@@ -1962,13 +2240,17 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
                 }
                 serialize_multiplicity_sumcheck(multiplicity_sumcheck, output);
                 // var_eval (for verifier, not channel-mixed)
-                if let Some(ve) = var_eval { serialize_qm31(*ve, output); }
+                if let Some(ve) = var_eval {
+                    serialize_qm31(*ve, output);
+                }
                 // Per-row means for multi-row binding
                 match row_means {
                     Some(rm) => {
                         serialize_u32(1, output);
                         serialize_u32(rm.len() as u32, output);
-                        for m in rm { serialize_u32(m.0, output); }
+                        for m in rm {
+                            serialize_u32(m.0, output);
+                        }
                     }
                     None => serialize_u32(0, output),
                 }
@@ -1977,7 +2259,9 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
                     Some(rv) => {
                         serialize_u32(1, output);
                         serialize_u32(rv.len() as u32, output);
-                        for v in rv { serialize_u32(v.0, output); }
+                        for v in rv {
+                            serialize_u32(v.0, output);
+                        }
                     }
                     None => serialize_u32(0, output),
                 }
@@ -2216,20 +2500,30 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
                     Some(rr) => {
                         serialize_u32(1, output);
                         serialize_u32(rr.len() as u32, output);
-                        for v in rr { serialize_u32(v.0, output); }
+                        for v in rr {
+                            serialize_u32(v.0, output);
+                        }
                     }
                     None => serialize_u32(0, output),
                 }
             }
             LayerProof::TopK {
-                num_experts, top_k, selected_indices, selected_values,
-                threshold_gap, logits_commitment,
+                num_experts,
+                top_k,
+                selected_indices,
+                selected_values,
+                threshold_gap,
+                logits_commitment,
             } => {
                 serialize_u32(12, output); // tag: TopK
                 serialize_u32(*num_experts as u32, output);
                 serialize_u32(*top_k as u32, output);
-                for &idx in selected_indices { serialize_u32(idx, output); }
-                for &val in selected_values { serialize_qm31(val, output); }
+                for &idx in selected_indices {
+                    serialize_u32(idx, output);
+                }
+                for &val in selected_values {
+                    serialize_qm31(val, output);
+                }
                 serialize_qm31(*threshold_gap, output);
                 output.push(*logits_commitment);
             }
@@ -2243,7 +2537,7 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
         serialize_qm31(deferred.claim.value, output);
         if deferred.has_weights() {
             serialize_u32(0, output); // kind: MatMul
-            // MatMul dimensions
+                                      // MatMul dimensions
             let (m, k, n) = deferred.dims().unwrap();
             serialize_u32(m as u32, output);
             serialize_u32(k as u32, output);
@@ -2268,7 +2562,7 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
             output.push(deferred.weight_commitment().unwrap());
         } else {
             serialize_u32(1, output); // kind: Weightless (Quantize/Dequantize)
-            // Serialize layer proof data with length prefix (replay skips this blob)
+                                      // Serialize layer proof data with length prefix (replay skips this blob)
             let mut sub = Vec::new();
             serialize_layer_proof_packed_inner(&deferred.layer_proof, &mut sub, None);
             serialize_u32(sub.len() as u32, output);
@@ -2281,7 +2575,10 @@ pub fn serialize_gkr_proof_data_only(proof: &crate::gkr::GKRProof, output: &mut 
 ///
 /// Extracted for incremental/streaming serialization: callers can serialize
 /// layer proofs one at a time as they are produced by the GKR prover.
-pub fn serialize_layer_proof_packed(layer_proof: &crate::gkr::types::LayerProof, output: &mut Vec<FieldElement>) {
+pub fn serialize_layer_proof_packed(
+    layer_proof: &crate::gkr::types::LayerProof,
+    output: &mut Vec<FieldElement>,
+) {
     serialize_layer_proof_packed_inner(layer_proof, output, None);
 }
 
@@ -2431,13 +2728,17 @@ fn serialize_layer_proof_packed_inner(
             }
             serialize_multiplicity_sumcheck_packed(multiplicity_sumcheck, output);
             // var_eval (for verifier, not channel-mixed)
-            if let Some(ve) = var_eval { serialize_qm31_packed(*ve, output); }
+            if let Some(ve) = var_eval {
+                serialize_qm31_packed(*ve, output);
+            }
             // Per-row means for multi-row binding
             match row_means {
                 Some(rm) => {
                     serialize_u32(1, output);
                     serialize_u32(rm.len() as u32, output);
-                    for m in rm { serialize_u32(m.0, output); }
+                    for m in rm {
+                        serialize_u32(m.0, output);
+                    }
                 }
                 None => serialize_u32(0, output),
             }
@@ -2446,7 +2747,9 @@ fn serialize_layer_proof_packed_inner(
                 Some(rv) => {
                     serialize_u32(1, output);
                     serialize_u32(rv.len() as u32, output);
-                    for v in rv { serialize_u32(v.0, output); }
+                    for v in rv {
+                        serialize_u32(v.0, output);
+                    }
                 }
                 None => serialize_u32(0, output),
             }
@@ -2519,7 +2822,11 @@ fn serialize_layer_proof_packed_inner(
             match logup_proof {
                 Some(lup) => {
                     serialize_u32(1, output);
-                    serialize_logup_proof_inner_packed(lup, output, lup.multiplicities.len() <= 256);
+                    serialize_logup_proof_inner_packed(
+                        lup,
+                        output,
+                        lup.multiplicities.len() <= 256,
+                    );
                 }
                 None => serialize_u32(0, output),
             }
@@ -2574,7 +2881,7 @@ fn serialize_layer_proof_packed_inner(
             // Rust self-verifier, but the on-chain Cairo contract doesn't replay it.
             // Both prover and serializer skip Part 0 channel ops, keeping channels in sync.
             serialize_u32(0, output); // has_rms_sq_proof = 0
-            // === Part 1: Linear eq-sumcheck round polys ===
+                                      // === Part 1: Linear eq-sumcheck round polys ===
             serialize_u32(linear_round_polys.len() as u32, output);
             for rp in linear_round_polys {
                 serialize_qm31_packed(rp.c0, output);
@@ -2598,7 +2905,9 @@ fn serialize_layer_proof_packed_inner(
                 Some(rr) => {
                     serialize_u32(1, output);
                     serialize_u32(rr.len() as u32, output);
-                    for v in rr { serialize_u32(v.0, output); }
+                    for v in rr {
+                        serialize_u32(v.0, output);
+                    }
                 }
                 None => serialize_u32(0, output),
             }
@@ -2677,17 +2986,25 @@ fn serialize_layer_proof_packed_inner(
             }
         }
         LayerProof::TopK {
-                num_experts, top_k, selected_indices, selected_values,
-                threshold_gap, logits_commitment,
-            } => {
-                serialize_u32(12, output); // tag: TopK
-                serialize_u32(*num_experts as u32, output);
-                serialize_u32(*top_k as u32, output);
-                for &idx in selected_indices { serialize_u32(idx, output); }
-                for &val in selected_values { serialize_qm31(val, output); }
-                serialize_qm31(*threshold_gap, output);
-                output.push(*logits_commitment);
+            num_experts,
+            top_k,
+            selected_indices,
+            selected_values,
+            threshold_gap,
+            logits_commitment,
+        } => {
+            serialize_u32(12, output); // tag: TopK
+            serialize_u32(*num_experts as u32, output);
+            serialize_u32(*top_k as u32, output);
+            for &idx in selected_indices {
+                serialize_u32(idx, output);
             }
+            for &val in selected_values {
+                serialize_qm31(val, output);
+            }
+            serialize_qm31(*threshold_gap, output);
+            output.push(*logits_commitment);
+        }
     }
 }
 
@@ -2695,7 +3012,10 @@ fn serialize_layer_proof_packed_inner(
 ///
 /// Achieves ~4x compression on proof_data (75K → ~19K felts for Qwen3-14B 40 layers).
 /// Tags, u32 metadata, and felt252 commitments are unchanged.
-pub fn serialize_gkr_proof_data_only_packed(proof: &crate::gkr::GKRProof, output: &mut Vec<FieldElement>) {
+pub fn serialize_gkr_proof_data_only_packed(
+    proof: &crate::gkr::GKRProof,
+    output: &mut Vec<FieldElement>,
+) {
     for layer_proof in &proof.layer_proofs {
         serialize_layer_proof_packed_inner(layer_proof, output, Some(proof));
     }
@@ -2739,7 +3059,10 @@ pub fn serialize_gkr_proof_data_only_packed(proof: &crate::gkr::GKRProof, output
 /// Double-packed variant: degree-2 round polys (c0, c2) packed as QM31 pairs (1 felt each),
 /// degree-3 round polys (c0, c2) as pair + c3 as single packed QM31.
 /// All other QM31 values remain single-packed. Saves ~50% on proof_data section.
-pub fn serialize_gkr_proof_data_only_double_packed(proof: &crate::gkr::GKRProof, output: &mut Vec<FieldElement>) {
+pub fn serialize_gkr_proof_data_only_double_packed(
+    proof: &crate::gkr::GKRProof,
+    output: &mut Vec<FieldElement>,
+) {
     for layer_proof in &proof.layer_proofs {
         serialize_layer_proof_double_packed_inner(layer_proof, output, Some(proof));
     }
@@ -2925,13 +3248,17 @@ fn serialize_layer_proof_double_packed_inner(
             }
             serialize_multiplicity_sumcheck_packed(multiplicity_sumcheck, output);
             // var_eval (for verifier, not channel-mixed)
-            if let Some(ve) = var_eval { serialize_qm31_packed(*ve, output); }
+            if let Some(ve) = var_eval {
+                serialize_qm31_packed(*ve, output);
+            }
             // Per-row means for multi-row binding
             match row_means {
                 Some(rm) => {
                     serialize_u32(1, output);
                     serialize_u32(rm.len() as u32, output);
-                    for m in rm { serialize_u32(m.0, output); }
+                    for m in rm {
+                        serialize_u32(m.0, output);
+                    }
                 }
                 None => serialize_u32(0, output),
             }
@@ -2940,7 +3267,9 @@ fn serialize_layer_proof_double_packed_inner(
                 Some(rv) => {
                     serialize_u32(1, output);
                     serialize_u32(rv.len() as u32, output);
-                    for v in rv { serialize_u32(v.0, output); }
+                    for v in rv {
+                        serialize_u32(v.0, output);
+                    }
                 }
                 None => serialize_u32(0, output),
             }
@@ -3013,7 +3342,11 @@ fn serialize_layer_proof_double_packed_inner(
             match logup_proof {
                 Some(lup) => {
                     serialize_u32(1, output);
-                    serialize_logup_proof_inner_double_packed(lup, output, lup.multiplicities.len() <= 256);
+                    serialize_logup_proof_inner_double_packed(
+                        lup,
+                        output,
+                        lup.multiplicities.len() <= 256,
+                    );
                 }
                 None => serialize_u32(0, output),
             }
@@ -3067,7 +3400,7 @@ fn serialize_layer_proof_double_packed_inner(
             // Rust self-verifier, but the on-chain Cairo contract doesn't replay it.
             // Both prover and serializer skip Part 0 channel ops, keeping channels in sync.
             serialize_u32(0, output); // has_rms_sq_proof = 0
-            // === Part 1: Linear eq-sumcheck round polys ===
+                                      // === Part 1: Linear eq-sumcheck round polys ===
             serialize_u32(linear_round_polys.len() as u32, output);
             for rp in linear_round_polys {
                 // Double-packed: (c0, c2) as pair, c3 as single
@@ -3091,7 +3424,9 @@ fn serialize_layer_proof_double_packed_inner(
                 Some(rr) => {
                     serialize_u32(1, output);
                     serialize_u32(rr.len() as u32, output);
-                    for v in rr { serialize_u32(v.0, output); }
+                    for v in rr {
+                        serialize_u32(v.0, output);
+                    }
                 }
                 None => serialize_u32(0, output),
             }
@@ -3169,17 +3504,25 @@ fn serialize_layer_proof_double_packed_inner(
             }
         }
         LayerProof::TopK {
-                num_experts, top_k, selected_indices, selected_values,
-                threshold_gap, logits_commitment,
-            } => {
-                serialize_u32(12, output); // tag: TopK
-                serialize_u32(*num_experts as u32, output);
-                serialize_u32(*top_k as u32, output);
-                for &idx in selected_indices { serialize_u32(idx, output); }
-                for &val in selected_values { serialize_qm31(val, output); }
-                serialize_qm31(*threshold_gap, output);
-                output.push(*logits_commitment);
+            num_experts,
+            top_k,
+            selected_indices,
+            selected_values,
+            threshold_gap,
+            logits_commitment,
+        } => {
+            serialize_u32(12, output); // tag: TopK
+            serialize_u32(*num_experts as u32, output);
+            serialize_u32(*top_k as u32, output);
+            for &idx in selected_indices {
+                serialize_u32(idx, output);
             }
+            for &val in selected_values {
+                serialize_qm31(val, output);
+            }
+            serialize_qm31(*threshold_gap, output);
+            output.push(*logits_commitment);
+        }
     }
 }
 
@@ -3597,7 +3940,7 @@ mod recursive_serde {
     /// └──────────────────────────────────────────────────────────┘
     /// ```
     ///
-    /// Total: ~16 header felts + STARK proof body.
+    /// Total: 34 header felts + STARK proof body.
     /// For a log_size=10 recursive STARK this is typically 200-600 felts,
     /// compared to 10,000+ for the raw GKR streaming pipeline.
     pub fn serialize_recursive_proof_calldata(
@@ -3628,8 +3971,16 @@ mod recursive_serde {
         // Trace log_size (needed by verifier to reconstruct the AIR)
         serialize_u32(proof.log_size, &mut output);
 
-        // n_real_rows (number of active HadesPerm rows for accumulator correction)
+        // Row counts needed by the verifier to reconstruct each active AIR
+        // component and its accumulator correction.
         serialize_u32(proof.n_real_rows, &mut output);
+        serialize_u32(proof.n_arithmetic_rows, &mut output);
+        serialize_u32(proof.n_sumcheck_rows, &mut output);
+        serialize_u32(proof.n_draw_rows, &mut output);
+
+        // LogUp claimed sum for the recursive interaction trace. Cairo must
+        // know this public value to evaluate the LogUp interaction AIR.
+        serialize_qm31(proof.logup_claimed_sum, &mut output);
 
         // KV-cache continuity (multi-token autoregressive sessions).
         // ZERO felts on prefill / non-decode proofs.
@@ -3638,6 +3989,10 @@ mod recursive_serde {
         //   session storage's last_kv_commitment (= step N-1's kv_cache_commitment).
         output.push(proof.public_inputs.prev_kv_cache_commitment);
         output.push(proof.public_inputs.kv_cache_commitment);
+
+        // Conversation/action statement binding. ZERO for legacy proofs.
+        // Non-zero equals ConversationBatchStatement::statement_hash().
+        output.push(proof.public_inputs.conversation_statement_hash);
 
         // ── STARK Proof Body ─────────────────────────────────────────────
         serialize_commitment_scheme_proof_poseidon252(&proof.stark_proof.0, &mut output);
@@ -3665,9 +4020,12 @@ mod recursive_serde {
             total_felts: calldata.len(),
             // 4 (circuit_hash) + 4 (io_commitment) + 4 (weight_super_root) + 1 (n_layers)
             // + 1 (n_poseidon_perms) + 4 (seed_digest) + 1 (hades_commitment) + 1 (io_felt)
-            // + 1 (pass1_digest) + 1 (final_digest) + 1 (log_size) + 1 (n_real_rows)
-            // + 1 (prev_kv_cache_commitment) + 1 (kv_cache_commitment) = 26
-            header_felts: 26,
+            // + 1 (pass1_digest) + 1 (final_digest) + 1 (log_size)
+            // + 4 (chain/arithmetic/sumcheck/draw row counts)
+            // + 4 (recursive LogUp claimed_sum)
+            // + 1 (prev_kv_cache_commitment) + 1 (kv_cache_commitment)
+            // + 1 (conversation_statement_hash) = 34
+            header_felts: 34,
             n_commitments,
             n_fri_layers,
             n_queries,
@@ -3695,9 +4053,7 @@ mod recursive_serde {
 
 #[cfg(feature = "cli")]
 pub use recursive_serde::{
-    serialize_recursive_proof_calldata,
-    recursive_proof_calldata_summary,
-    Poseidon252Proof,
+    recursive_proof_calldata_summary, serialize_recursive_proof_calldata, Poseidon252Proof,
     RecursiveCalldataSummary,
 };
 
@@ -3752,7 +4108,13 @@ pub fn serialize_raw_io(
 /// Hard-fails on truncated data, dimension mismatch, or out-of-range M31 values.
 pub fn deserialize_raw_io(
     felts: &[FieldElement],
-) -> Result<(crate::components::matmul::M31Matrix, crate::components::matmul::M31Matrix), String> {
+) -> Result<
+    (
+        crate::components::matmul::M31Matrix,
+        crate::components::matmul::M31Matrix,
+    ),
+    String,
+> {
     use crate::components::matmul::M31Matrix;
 
     const P: u32 = (1u32 << 31) - 1;
@@ -4183,14 +4545,20 @@ mod tests {
 
     #[test]
     fn test_serialize_qm31_packed_roundtrip() {
-        use crate::crypto::poseidon_channel::{securefield_to_felt, felt_to_securefield};
+        use crate::crypto::poseidon_channel::{felt_to_securefield, securefield_to_felt};
         use stwo::core::fields::cm31::CM31;
         use stwo::core::fields::qm31::QM31;
 
         // Test with various M31 values including boundary cases
         let test_cases = vec![
-            QM31(CM31(M31::from(0), M31::from(0)), CM31(M31::from(0), M31::from(0))),
-            QM31(CM31(M31::from(1), M31::from(2)), CM31(M31::from(3), M31::from(4))),
+            QM31(
+                CM31(M31::from(0), M31::from(0)),
+                CM31(M31::from(0), M31::from(0)),
+            ),
+            QM31(
+                CM31(M31::from(1), M31::from(2)),
+                CM31(M31::from(3), M31::from(4)),
+            ),
             QM31(
                 CM31(M31::from(2147483646), M31::from(1000000)),
                 CM31(M31::from(999999), M31::from(12345)),
@@ -4538,6 +4906,8 @@ mod tests {
         };
 
         let felts = serialize_ml_proof_for_recursive(&aggregated, &metadata, None);
+        let v1_felts = serialize_ml_proof_v1_for_recursive(&aggregated, &metadata, None).unwrap();
+        let v2_felts = serialize_ml_proof_v2_for_recursive(&aggregated, &metadata, None).unwrap();
 
         // Verify structure:
         // MLClaim: model_id(1) + num_layers(1) + activation_type(1) + io_commitment(1) + weight_commitment(1) = 5
@@ -4598,6 +4968,30 @@ mod tests {
         let json = serialize_ml_proof_to_arguments_file(&felts);
         assert!(json.starts_with("[\"0x"));
         assert!(json.ends_with("\"]"));
+
+        // V1 is the exact current Cairo MLProof schema: no batched-matmul
+        // length and no trailing unsupported sections.
+        assert_eq!(v1_felts[0], FieldElement::from(0x42u64), "v1 model_id");
+        assert_eq!(v1_felts[5], FieldElement::from(1u64), "v1 matmul count");
+        assert_eq!(
+            v1_felts[v1_felts.len() - 2],
+            FieldElement::ZERO,
+            "v1 channel_salt = None"
+        );
+        assert_eq!(
+            v1_felts[v1_felts.len() - 1],
+            FieldElement::ZERO,
+            "v1 activation_stark_proof = None"
+        );
+        assert_eq!(v2_felts, felts, "v2 uses the versioned wider layout");
+
+        let metadata_with_tee = MLClaimMetadata {
+            tee_attestation_hash: Some(FieldElement::from(0x123u64)),
+            ..metadata
+        };
+        let err = serialize_ml_proof_v2_for_recursive(&aggregated, &metadata_with_tee, None)
+            .expect_err("V2 must reject unverified TEE attestations");
+        assert!(err.contains("tee_attestation_hash"));
     }
 
     #[test]
@@ -5779,7 +6173,7 @@ mod tests {
 
     #[test]
     fn test_serialize_raw_io_packed_commitment() {
-        use crate::aggregation::{compute_io_commitment_packed};
+        use crate::aggregation::compute_io_commitment_packed;
         use crate::components::matmul::M31Matrix;
         use crate::starknet::pack_m31_io_data;
 
@@ -6047,13 +6441,25 @@ mod tests {
         let test_pairs = vec![
             // (a, b) — both zero
             (
-                QM31(CM31(M31::from(0), M31::from(0)), CM31(M31::from(0), M31::from(0))),
-                QM31(CM31(M31::from(0), M31::from(0)), CM31(M31::from(0), M31::from(0))),
+                QM31(
+                    CM31(M31::from(0), M31::from(0)),
+                    CM31(M31::from(0), M31::from(0)),
+                ),
+                QM31(
+                    CM31(M31::from(0), M31::from(0)),
+                    CM31(M31::from(0), M31::from(0)),
+                ),
             ),
             // Small values
             (
-                QM31(CM31(M31::from(1), M31::from(2)), CM31(M31::from(3), M31::from(4))),
-                QM31(CM31(M31::from(5), M31::from(6)), CM31(M31::from(7), M31::from(8))),
+                QM31(
+                    CM31(M31::from(1), M31::from(2)),
+                    CM31(M31::from(3), M31::from(4)),
+                ),
+                QM31(
+                    CM31(M31::from(5), M31::from(6)),
+                    CM31(M31::from(7), M31::from(8)),
+                ),
             ),
             // Max M31 values (2^31 - 2)
             (
@@ -6068,8 +6474,14 @@ mod tests {
             ),
             // Mixed zero and max
             (
-                QM31(CM31(M31::from(0), M31::from(2147483646u32)), CM31(M31::from(0), M31::from(0))),
-                QM31(CM31(M31::from(2147483646u32), M31::from(0)), CM31(M31::from(0), M31::from(2147483646u32))),
+                QM31(
+                    CM31(M31::from(0), M31::from(2147483646u32)),
+                    CM31(M31::from(0), M31::from(0)),
+                ),
+                QM31(
+                    CM31(M31::from(2147483646u32), M31::from(0)),
+                    CM31(M31::from(0), M31::from(2147483646u32)),
+                ),
             ),
         ];
 
@@ -6092,8 +6504,14 @@ mod tests {
         use stwo::core::fields::cm31::CM31;
         use stwo::core::fields::qm31::QM31;
 
-        let c0 = QM31(CM31(M31::from(100), M31::from(200)), CM31(M31::from(300), M31::from(400)));
-        let c2 = QM31(CM31(M31::from(500), M31::from(600)), CM31(M31::from(700), M31::from(800)));
+        let c0 = QM31(
+            CM31(M31::from(100), M31::from(200)),
+            CM31(M31::from(300), M31::from(400)),
+        );
+        let c2 = QM31(
+            CM31(M31::from(500), M31::from(600)),
+            CM31(M31::from(700), M31::from(800)),
+        );
 
         // Regular packed: 2 felts (one per QM31)
         let mut packed = Vec::new();
@@ -6220,34 +6638,55 @@ mod tests {
         // serialize→deserialize round-trip for both packed and double-packed.
         use crate::components::matmul::RoundPoly;
         use crate::gkr::types::{
-            GKRClaim, GKRProof, LayerProof, RoundPolyDeg3,
-            WeightOpeningTranscriptMode,
+            GKRClaim, GKRProof, LayerProof, RoundPolyDeg3, WeightOpeningTranscriptMode,
         };
         use num_traits::Zero;
 
-        let q = |a: u32, b: u32, c: u32, d: u32| QM31(CM31(M31::from(a), M31::from(b)), CM31(M31::from(c), M31::from(d)));
+        let q = |a: u32, b: u32, c: u32, d: u32| {
+            QM31(
+                CM31(M31::from(a), M31::from(b)),
+                CM31(M31::from(c), M31::from(d)),
+            )
+        };
 
         let matmul_proof = LayerProof::MatMul {
             round_polys: vec![
-                RoundPoly { c0: q(10, 20, 30, 40), c1: q(50, 60, 70, 80), c2: q(90, 100, 110, 120) },
-                RoundPoly { c0: q(130, 140, 150, 160), c1: q(170, 180, 190, 200), c2: q(210, 220, 230, 240) },
+                RoundPoly {
+                    c0: q(10, 20, 30, 40),
+                    c1: q(50, 60, 70, 80),
+                    c2: q(90, 100, 110, 120),
+                },
+                RoundPoly {
+                    c0: q(130, 140, 150, 160),
+                    c1: q(170, 180, 190, 200),
+                    c2: q(210, 220, 230, 240),
+                },
             ],
             final_a_eval: q(1000, 2000, 3000, 4000),
             final_b_eval: q(5000, 6000, 7000, 8000),
         };
 
         let mul_proof = LayerProof::Mul {
-            eq_round_polys: vec![
-                RoundPolyDeg3 { c0: q(11, 22, 33, 44), c1: q(55, 66, 77, 88), c2: q(99, 111, 122, 133), c3: q(144, 155, 166, 177) },
-            ],
+            eq_round_polys: vec![RoundPolyDeg3 {
+                c0: q(11, 22, 33, 44),
+                c1: q(55, 66, 77, 88),
+                c2: q(99, 111, 122, 133),
+                c3: q(144, 155, 166, 177),
+            }],
             lhs_eval: q(1001, 2001, 3001, 4001),
             rhs_eval: q(5001, 6001, 7001, 8001),
         };
 
         let proof = GKRProof {
             layer_proofs: vec![matmul_proof, mul_proof],
-            output_claim: GKRClaim { point: vec![], value: QM31::zero() },
-            input_claim: GKRClaim { point: vec![], value: QM31::zero() },
+            output_claim: GKRClaim {
+                point: vec![],
+                value: QM31::zero(),
+            },
+            input_claim: GKRClaim {
+                point: vec![],
+                value: QM31::zero(),
+            },
             weight_commitments: vec![],
             weight_openings: vec![],
             weight_claims: vec![],
@@ -6281,7 +6720,8 @@ mod tests {
         // deferred count(1) = 1
         // Total = 13
         assert_eq!(
-            double_packed.len(), 13,
+            double_packed.len(),
+            13,
             "expected 13 felts for double-packed proof, got {}",
             double_packed.len()
         );
@@ -6294,48 +6734,61 @@ mod tests {
         let mut off = 0usize;
 
         // MatMul layer
-        let tag = felt_to_u32(double_packed[off]); off += 1;
+        let tag = felt_to_u32(double_packed[off]);
+        off += 1;
         assert_eq!(tag, 0, "MatMul tag");
-        let nrounds = felt_to_u32(double_packed[off]); off += 1;
+        let nrounds = felt_to_u32(double_packed[off]);
+        off += 1;
         assert_eq!(nrounds, 2, "MatMul rounds");
 
         // Round 0: (c0, c2) pair
-        let (rc0, rc2) = deserialize_qm31_pair_packed(double_packed[off]); off += 1;
+        let (rc0, rc2) = deserialize_qm31_pair_packed(double_packed[off]);
+        off += 1;
         assert_eq!(rc0, q(10, 20, 30, 40), "MatMul round 0 c0");
         assert_eq!(rc2, q(90, 100, 110, 120), "MatMul round 0 c2");
 
         // Round 1: (c0, c2) pair
-        let (rc0, rc2) = deserialize_qm31_pair_packed(double_packed[off]); off += 1;
+        let (rc0, rc2) = deserialize_qm31_pair_packed(double_packed[off]);
+        off += 1;
         assert_eq!(rc0, q(130, 140, 150, 160), "MatMul round 1 c0");
         assert_eq!(rc2, q(210, 220, 230, 240), "MatMul round 1 c2");
 
         // final_a, final_b
-        let final_a = crate::crypto::poseidon_channel::felt_to_securefield(double_packed[off]); off += 1;
+        let final_a = crate::crypto::poseidon_channel::felt_to_securefield(double_packed[off]);
+        off += 1;
         assert_eq!(final_a, q(1000, 2000, 3000, 4000), "MatMul final_a");
-        let final_b = crate::crypto::poseidon_channel::felt_to_securefield(double_packed[off]); off += 1;
+        let final_b = crate::crypto::poseidon_channel::felt_to_securefield(double_packed[off]);
+        off += 1;
         assert_eq!(final_b, q(5000, 6000, 7000, 8000), "MatMul final_b");
 
         // Mul layer
-        let tag = felt_to_u32(double_packed[off]); off += 1;
+        let tag = felt_to_u32(double_packed[off]);
+        off += 1;
         assert_eq!(tag, 2, "Mul tag");
-        let nrounds = felt_to_u32(double_packed[off]); off += 1;
+        let nrounds = felt_to_u32(double_packed[off]);
+        off += 1;
         assert_eq!(nrounds, 1, "Mul rounds");
 
         // Round 0: (c0, c2) pair + c3 single
-        let (rc0, rc2) = deserialize_qm31_pair_packed(double_packed[off]); off += 1;
+        let (rc0, rc2) = deserialize_qm31_pair_packed(double_packed[off]);
+        off += 1;
         assert_eq!(rc0, q(11, 22, 33, 44), "Mul round 0 c0");
         assert_eq!(rc2, q(99, 111, 122, 133), "Mul round 0 c2");
-        let rc3 = crate::crypto::poseidon_channel::felt_to_securefield(double_packed[off]); off += 1;
+        let rc3 = crate::crypto::poseidon_channel::felt_to_securefield(double_packed[off]);
+        off += 1;
         assert_eq!(rc3, q(144, 155, 166, 177), "Mul round 0 c3");
 
         // lhs, rhs
-        let lhs = crate::crypto::poseidon_channel::felt_to_securefield(double_packed[off]); off += 1;
+        let lhs = crate::crypto::poseidon_channel::felt_to_securefield(double_packed[off]);
+        off += 1;
         assert_eq!(lhs, q(1001, 2001, 3001, 4001), "Mul lhs");
-        let rhs = crate::crypto::poseidon_channel::felt_to_securefield(double_packed[off]); off += 1;
+        let rhs = crate::crypto::poseidon_channel::felt_to_securefield(double_packed[off]);
+        off += 1;
         assert_eq!(rhs, q(5001, 6001, 7001, 8001), "Mul rhs");
 
         // Deferred count
-        let deferred_count = felt_to_u32(double_packed[off]); off += 1;
+        let deferred_count = felt_to_u32(double_packed[off]);
+        off += 1;
         assert_eq!(deferred_count, 0, "deferred count");
 
         assert_eq!(off, double_packed.len(), "consumed all double-packed data");

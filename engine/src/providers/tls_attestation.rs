@@ -171,18 +171,15 @@ mod tests {
 
     #[test]
     fn test_deterministic_commitment() {
-        let c1 = compute_tls_io_commitment(
-            "api.openai.com", b"request", b"response", "cert123", 1000,
-        );
-        let c2 = compute_tls_io_commitment(
-            "api.openai.com", b"request", b"response", "cert123", 1000,
-        );
+        let c1 =
+            compute_tls_io_commitment("api.openai.com", b"request", b"response", "cert123", 1000);
+        let c2 =
+            compute_tls_io_commitment("api.openai.com", b"request", b"response", "cert123", 1000);
         assert_eq!(c1, c2);
 
         // Different response → different commitment
-        let c3 = compute_tls_io_commitment(
-            "api.openai.com", b"request", b"different", "cert123", 1000,
-        );
+        let c3 =
+            compute_tls_io_commitment("api.openai.com", b"request", b"different", "cert123", 1000);
         assert_ne!(c1, c3);
     }
 }

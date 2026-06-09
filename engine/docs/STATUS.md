@@ -2,6 +2,11 @@
 
 *Last updated: April 6, 2026*
 
+> Current Qwen3.5/Qwen3.5-35B prover handoff: see
+> [QWEN35_PROVER_HANDOFF.md](./QWEN35_PROVER_HANDOFF.md). That document records
+> the May 18, 2026 active-recursive statement work, H100 setup script, local
+> verification results, and next GPU steps.
+
 ---
 
 ## What This Project Does

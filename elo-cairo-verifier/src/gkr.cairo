@@ -17,17 +17,12 @@
 //   10. Reduce claims: fold(v0, v1, r) for each column
 //   11. Extend OOD point with r
 
+use crate::channel::{PoseidonChannel, channel_draw_qm31, channel_mix_felts};
 use crate::field::{
-    QM31, CM31, qm31_one, qm31_add, qm31_mul, qm31_eq,
-    m31_mul, poly_eval_degree3, eq_eval, fold_mle_eval, random_linear_combination,
+    CM31, QM31, eq_eval, fold_mle_eval, m31_mul, poly_eval_degree3, qm31_add, qm31_eq, qm31_mul,
+    qm31_one, random_linear_combination,
 };
-use crate::channel::{
-    PoseidonChannel, channel_mix_felts, channel_draw_qm31,
-};
-use crate::types::{
-    GateType, GkrMask, GkrSumcheckProof,
-    GkrBatchProof, GkrArtifact,
-};
+use crate::types::{GateType, GkrArtifact, GkrBatchProof, GkrMask, GkrSumcheckProof};
 
 // ============================================================================
 // Gate Evaluation
@@ -86,7 +81,7 @@ pub fn reduce_mask_at_point(mask: @GkrMask, r: QM31) -> Array<QM31> {
         let v1 = *mask.values.at(col * 2 + 1);
         result.append(fold_mle_eval(r, v0, v1));
         col += 1;
-    };
+    }
     result
 }
 
@@ -103,9 +98,7 @@ pub fn reduce_mask_at_point(mask: @GkrMask, r: QM31) -> Array<QM31> {
 ///   3. Draw challenge
 ///   4. expected_sum = p(challenge)
 pub fn verify_gkr_sumcheck(
-    claim: QM31,
-    proof: @GkrSumcheckProof,
-    ref ch: PoseidonChannel,
+    claim: QM31, proof: @GkrSumcheckProof, ref ch: PoseidonChannel,
 ) -> (Array<QM31>, QM31) {
     let num_rounds = proof.round_polys.len();
     let mut expected_sum = claim;
@@ -159,7 +152,7 @@ pub fn verify_gkr_sumcheck(
         expected_sum = poly_eval_degree3(poly.c0, poly.c1, poly.c2, poly.c3, challenge);
 
         round += 1;
-    };
+    }
 
     (assignment, expected_sum)
 }
@@ -177,10 +170,7 @@ pub fn verify_gkr_sumcheck(
 /// - Reduces claims via folding for the next layer
 ///
 /// Returns GkrArtifact with OOD point and per-instance claims to verify.
-pub fn partially_verify_batch(
-    proof: @GkrBatchProof,
-    ref ch: PoseidonChannel,
-) -> GkrArtifact {
+pub fn partially_verify_batch(proof: @GkrBatchProof, ref ch: PoseidonChannel) -> GkrArtifact {
     let n_instances = proof.instances.len();
     assert!(n_instances > 0, "GKR: no instances");
 
@@ -199,7 +189,7 @@ pub fn partially_verify_batch(
             n_layers = nv;
         }
         i += 1;
-    };
+    }
 
     assert!(proof.layer_proofs.len() == n_layers, "GKR: layer count mismatch");
 
@@ -215,7 +205,7 @@ pub fn partially_verify_batch(
         claims_storage.append(array![]);
         initialized.append(false);
         i += 1;
-    };
+    }
 
     let mut ood_point: Array<QM31> = array![];
 
@@ -247,12 +237,12 @@ pub fn partially_verify_batch(
                     }
                     claims_copy.append(*output_claims.at(j));
                     j += 1;
-                };
+                }
                 claims_storage = _replace_array(claims_storage, inst, claims_copy);
                 initialized = _replace_bool(initialized, inst, true);
             }
             inst += 1;
-        };
+        }
 
         // Step 2: Seed the channel with all active instances' claims
         inst = 0;
@@ -265,7 +255,7 @@ pub fn partially_verify_batch(
                 channel_mix_felts(ref ch, claims);
             }
             inst += 1;
-        };
+        }
 
         // Step 3: Draw sumcheck_alpha and instance_lambda
         let sumcheck_alpha = channel_draw_qm31(ref ch);
@@ -293,12 +283,10 @@ pub fn partially_verify_batch(
                 sumcheck_instances.append(inst);
             }
             inst += 1;
-        };
+        }
 
         // Step 5: Batched sumcheck claim
-        let sumcheck_claim = random_linear_combination(
-            sumcheck_claims.span(), sumcheck_alpha,
-        );
+        let sumcheck_claim = random_linear_combination(sumcheck_claims.span(), sumcheck_alpha);
 
         // Step 6: Verify sumcheck
         let (sumcheck_ood_point, sumcheck_eval) = verify_gkr_sumcheck(
@@ -323,16 +311,14 @@ pub fn partially_verify_batch(
             let gate_output = eval_gate(@gate, mask);
 
             // eq(ood_point[n_unused..], sumcheck_ood_point[n_unused..])
-            let eq_val = _eq_eval_sliced(
-                @ood_point, @sumcheck_ood_point, n_unused,
-            );
+            let eq_val = _eq_eval_sliced(@ood_point, @sumcheck_ood_point, n_unused);
 
             let rlc_gate = random_linear_combination(gate_output.span(), instance_lambda);
             layer_evals.append(qm31_mul(eq_val, rlc_gate));
 
             mask_idx += 1;
             si += 1;
-        };
+        }
 
         // Step 8: Check circuit evaluation
         let layer_eval = random_linear_combination(layer_evals.span(), sumcheck_alpha);
@@ -349,7 +335,7 @@ pub fn partially_verify_batch(
             channel_mix_felts(ref ch, mask.values.span());
             mask_idx += 1;
             si += 1;
-        };
+        }
 
         // Draw challenge for next layer
         let challenge = channel_draw_qm31(ref ch);
@@ -371,10 +357,10 @@ pub fn partially_verify_batch(
             claims_storage = _replace_array(claims_storage, instance_id, reduced);
             mask_idx += 1;
             si += 1;
-        };
+        }
 
         layer += 1;
-    };
+    }
 
     // Collect final claims
     let mut final_claims: Array<Array<QM31>> = array![];
@@ -388,13 +374,9 @@ pub fn partially_verify_batch(
         final_claims.append(claims);
         final_n_vars.append(*instance_n_layers.at(i));
         i += 1;
-    };
-
-    GkrArtifact {
-        ood_point,
-        claims_to_verify: final_claims,
-        n_variables_by_instance: final_n_vars,
     }
+
+    GkrArtifact { ood_point, claims_to_verify: final_claims, n_variables_by_instance: final_n_vars }
 }
 
 // ============================================================================
@@ -419,14 +401,12 @@ fn _pow2_u64(n: u32) -> u64 {
         }
         result = result * 2;
         i += 1;
-    };
+    }
     result
 }
 
 /// Replace element at index in an array of arrays. Returns new array.
-fn _replace_array(
-    old: Array<Array<QM31>>, index: u32, new_val: Array<QM31>,
-) -> Array<Array<QM31>> {
+fn _replace_array(old: Array<Array<QM31>>, index: u32, new_val: Array<QM31>) -> Array<Array<QM31>> {
     let span = old.span();
     let mut result: Array<Array<QM31>> = array![];
     let mut i: u32 = 0;
@@ -446,11 +426,11 @@ fn _replace_array(
                 }
                 copy.append(*src.at(j));
                 j += 1;
-            };
+            }
             result.append(copy);
         }
         i += 1;
-    };
+    }
     result
 }
 
@@ -469,7 +449,7 @@ fn _replace_bool(old: Array<bool>, index: u32, new_val: bool) -> Array<bool> {
             result.append(*span.at(i));
         }
         i += 1;
-    };
+    }
     result
 }
 
@@ -488,7 +468,7 @@ fn _clone_array(src: @Array<QM31>) -> Array<QM31> {
         }
         result.append(*src.at(i));
         i += 1;
-    };
+    }
     result
 }
 
@@ -504,14 +484,12 @@ fn _extract_array(ref storage: Array<Array<QM31>>, index: u32) -> Array<QM31> {
         }
         result.append(*src.at(j));
         j += 1;
-    };
+    }
     result
 }
 
 /// Compute eq(a[offset..], b[offset..]) for sliced OOD point comparison.
-fn _eq_eval_sliced(
-    a: @Array<QM31>, b: @Array<QM31>, offset: u32,
-) -> QM31 {
+fn _eq_eval_sliced(a: @Array<QM31>, b: @Array<QM31>, offset: u32) -> QM31 {
     let a_len = a.len();
     let b_len = b.len();
 
@@ -521,8 +499,16 @@ fn _eq_eval_sliced(
     }
 
     // Build sliced spans — lengths MUST match (STWO asserts this)
-    let a_slice_len = if offset < a_len { a_len - offset } else { 0 };
-    let b_slice_len = if offset < b_len { b_len - offset } else { 0 };
+    let a_slice_len = if offset < a_len {
+        a_len - offset
+    } else {
+        0
+    };
+    let b_slice_len = if offset < b_len {
+        b_len - offset
+    } else {
+        0
+    };
     assert!(a_slice_len == b_slice_len, "GKR: eq_eval slice length mismatch");
 
     let eq_len = a_slice_len;
@@ -541,6 +527,6 @@ fn _eq_eval_sliced(
         x_arr.append(*a.at(offset + i));
         y_arr.append(*b.at(offset + i));
         i += 1;
-    };
+    }
     eq_eval(x_arr.span(), y_arr.span())
 }

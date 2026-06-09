@@ -329,8 +329,7 @@ impl PhaseProfiler {
         for &name in &inner.phase_order {
             if let Some(timing) = inner.phases.get(name) {
                 // Leak a prefixed name — same lifetime pattern as other &'static str phases
-                let prefixed: &'static str =
-                    Box::leak(format!("gkr/{name}").into_boxed_str());
+                let prefixed: &'static str = Box::leak(format!("gkr/{name}").into_boxed_str());
                 if !self.phases.contains_key(prefixed) {
                     self.phase_order.push(prefixed);
                 }
@@ -390,10 +389,7 @@ impl PhaseProfiler {
                     // Show non-matmul layer types
                     for (kind, count) in &self.layer_type_counts {
                         if *kind != "matmul" {
-                            lines.push(format!(
-                                "[profile]    ├─ {} ({})",
-                                kind, count,
-                            ));
+                            lines.push(format!("[profile]    ├─ {} ({})", kind, count,));
                         }
                     }
                 }
@@ -407,9 +403,7 @@ impl PhaseProfiler {
         lines.push("[profile] ─────────────────────────────────────────────".to_string());
         lines.push(format!(
             "[profile]  {:<20} {:>7.3}s {:>6} hashes",
-            "TOTAL",
-            total_secs,
-            total_hashes,
+            "TOTAL", total_secs, total_hashes,
         ));
 
         // Serialization section
@@ -455,7 +449,11 @@ impl PhaseProfiler {
         .collect();
 
         for (i, (name, count, dur)) in entries.iter().enumerate() {
-            let prefix = if i + 1 < entries.len() { "├─" } else { "└─" };
+            let prefix = if i + 1 < entries.len() {
+                "├─"
+            } else {
+                "└─"
+            };
             lines.push(format!(
                 "[profile]    {} {} ({})  {:>7.3}s",
                 prefix,

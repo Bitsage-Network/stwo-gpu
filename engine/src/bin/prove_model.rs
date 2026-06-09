@@ -44,13 +44,16 @@ use stwo::prover::backend::gpu::cuda_executor::{
 
 use obelyzk::aggregation::compute_io_commitment;
 use obelyzk::cairo_serde::{
-    deserialize_raw_io, serialize_ml_proof_for_recursive, serialize_ml_proof_to_file,
+    deserialize_raw_io, serialize_ml_proof_to_file, serialize_ml_proof_v2_for_recursive,
     DirectProofMetadata, MLClaimMetadata,
 };
 use obelyzk::compiler::hf_loader::load_hf_model_decode;
 use obelyzk::compiler::inspect::summarize_model;
 use obelyzk::compiler::onnx::{load_onnx, OnnxModel};
 use obelyzk::components::matmul::M31Matrix;
+use obelyzk::components::qwen35_delta_recurrence::{
+    qwen35_delta_recurrence_air_spec, Qwen35DeltaRecurrenceMode,
+};
 use obelyzk::gadgets::quantize::{quantize_tensor, QuantStrategy};
 use obelyzk::json_serde;
 use obelyzk::starknet::build_starknet_proof_direct;
@@ -67,6 +70,26 @@ enum OutputFormat {
     /// Output: JSON with GKR calldata, IO calldata, weight openings/claims, and
     /// submission readiness metadata.
     MlGkr,
+}
+
+/// Which model graph should be loaded for `--generate-cache`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheGraph {
+    /// Match the normal top-level proving path (`load_model`).
+    Prove,
+    /// Match `prove-model capture` / `prove-model audit` for replay proofs.
+    Audit,
+}
+
+impl std::str::FromStr for CacheGraph {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "prove" | "default" | "decode" => Ok(CacheGraph::Prove),
+            "audit" | "capture" | "audit-capture" => Ok(CacheGraph::Audit),
+            _ => Err(format!("invalid cache graph '{s}', expected: prove, audit")),
+        }
+    }
 }
 
 impl std::str::FromStr for OutputFormat {
@@ -140,6 +163,14 @@ struct Cli {
     #[arg(long)]
     inspect: bool,
 
+    /// Write a structured Qwen3.5 typed-prover readiness artifact.
+    ///
+    /// This is emitted from config.json before model loading/proving. It is
+    /// intended for CI/H100 preflight gates and remains useful when production
+    /// validation correctly refuses an incomplete Qwen3.5 proof path.
+    #[arg(long)]
+    qwen35_readiness_json: Option<PathBuf>,
+
     /// Validate model directory only.
     #[arg(long)]
     validate: bool,
@@ -163,6 +194,13 @@ struct Cli {
     /// Use this to pre-compute the cache so subsequent proofs skip weight commitments.
     #[arg(long)]
     generate_cache: bool,
+
+    /// Graph loader to use with --generate-cache: 'prove' or 'audit'.
+    ///
+    /// Use 'audit' to warm the exact graph used by `prove-model capture` and
+    /// `prove-model audit`; the default matches the normal top-level proving path.
+    #[arg(long, default_value = "prove")]
+    cache_graph: CacheGraph,
 
     /// Verify an existing proof file and exit.
     #[arg(long)]
@@ -347,6 +385,32 @@ enum Command {
     ///   prove-model capture --model-dir ./qwen3-14b --log-dir /tmp/logs --count 10
     ///   prove-model capture --model model.onnx --log-dir /tmp/logs --count 5 --skip-commitment
     Capture(CaptureCmd),
+    /// Build a canonical multi-conversation/action statement artifact.
+    Statement(StatementCmd),
+}
+
+/// CLI arguments for the `statement` subcommand.
+#[derive(Parser, Debug)]
+struct StatementCmd {
+    /// Input conversation/action statement JSON.
+    #[arg(long)]
+    input: PathBuf,
+
+    /// Treat --input as an active Qwen3.5 conversation statement document and emit the active artifact.
+    #[arg(long)]
+    qwen35_active: bool,
+
+    /// Optional Qwen3.5 contract sidecar from run_h100_qwen35b_full.sh.
+    #[arg(long)]
+    qwen35_contract: Option<PathBuf>,
+
+    /// Path to write the full statement artifact JSON.
+    #[arg(long, default_value = "conversation_statement.artifact.json")]
+    output: PathBuf,
+
+    /// Optional path to write only the flat Cairo argument array.
+    #[arg(long)]
+    args_output: Option<PathBuf>,
 }
 
 /// CLI arguments for the `audit` subcommand.
@@ -910,10 +974,7 @@ fn load_model(cli: &Cli) -> OnnxModel {
         //
         // Set `OBELYSK_FLAT_GRAPH=1` to opt into the legacy residualless
         // loader (smaller proofs, faster, but does NOT prove residual adds).
-        let use_flat_graph = std::env::var("OBELYSK_FLAT_GRAPH")
-            .ok()
-            .as_deref()
-            == Some("1");
+        let use_flat_graph = std::env::var("OBELYSK_FLAT_GRAPH").ok().as_deref() == Some("1");
         eprintln!(
             "Loading HuggingFace model from: {} ({})",
             model_dir.display(),
@@ -948,6 +1009,512 @@ fn load_model(cli: &Cli) -> OnnxModel {
         );
         process::exit(1);
     }
+}
+
+fn qwen35_component_requirement(
+    component: obelyzk::compiler::qwen35::Qwen35ProofComponent,
+) -> &'static str {
+    use obelyzk::compiler::qwen35::Qwen35ProofComponent;
+
+    match component {
+        Qwen35ProofComponent::GatedDeltaNet => {
+            "dedicated AIR/witness for qkv projection, depthwise conv, gated delta recurrence, normalization, z gate, and output projection"
+        }
+        Qwen35ProofComponent::GatedFullAttention => {
+            "dedicated AIR/witness for q/k/v projection, q/k RMSNorm, grouped-query attention, output gate, and output projection"
+        }
+        Qwen35ProofComponent::PackedExpertBank => {
+            "dedicated packed MoE expert-bank proof for selected top-k routed experts over gate_up and down projections"
+        }
+        Qwen35ProofComponent::SharedExpert => {
+            "dedicated shared-expert MLP proof for always-on gate/up/down projections"
+        }
+        Qwen35ProofComponent::SharedExpertGate => {
+            "dedicated binding for the shared-expert sigmoid/gating path and contribution into the layer MLP output"
+        }
+        Qwen35ProofComponent::TokenEmbedding
+        | Qwen35ProofComponent::InputRmsNorm
+        | Qwen35ProofComponent::AttentionResidualAdd
+        | Qwen35ProofComponent::PostAttentionRmsNorm
+        | Qwen35ProofComponent::RouterTopK
+        | Qwen35ProofComponent::MlpResidualAdd
+        | Qwen35ProofComponent::FinalNorm
+        | Qwen35ProofComponent::LmHead => "available through generic proof components",
+    }
+}
+
+fn write_qwen35_readiness_json(cli: &Cli, output: &PathBuf) {
+    use obelyzk::compiler::hf_loader::HfConfig;
+    use obelyzk::compiler::qwen35::{
+        Qwen35AttentionKind, Qwen35ComponentStatus, Qwen35ProofPlan, Qwen35TensorShape,
+        Qwen35TypedWitnessRootKind, Qwen35TypedWitnessSourceKind,
+    };
+
+    let Some(model_dir) = cli.model_dir.as_ref() else {
+        eprintln!("Error: --qwen35-readiness-json requires --model-dir");
+        process::exit(1);
+    };
+
+    let config_path = model_dir.join("config.json");
+    let cfg = HfConfig::from_file(&config_path).unwrap_or_else(|e| {
+        eprintln!(
+            "Error: cannot build Qwen3.5 readiness artifact from '{}': {e}",
+            config_path.display()
+        );
+        process::exit(1);
+    });
+    if cfg.model_type != "qwen3_5_moe" {
+        eprintln!(
+            "Error: --qwen35-readiness-json expected model_type=qwen3_5_moe, got {}",
+            cfg.model_type
+        );
+        process::exit(1);
+    }
+
+    let plan = Qwen35ProofPlan::from_hf_config(&cfg).unwrap_or_else(|e| {
+        eprintln!("Error: invalid Qwen3.5 proof plan: {e}");
+        process::exit(1);
+    });
+    let execution = plan.execution_plan();
+    let gated_delta_stage_readiness = plan.gated_delta_net_stage_readiness(1).unwrap_or_else(|e| {
+        eprintln!("Error: invalid GatedDeltaNet stage readiness: {e}");
+        process::exit(1);
+    });
+    let depthwise_conv1d_readiness = plan.depthwise_conv1d_air_readiness(1).unwrap_or_else(|e| {
+        eprintln!("Error: invalid DepthwiseConv1D AIR readiness: {e}");
+        process::exit(1);
+    });
+    let typed_ledger_contract = plan.typed_proof_ledger(1);
+    let typed_witness_manifest = plan.typed_witness_manifest(1).unwrap_or_else(|e| {
+        eprintln!("Error: invalid Qwen3.5 typed witness manifest: {e}");
+        process::exit(1);
+    });
+    let typed_witness_source_requirements = typed_witness_manifest
+        .source_requirements()
+        .unwrap_or_else(|e| {
+            eprintln!("Error: invalid Qwen3.5 typed witness source requirements: {e}");
+            process::exit(1);
+        });
+    let typed_witness_source_count = |kind: Qwen35TypedWitnessSourceKind| {
+        typed_witness_source_requirements
+            .iter()
+            .filter(|req| req.source_kind == kind)
+            .count()
+    };
+    let first_witness_sources = typed_witness_source_requirements
+        .iter()
+        .take(24)
+        .map(|req| {
+            let (rank, dimensions) = match req.shape {
+                Qwen35TensorShape::Vector(n) => ("vector", vec![n]),
+                Qwen35TensorShape::Matrix(shape) => ("matrix", vec![shape.rows, shape.cols]),
+                Qwen35TensorShape::Tensor3D(shape) => {
+                    ("tensor3d", vec![shape.outer, shape.middle, shape.inner])
+                }
+            };
+            serde_json::json!({
+                "source": req.source.as_str(),
+                "source_kind": req.source_kind.label(),
+                "rank": rank,
+                "dimensions": dimensions,
+                "root_hashes": req.root_hashes.iter().map(|root_hash| format!("0x{root_hash:x}")).collect::<Vec<_>>(),
+                "fanout_roots": req.root_hashes.len(),
+                "layer_indices": req.layer_indices,
+            })
+        })
+        .collect::<Vec<_>>();
+    let first_witness_layer = typed_witness_manifest.layers.first().map(|layer| {
+        let roots = layer
+            .roots
+            .iter()
+            .map(|root| {
+                let (rank, dimensions) = match root.shape {
+                    Qwen35TensorShape::Vector(n) => ("vector", vec![n]),
+                    Qwen35TensorShape::Matrix(shape) => ("matrix", vec![shape.rows, shape.cols]),
+                    Qwen35TensorShape::Tensor3D(shape) => {
+                        ("tensor3d", vec![shape.outer, shape.middle, shape.inner])
+                    }
+                };
+                serde_json::json!({
+                    "name": root.name.as_str(),
+                    "statement_kind": root.statement_kind.label(),
+                    "stage_idx": root.stage_idx,
+                    "kind": root.kind.label(),
+                    "rank": rank,
+                    "dimensions": dimensions,
+                    "source": root.source.as_str(),
+                    "root_hash": format!("0x{:x}", root.root_hash()),
+                    "trace_root_contract_hash": format!("0x{:x}", root.trace_root_contract_hash),
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "layer_idx": layer.layer_idx,
+            "seq_len": layer.seq_len,
+            "depthwise_conv1d_trace_binding_hash": format!("0x{:x}", layer.depthwise_conv1d_trace_binding_hash),
+            "delta_recurrence_trace_binding_hash": format!("0x{:x}", layer.delta_recurrence_trace_binding_hash),
+            "norm_and_z_gate_trace_binding_hash": format!("0x{:x}", layer.norm_and_z_gate_trace_binding_hash),
+            "root_count": layer.roots.len(),
+            "roots": roots,
+        })
+    });
+    let gated_delta_missing_stage_counts = gated_delta_stage_readiness
+        .missing_stage_counts
+        .iter()
+        .map(|(kind, count)| {
+            serde_json::json!({
+                "stage": kind.label(),
+                "count": count,
+            })
+        })
+        .collect::<Vec<_>>();
+    let gated_delta_dedicated_air_stage_counts = gated_delta_stage_readiness
+        .dedicated_air_stage_counts
+        .iter()
+        .map(|(kind, count)| {
+            serde_json::json!({
+                "stage": kind.label(),
+                "count": count,
+            })
+        })
+        .collect::<Vec<_>>();
+    let gated_delta_stage_contract = plan
+        .layers
+        .iter()
+        .find(|layer| layer.attention == Qwen35AttentionKind::GatedDeltaNet)
+        .and_then(|layer| plan.gated_delta_net_contract(layer.layer_idx, 1).ok())
+        .map(|contract| {
+            let stages = contract
+                .stage_contracts()
+                .iter()
+                .map(|stage| {
+                    serde_json::json!({
+                        "stage_idx": stage.stage_idx,
+                        "kind": stage.kind.label(),
+                        "status": stage.status.label(),
+                        "relation": stage.relation,
+                        "stage_hash": format!(
+                            "0x{:x}",
+                            stage.contract_hash(contract.layer_idx, contract.seq_len)
+                        ),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let (generic_ready_stages, dedicated_air_available_stages, missing_dedicated_stages) =
+                contract.stage_status_counts();
+            let depthwise_trace_binding = contract
+                .depthwise_conv1d_trace_binding_contract()
+                .map(|binding| {
+                    serde_json::json!({
+                        "layer_idx": binding.layer_idx,
+                        "seq_len": binding.seq_len,
+                        "stage_idx": binding.stage_idx,
+                        "producer_stage_idx": binding.producer_stage_idx,
+                        "consumer_stage_idx": binding.consumer_stage_idx,
+                        "channels": binding.channels,
+                        "kernel": binding.kernel,
+                        "input_root": {
+                            "name": binding.input_root.name,
+                            "role": binding.input_root.role.label(),
+                        },
+                        "weight_root": {
+                            "name": binding.weight_root.name,
+                            "role": binding.weight_root.role.label(),
+                        },
+                        "output_root": {
+                            "name": binding.output_root.name,
+                            "role": binding.output_root.role.label(),
+                        },
+                        "stage_contract_hash": format!("0x{:x}", binding.stage_contract_hash),
+                        "air_contract_hash": format!("0x{:x}", binding.air_contract_hash),
+                        "trace_binding_hash": format!("0x{:x}", binding.contract_hash()),
+                    })
+                })
+                .ok();
+            let delta_recurrence_trace_binding = contract
+                .delta_recurrence_trace_binding_contract()
+                .map(|binding| {
+                    let air_spec = qwen35_delta_recurrence_air_spec(
+                        binding.seq_len,
+                        binding.query_width,
+                        binding.key_width,
+                        binding.value_width,
+                        binding.state_rows,
+                        binding.value_head_dim,
+                        Qwen35DeltaRecurrenceMode::ChunkPrefill,
+                        true,
+                        true,
+                    )
+                    .ok();
+                    serde_json::json!({
+                        "layer_idx": binding.layer_idx,
+                        "seq_len": binding.seq_len,
+                        "stage_idx": binding.stage_idx,
+                        "qkv_split_stage_idx": binding.qkv_split_stage_idx,
+                        "ab_projection_stage_idx": binding.ab_projection_stage_idx,
+                        "consumer_stage_idx": binding.consumer_stage_idx,
+                        "query_width": binding.query_width,
+                        "key_width": binding.key_width,
+                        "value_width": binding.value_width,
+                        "state_rows": binding.state_rows,
+                        "value_head_dim": binding.value_head_dim,
+                        "input_roots": [
+                            {"name": binding.query_root.name, "role": binding.query_root.role.label()},
+                            {"name": binding.key_root.name, "role": binding.key_root.role.label()},
+                            {"name": binding.projected_value_root.name, "role": binding.projected_value_root.role.label()},
+                            {"name": binding.a_gate_root.name, "role": binding.a_gate_root.role.label()},
+                            {"name": binding.b_gate_root.name, "role": binding.b_gate_root.role.label()},
+                            {"name": binding.a_log_weight_root.name, "role": binding.a_log_weight_root.role.label()},
+                            {"name": binding.dt_bias_root.name, "role": binding.dt_bias_root.role.label()},
+                        ],
+                        "output_root": {
+                            "name": binding.output_root.name,
+                            "role": binding.output_root.role.label(),
+                        },
+                        "stage_contract_hash": format!("0x{:x}", binding.stage_contract_hash),
+                        "trace_binding_hash": format!("0x{:x}", binding.contract_hash()),
+                        "air_spec": air_spec.map(|spec| serde_json::json!({
+                            "upstream": spec.upstream,
+                            "mode": spec.mode.as_str(),
+                            "qk_head_dim": spec.qk_head_dim,
+                            "qk_repeat_factor": spec.qk_repeat_factor,
+                            "uses_qk_l2norm": spec.uses_qk_l2norm,
+                            "query_scale_is_inverse_sqrt_head_dim": spec.query_scale_is_inverse_sqrt_head_dim,
+                            "beta_is_sigmoid_b": spec.beta_is_sigmoid_b,
+                            "decay_is_neg_exp_a_log_times_softplus_a_plus_dt_bias": spec.decay_is_neg_exp_a_log_times_softplus_a_plus_dt_bias,
+                            "state_update_is_gated_delta_rule": spec.state_update_is_gated_delta_rule,
+                            "output_is_pre_norm_attended_value": spec.output_is_pre_norm_attended_value,
+                            "binds_initial_recurrent_state": spec.binds_initial_recurrent_state,
+                            "emits_final_recurrent_state": spec.emits_final_recurrent_state,
+                            "spec_hash": format!("0x{:x}", spec.spec_hash),
+                        })),
+                        "statement_binding_fields": [
+                            "mode",
+                            "air_spec_hash",
+                            "query_commitment",
+                            "key_commitment",
+                            "projected_value_commitment",
+                            "a_gate_commitment",
+                            "b_gate_commitment",
+                            "a_log_weight_commitment",
+                            "dt_bias_commitment",
+                            "initial_recurrent_state_commitment",
+                            "final_recurrent_state_commitment",
+                            "output_commitment",
+                        ],
+                        "state_binding": {
+                            "initial_recurrent_state": "must match the conversation/layer recurrent cache root consumed by this token span",
+                            "final_recurrent_state": "must be emitted as the conversation/layer recurrent cache root for the next token span",
+                            "required_for_multi_token_conversation_continuity": true,
+                        },
+                    })
+                })
+                .ok();
+            let norm_and_z_gate_trace_binding = contract
+                .norm_and_z_gate_trace_binding_contract()
+                .map(|binding| {
+                    serde_json::json!({
+                        "layer_idx": binding.layer_idx,
+                        "seq_len": binding.seq_len,
+                        "stage_idx": binding.stage_idx,
+                        "delta_recurrence_stage_idx": binding.delta_recurrence_stage_idx,
+                        "z_projection_stage_idx": binding.z_projection_stage_idx,
+                        "consumer_stage_idx": binding.consumer_stage_idx,
+                        "width": binding.width,
+                        "value_heads": binding.width / binding.norm_width,
+                        "head_dim": binding.norm_width,
+                        "input_roots": [
+                            {"name": binding.attended_value_root.name, "role": binding.attended_value_root.role.label()},
+                            {"name": binding.norm_weight_root.name, "role": binding.norm_weight_root.role.label()},
+                            {"name": binding.z_gate_root.name, "role": binding.z_gate_root.role.label()},
+                        ],
+                        "output_root": {
+                            "name": binding.output_root.name,
+                            "role": binding.output_root.role.label(),
+                        },
+                        "stage_contract_hash": format!("0x{:x}", binding.stage_contract_hash),
+                        "trace_binding_hash": format!("0x{:x}", binding.contract_hash()),
+                        "statement_binding_fields": [
+                            "table_log_size",
+                            "trace_checksum",
+                            "table_commitment",
+                            "attended_value_commitment",
+                            "norm_weight_commitment",
+                            "z_gate_commitment",
+                            "output_commitment",
+                        ],
+                        "semantics": "gated_value = rmsnorm(attended_value, norm_weight) * z_gate with LogUp-bound rsqrt table and AIR-constrained trace checksum",
+                    })
+                })
+                .ok();
+            serde_json::json!({
+                "layer_idx": contract.layer_idx,
+                "seq_len": contract.seq_len,
+                "stage_contract_hash": format!("0x{:x}", contract.stage_contract_hash()),
+                "generic_ready_stages": generic_ready_stages,
+                "dedicated_air_available_stages": dedicated_air_available_stages,
+                "missing_dedicated_stages": missing_dedicated_stages,
+                "depthwise_trace_binding": depthwise_trace_binding,
+                "delta_recurrence_trace_binding": delta_recurrence_trace_binding,
+                "norm_and_z_gate_trace_binding": norm_and_z_gate_trace_binding,
+                "stages": stages,
+            })
+        });
+
+    let missing_components: Vec<serde_json::Value> = execution
+        .missing_component_counts()
+        .into_iter()
+        .map(|(component, count)| {
+            serde_json::json!({
+                "component": component.label(),
+                "count": count,
+                "requirement": qwen35_component_requirement(component),
+            })
+        })
+        .collect();
+
+    let dedicated_missing_steps: Vec<serde_json::Value> = execution
+        .steps
+        .iter()
+        .filter(|step| step.status == Qwen35ComponentStatus::DedicatedMissing)
+        .map(|step| {
+            serde_json::json!({
+                "step_idx": step.step_idx,
+                "layer_idx": step.layer_idx,
+                "component": step.component.label(),
+                "requirement": qwen35_component_requirement(step.component),
+            })
+        })
+        .collect();
+
+    let artifact = serde_json::json!({
+        "schema": "obelyzk.qwen35_readiness.v1",
+        "model_dir": model_dir.display().to_string(),
+        "layers_requested": cli.layers.map_or_else(|| "all".to_string(), |n| n.to_string()),
+        "model_type": cfg.model_type,
+        "architecture": {
+            "hidden_size": plan.hidden_size,
+            "vocab_size": plan.vocab_size,
+            "num_layers": plan.num_layers,
+            "linear_attention_layers": plan.linear_attention_layers(),
+            "full_attention_layers": plan.full_attention_layers(),
+            "num_attention_heads": plan.num_attention_heads,
+            "num_key_value_heads": plan.num_key_value_heads,
+            "head_dim": plan.head_dim,
+            "q_dim": plan.q_dim,
+            "kv_dim": plan.kv_dim,
+            "linear_qkv_rows": plan.linear_qkv_rows,
+            "linear_key_rows": plan.linear_key_rows,
+            "linear_value_rows": plan.linear_value_rows,
+            "linear_state_rows": plan.linear_state_rows,
+            "linear_conv_kernel_dim": plan.linear_conv_kernel_dim,
+            "num_experts": plan.num_experts,
+            "top_k": plan.top_k,
+            "routed_ff": plan.routed_ff,
+            "shared_ff": plan.shared_ff,
+            "expected_language_tensors": plan.expected_language_tensor_count(),
+        },
+        "execution_contract_hash": format!("0x{:x}", execution.contract_hash),
+        "production_ready": execution.production_ready(),
+        "total_steps": execution.total_steps(),
+        "generic_ready_steps": execution.count_status(Qwen35ComponentStatus::GenericAvailable),
+        "missing_dedicated_steps": execution.count_status(Qwen35ComponentStatus::DedicatedMissing),
+        "missing_components": missing_components,
+        "dedicated_missing_steps": dedicated_missing_steps,
+        "gated_delta_net_stage_totals": {
+            "seq_len": 1,
+            "total_stages": gated_delta_stage_readiness.total_stages,
+            "generic_ready_stages": gated_delta_stage_readiness.generic_ready_stages,
+            "dedicated_air_available_stages": gated_delta_stage_readiness.dedicated_air_available_stages,
+            "missing_dedicated_stages": gated_delta_stage_readiness.missing_dedicated_stages,
+            "dedicated_air_stage_counts": gated_delta_dedicated_air_stage_counts,
+            "missing_stage_counts": gated_delta_missing_stage_counts,
+        },
+        "depthwise_conv1d_air_totals": {
+            "seq_len": depthwise_conv1d_readiness.seq_len,
+            "layers": depthwise_conv1d_readiness.layers,
+            "channels_per_layer": depthwise_conv1d_readiness.channels_per_layer,
+            "kernel": depthwise_conv1d_readiness.kernel,
+            "logical_rows_per_layer": depthwise_conv1d_readiness.logical_rows_per_layer,
+            "total_logical_rows": depthwise_conv1d_readiness.total_logical_rows,
+            "columns_per_layer": depthwise_conv1d_readiness.columns_per_layer,
+            "arithmetic_constraints_per_row": depthwise_conv1d_readiness.arithmetic_constraints_per_row,
+            "row_binding_constraints_per_row": depthwise_conv1d_readiness.row_binding_constraints_per_row,
+            "aggregate_contract_hash": format!("0x{:x}", depthwise_conv1d_readiness.aggregate_contract_hash),
+            "aggregate_trace_binding_hash": format!("0x{:x}", depthwise_conv1d_readiness.aggregate_trace_binding_hash),
+            "statement_binding": "fiat-shamir-bound-to-layer-input-weight-output-commitments",
+            "trace_binding": "qkv_projected producer root + conv1d_weight model root + qkv_after_conv consumer root",
+            "implementation_status": "standalone-statement-bound-air-proof-defined-typed-trace-binding-contract-defined-active-prover-integration-missing",
+        },
+        "typed_witness_manifest": {
+            "seq_len": typed_witness_manifest.seq_len,
+            "architecture_contract_hash": format!("0x{:x}", typed_witness_manifest.architecture_contract_hash),
+            "manifest_hash": format!("0x{:x}", typed_witness_manifest.manifest_hash),
+            "layers": typed_witness_manifest.layers.len(),
+            "total_roots": typed_witness_manifest.total_roots(),
+            "activation_roots": typed_witness_manifest.root_count_by_kind(Qwen35TypedWitnessRootKind::Activation),
+            "model_weight_roots": typed_witness_manifest.root_count_by_kind(Qwen35TypedWitnessRootKind::ModelWeight),
+            "recurrent_state_roots": typed_witness_manifest.root_count_by_kind(Qwen35TypedWitnessRootKind::RecurrentState),
+            "lookup_table_roots": typed_witness_manifest.root_count_by_kind(Qwen35TypedWitnessRootKind::LookupTable),
+            "unique_sources": typed_witness_source_requirements.len(),
+            "runtime_sources": typed_witness_source_count(Qwen35TypedWitnessSourceKind::Runtime),
+            "safetensors_sources": typed_witness_source_count(Qwen35TypedWitnessSourceKind::Safetensors),
+            "conversation_state_sources": typed_witness_source_count(Qwen35TypedWitnessSourceKind::ConversationState),
+            "statement_sources": typed_witness_source_count(Qwen35TypedWitnessSourceKind::Statement),
+            "first_sources": first_witness_sources,
+            "first_layer": first_witness_layer,
+            "statement": "defines the exact real Qwen3.5 per-layer runtime activation roots, model weight roots, recurrent-state roots, and lookup table commitments that active typed component proofs must consume",
+            "source_capture_requirement": "runtime extractor must emit one value per unique manifest source through separate runtime, safetensors, conversation-state, and statement namespaces; repeated sources such as DeltaRecurrence attended_value feeding NormAndZGate fan out into multiple root commitments",
+            "commitment_set_requirement": "source capture is converted into one non-zero commitment per manifest root; missing, duplicate, extra, zero, wrong-shape, or reordered commitments are rejected before typed proof ledger ingestion",
+            "implementation_status": "manifest-commitment-set-validator-source-capture-and-namespaced-source-inventory-defined-real-runtime-instrumentation-and-active-full-model-witness-capture-missing",
+        },
+        "typed_component_ledger": {
+            "seq_len": typed_ledger_contract.seq_len,
+            "expected_depthwise_conv1d_statements": typed_ledger_contract.expected_depthwise_conv1d_statements,
+            "expected_delta_recurrence_statements": typed_ledger_contract.expected_delta_recurrence_statements,
+            "expected_norm_and_z_gate_statements": typed_ledger_contract.expected_norm_and_z_gate_statements,
+            "recorded_statements": typed_ledger_contract.statements.len(),
+            "empty_ledger_hash": format!("0x{:x}", typed_ledger_contract.ledger_hash()),
+            "production_ready": typed_ledger_contract.production_ready(),
+            "activation_requirement": "full prover must record one accepted DepthwiseConv1D statement, one accepted DeltaRecurrence statement, and one accepted NormAndZGate statement per GatedDeltaNet layer from active component proofs, including Depthwise producer/consumer trace binding, DeltaRecurrence source-pinned AIR spec hash, verified trace-binding AIR proof, transform-binding proof/hash from original q/k/gates into scaled q/normalized k/decay/beta, nonlinear transform proof/hash for q/k normalization plus beta/decay lookup semantics, transformed-domain recurrence arithmetic AIR proof, initial/final recurrent-state commitments for conversation continuity, and NormAndZGate rsqrt-table/trace-checksum/input-weight-z-output binding",
+            "delta_recurrence_status": "statement-bound-typed-proof-object-source-pinned-air-spec-recurrent-state-binding-active-trace-binding-witness-standalone-trace-binding-air-transformed-domain-arithmetic-witness-verifier-qk-fold-arithmetic-air-constraints-standalone-arithmetic-air-proof-object-cross-token-state-continuity-air-constraint-transform-binding-witness-standalone-transform-binding-air-proof-object-and-typed-ledger-nonlinear-transform-hash-requirement-defined-transform-nonlinear-logup-and-full-prover-integration-missing",
+            "norm_and_z_gate_status": "statement-bound-typed-proof-object-rsqrt-logup-provider-consumer-standalone-active-air-proof-and-typed-ledger-ingestion-defined-full-active-prover-integration-missing",
+            "conversation_state_continuity": {
+                "required_for_multi_token_proofs": true,
+                "requires_production_ready_typed_span_ledger": true,
+                "status": "contract-negative-test-active-span-ingestion-api-delta-trace-binding-witness-standalone-trace-binding-air-norm-and-z-gate-typed-ledger-proof-ingestion-and-production-ready-ledger-requirement-defined-full-active-prover-wiring-missing",
+                "enforces": [
+                    "each conversation span must be ingested from a production-ready typed ledger with DepthwiseConv1D, DeltaRecurrence, and NormAndZGate coverage complete",
+                    "every token span records one DeltaRecurrence recurrent-state transition per GatedDeltaNet layer",
+                    "span_n.final_recurrent_state_commitment equals span_n_plus_1.initial_recurrent_state_commitment for the same layer and stage",
+                    "span indices are contiguous and duplicate layer/stage state transitions are rejected"
+                ],
+            },
+        },
+        "gated_delta_net_stage_contract": gated_delta_stage_contract,
+        "summary": execution.readiness_summary(),
+    });
+
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).unwrap_or_else(|e| {
+            eprintln!(
+                "Error: cannot create readiness output directory '{}': {e}",
+                parent.display()
+            );
+            process::exit(1);
+        });
+    }
+    std::fs::write(output, serde_json::to_string_pretty(&artifact).unwrap()).unwrap_or_else(|e| {
+        eprintln!(
+            "Error: cannot write Qwen3.5 readiness artifact '{}': {e}",
+            output.display()
+        );
+        process::exit(1);
+    });
+    eprintln!("Qwen3.5 readiness artifact: {}", output.display());
 }
 
 fn main() {
@@ -1004,7 +1571,14 @@ fn main() {
 
     // Print policy banner
     if !obelyzk::is_quiet() {
-        eprintln!("Policy: {}", obelyzk::policy::summary_line(&resolved_policy));
+        eprintln!(
+            "Policy: {}",
+            obelyzk::policy::summary_line(&resolved_policy)
+        );
+    }
+
+    if let Some(ref output) = cli.qwen35_readiness_json {
+        write_qwen35_readiness_json(&cli, output);
     }
 
     // Dispatch to subcommands if specified
@@ -1047,6 +1621,10 @@ fn main() {
         }
         Some(Command::Capture(ref cmd)) => {
             run_capture_command(cmd);
+            return;
+        }
+        Some(Command::Statement(ref cmd)) => {
+            run_statement_command(cmd);
             return;
         }
         _ => {}
@@ -1096,14 +1674,15 @@ fn main() {
             //     separate gkr/io/weight arrays. For other formats, fall back to V4 packed-IO.
             if let Some(gkr_arr) = proof_json.get("gkr_calldata").and_then(|v| v.as_array()) {
                 if !gkr_arr.is_empty() {
-                    let parse_felt_arr = |arr: &[serde_json::Value]| -> Result<Vec<FieldElement>, String> {
-                        arr.iter()
-                            .map(|v| {
-                                let hex = v.as_str().unwrap_or("0x0");
-                                FieldElement::from_hex_be(hex).map_err(|e| e.to_string())
-                            })
-                            .collect()
-                    };
+                    let parse_felt_arr =
+                        |arr: &[serde_json::Value]| -> Result<Vec<FieldElement>, String> {
+                            arr.iter()
+                                .map(|v| {
+                                    let hex = v.as_str().unwrap_or("0x0");
+                                    FieldElement::from_hex_be(hex).map_err(|e| e.to_string())
+                                })
+                                .collect()
+                        };
 
                     let gkr_felts = parse_felt_arr(gkr_arr);
 
@@ -1124,9 +1703,13 @@ fn main() {
                                 let nlp = proof_json
                                     .get("num_layer_proofs")
                                     .and_then(|v| v.as_u64())
-                                    .unwrap_or(0) as usize;
+                                    .unwrap_or(0)
+                                    as usize;
                                 obelyzk::starknet::verify_proof_fast_ml_gkr(
-                                    &gkr_calldata, &io_calldata, &wc, nlp,
+                                    &gkr_calldata,
+                                    &io_calldata,
+                                    &wc,
+                                    nlp,
                                 )
                             } else {
                                 obelyzk::starknet::verify_proof_fast(&gkr_calldata)
@@ -1155,12 +1738,8 @@ fn main() {
 
             // (b) If io_calldata + io_commitment present, recompute and verify.
             if let (Some(io_arr), Some(commitment_str)) = (
-                proof_json
-                    .get("io_calldata")
-                    .and_then(|v| v.as_array()),
-                proof_json
-                    .get("io_commitment")
-                    .and_then(|v| v.as_str()),
+                proof_json.get("io_calldata").and_then(|v| v.as_array()),
+                proof_json.get("io_commitment").and_then(|v| v.as_str()),
             ) {
                 if !io_arr.is_empty() {
                     let io_felts: Result<Vec<FieldElement>, _> = io_arr
@@ -1202,7 +1781,9 @@ fn main() {
                             }
                         },
                         Err(e) => {
-                            eprintln!("VERIFICATION FAILED: could not parse io_calldata felts: {e}");
+                            eprintln!(
+                                "VERIFICATION FAILED: could not parse io_calldata felts: {e}"
+                            );
                             failed = true;
                         }
                     }
@@ -1224,9 +1805,7 @@ fn main() {
                     "VERIFICATION FAILED: proof has no gkr_calldata or io_calldata — \
                      cannot perform any cryptographic verification."
                 );
-                eprintln!(
-                    "Re-prove with ml_gkr format for a verifiable proof file."
-                );
+                eprintln!("Re-prove with ml_gkr format for a verifiable proof file.");
                 process::exit(1);
             }
             process::exit(0);
@@ -1398,14 +1977,10 @@ fn main() {
             // Step C4: Full GKR cryptographic re-verification with native proof
             // This is MANDATORY — without it, the proof is not cryptographically verified.
             let native_proof_val = proof_json.get("gkr_proof_native");
-            let has_native_proof = native_proof_val
-                .map(|v| !v.is_null())
-                .unwrap_or(false);
+            let has_native_proof = native_proof_val.map(|v| !v.is_null()).unwrap_or(false);
 
             if !has_native_proof {
-                eprintln!(
-                    "VERIFICATION FAILED: gkr_proof_native is missing or null."
-                );
+                eprintln!("VERIFICATION FAILED: gkr_proof_native is missing or null.");
                 eprintln!(
                     "The proof file does not contain the native GKR proof data \
                      required for cryptographic verification. Re-generate the proof \
@@ -1415,15 +1990,14 @@ fn main() {
             }
 
             eprintln!("Re-verifying GKR proof cryptographically...");
-            let native_proof = serde_json::from_value::<obelyzk::gkr::GKRProof>(
-                native_proof_val.unwrap().clone(),
-            )
-            .unwrap_or_else(|e| {
-                eprintln!(
-                    "VERIFICATION FAILED: could not deserialize gkr_proof_native: {e}"
-                );
-                process::exit(1);
-            });
+            let native_proof =
+                serde_json::from_value::<obelyzk::gkr::GKRProof>(native_proof_val.unwrap().clone())
+                    .unwrap_or_else(|e| {
+                        eprintln!(
+                            "VERIFICATION FAILED: could not deserialize gkr_proof_native: {e}"
+                        );
+                        process::exit(1);
+                    });
 
             // Cross-check: gkr_calldata must serialize from gkr_proof_native.
             // The on-chain Cairo verifier consumes gkr_calldata; the local
@@ -1433,15 +2007,9 @@ fn main() {
             // false-positive (G9, fixed Apr 30 2026). On-chain still rejects
             // tampered calldata via Fiat-Shamir divergence, but local verify
             // shouldn't be misleading.
-            if let Some(gkr_arr) = proof_json
-                .get("gkr_calldata")
-                .and_then(|v| v.as_array())
-            {
+            if let Some(gkr_arr) = proof_json.get("gkr_calldata").and_then(|v| v.as_array()) {
                 let mut expected = Vec::new();
-                obelyzk::cairo_serde::serialize_gkr_proof_data_only(
-                    &native_proof,
-                    &mut expected,
-                );
+                obelyzk::cairo_serde::serialize_gkr_proof_data_only(&native_proof, &mut expected);
                 let actual: Result<Vec<FieldElement>, String> = gkr_arr
                     .iter()
                     .map(|v| {
@@ -1484,16 +2052,14 @@ fn main() {
                         eprintln!("  calldata/native consistency: verified ✓");
                     }
                     Err(e) => {
-                        eprintln!(
-                            "VERIFICATION FAILED: could not parse gkr_calldata felts: {e}"
-                        );
+                        eprintln!("VERIFICATION FAILED: could not parse gkr_calldata felts: {e}");
                         process::exit(1);
                     }
                 }
             }
 
-            let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&model.graph)
-                .unwrap_or_else(|e| {
+            let circuit =
+                obelyzk::gkr::LayeredCircuit::from_graph(&model.graph).unwrap_or_else(|e| {
                     eprintln!(
                         "VERIFICATION FAILED: could not build circuit for GKR verification: {e}"
                     );
@@ -1512,9 +2078,7 @@ fn main() {
                     eprintln!("  GKR cryptographic verification: passed ✓");
                 }
                 Err(e) => {
-                    eprintln!(
-                        "VERIFICATION FAILED: GKR verification error: {e}"
-                    );
+                    eprintln!("VERIFICATION FAILED: GKR verification error: {e}");
                     process::exit(1);
                 }
             }
@@ -1665,23 +2229,32 @@ fn main() {
         });
 
         let bench_path = cli.output.with_extension("bench.json");
-        std::fs::write(&bench_path, serde_json::to_string_pretty(&bench_json).unwrap())
-            .unwrap_or_else(|e| {
-                eprintln!("Error writing benchmark results: {e}");
-            });
+        std::fs::write(
+            &bench_path,
+            serde_json::to_string_pretty(&bench_json).unwrap(),
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("Error writing benchmark results: {e}");
+        });
 
         eprintln!("\n=== Benchmark Complete ===");
         eprintln!("Results: {}", bench_path.display());
 
         // Print summary table
-        eprintln!("\n{:<12} {:>12} {:>12} {:>12}", "seq_len", "time (s)", "tok/s", "felts");
+        eprintln!(
+            "\n{:<12} {:>12} {:>12} {:>12}",
+            "seq_len", "time (s)", "tok/s", "felts"
+        );
         eprintln!("{}", "-".repeat(52));
         for r in &bench_results {
             if r["status"] == "ok" {
-                eprintln!("{:<12} {:>12.2} {:>12.1} {:>12}",
-                    r["seq_len"], r["prove_time_ms"].as_f64().unwrap() / 1000.0,
+                eprintln!(
+                    "{:<12} {:>12.2} {:>12.1} {:>12}",
+                    r["seq_len"],
+                    r["prove_time_ms"].as_f64().unwrap() / 1000.0,
                     r["tokens_per_second"].as_f64().unwrap(),
-                    r["calldata_felts"]);
+                    r["calldata_felts"]
+                );
             } else {
                 eprintln!("{:<12} {:>12}", r["seq_len"], "FAILED");
             }
@@ -1696,15 +2269,48 @@ fn main() {
             eprintln!("Error: --generate-cache requires --model-dir");
             process::exit(1);
         });
+        if let Err(e) = obelyzk::weight_cache::ensure_cache_file_writable(model_dir) {
+            eprintln!(
+                "Error: cannot write weight cache in '{}': {e}",
+                model_dir.display()
+            );
+            eprintln!(
+                "Hint: make the model directory writable or run cache generation with permission to create .stwo_weight_cache.swcf."
+            );
+            process::exit(1);
+        }
 
         let t_cache = Instant::now();
-        eprintln!("Loading model for cache generation...");
-        let model = load_model(&cli);
+        eprintln!(
+            "Loading model for cache generation ({:?} graph)...",
+            cli.cache_graph
+        );
+        let model = match cli.cache_graph {
+            CacheGraph::Prove => load_model(&cli),
+            CacheGraph::Audit => {
+                eprintln!(
+                    "Loading HuggingFace model from: {} (audit/capture graph)",
+                    model_dir.display()
+                );
+                obelyzk::compiler::hf_loader::load_hf_model(model_dir, cli.layers).unwrap_or_else(
+                    |e| {
+                        eprintln!("Error loading model directory: {e}");
+                        process::exit(1);
+                    },
+                )
+            }
+        };
         eprintln!("Model loaded in {:.2}s", t_cache.elapsed().as_secs_f64());
 
-        let model_id = if cli.model_id.is_empty() { "unknown".to_string() } else { cli.model_id.clone() };
+        let model_id = if cli.model_id.is_empty() {
+            "unknown".to_string()
+        } else {
+            cli.model_id.clone()
+        };
         let cache = obelyzk::weight_cache::shared_cache_for_model_mmap(
-            model_dir, &model_id, &model.weights,
+            model_dir,
+            &model_id,
+            &model.weights,
         );
 
         let existing = cache.read().map(|c| c.len()).unwrap_or(0);
@@ -1718,7 +2324,9 @@ fn main() {
 
         eprintln!("Computing Merkle roots for {total_weights} weight matrices...");
         let computed = obelyzk::weight_cache::prewarm_weight_roots_gpu_exclusive(
-            &model.weights, &cache, Some(model_dir.as_path()),
+            &model.weights,
+            &cache,
+            Some(model_dir.as_path()),
         );
 
         let total_cached = cache.read().map(|c| c.len()).unwrap_or(0);
@@ -1731,9 +2339,7 @@ fn main() {
         eprintln!("Cache file: {}", cache_path.display());
 
         if cache_path.exists() {
-            let size = std::fs::metadata(&cache_path)
-                .map(|m| m.len())
-                .unwrap_or(0);
+            let size = std::fs::metadata(&cache_path).map(|m| m.len()).unwrap_or(0);
             eprintln!("Cache file size: {:.1} KB", size as f64 / 1024.0);
         }
 
@@ -1787,7 +2393,10 @@ fn main() {
     let model = load_model(&cli);
     let model_load_elapsed = t_e2e.elapsed();
     if is_e2e {
-        eprintln!("[E2E] Model loaded in {:.2}s", model_load_elapsed.as_secs_f64());
+        eprintln!(
+            "[E2E] Model loaded in {:.2}s",
+            model_load_elapsed.as_secs_f64()
+        );
     }
 
     // --inspect: print summary and exit
@@ -1934,10 +2543,12 @@ fn main() {
     // ── Decode mode: branch off before normal proving pipeline ──
     if cli.decode {
         let weight_cache = cli.model_dir.as_ref().map(|dir| {
-            let model_id_str = if cli.model_id.is_empty() { "unknown".to_string() } else { cli.model_id.clone() };
-            obelyzk::weight_cache::shared_cache_for_model_mmap(
-                dir, &model_id_str, &model.weights,
-            )
+            let model_id_str = if cli.model_id.is_empty() {
+                "unknown".to_string()
+            } else {
+                cli.model_id.clone()
+            };
+            obelyzk::weight_cache::shared_cache_for_model_mmap(dir, &model_id_str, &model.weights)
         });
         run_decode_mode(&cli, &model, weight_cache.as_ref(), &resolved_policy);
         return;
@@ -1949,10 +2560,12 @@ fn main() {
     // Uses mmap variant: near-zero startup cost (<1ms vs ~200ms file I/O).
     // Falls back to validated file I/O if mmap fails.
     let weight_cache = cli.model_dir.as_ref().map(|dir| {
-        let model_id = if cli.model_id.is_empty() { "unknown".to_string() } else { cli.model_id.clone() };
-        obelyzk::weight_cache::shared_cache_for_model_mmap(
-            dir, &model_id, &model.weights,
-        )
+        let model_id = if cli.model_id.is_empty() {
+            "unknown".to_string()
+        } else {
+            cli.model_id.clone()
+        };
+        obelyzk::weight_cache::shared_cache_for_model_mmap(dir, &model_id, &model.weights)
     });
 
     // Pre-warming: compute Merkle roots for uncached weight matrices in the
@@ -1970,7 +2583,10 @@ fn main() {
             // The KV-cache persists across calls within the same process via &mut ref.
             obelyzk::components::attention::ModelKVCache::new()
         } else {
-            eprintln!("Creating new KV-cache (will save to {})", cache_path.display());
+            eprintln!(
+                "Creating new KV-cache (will save to {})",
+                cache_path.display()
+            );
             obelyzk::components::attention::ModelKVCache::new()
         }
     });
@@ -1995,21 +2611,40 @@ fn main() {
             let total_weights = model.weights.weights.len();
             let cache_count = wc.read().map(|c| c.len()).unwrap_or(0);
             if cache_count < total_weights {
-                eprintln!("[BENCH] Pre-warming {} weight Merkle roots...", total_weights - cache_count);
+                eprintln!(
+                    "[BENCH] Pre-warming {} weight Merkle roots...",
+                    total_weights - cache_count
+                );
                 obelyzk::weight_cache::prewarm_weight_roots_gpu_exclusive(
-                    &model.weights, wc, cli.model_dir.as_deref(),
+                    &model.weights,
+                    wc,
+                    cli.model_dir.as_deref(),
                 );
             }
         }
 
-        // Phase 1: Prefill
         let (_, d_model) = model.input_shape;
-        eprintln!("[BENCH] Prefill ({} tokens, d_model={})...", input.rows, d_model);
+        let prefill_input = if cli.prefill_len == input.rows {
+            input.clone()
+        } else {
+            generate_random_input(cli.prefill_len, d_model)
+        };
+
+        // Phase 1: Prefill
+        eprintln!(
+            "[BENCH] Prefill ({} tokens, d_model={})...",
+            prefill_input.rows, d_model
+        );
         let t_prefill = Instant::now();
         let _prefill_proof = obelyzk::aggregation::prove_model_pure_gkr_prefill_with_cache(
-            &model.graph, &input, &model.weights, &mut kvc,
-            weight_cache.as_ref(), None,
-        ).unwrap_or_else(|e| {
+            &model.graph,
+            &prefill_input,
+            &model.weights,
+            &mut kvc,
+            weight_cache.as_ref(),
+            None,
+        )
+        .unwrap_or_else(|e| {
             eprintln!("Error: prefill failed: {e}");
             process::exit(1);
         });
@@ -2031,13 +2666,23 @@ fn main() {
             }
 
             // Get cache length before this step
-            let cache_len: usize = kvc.layers.values().next().map(|c| c.cached_len).unwrap_or(0);
+            let cache_len: usize = kvc
+                .layers
+                .values()
+                .next()
+                .map(|c| c.cached_len)
+                .unwrap_or(0);
 
             let t_step = Instant::now();
             let _proof = obelyzk::aggregation::prove_model_pure_gkr_decode_step(
-                &model.graph, &token, &model.weights, &mut kvc,
-                weight_cache.as_ref(), None,
-            ).unwrap_or_else(|e| {
+                &model.graph,
+                &token,
+                &model.weights,
+                &mut kvc,
+                weight_cache.as_ref(),
+                None,
+            )
+            .unwrap_or_else(|e| {
                 eprintln!("Error: decode step {} failed: {e}", step + 1);
                 process::exit(1);
             });
@@ -2052,8 +2697,13 @@ fn main() {
 
             eprintln!(
                 "Step {:>2}: {:>6.0}ms (fwd={:.0}ms gkr={:.0}ms attn={:.0}ms kv={:.0}ms) cache={}",
-                step + 1, step_ms, ph.forward_pass_ms, ph.gkr_proof_ms,
-                ph.attention_proofs_ms, ph.commitments_kv_cache_ms, cache_len + 1,
+                step + 1,
+                step_ms,
+                ph.forward_pass_ms,
+                ph.gkr_proof_ms,
+                ph.attention_proofs_ms,
+                ph.commitments_kv_cache_ms,
+                cache_len + 1,
             );
 
             steps.push(serde_json::json!({
@@ -2078,7 +2728,7 @@ fn main() {
 
         let report = serde_json::json!({
             "prefill": {
-                "tokens": input.rows,
+                "tokens": prefill_input.rows,
                 "elapsed_ms": round1(prefill_ms),
             },
             "decode_steps": steps,
@@ -2107,13 +2757,20 @@ fn main() {
             if let Some(ref mut kvc) = model_kv_cache {
                 eprintln!("  KV-cache enabled: prefill batch proving");
                 obelyzk::aggregation::prove_model_pure_gkr_prefill_with_cache(
-                    &model.graph, &input, &model.weights, kvc,
-                    weight_cache.as_ref(), Some(&resolved_policy),
+                    &model.graph,
+                    &input,
+                    &model.weights,
+                    kvc,
+                    weight_cache.as_ref(),
+                    Some(&resolved_policy),
                 )
             } else {
                 obelyzk::aggregation::prove_model_pure_gkr_auto_with_cache(
-                    &model.graph, &input, &model.weights,
-                    weight_cache.as_ref(), Some(&resolved_policy),
+                    &model.graph,
+                    &input,
+                    &model.weights,
+                    weight_cache.as_ref(),
+                    Some(&resolved_policy),
                 )
             }
         } else if cli.multi_gpu {
@@ -2129,9 +2786,9 @@ fn main() {
                         memory_budget,
                     )
                     .map_err(|e| {
-                        obelyzk::aggregation::AggregationError::ProvingError(
-                            format!("Multi-GPU chunked proving: {e}"),
-                        )
+                        obelyzk::aggregation::AggregationError::ProvingError(format!(
+                            "Multi-GPU chunked proving: {e}"
+                        ))
                     })?;
 
                 eprintln!(
@@ -2156,9 +2813,11 @@ fn main() {
                     &input,
                     &model.weights,
                 )
-                .map_err(|e| obelyzk::aggregation::AggregationError::ProvingError(
-                    format!("Chunk composition: {e}"),
-                ))
+                .map_err(|e| {
+                    obelyzk::aggregation::AggregationError::ProvingError(format!(
+                        "Chunk composition: {e}"
+                    ))
+                })
             }
             #[cfg(not(feature = "multi-gpu"))]
             {
@@ -2243,7 +2902,9 @@ fn main() {
                 }
                 let t_prewarm = Instant::now();
                 let computed = obelyzk::weight_cache::prewarm_weight_roots_gpu_exclusive(
-                    prewarm_weights, wc, prewarm_dir.as_deref(),
+                    prewarm_weights,
+                    wc,
+                    prewarm_dir.as_deref(),
                 );
                 if !is_quiet() {
                     eprintln!(
@@ -2262,13 +2923,17 @@ fn main() {
             eprintln!(
                 "[BG] Single-GPU mode: running weight commitment before proving to avoid GPU contention."
             );
-            eprintln!("[BG] Set STWO_PARALLEL_GPU_COMMIT=1 to force overlapping commitment + proving.");
+            eprintln!(
+                "[BG] Set STWO_PARALLEL_GPU_COMMIT=1 to force overlapping commitment + proving."
+            );
         }
         std::thread::scope(|s| {
             let _prewarm = prewarm_cache.as_ref().map(|wc| {
                 s.spawn(|| {
                     obelyzk::weight_cache::prewarm_weight_roots(
-                        prewarm_weights, wc, prewarm_dir.as_deref(),
+                        prewarm_weights,
+                        wc,
+                        prewarm_dir.as_deref(),
                     )
                 })
             });
@@ -2294,7 +2959,9 @@ fn main() {
             let _prewarm = prewarm_cache.as_ref().map(|wc| {
                 s.spawn(|| {
                     obelyzk::weight_cache::prewarm_weight_roots(
-                        prewarm_weights, wc, prewarm_dir.as_deref(),
+                        prewarm_weights,
+                        wc,
+                        prewarm_dir.as_deref(),
                     )
                 })
             });
@@ -2316,7 +2983,8 @@ fn main() {
 
     let prove_elapsed = t0.elapsed();
     if is_e2e {
-        let cached = weight_cache.as_ref()
+        let cached = weight_cache
+            .as_ref()
             .and_then(|c| c.read().ok())
             .map_or(false, |c| c.len() > 0);
         eprintln!(
@@ -2337,7 +3005,10 @@ fn main() {
         match obelyzk::weight_cache::save_shared_cache(cache, dir) {
             Ok(true) => {
                 let count = cache.read().map(|c| c.len()).unwrap_or(0);
-                eprintln!("Weight commitment cache: saved {count} entries to {}", dir.display());
+                eprintln!(
+                    "Weight commitment cache: saved {count} entries to {}",
+                    dir.display()
+                );
             }
             Ok(false) => {} // clean, no write needed
             Err(e) => eprintln!("Warning: failed to save weight commitment cache: {e}"),
@@ -2399,7 +3070,8 @@ fn main() {
 
             // Compute real public inputs for the recursive proof
             let recursive_io = compute_io_commitment(&input, &proof.execution.output);
-            let recursive_io_qm31 = obelyzk::crypto::poseidon_channel::felt_to_securefield(recursive_io);
+            let recursive_io_qm31 =
+                obelyzk::crypto::poseidon_channel::felt_to_securefield(recursive_io);
             // Weight super root: Poseidon hash of all weight Merkle roots.
             // Uses weight_commitments (Poseidon Merkle roots of weight matrices)
             // instead of weight_claims (Fiat-Shamir-dependent evaluated values).
@@ -2416,20 +3088,20 @@ fn main() {
                 stwo::core::fields::qm31::QM31::default()
             };
 
-            match obelyzk::recursive::prove_recursive_with_policy(
+            match obelyzk::recursive::prove_recursive_with_policy_and_io_felt(
                 &circuit,
                 gkr,
                 &proof.execution.output,
                 &model.weights,
                 recursive_weight_root,
                 recursive_io_qm31,
+                Some(recursive_io),
                 prove_elapsed.as_secs_f64(),
                 Some(&resolved_policy),
             ) {
                 Ok(recursive_proof) => {
-                    // NOTE: io_commitment_felt252 uses the lossy QM31→felt252 conversion.
-                    // The Cairo contract's io_commitment check compares against this value
-                    // (read from the proof body). The caller param must match.
+                    // Recursive Fiat-Shamir binds the original full felt252 IO commitment.
+                    // The Cairo contract compares the caller param against this proof-body value.
                     eprintln!(
                         "  Recursive STARK: {:.2}s, {} Poseidon perms, log_size={}",
                         recursive_proof.metadata.recursive_prove_time_secs,
@@ -2450,18 +3122,20 @@ fn main() {
                     );
 
                     // Serialize recursive proof into calldata felts for single-TX submission
-                    let calldata = obelyzk::cairo_serde::serialize_recursive_proof_calldata(
-                        &recursive_proof,
-                    );
-                    let summary = obelyzk::cairo_serde::recursive_proof_calldata_summary(
-                        &recursive_proof,
-                    );
+                    let calldata =
+                        obelyzk::cairo_serde::serialize_recursive_proof_calldata(&recursive_proof);
+                    let summary =
+                        obelyzk::cairo_serde::recursive_proof_calldata_summary(&recursive_proof);
 
-                    let gkr_felts = proof.gkr_proof.as_ref().map(|g| {
-                        let mut v = Vec::new();
-                        obelyzk::cairo_serde::serialize_gkr_proof_data_only(g, &mut v);
-                        v.len()
-                    }).unwrap_or(0);
+                    let gkr_felts = proof
+                        .gkr_proof
+                        .as_ref()
+                        .map(|g| {
+                            let mut v = Vec::new();
+                            obelyzk::cairo_serde::serialize_gkr_proof_data_only(g, &mut v);
+                            v.len()
+                        })
+                        .unwrap_or(0);
 
                     eprintln!(
                         "  Recursive calldata: {} felts (header: {}, commitments: {}, FRI layers: {}, queries: {})",
@@ -2472,7 +3146,11 @@ fn main() {
                         "  Compression: GKR {} felts -> Recursive {} felts ({:.1}x reduction)",
                         gkr_felts,
                         summary.total_felts,
-                        if summary.total_felts > 0 { gkr_felts as f64 / summary.total_felts as f64 } else { 0.0 },
+                        if summary.total_felts > 0 {
+                            gkr_felts as f64 / summary.total_felts as f64
+                        } else {
+                            0.0
+                        },
                     );
 
                     recursive_calldata = Some(calldata);
@@ -2510,7 +3188,10 @@ fn main() {
     if is_e2e {
         let post_elapsed = t_post.elapsed();
         if post_elapsed.as_millis() > 100 {
-            eprintln!("[E2E] Post-proof overhead: {:.1}s (cache, TEE, IO commitment)", post_elapsed.as_secs_f64());
+            eprintln!(
+                "[E2E] Post-proof overhead: {:.1}s (cache, TEE, IO commitment)",
+                post_elapsed.as_secs_f64()
+            );
         }
     }
 
@@ -2519,7 +3200,16 @@ fn main() {
     let t_ser = Instant::now();
     let output_bytes = match cli.format {
         OutputFormat::CairoSerde => {
-            let felts = serialize_ml_proof_for_recursive(&proof, &metadata, cli.salt);
+            let felts =
+                serialize_ml_proof_v2_for_recursive(&proof, &metadata, cli.salt).unwrap_or_else(
+                    |e| {
+                        eprintln!("Error: proof is not compatible with Cairo MLProofV2: {e}");
+                        eprintln!(
+                            "       Use --format ml_gkr for current full-model artifacts, or finish the missing Cairo verifier sections before recursive Cairo proving."
+                        );
+                        process::exit(1);
+                    },
+                );
             eprintln!("  {} felt252 values, streaming to file...", felts.len());
             serialize_ml_proof_to_file(&felts, &cli.output).unwrap_or_else(|e| {
                 eprintln!("Error writing output to '{}': {e}", cli.output.display());
@@ -2538,19 +3228,18 @@ fn main() {
         OutputFormat::MlGkr => {
             use obelyzk::starknet::{
                 build_chunked_gkr_calldata, build_circuit_descriptor,
-                build_gkr_serializable_proof_parallel,
-                build_register_gkr_calldata, build_verify_model_gkr_calldata,
+                build_gkr_serializable_proof_parallel, build_register_gkr_calldata,
+                build_streaming_gkr_calldata, build_verify_model_gkr_calldata,
                 build_verify_model_gkr_v2_calldata, build_verify_model_gkr_v3_calldata,
-                build_verify_model_gkr_v4_calldata, build_verify_model_gkr_v4_packed_calldata,
-                build_verify_model_gkr_v4_packed_io_calldata,
+                build_verify_model_gkr_v4_calldata,
                 build_verify_model_gkr_v4_double_packed_io_calldata,
-                build_streaming_gkr_calldata,
-                CHUNKED_GKR_THRESHOLD,
+                build_verify_model_gkr_v4_packed_calldata,
+                build_verify_model_gkr_v4_packed_io_calldata, CHUNKED_GKR_THRESHOLD,
             };
 
             // Use parallel serialization to overlap independent calldata components.
-            let gkr_proof =
-                build_gkr_serializable_proof_parallel(&proof, model_id, &input).unwrap_or_else(|e| {
+            let gkr_proof = build_gkr_serializable_proof_parallel(&proof, model_id, &input)
+                .unwrap_or_else(|e| {
                     eprintln!("Error building GKR proof artifact: {e}");
                     eprintln!(
                         "Hint: --format ml_gkr requires the ML GKR pipeline (pure GKR proving)."
@@ -2580,46 +3269,45 @@ fn main() {
             // ── Cryptographic self-verification ──
             // Verify the GKR proof we just produced before writing to disk.
             // This catches prover bugs and ensures no corrupt proof is emitted.
-            let cryptographic_self_verified =
-                if let Some(gkr_p) = proof.gkr_proof.as_ref() {
-                    match obelyzk::gkr::LayeredCircuit::from_graph(&model.graph) {
-                        Ok(circuit) => {
-                            let mut verify_channel =
-                                obelyzk::crypto::poseidon_channel::PoseidonChannel::new();
-                            // Mix KV-cache commitment before GKR verification
-                            // (must match prover's channel seeding in aggregation.rs)
-                            if let Some(kvc) = proof.kv_cache_commitment {
-                                verify_channel.mix_felt(kvc);
-                            }
-                            match obelyzk::gkr::verify_gkr_with_policy(
-                                &circuit,
-                                gkr_p,
-                                &proof.execution.output,
-                                Some(&model.weights),
-                                &mut verify_channel,
-                                &resolved_policy,
-                            ) {
-                                Ok(_claim) => {
-                                    eprintln!("  cryptographic_self_verify: passed");
-                                    true
-                                }
-                                Err(e) => {
-                                    eprintln!("  cryptographic_self_verify: FAILED — {e}");
-                                    false
-                                }
-                            }
+            let cryptographic_self_verified = if let Some(gkr_p) = proof.gkr_proof.as_ref() {
+                match obelyzk::gkr::LayeredCircuit::from_graph(&model.graph) {
+                    Ok(circuit) => {
+                        let mut verify_channel =
+                            obelyzk::crypto::poseidon_channel::PoseidonChannel::new();
+                        // Mix KV-cache commitment before GKR verification
+                        // (must match prover's channel seeding in aggregation.rs)
+                        if let Some(kvc) = proof.kv_cache_commitment {
+                            verify_channel.mix_felt(kvc);
                         }
-                        Err(e) => {
-                            eprintln!(
-                                "  cryptographic_self_verify: skipped (circuit build failed: {e})"
-                            );
-                            false
+                        match obelyzk::gkr::verify_gkr_with_policy(
+                            &circuit,
+                            gkr_p,
+                            &proof.execution.output,
+                            Some(&model.weights),
+                            &mut verify_channel,
+                            &resolved_policy,
+                        ) {
+                            Ok(_claim) => {
+                                eprintln!("  cryptographic_self_verify: passed");
+                                true
+                            }
+                            Err(e) => {
+                                eprintln!("  cryptographic_self_verify: FAILED — {e}");
+                                false
+                            }
                         }
                     }
-                } else {
-                    eprintln!("  cryptographic_self_verify: skipped (no native GKR proof)");
-                    false
-                };
+                    Err(e) => {
+                        eprintln!(
+                            "  cryptographic_self_verify: skipped (circuit build failed: {e})"
+                        );
+                        false
+                    }
+                }
+            } else {
+                eprintln!("  cryptographic_self_verify: skipped (no native GKR proof)");
+                false
+            };
 
             let use_starknet_gkr_v4_env = std::env::var("STWO_STARKNET_GKR_V4")
                 .ok()
@@ -2680,89 +3368,158 @@ fn main() {
                             .map(|v| v == "0" || v == "false" || v == "off")
                             .map(|is_off| !is_off)
                             .unwrap_or(true);
-                        let (verify_result, is_packed, is_io_packed, is_double_packed) = if use_starknet_gkr_v4 {
-                            // Try double-packed-io first (c0+c2 QM31 pairs in 1 felt) — smallest possible
-                            if !no_io_pack && !force_streaming {
-                                match build_verify_model_gkr_v4_double_packed_io_calldata(gkr_p, &circuit, model_id, &raw_io) {
-                                    Ok(dp_vc) if dp_vc.total_felts <= CHUNKED_GKR_THRESHOLD => {
-                                        eprintln!(
+                        let (verify_result, is_packed, is_io_packed, is_double_packed) =
+                            if use_starknet_gkr_v4 {
+                                // Try double-packed-io first (c0+c2 QM31 pairs in 1 felt) — smallest possible
+                                if !no_io_pack && !force_streaming {
+                                    match build_verify_model_gkr_v4_double_packed_io_calldata(
+                                        gkr_p, &circuit, model_id, &raw_io,
+                                    ) {
+                                        Ok(dp_vc) if dp_vc.total_felts <= CHUNKED_GKR_THRESHOLD => {
+                                            eprintln!(
                                             "  double_packed_io calldata: {} felts (fits single TX, v25.1)",
                                             dp_vc.total_felts
                                         );
-                                        (Ok(dp_vc), true, true, true)
-                                    }
-                                    _ => {
-                                        // Fall back to regular IO-packed
-                                        match build_verify_model_gkr_v4_packed_io_calldata(gkr_p, &circuit, model_id, &raw_io) {
-                                            Ok(io_packed_vc) if io_packed_vc.total_felts <= CHUNKED_GKR_THRESHOLD => {
-                                                eprintln!(
+                                            (Ok(dp_vc), true, true, true)
+                                        }
+                                        _ => {
+                                            // Fall back to regular IO-packed
+                                            match build_verify_model_gkr_v4_packed_io_calldata(
+                                                gkr_p, &circuit, model_id, &raw_io,
+                                            ) {
+                                                Ok(io_packed_vc)
+                                                    if io_packed_vc.total_felts
+                                                        <= CHUNKED_GKR_THRESHOLD =>
+                                                {
+                                                    eprintln!(
                                                     "  io_packed calldata: {} felts (fits single TX, no storage reads)",
                                                     io_packed_vc.total_felts
                                                 );
-                                                (Ok(io_packed_vc), true, true, false)
-                                            }
-                                            _ => {
-                                                // IO-packed didn't fit — try regular packed
-                                                match build_verify_model_gkr_v4_packed_calldata(gkr_p, &circuit, model_id, &raw_io) {
-                                                    Ok(packed_vc) if packed_vc.total_felts <= CHUNKED_GKR_THRESHOLD => {
-                                                        eprintln!(
+                                                    (Ok(io_packed_vc), true, true, false)
+                                                }
+                                                _ => {
+                                                    // IO-packed didn't fit — try regular packed
+                                                    match build_verify_model_gkr_v4_packed_calldata(
+                                                        gkr_p, &circuit, model_id, &raw_io,
+                                                    ) {
+                                                        Ok(packed_vc)
+                                                            if packed_vc.total_felts
+                                                                <= CHUNKED_GKR_THRESHOLD =>
+                                                        {
+                                                            eprintln!(
                                                             "  packed calldata: {} felts (fits single TX)",
                                                             packed_vc.total_felts
                                                         );
-                                                        (Ok(packed_vc), true, false, false)
-                                                    }
-                                                    _ => {
-                                                        (build_verify_model_gkr_v4_calldata(gkr_p, &circuit, model_id, &raw_io), false, false, false)
+                                                            (Ok(packed_vc), true, false, false)
+                                                        }
+                                                        _ => (
+                                                            build_verify_model_gkr_v4_calldata(
+                                                                gkr_p, &circuit, model_id, &raw_io,
+                                                            ),
+                                                            false,
+                                                            false,
+                                                            false,
+                                                        ),
                                                     }
                                                 }
                                             }
                                         }
                                     }
-                                }
-                            } else if !force_streaming {
-                                match build_verify_model_gkr_v4_packed_calldata(gkr_p, &circuit, model_id, &raw_io) {
-                                    Ok(packed_vc) if packed_vc.total_felts <= CHUNKED_GKR_THRESHOLD => {
-                                        eprintln!(
-                                            "  packed calldata: {} felts (fits single TX)",
-                                            packed_vc.total_felts
-                                        );
-                                        (Ok(packed_vc), true, false, false)
+                                } else if !force_streaming {
+                                    match build_verify_model_gkr_v4_packed_calldata(
+                                        gkr_p, &circuit, model_id, &raw_io,
+                                    ) {
+                                        Ok(packed_vc)
+                                            if packed_vc.total_felts <= CHUNKED_GKR_THRESHOLD =>
+                                        {
+                                            eprintln!(
+                                                "  packed calldata: {} felts (fits single TX)",
+                                                packed_vc.total_felts
+                                            );
+                                            (Ok(packed_vc), true, false, false)
+                                        }
+                                        _ => (
+                                            build_verify_model_gkr_v4_calldata(
+                                                gkr_p, &circuit, model_id, &raw_io,
+                                            ),
+                                            false,
+                                            false,
+                                            false,
+                                        ),
                                     }
-                                    _ => {
-                                        (build_verify_model_gkr_v4_calldata(gkr_p, &circuit, model_id, &raw_io), false, false, false)
-                                    }
+                                } else {
+                                    // force_streaming: build unpacked calldata (will be routed to streaming below)
+                                    (
+                                        build_verify_model_gkr_v4_calldata(
+                                            gkr_p, &circuit, model_id, &raw_io,
+                                        ),
+                                        false,
+                                        false,
+                                        false,
+                                    )
                                 }
+                            } else if use_starknet_gkr_v3 {
+                                (
+                                    build_verify_model_gkr_v3_calldata(
+                                        gkr_p, &circuit, model_id, &raw_io,
+                                    ),
+                                    false,
+                                    false,
+                                    false,
+                                )
+                            } else if use_starknet_gkr_v2 {
+                                (
+                                    build_verify_model_gkr_v2_calldata(
+                                        gkr_p, &circuit, model_id, &raw_io,
+                                    ),
+                                    false,
+                                    false,
+                                    false,
+                                )
                             } else {
-                                // force_streaming: build unpacked calldata (will be routed to streaming below)
-                                (build_verify_model_gkr_v4_calldata(gkr_p, &circuit, model_id, &raw_io), false, false, false)
-                            }
-                        } else if use_starknet_gkr_v3 {
-                            (build_verify_model_gkr_v3_calldata(gkr_p, &circuit, model_id, &raw_io), false, false, false)
-                        } else if use_starknet_gkr_v2 {
-                            (build_verify_model_gkr_v2_calldata(gkr_p, &circuit, model_id, &raw_io), false, false, false)
-                        } else {
-                            (build_verify_model_gkr_calldata(gkr_p, &circuit, model_id, &raw_io), false, false, false)
-                        };
+                                (
+                                    build_verify_model_gkr_calldata(
+                                        gkr_p, &circuit, model_id, &raw_io,
+                                    ),
+                                    false,
+                                    false,
+                                    false,
+                                )
+                            };
                         match verify_result {
                             Ok(vc) => {
-                                if (vc.total_felts > CHUNKED_GKR_THRESHOLD || force_streaming) && use_starknet_gkr_v4 {
+                                if (vc.total_felts > CHUNKED_GKR_THRESHOLD || force_streaming)
+                                    && use_starknet_gkr_v4
+                                {
                                     // Auto-select streaming verification (v25) for large proofs.
                                     // Streaming passes proof data as calldata (no storage reads),
                                     // avoiding the step limit hit by verify_gkr_execute.
-                                    match build_streaming_gkr_calldata(gkr_p, &circuit, model_id, &raw_io, proof.kv_cache_commitment, proof.prev_kv_cache_commitment, proof.policy_commitment) {
+                                    match build_streaming_gkr_calldata(
+                                        gkr_p,
+                                        &circuit,
+                                        model_id,
+                                        &raw_io,
+                                        proof.kv_cache_commitment,
+                                        proof.prev_kv_cache_commitment,
+                                        proof.policy_commitment,
+                                    ) {
                                         Ok(streaming) => {
                                             let num_batches = streaming.stream_batches.len();
                                             eprintln!(
                                                 "  verify_calldata: {} felts → {} stream batches (streaming v25 mode)",
                                                 streaming.session_metadata.total_felts, num_batches
                                             );
-                                            let batch_json: Vec<serde_json::Value> = streaming.stream_batches.iter().map(|b| {
-                                                serde_json::json!({
-                                                    "batch_idx": b.batch_idx,
-                                                    "num_layers": b.num_layers,
-                                                    "calldata": b.calldata,
+                                            let batch_json: Vec<serde_json::Value> = streaming
+                                                .stream_batches
+                                                .iter()
+                                                .map(|b| {
+                                                    serde_json::json!({
+                                                        "batch_idx": b.batch_idx,
+                                                        "num_layers": b.num_layers,
+                                                        "calldata": b.calldata,
+                                                    })
                                                 })
-                                            }).collect();
+                                                .collect();
                                             serde_json::json!({
                                                 "schema_version": 3,
                                                 "entrypoint": "verify_gkr_stream",
@@ -2812,7 +3569,13 @@ fn main() {
                                                 "  Warning: streaming calldata build failed, falling back to chunked v2: {e}"
                                             );
                                             // Fall back to chunked v2 (may hit step limit for large proofs)
-                                            match build_chunked_gkr_calldata(gkr_p, &circuit, model_id, &raw_io, proof.kv_cache_commitment) {
+                                            match build_chunked_gkr_calldata(
+                                                gkr_p,
+                                                &circuit,
+                                                model_id,
+                                                &raw_io,
+                                                proof.kv_cache_commitment,
+                                            ) {
                                                 Ok(chunked) => {
                                                     eprintln!(
                                                         "  verify_calldata: {} felts → {} chunks (chunked session mode)",
@@ -2945,9 +3708,8 @@ fn main() {
 
             // When using packed-IO entrypoint, the on-chain io_commitment is computed
             // from the packed felts (not the unpacked raw_io_data). Include both.
-            let packed_io_commitment = obelyzk::aggregation::compute_io_commitment_packed(
-                &input, &proof.execution.output,
-            );
+            let packed_io_commitment =
+                obelyzk::aggregation::compute_io_commitment_packed(&input, &proof.execution.output);
 
             let json_obj = serde_json::json!({
                 "format": "ml_gkr",
@@ -3095,7 +3857,8 @@ fn main() {
     if is_e2e {
         eprintln!(
             "[E2E] Calldata serialization: {:.1}s ({} bytes)",
-            ser_elapsed.as_secs_f64(), output_bytes,
+            ser_elapsed.as_secs_f64(),
+            output_bytes,
         );
     }
 
@@ -3134,7 +3897,8 @@ fn main() {
     // Clean summary block
     let total_elapsed = t_e2e.elapsed();
     eprintln!("=== Proof Summary ===");
-    eprintln!("  Model:       {} ({} layers, {} weights)",
+    eprintln!(
+        "  Model:       {} ({} layers, {} weights)",
         model.metadata.name,
         model.metadata.num_layers,
         model.weights.weights.len(),
@@ -3146,7 +3910,8 @@ fn main() {
     eprintln!("  Prove time:  {:.1}s", prove_elapsed.as_secs_f64());
     eprintln!("  Serialize:   {:.1}s", ser_elapsed.as_secs_f64());
     eprintln!("  Total:       {:.1}s", total_elapsed.as_secs_f64());
-    eprintln!("  Output:      {} ({:.1} MB)",
+    eprintln!(
+        "  Output:      {} ({:.1} MB)",
         cli.output.display(),
         output_bytes as f64 / (1024.0 * 1024.0),
     );
@@ -3160,10 +3925,11 @@ fn main() {
             eprintln!("Error: cannot read proof file for health check: {e}");
             process::exit(1);
         });
-        let hc_json: serde_json::Value = serde_json::from_str(&proof_contents).unwrap_or_else(|e| {
-            eprintln!("Error: invalid JSON in proof file for health check: {e}");
-            process::exit(1);
-        });
+        let hc_json: serde_json::Value =
+            serde_json::from_str(&proof_contents).unwrap_or_else(|e| {
+                eprintln!("Error: invalid JSON in proof file for health check: {e}");
+                process::exit(1);
+            });
 
         let hc_format = hc_json.get("format").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -3185,7 +3951,10 @@ fn main() {
         let gkr_calldata = parse_felt_array("gkr_calldata");
         let io_calldata_felts = parse_felt_array("io_calldata");
         let wc_felts = parse_felt_array("weight_commitments");
-        let nlp = hc_json.get("num_layer_proofs").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let nlp = hc_json
+            .get("num_layer_proofs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
 
         // Choose format-appropriate health check
         let has_data = !gkr_calldata.is_empty() || !io_calldata_felts.is_empty();
@@ -3195,13 +3964,23 @@ fn main() {
         } else if cli.dry_run {
             let result = if is_ml_gkr {
                 obelyzk::starknet::dry_run_onchain_ml_gkr(
-                    &gkr_calldata, &io_calldata_felts, &wc_felts, nlp,
-                    cli.rpc_url.as_deref(), Some(&cli.contract),
+                    &gkr_calldata,
+                    &io_calldata_felts,
+                    &wc_felts,
+                    nlp,
+                    cli.rpc_url.as_deref(),
+                    Some(&cli.contract),
                 )
             } else {
-                let fallback = if gkr_calldata.is_empty() { &io_calldata_felts } else { &gkr_calldata };
+                let fallback = if gkr_calldata.is_empty() {
+                    &io_calldata_felts
+                } else {
+                    &gkr_calldata
+                };
                 obelyzk::starknet::dry_run_onchain(
-                    fallback, cli.rpc_url.as_deref(), Some(&cli.contract),
+                    fallback,
+                    cli.rpc_url.as_deref(),
+                    Some(&cli.contract),
                 )
             };
             eprintln!("=== Dry-Run Report ===");
@@ -3215,9 +3994,15 @@ fn main() {
             }
             if let Some(ref rpc) = result.rpc_simulation {
                 if rpc.success {
-                    eprintln!("  [RPC] Simulation passed: {} actual steps", rpc.actual_steps);
+                    eprintln!(
+                        "  [RPC] Simulation passed: {} actual steps",
+                        rpc.actual_steps
+                    );
                 } else {
-                    eprintln!("  [RPC] Simulation failed: {}", rpc.error.as_deref().unwrap_or("unknown"));
+                    eprintln!(
+                        "  [RPC] Simulation failed: {}",
+                        rpc.error.as_deref().unwrap_or("unknown")
+                    );
                 }
             }
             if !result.health.passed {
@@ -3229,10 +4014,17 @@ fn main() {
             // --health-check only
             let report = if is_ml_gkr {
                 obelyzk::starknet::verify_proof_fast_ml_gkr(
-                    &gkr_calldata, &io_calldata_felts, &wc_felts, nlp,
+                    &gkr_calldata,
+                    &io_calldata_felts,
+                    &wc_felts,
+                    nlp,
                 )
             } else {
-                let fallback = if gkr_calldata.is_empty() { &io_calldata_felts } else { &gkr_calldata };
+                let fallback = if gkr_calldata.is_empty() {
+                    &io_calldata_felts
+                } else {
+                    &gkr_calldata
+                };
                 obelyzk::starknet::verify_proof_fast(fallback)
             };
             eprintln!("=== Health Check ===");
@@ -3280,10 +4072,18 @@ fn main() {
         let t_submit = Instant::now();
         submit_gkr_onchain(&cli, &model, &proof, &input, model_id, io_commitment);
         if is_e2e {
-            eprintln!("[E2E] Submission (sncast): {:.1}s", t_submit.elapsed().as_secs_f64());
+            eprintln!(
+                "[E2E] Submission (sncast): {:.1}s",
+                t_submit.elapsed().as_secs_f64()
+            );
             let total = t_e2e.elapsed();
             let secs = total.as_secs();
-            eprintln!("[E2E] Total: {:.1}s ({}m {}s)", total.as_secs_f64(), secs / 60, secs % 60);
+            eprintln!(
+                "[E2E] Total: {:.1}s ({}m {}s)",
+                total.as_secs_f64(),
+                secs / 60,
+                secs % 60
+            );
         }
     }
 
@@ -3292,17 +4092,27 @@ fn main() {
         let t_submit = Instant::now();
         submit_gkr_via_paymaster(&cli);
         if is_e2e {
-            eprintln!("[E2E] Submission (paymaster): {:.1}s", t_submit.elapsed().as_secs_f64());
+            eprintln!(
+                "[E2E] Submission (paymaster): {:.1}s",
+                t_submit.elapsed().as_secs_f64()
+            );
             let total = t_e2e.elapsed();
             let secs = total.as_secs();
-            eprintln!("[E2E] Total: {:.1}s ({}m {}s)", total.as_secs_f64(), secs / 60, secs % 60);
+            eprintln!(
+                "[E2E] Total: {:.1}s ({}m {}s)",
+                total.as_secs_f64(),
+                secs / 60,
+                secs % 60
+            );
         }
     }
 
     // --on-chain: submit recursive STARK proof on-chain via scripts/submit_recursive.mjs
     if cli.on_chain {
         if !cli.recursive {
-            eprintln!("Error: --on-chain requires --recursive (which implies --gkr --format ml_gkr)");
+            eprintln!(
+                "Error: --on-chain requires --recursive (which implies --gkr --format ml_gkr)"
+            );
             process::exit(1);
         }
         if recursive_calldata.is_none() {
@@ -3313,10 +4123,18 @@ fn main() {
         let t_submit = Instant::now();
         submit_recursive_proof_onchain(&cli);
         if is_e2e {
-            eprintln!("[E2E] Submission (recursive on-chain): {:.1}s", t_submit.elapsed().as_secs_f64());
+            eprintln!(
+                "[E2E] Submission (recursive on-chain): {:.1}s",
+                t_submit.elapsed().as_secs_f64()
+            );
             let total = t_e2e.elapsed();
             let secs = total.as_secs();
-            eprintln!("[E2E] Total: {:.1}s ({}m {}s)", total.as_secs_f64(), secs / 60, secs % 60);
+            eprintln!(
+                "[E2E] Total: {:.1}s ({}m {}s)",
+                total.as_secs_f64(),
+                secs / 60,
+                secs % 60
+            );
         }
     }
 }
@@ -3544,17 +4362,25 @@ fn submit_gkr_onchain(
 
     // Read calldata from file and pass as argument (no shell interpolation).
     let calldata_contents = std::fs::read_to_string(&calldata_path).unwrap_or_else(|e| {
-        eprintln!("  Error: could not read calldata file {}: {e}", calldata_path.display());
+        eprintln!(
+            "  Error: could not read calldata file {}: {e}",
+            calldata_path.display()
+        );
         process::exit(1);
     });
     let verify_result = std::process::Command::new("sncast")
         .args(&[
-            "--account", &cli.account,
+            "--account",
+            &cli.account,
             "invoke",
-            "--network", &cli.network,
-            "--contract-address", &cli.contract,
-            "--function", &verify_entrypoint,
-            "--calldata", calldata_contents.trim(),
+            "--network",
+            &cli.network,
+            "--contract-address",
+            &cli.contract,
+            "--function",
+            &verify_entrypoint,
+            "--calldata",
+            calldata_contents.trim(),
         ])
         .output();
 
@@ -3629,8 +4455,7 @@ fn submit_gkr_via_paymaster(cli: &Cli) {
 
     // 4. Relative to model_dir (scripts often colocated with model on EC2)
     if let Some(ref model_dir) = cli.model_dir {
-        let candidate = model_dir
-            .join("../../scripts/pipeline/lib/paymaster_submit.mjs");
+        let candidate = model_dir.join("../../scripts/pipeline/lib/paymaster_submit.mjs");
         script_candidates.push(candidate);
     }
 
@@ -3639,10 +4464,7 @@ fn submit_gkr_via_paymaster(cli: &Cli) {
         .join("../scripts/pipeline/lib/paymaster_submit.mjs");
     script_candidates.push(manifest_candidate);
 
-    let script_path = script_candidates
-        .iter()
-        .find(|p| p.exists())
-        .cloned();
+    let script_path = script_candidates.iter().find(|p| p.exists()).cloned();
 
     let script_path = match script_path {
         Some(p) => p,
@@ -3696,7 +4518,9 @@ fn submit_gkr_via_paymaster(cli: &Cli) {
         Ok(child) => child,
         Err(e) => {
             if e.kind() == std::io::ErrorKind::NotFound {
-                eprintln!("Error: 'node' not found in PATH. Install Node.js to use --submit-paymaster.");
+                eprintln!(
+                    "Error: 'node' not found in PATH. Install Node.js to use --submit-paymaster."
+                );
                 eprintln!("  Or use --submit-gkr for sncast-based submission.");
             } else {
                 eprintln!("Error: failed to invoke paymaster script: {e}");
@@ -3794,8 +4618,12 @@ fn submit_gkr_via_paymaster(cli: &Cli) {
 
             eprintln!();
             if !found_json {
-                eprintln!("  WARNING: Paymaster script exited successfully but produced no JSON output.");
-                eprintln!("  This may indicate the script version is outdated or the proof was rejected.");
+                eprintln!(
+                    "  WARNING: Paymaster script exited successfully but produced no JSON output."
+                );
+                eprintln!(
+                    "  This may indicate the script version is outdated or the proof was rejected."
+                );
                 if !stdout.is_empty() {
                     eprintln!("  stdout: {}", stdout.chars().take(500).collect::<String>());
                 }
@@ -3818,7 +4646,10 @@ fn submit_gkr_via_paymaster(cli: &Cli) {
         }
         Ok((_status, stdout_bytes, stderr_captured)) => {
             let stdout = String::from_utf8_lossy(&stdout_bytes);
-            eprintln!("Error: paymaster submission failed (exit code {:?})", _status.code());
+            eprintln!(
+                "Error: paymaster submission failed (exit code {:?})",
+                _status.code()
+            );
             if !stdout.is_empty() {
                 eprintln!("  stdout: {}", stdout.chars().take(500).collect::<String>());
             }
@@ -3872,9 +4703,7 @@ fn submit_recursive_proof_onchain(cli: &Cli) {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_dir) = exe.parent() {
             for depth in &["../../..", "../../../.."] {
-                script_candidates.push(
-                    exe_dir.join(depth).join("scripts/submit_recursive.mjs"),
-                );
+                script_candidates.push(exe_dir.join(depth).join("scripts/submit_recursive.mjs"));
             }
         }
     }
@@ -3883,9 +4712,8 @@ fn submit_recursive_proof_onchain(cli: &Cli) {
     script_candidates.push(PathBuf::from("scripts/submit_recursive.mjs"));
 
     // 4. Compile-time manifest dir
-    script_candidates.push(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/submit_recursive.mjs"),
-    );
+    script_candidates
+        .push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/submit_recursive.mjs"));
 
     let script_path = match script_candidates.iter().find(|p| p.exists()).cloned() {
         Some(p) => p,
@@ -3902,10 +4730,12 @@ fn submit_recursive_proof_onchain(cli: &Cli) {
     };
 
     let proof_path = cli.output.display().to_string();
-    let contract = std::env::var("RECURSIVE_CONTRACT")
-        .unwrap_or_else(|_| "0x1c208a5fe731c0d03b098b524f274c537587ea1d43d903838cc4a2bf90c40c7".to_string());
-    let rpc = std::env::var("STARKNET_RPC")
-        .unwrap_or_else(|_| "https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_8/demo".to_string());
+    let contract = std::env::var("RECURSIVE_CONTRACT").unwrap_or_else(|_| {
+        "0x1c208a5fe731c0d03b098b524f274c537587ea1d43d903838cc4a2bf90c40c7".to_string()
+    });
+    let rpc = std::env::var("STARKNET_RPC").unwrap_or_else(|_| {
+        "https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_8/demo".to_string()
+    });
 
     eprintln!();
     eprintln!("=== Recursive On-Chain Submission ===");
@@ -3926,7 +4756,9 @@ fn submit_recursive_proof_onchain(cli: &Cli) {
         Ok(o) => o,
         Err(e) => {
             if e.kind() == std::io::ErrorKind::NotFound {
-                eprintln!("Error: 'node' not found in PATH. Install Node.js >= 18 to use --on-chain.");
+                eprintln!(
+                    "Error: 'node' not found in PATH. Install Node.js >= 18 to use --on-chain."
+                );
             } else {
                 eprintln!("Error: failed to invoke submit_recursive.mjs: {e}");
             }
@@ -3972,7 +4804,10 @@ fn submit_recursive_proof_onchain(cli: &Cli) {
     }
 
     if !output.status.success() {
-        eprintln!("Error: submit_recursive.mjs exited with code {:?}", output.status.code());
+        eprintln!(
+            "Error: submit_recursive.mjs exited with code {:?}",
+            output.status.code()
+        );
         process::exit(1);
     }
 }
@@ -5049,8 +5884,7 @@ fn generate_diverse_input(rows: usize, cols: usize, iteration: usize) -> M31Matr
         .unwrap_or_default()
         .as_nanos() as u64
         ^ (std::process::id() as u64).wrapping_mul(0x6C62_272E_07BB_0142);
-    let mut state: u64 =
-        0xDEAD_BEEF_CAFE_0000 ^ (iteration as u64 * 0x9E37_79B9_7F4A_7C15) ^ nonce;
+    let mut state: u64 = 0xDEAD_BEEF_CAFE_0000 ^ (iteration as u64 * 0x9E37_79B9_7F4A_7C15) ^ nonce;
     let mut matrix = M31Matrix::new(rows, cols);
     let p = (1u32 << 31) - 1; // M31 modulus
     for i in 0..(rows * cols) {
@@ -5071,9 +5905,9 @@ fn generate_diverse_input(rows: usize, cols: usize, iteration: usize) -> M31Matr
 
 /// Run the `prove-model capture` subcommand.
 fn run_capture_command(cmd: &CaptureCmd) {
-    use std::time::{SystemTime, UNIX_EPOCH};
     use obelyzk::audit::capture::{CaptureHook, CaptureJob};
     use obelyzk::audit::replay::execute_forward_pass;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     eprintln!();
     eprintln!("  prove-model capture");
@@ -5088,17 +5922,25 @@ fn run_capture_command(cmd: &CaptureCmd) {
         });
         eprintln!("Loading model: {} (full attention)", model_dir.display());
         // Determine seq_len from conversation tokens or default to 1
-        let seq_len = cmd.conversation.as_ref().map(|conv_path| {
-            let conv_json = std::fs::read_to_string(conv_path).unwrap_or_default();
-            let conv: serde_json::Value = serde_json::from_str(&conv_json).unwrap_or_default();
-            conv["turns"].as_array()
-                .map(|turns| turns.iter()
-                    .flat_map(|t| t["response"]["tokens"].as_array())
-                    .map(|a| a.len())
-                    .sum::<usize>()
-                    .max(1))
-                .unwrap_or(1)
-        }).unwrap_or(1);
+        let seq_len = cmd
+            .conversation
+            .as_ref()
+            .map(|conv_path| {
+                let conv_json = std::fs::read_to_string(conv_path).unwrap_or_default();
+                let conv: serde_json::Value = serde_json::from_str(&conv_json).unwrap_or_default();
+                conv["turns"]
+                    .as_array()
+                    .map(|turns| {
+                        turns
+                            .iter()
+                            .flat_map(|t| t["response"]["tokens"].as_array())
+                            .map(|a| a.len())
+                            .sum::<usize>()
+                            .max(1)
+                    })
+                    .unwrap_or(1)
+            })
+            .unwrap_or(1);
         eprintln!("  seq_len={} (from conversation tokens)", seq_len);
         obelyzk::compiler::hf_loader::load_hf_model_full(model_dir, cmd.layers, seq_len)
             .unwrap_or_else(|e| {
@@ -5169,7 +6011,10 @@ fn run_capture_command(cmd: &CaptureCmd) {
 
     if let Some(ref conv_path) = cmd.conversation {
         let conv_json = std::fs::read_to_string(conv_path).unwrap_or_else(|e| {
-            eprintln!("Error: cannot read conversation file '{}': {e}", conv_path.display());
+            eprintln!(
+                "Error: cannot read conversation file '{}': {e}",
+                conv_path.display()
+            );
             process::exit(1);
         });
         let conv: ConversationFile = serde_json::from_str(&conv_json).unwrap_or_else(|e| {
@@ -5184,7 +6029,10 @@ fn run_capture_command(cmd: &CaptureCmd) {
 
         let num_turns = conv.turns.len();
         eprintln!();
-        eprintln!("  conversation: {} ({} turns)", conv.conversation_id, num_turns);
+        eprintln!(
+            "  conversation: {} ({} turns)",
+            conv.conversation_id, num_turns
+        );
         eprintln!("  topic: {:?}", conv.topic);
         eprintln!();
 
@@ -5198,7 +6046,8 @@ fn run_capture_command(cmd: &CaptureCmd) {
         let all_response_tokens: Vec<u32> = if skip_batch {
             Vec::new()
         } else {
-            conv.turns.iter()
+            conv.turns
+                .iter()
                 .flat_map(|t| t.response.tokens.iter().copied())
                 .collect()
         };
@@ -5207,11 +6056,14 @@ fn run_capture_command(cmd: &CaptureCmd) {
             let t_batch = Instant::now();
             eprintln!(
                 "\n  Batched token proving: {} response tokens across {} turns",
-                all_response_tokens.len(), conv.turns.len(),
+                all_response_tokens.len(),
+                conv.turns.len(),
             );
 
             match obelyzk::compiler::hf_loader::load_embedding_batch(
-                model_dir, input_cols, &all_response_tokens,
+                model_dir,
+                input_cols,
+                &all_response_tokens,
             ) {
                 Ok(batch_embedding) => {
                     // Run ONE batched forward pass for all tokens
@@ -5220,9 +6072,12 @@ fn run_capture_command(cmd: &CaptureCmd) {
                             let batch_ms = t_batch.elapsed().as_millis() as u64;
                             eprintln!(
                                 "  Batched forward pass: {}x{} → {}x{} in {}ms ({} tokens)",
-                                batch_embedding.rows, batch_embedding.cols,
-                                batch_output.rows, batch_output.cols,
-                                batch_ms, all_response_tokens.len(),
+                                batch_embedding.rows,
+                                batch_embedding.cols,
+                                batch_output.rows,
+                                batch_output.cols,
+                                batch_ms,
+                                all_response_tokens.len(),
                             );
 
                             // Record the batched inference as an additional log entry
@@ -5243,42 +6098,85 @@ fn run_capture_command(cmd: &CaptureCmd) {
                                 task_category: Some("batched_tokens".to_string()),
                                 input_preview: Some(format!(
                                     "[batch: {} tokens from {} turns]",
-                                    all_response_tokens.len(), conv.turns.len(),
+                                    all_response_tokens.len(),
+                                    conv.turns.len(),
                                 )),
                                 output_preview: Some(format!(
                                     "batched forward pass ({}x{})",
-                                    all_response_tokens.len(), input_cols,
+                                    all_response_tokens.len(),
+                                    input_cols,
                                 )),
                             };
 
                             hook.record(batch_job);
                         }
-                        Err(e) => eprintln!("  Batched forward pass failed: {e} (continuing with per-turn)"),
+                        Err(e) => eprintln!(
+                            "  Batched forward pass failed: {e} (continuing with per-turn)"
+                        ),
                     }
                 }
-                Err(e) => eprintln!("  Batch embedding load failed: {e} (continuing with per-turn)"),
+                Err(e) => {
+                    eprintln!("  Batch embedding load failed: {e} (continuing with per-turn)")
+                }
             }
         }
 
-        // ── Per-turn proving (original flow) ─────────────────────────
+        // ── Per-turn context proving ─────────────────────────────────
+        //
+        // Production conversation capture must bind the full context tokens,
+        // not only the final prompt token. The old last-token-only mode can
+        // make different turns share the same IO commitment when they end on
+        // the same token (for example two questions ending in "?"). Keep it
+        // behind an explicit env var for legacy demos.
+        let legacy_last_token_only = std::env::var("OBELYZK_LAST_TOKEN_ONLY_CAPTURE").is_ok();
+        if legacy_last_token_only {
+            eprintln!(
+                "  WARNING: OBELYZK_LAST_TOKEN_ONLY_CAPTURE is set; only the final context token is bound",
+            );
+        }
+
         for turn in &conv.turns {
             let t_turn = Instant::now();
 
-            // Extract embedding for this turn's last token
-            let (embedding, _vocab_size) = obelyzk::compiler::hf_loader::load_embedding_row(
-                model_dir, input_cols, turn.last_token_id,
-            )
-            .unwrap_or_else(|e| {
-                eprintln!("Error: cannot load embedding for turn {}: {e}", turn.turn_index);
-                process::exit(1);
-            });
+            let embedding = if legacy_last_token_only {
+                let (embedding, _vocab_size) = obelyzk::compiler::hf_loader::load_embedding_row(
+                    model_dir,
+                    input_cols,
+                    turn.last_token_id,
+                )
+                .unwrap_or_else(|e| {
+                    eprintln!(
+                        "Error: cannot load embedding for turn {}: {e}",
+                        turn.turn_index
+                    );
+                    process::exit(1);
+                });
+                embedding
+            } else {
+                obelyzk::compiler::hf_loader::load_embedding_batch(
+                    model_dir,
+                    input_cols,
+                    &turn.full_context_tokens,
+                )
+                .unwrap_or_else(|e| {
+                    eprintln!(
+                        "Error: cannot load full context embedding for turn {}: {e}",
+                        turn.turn_index
+                    );
+                    process::exit(1);
+                })
+            };
 
             // Run M31 forward pass
             let output = execute_forward_pass(graph, &embedding, weights).unwrap_or_else(|e| {
-                eprintln!("Error: forward pass failed on turn {}: {e}", turn.turn_index);
+                eprintln!(
+                    "Error: forward pass failed on turn {}: {e}",
+                    turn.turn_index
+                );
                 process::exit(1);
             });
             let latency_ms = t_turn.elapsed().as_millis() as u64;
+            let bound_rows = embedding.rows;
 
             let now_ns = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -5287,7 +6185,11 @@ fn run_capture_command(cmd: &CaptureCmd) {
 
             // Truncate user query for preview
             let query_truncated: String = turn.content.chars().take(60).collect();
-            let q_ellipsis = if turn.content.chars().count() > 60 { "..." } else { "" };
+            let q_ellipsis = if turn.content.chars().count() > 60 {
+                "..."
+            } else {
+                ""
+            };
             let input_preview = format!(
                 "[conv:{}|turn:{}] {}{}",
                 conv.conversation_id, turn.turn_index, query_truncated, q_ellipsis,
@@ -5295,7 +6197,11 @@ fn run_capture_command(cmd: &CaptureCmd) {
 
             // Use the real model response as output preview
             let resp_truncated: String = turn.response.content.chars().take(200).collect();
-            let r_ellipsis = if turn.response.content.chars().count() > 200 { "..." } else { "" };
+            let r_ellipsis = if turn.response.content.chars().count() > 200 {
+                "..."
+            } else {
+                ""
+            };
             let output_preview = format!("{}{}", resp_truncated, r_ellipsis);
 
             hook.record(CaptureJob {
@@ -5313,12 +6219,13 @@ fn run_capture_command(cmd: &CaptureCmd) {
             });
 
             eprintln!(
-                "  [{}/{}] turn {} (last_token={}, ctx_len={}, resp_tokens={}): {}ms",
+                "  [{}/{}] turn {} (last_token={}, ctx_len={}, bound_rows={}, resp_tokens={}): {}ms",
                 turn.turn_index + 1,
                 num_turns,
                 turn.turn_index,
                 turn.last_token_id,
                 turn.full_context_tokens.len(),
+                bound_rows,
                 turn.response.tokens.len(),
                 latency_ms,
             );
@@ -5377,17 +6284,18 @@ fn run_capture_command(cmd: &CaptureCmd) {
             );
             (None, vec![], None)
         } else {
-            let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-                .unwrap_or_else(|e| {
-                    eprintln!("Error: cannot load tokenizer: {e}");
-                    process::exit(1);
-                });
-
-            // 2. Encode prompt
-            let encoding = tokenizer.encode(prompt_text.as_str(), false).unwrap_or_else(|e| {
-                eprintln!("Error: tokenization failed: {e}");
+            let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).unwrap_or_else(|e| {
+                eprintln!("Error: cannot load tokenizer: {e}");
                 process::exit(1);
             });
+
+            // 2. Encode prompt
+            let encoding = tokenizer
+                .encode(prompt_text.as_str(), false)
+                .unwrap_or_else(|e| {
+                    eprintln!("Error: tokenization failed: {e}");
+                    process::exit(1);
+                });
             let token_ids: Vec<u32> = encoding.get_ids().to_vec();
             if token_ids.is_empty() {
                 eprintln!("Error: prompt produced zero tokens");
@@ -5404,7 +6312,9 @@ fn run_capture_command(cmd: &CaptureCmd) {
 
             // 3. Extract single embedding row (zero-copy from mmap, ~40 KB not ~3 GB)
             let (row, vocab_size) = obelyzk::compiler::hf_loader::load_embedding_row(
-                model_dir, input_cols, last_token_id,
+                model_dir,
+                input_cols,
+                last_token_id,
             )
             .unwrap_or_else(|e| {
                 eprintln!("Error: cannot load embedding row: {e}");
@@ -5417,7 +6327,11 @@ fn run_capture_command(cmd: &CaptureCmd) {
 
             // UTF-8 safe truncation for preview
             let truncated: String = prompt_text.chars().take(60).collect();
-            let ellipsis = if prompt_text.chars().count() > 60 { "..." } else { "" };
+            let ellipsis = if prompt_text.chars().count() > 60 {
+                "..."
+            } else {
+                ""
+            };
             let preview = format!(
                 "real embedding from prompt {:?}",
                 format!("{truncated}{ellipsis}"),
@@ -5457,14 +6371,29 @@ fn run_capture_command(cmd: &CaptureCmd) {
         // Generate output preview from M31 matrix.
         let output_preview = {
             let n = output.data.len();
-            let first: Vec<String> = output.data.iter().take(5).map(|v| v.0.to_string()).collect();
-            let last: Vec<String> = output.data.iter().rev().take(3).rev().map(|v| v.0.to_string()).collect();
+            let first: Vec<String> = output
+                .data
+                .iter()
+                .take(5)
+                .map(|v| v.0.to_string())
+                .collect();
+            let last: Vec<String> = output
+                .data
+                .iter()
+                .rev()
+                .take(3)
+                .rev()
+                .map(|v| v.0.to_string())
+                .collect();
             let sum: u64 = output.data.iter().map(|v| v.0 as u64).sum();
             let mean = if n > 0 { sum / n as u64 } else { 0 };
             Some(format!(
                 "M31[{}x{}] first=[{}] last=[{}] mean={}",
-                output.rows, output.cols,
-                first.join(","), last.join(","), mean
+                output.rows,
+                output.cols,
+                first.join(","),
+                last.join(","),
+                mean
             ))
         };
 
@@ -5511,6 +6440,217 @@ fn run_capture_command(cmd: &CaptureCmd) {
     println!("CAPTURE_MODEL={}", model_name);
 }
 
+#[cfg(feature = "serde")]
+fn run_statement_command(cmd: &StatementCmd) {
+    let mut input = std::fs::read_to_string(&cmd.input).unwrap_or_else(|e| {
+        eprintln!(
+            "Error: cannot read statement input '{}': {e}",
+            cmd.input.display()
+        );
+        process::exit(1);
+    });
+    if cmd.qwen35_active {
+        if cmd.qwen35_contract.is_some() {
+            eprintln!("Error: --qwen35-active cannot be combined with --qwen35-contract");
+            process::exit(1);
+        }
+        let artifact =
+            obelyzk::compiler::qwen35::qwen35_active_conversation_batch_artifact_json_from_str(
+                &input,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("Error: invalid active Qwen3.5 statement: {e}");
+                process::exit(1);
+            });
+        let verifier_args =
+            obelyzk::compiler::qwen35::qwen35_active_conversation_verifier_args_json_from_str(
+                &input,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("Error: invalid active Qwen3.5 verifier args: {e}");
+                process::exit(1);
+            });
+        let output_json = serde_json::to_string_pretty(&artifact).unwrap_or_else(|e| {
+            eprintln!("Error: cannot serialize active Qwen3.5 artifact: {e}");
+            process::exit(1);
+        });
+        std::fs::write(&cmd.output, output_json).unwrap_or_else(|e| {
+            eprintln!(
+                "Error: cannot write active Qwen3.5 artifact '{}': {e}",
+                cmd.output.display()
+            );
+            process::exit(1);
+        });
+
+        if let Some(args_output) = &cmd.args_output {
+            let args_json = serde_json::to_string_pretty(&verifier_args).unwrap_or_else(|e| {
+                eprintln!("Error: cannot serialize active Qwen3.5 verifier args: {e}");
+                process::exit(1);
+            });
+            std::fs::write(args_output, args_json).unwrap_or_else(|e| {
+                eprintln!(
+                    "Error: cannot write active Qwen3.5 args '{}': {e}",
+                    args_output.display()
+                );
+                process::exit(1);
+            });
+        }
+
+        eprintln!("Active Qwen3.5 artifact written: {}", cmd.output.display());
+        eprintln!(
+            "  statement_hash: {}",
+            artifact
+                .get("statement_hash")
+                .and_then(|value| value.as_str())
+                .unwrap_or("0x0")
+        );
+        eprintln!(
+            "  active_batch_felts: {}",
+            artifact
+                .get("active_batch_felts")
+                .and_then(|value| value.as_array())
+                .map(|values| values.len())
+                .unwrap_or(0)
+        );
+        eprintln!(
+            "  active_verifier_args: {}",
+            verifier_args
+                .as_array()
+                .map(|values| values.len())
+                .unwrap_or(0)
+        );
+        return;
+    }
+    if let Some(contract_path) = &cmd.qwen35_contract {
+        input = merge_qwen35_contract_into_statement_input(&input, contract_path);
+    }
+    let artifact =
+        obelyzk::conversation_statement::build_conversation_statement_artifact_from_json_str(
+            &input,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("Error: invalid conversation statement: {e}");
+            process::exit(1);
+        });
+
+    let output_json = serde_json::to_string_pretty(&artifact).unwrap_or_else(|e| {
+        eprintln!("Error: cannot serialize statement artifact: {e}");
+        process::exit(1);
+    });
+    std::fs::write(&cmd.output, output_json).unwrap_or_else(|e| {
+        eprintln!(
+            "Error: cannot write statement artifact '{}': {e}",
+            cmd.output.display()
+        );
+        process::exit(1);
+    });
+
+    if let Some(args_output) = &cmd.args_output {
+        let args_json = serde_json::to_string_pretty(&artifact.cairo_args).unwrap_or_else(|e| {
+            eprintln!("Error: cannot serialize Cairo args: {e}");
+            process::exit(1);
+        });
+        std::fs::write(args_output, args_json).unwrap_or_else(|e| {
+            eprintln!(
+                "Error: cannot write Cairo args '{}': {e}",
+                args_output.display()
+            );
+            process::exit(1);
+        });
+    }
+
+    eprintln!("Statement artifact written to {}", cmd.output.display());
+    eprintln!("  statement_hash: {}", artifact.statement_hash);
+    eprintln!("  cairo_args: {} felts", artifact.cairo_args.len());
+}
+
+#[cfg(feature = "serde")]
+fn merge_qwen35_contract_into_statement_input(input: &str, contract_path: &PathBuf) -> String {
+    let contract_json = std::fs::read_to_string(contract_path).unwrap_or_else(|e| {
+        eprintln!(
+            "Error: cannot read Qwen3.5 contract '{}': {e}",
+            contract_path.display()
+        );
+        process::exit(1);
+    });
+    let contract: serde_json::Value = serde_json::from_str(&contract_json).unwrap_or_else(|e| {
+        eprintln!(
+            "Error: invalid Qwen3.5 contract JSON '{}': {e}",
+            contract_path.display()
+        );
+        process::exit(1);
+    });
+    let contract_hash = contract
+        .get("execution_contract_hash")
+        .and_then(|value| value.as_str())
+        .unwrap_or_else(|| {
+            eprintln!(
+                "Error: Qwen3.5 contract '{}' is missing execution_contract_hash",
+                contract_path.display()
+            );
+            process::exit(1);
+        });
+
+    let mut statement: serde_json::Value = serde_json::from_str(input).unwrap_or_else(|e| {
+        eprintln!("Error: invalid statement input JSON: {e}");
+        process::exit(1);
+    });
+    let Some(statement_object) = statement.as_object_mut() else {
+        eprintln!("Error: statement input JSON must be an object");
+        process::exit(1);
+    };
+
+    if let Some(existing) = statement_object
+        .get("circuit_hash")
+        .and_then(|value| value.as_str())
+    {
+        if !felt_hex_strings_equal(existing, contract_hash) {
+            eprintln!(
+                "Error: statement circuit_hash {existing} does not match Qwen3.5 execution_contract_hash {contract_hash}"
+            );
+            process::exit(1);
+        }
+    }
+    statement_object.insert(
+        "circuit_hash".to_string(),
+        serde_json::Value::String(contract_hash.to_string()),
+    );
+    statement_object.insert(
+        "execution_contract_hash".to_string(),
+        serde_json::Value::String(contract_hash.to_string()),
+    );
+
+    serde_json::to_string(&statement).unwrap_or_else(|e| {
+        eprintln!("Error: cannot serialize merged statement input: {e}");
+        process::exit(1);
+    })
+}
+
+#[cfg(feature = "serde")]
+fn felt_hex_strings_equal(left: &str, right: &str) -> bool {
+    fn normalize(value: &str) -> String {
+        let trimmed = value.trim();
+        let stripped = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+            .unwrap_or(trimmed);
+        let stripped = stripped.trim_start_matches('0');
+        if stripped.is_empty() {
+            "0".to_string()
+        } else {
+            stripped.to_ascii_lowercase()
+        }
+    }
+
+    normalize(left) == normalize(right)
+}
+
+#[cfg(not(feature = "serde"))]
+fn run_statement_command(_cmd: &StatementCmd) {
+    eprintln!("Error: statement command requires the 'serde' feature");
+    process::exit(1);
+}
+
 /// Run the `prove-model audit` subcommand.
 fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
     use obelyzk::audit::log::InferenceLog;
@@ -5543,7 +6683,10 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
         eprintln!("=== Multi-Session Audit Report ===");
         eprintln!("  sessions: {}", report.sessions.len());
         eprintln!("  total entries: {}", report.total_entries);
-        eprintln!("  time span: {} — {}", report.time_span.0, report.time_span.1);
+        eprintln!(
+            "  time span: {} — {}",
+            report.time_span.0, report.time_span.1
+        );
         eprintln!("  chain hash: {}", digest_to_hex(&report.chain_hash));
         if let Some(score) = report.overall_score {
             eprintln!("  overall score: {:.4}", score);
@@ -5577,7 +6720,10 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
         });
         let output_str = serde_json::to_string_pretty(&json).unwrap();
         std::fs::write(&cmd.output, &output_str).unwrap_or_else(|e| {
-            eprintln!("Error: cannot write report to {}: {e}", cmd.output.display());
+            eprintln!(
+                "Error: cannot write report to {}: {e}",
+                cmd.output.display()
+            );
             process::exit(1);
         });
         eprintln!("Report written to {}", cmd.output.display());
@@ -5756,9 +6902,19 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
                 eprintln!("=== Streaming GKR Verification Calldata (dry-run) ===");
                 for (idx, steps) in streaming_steps.iter().enumerate() {
                     let total_felts: usize = steps.iter().map(|s| s.calldata.len()).sum();
-                    eprintln!("  Inference {}: {} steps, {} total felts", idx, steps.len(), total_felts);
+                    eprintln!(
+                        "  Inference {}: {} steps, {} total felts",
+                        idx,
+                        steps.len(),
+                        total_felts
+                    );
                     for step in steps {
-                        eprintln!("    {} ({}) → {} felts", step.filename, step.entrypoint, step.calldata.len());
+                        eprintln!(
+                            "    {} ({}) → {} felts",
+                            step.filename,
+                            step.entrypoint,
+                            step.calldata.len()
+                        );
                     }
 
                     // Write streaming calldata files for manual inspection
@@ -5982,7 +7138,11 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
             eprintln!("=== On-Chain Audit Submission (Avnu Paymaster) ===");
             eprintln!("  Contract: {}", cmd.contract);
             eprintln!("  Network:  {}", cmd.network);
-            let submit_mode = if std::env::var("AVNU_API_KEY").is_ok() { "sponsored" } else { "direct" };
+            let submit_mode = if std::env::var("AVNU_API_KEY").is_ok() {
+                "sponsored"
+            } else {
+                "direct"
+            };
             eprintln!("  Fee:      {submit_mode}");
 
             if acct_addr.is_empty() || priv_key.is_empty() {
@@ -6042,9 +7202,7 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
                         eprintln!("  Audit submitted successfully!");
 
                         // Parse JSON output for tx hash
-                        if let Ok(json) =
-                            serde_json::from_str::<serde_json::Value>(stdout.trim())
-                        {
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
                             if let Some(tx) = json.get("transaction_hash").and_then(|v| v.as_str())
                             {
                                 eprintln!("  TX hash: {}", tx);
@@ -6084,7 +7242,9 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
             } else if cmd.mode != "gkr" {
                 eprintln!("Warning: --verify-gkr requires --mode gkr, skipping GKR verification");
             } else if acct_addr.is_empty() || priv_key.is_empty() {
-                eprintln!("Warning: --verify-gkr requires account credentials, skipping GKR verification");
+                eprintln!(
+                    "Warning: --verify-gkr requires account credentials, skipping GKR verification"
+                );
             } else if let Some(ref streaming_steps) = result.streaming_verification_steps {
                 // ── Streaming GKR verification (multi-TX) ────────────────────
                 eprintln!();
@@ -6130,11 +7290,16 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
                     let mut stream_cmd = std::process::Command::new("node");
                     stream_cmd
                         .arg(&streaming_script)
-                        .arg("--contract").arg(&cmd.verifier_contract)
-                        .arg("--calldata-dir").arg(&stream_dir)
-                        .arg("--account-address").arg(&acct_addr)
-                        .arg("--private-key").arg(&priv_key)
-                        .arg("--network").arg(&cmd.network);
+                        .arg("--contract")
+                        .arg(&cmd.verifier_contract)
+                        .arg("--calldata-dir")
+                        .arg(&stream_dir)
+                        .arg("--account-address")
+                        .arg(&acct_addr)
+                        .arg("--private-key")
+                        .arg(&priv_key)
+                        .arg("--network")
+                        .arg(&cmd.network);
 
                     if let Ok(api_key) = std::env::var("AVNU_API_KEY") {
                         stream_cmd.arg("--mode").arg("sponsored");
@@ -6156,14 +7321,20 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
                             if let Ok(json) =
                                 serde_json::from_str::<serde_json::Value>(stdout.trim())
                             {
-                                if let Some(steps_arr) = json.get("steps").and_then(|v| v.as_array()) {
+                                if let Some(steps_arr) =
+                                    json.get("steps").and_then(|v| v.as_array())
+                                {
                                     for step_val in steps_arr {
-                                        if let Some(tx) = step_val.get("tx_hash").and_then(|v| v.as_str()) {
+                                        if let Some(tx) =
+                                            step_val.get("tx_hash").and_then(|v| v.as_str())
+                                        {
                                             report.proof.gkr_verification_txs.push(tx.to_string());
                                         }
                                     }
                                     eprintln!("    {} streaming TX(s) submitted", steps_arr.len());
-                                    if let Some(sid) = json.get("session_id").and_then(|v| v.as_str()) {
+                                    if let Some(sid) =
+                                        json.get("session_id").and_then(|v| v.as_str())
+                                    {
                                         eprintln!("    Session ID: {}", sid);
                                     }
                                 }
@@ -6231,7 +7402,9 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
                     }
 
                     // Also write calldata JSON for manual retry
-                    let verify_json_path = cmd.output.with_extension(format!("verify_gkr_{}.json", idx));
+                    let verify_json_path = cmd
+                        .output
+                        .with_extension(format!("verify_gkr_{}.json", idx));
                     let verify_json = serde_json::to_string_pretty(&verify_strs).unwrap();
                     let _ = std::fs::write(&verify_json_path, &verify_json);
 
@@ -6274,10 +7447,7 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
                                     json.get("transaction_hash").and_then(|v| v.as_str())
                                 {
                                     eprintln!("    TX hash: {}", tx);
-                                    eprintln!(
-                                        "    Explorer: {}",
-                                        explorer_url(&cmd.network, tx)
-                                    );
+                                    eprintln!("    Explorer: {}", explorer_url(&cmd.network, tx));
                                     report.proof.gkr_verification_txs.push(tx.to_string());
                                 }
                             }
@@ -6312,7 +7482,9 @@ fn run_audit_command(cmd: &AuditCmd, _cli: &Cli) {
                     let _ = std::fs::write(&cmd.output, &report_json);
                 }
             } else {
-                eprintln!("Warning: --verify-gkr specified but no GKR verification calldata available");
+                eprintln!(
+                    "Warning: --verify-gkr specified but no GKR verification calldata available"
+                );
             }
         }
 
@@ -7244,7 +8416,9 @@ fn compute_weight_commitment(
                 panic!("GPU commitment strict mode enabled, but GPU hasher init failed: {e}");
             }
             if !is_quiet() {
-                eprintln!("[BG]   GPU Poseidon unavailable ({e}), falling back to CPU segment hashing");
+                eprintln!(
+                    "[BG]   GPU Poseidon unavailable ({e}), falling back to CPU segment hashing"
+                );
             }
             None
         }
@@ -7496,7 +8670,10 @@ fn parse_profile_phases(json: &Option<String>) -> StepPhases {
     let mut s = zero;
     for phase in phases {
         let name = phase.get("name").and_then(|n| n.as_str()).unwrap_or("");
-        let ms = phase.get("elapsed_ms").and_then(|m| m.as_f64()).unwrap_or(0.0);
+        let ms = phase
+            .get("elapsed_ms")
+            .and_then(|m| m.as_f64())
+            .unwrap_or(0.0);
         match name {
             "forward_pass" => s.forward_pass_ms = ms,
             "gkr_proof" => s.gkr_proof_ms += ms,
@@ -7518,15 +8695,21 @@ fn get_rss_mb() -> u64 {
         let ret = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
         if ret == 0 {
             #[cfg(target_os = "macos")]
-            { (usage.ru_maxrss as u64) / (1024 * 1024) }
+            {
+                (usage.ru_maxrss as u64) / (1024 * 1024)
+            }
             #[cfg(not(target_os = "macos"))]
-            { (usage.ru_maxrss as u64) / 1024 }
+            {
+                (usage.ru_maxrss as u64) / 1024
+            }
         } else {
             0
         }
     }
     #[cfg(not(unix))]
-    { 0 }
+    {
+        0
+    }
 }
 
 /// Round to 1 decimal place.
@@ -7538,7 +8721,8 @@ fn round1(v: f64) -> f64 {
 /// Returns (slope = growth per token, mean elapsed = steady state).
 fn compute_scaling_analysis(steps: &[serde_json::Value]) -> (f64, f64) {
     if steps.len() < 2 {
-        let ms = steps.first()
+        let ms = steps
+            .first()
             .and_then(|s| s.get("elapsed_ms"))
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0);
@@ -7554,7 +8738,10 @@ fn compute_scaling_analysis(steps: &[serde_json::Value]) -> (f64, f64) {
 
     for s in steps {
         let x = s.get("cache_len").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let y = s.get("attention_proofs_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let y = s
+            .get("attention_proofs_ms")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
         let elapsed = s.get("elapsed_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
         sum_x += x;
         sum_y += y;
@@ -7606,16 +8793,18 @@ fn run_decode_mode(
         }
     }
 
-    let model_dir = cli.model_dir.as_ref().expect("--decode requires --model-dir");
+    let model_dir = cli
+        .model_dir
+        .as_ref()
+        .expect("--decode requires --model-dir");
     let t_start = Instant::now();
 
     // 1. Load decode-compatible model (with Attention nodes + named weights)
     eprintln!("Loading decode-compatible model...");
-    let decode_model = load_hf_model_decode(model_dir, cli.layers)
-        .unwrap_or_else(|e| {
-            eprintln!("Error loading decode model: {e}");
-            process::exit(1);
-        });
+    let decode_model = load_hf_model_decode(model_dir, cli.layers).unwrap_or_else(|e| {
+        eprintln!("Error loading decode model: {e}");
+        process::exit(1);
+    });
 
     // 2. Load or initialize KV cache
     let (mut kv_cache, mut kv_commitment) = if let Some(ref kv_path) = cli.kv_cache {
@@ -7631,7 +8820,10 @@ fn run_decode_mode(
             run_prefill(&decode_model, cli.prefill_len)
         }
     } else {
-        eprintln!("No --kv-cache path: running prefill (len={})", cli.prefill_len);
+        eprintln!(
+            "No --kv-cache path: running prefill (len={})",
+            cli.prefill_len
+        );
         run_prefill(&decode_model, cli.prefill_len)
     };
 
@@ -7699,7 +8891,13 @@ fn run_decode_mode(
     let output_dir: std::path::PathBuf = cli
         .output
         .parent()
-        .map(|p| if p.as_os_str().is_empty() { std::path::PathBuf::from(".") } else { p.to_path_buf() })
+        .map(|p| {
+            if p.as_os_str().is_empty() {
+                std::path::PathBuf::from(".")
+            } else {
+                p.to_path_buf()
+            }
+        })
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let basename = cli
         .output
@@ -7710,6 +8908,14 @@ fn run_decode_mode(
 
     // chain_manifest entries — populated as we go.
     let mut manifest_steps: Vec<serde_json::Value> = Vec::new();
+    let mut statement_steps: Vec<obelyzk::conversation_statement::GenerationStepStatement> =
+        Vec::new();
+    let mut gkr_statement_steps: Vec<obelyzk::conversation_statement::GenerationStepStatement> =
+        Vec::new();
+    let mut gkr_step_proofs: Vec<obelyzk::conversation_statement::ConversationGkrStepProofArgs> =
+        Vec::new();
+    let mut gkr_conversation_circuit_hash: Option<FieldElement> = None;
+    let mut gkr_conversation_weight_root: Option<FieldElement> = None;
     // Cached invariants from the first recursive proof we emit (these are the
     // same across prefill/decode because they describe the model, not the input).
     let mut manifest_circuit_hash: Option<String> = None;
@@ -7778,7 +8984,11 @@ fn run_decode_mode(
         if cli.recursive {
             // step_idx in manifest: prefill consumes idx 0, so decode steps
             // start at idx=1 when the prefill was emitted, else idx=0.
-            let step_idx_manifest = if prefill_emitted { (step + 1) as u32 } else { step as u32 };
+            let step_idx_manifest = if prefill_emitted {
+                (step + 1) as u32
+            } else {
+                step as u32
+            };
             let gkr = proof.gkr_proof.as_ref().expect(
                 "gkr_proof must be present in --decode --recursive (decode prover always sets it)",
             );
@@ -7799,6 +9009,11 @@ fn run_decode_mode(
                 &mut manifest_circuit_hash,
                 &mut manifest_weight_super_root,
                 &mut manifest_policy_commitment,
+                &mut statement_steps,
+                &mut gkr_statement_steps,
+                &mut gkr_step_proofs,
+                &mut gkr_conversation_circuit_hash,
+                &mut gkr_conversation_weight_root,
             ) {
                 eprintln!("  Decode step {} recursive emit failed: {e}", step);
                 process::exit(1);
@@ -7807,7 +9022,11 @@ fn run_decode_mode(
             // ── Legacy minimal JSON output (unchanged behaviour) ──
             let output_path = if cli.decode_steps > 1 {
                 let stem = cli.output.file_stem().unwrap().to_str().unwrap();
-                let ext = cli.output.extension().map(|e| e.to_str().unwrap()).unwrap_or("json");
+                let ext = cli
+                    .output
+                    .extension()
+                    .map(|e| e.to_str().unwrap())
+                    .unwrap_or("json");
                 cli.output.with_file_name(format!("{stem}_{step}.{ext}"))
             } else {
                 cli.output.clone()
@@ -7826,7 +9045,10 @@ fn run_decode_mode(
 
             let output_str = serde_json::to_string_pretty(&json_obj).unwrap();
             std::fs::write(&output_path, &output_str).unwrap_or_else(|e| {
-                eprintln!("Error writing decode proof to '{}': {e}", output_path.display());
+                eprintln!(
+                    "Error writing decode proof to '{}': {e}",
+                    output_path.display()
+                );
                 process::exit(1);
             });
             eprintln!("    Proof written to {}", output_path.display());
@@ -7840,6 +9062,89 @@ fn run_decode_mode(
         // The first decode step's `prev_kv_cache_commitment` (proof header [24])
         // MUST equal this value or the contract will reject the step.
         let initial_kv_commit_hex = format!("0x{:x}", initial_kv_commitment_for_manifest);
+        let final_kv_commitment = statement_steps
+            .last()
+            .map(|step| step.kv_commitment)
+            .unwrap_or(initial_kv_commitment_for_manifest);
+        let statement_actions: Vec<obelyzk::conversation_statement::ConversationActionStatement> =
+            Vec::new();
+        let conversation_action_root =
+            obelyzk::conversation_statement::action_root(&statement_actions);
+        let statement_conversations = vec![
+            obelyzk::conversation_statement::ConversationTraceStatement {
+                conversation_index: 0,
+                conversation_id_hash: obelyzk::conversation_statement::text_commitment(
+                    0x434944, &basename,
+                ),
+                // The current decode CLI proves a KV-continuous generation
+                // chain over synthetic token inputs. Real transcript/prompt
+                // commitments are populated by the conversation verifier path.
+                prompt_commitment: FieldElement::ZERO,
+                transcript_commitment: FieldElement::ZERO,
+                action_root: conversation_action_root,
+                initial_kv_commitment: initial_kv_commitment_for_manifest,
+                final_kv_commitment,
+                n_turns: 0,
+                n_prefill_tokens: cli.prefill_len as u64,
+                n_generated_tokens: cli.decode_steps as u64,
+                first_step_index: 0,
+                n_steps: statement_steps.len() as u64,
+            },
+        ];
+        let parse_manifest_felt = |value: &Option<String>| -> FieldElement {
+            value
+                .as_deref()
+                .and_then(|s| {
+                    FieldElement::from_hex_be(
+                        s.strip_prefix("0x")
+                            .or_else(|| s.strip_prefix("0X"))
+                            .unwrap_or(s),
+                    )
+                    .ok()
+                })
+                .unwrap_or(FieldElement::ZERO)
+        };
+        let conversation_statement =
+            obelyzk::conversation_statement::build_conversation_batch_statement(
+                model_id,
+                FieldElement::ZERO,
+                parse_manifest_felt(&manifest_circuit_hash),
+                parse_manifest_felt(&manifest_weight_super_root),
+                resolved_policy.policy_commitment(),
+                FieldElement::ZERO,
+                FieldElement::ZERO,
+                &statement_conversations,
+                &statement_steps,
+                &statement_actions,
+                obelyzk::conversation_statement::PRODUCTION_SECURITY_BITS,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("Error building conversation statement: {e}");
+                process::exit(1);
+            });
+        let conversation_statement_felts = conversation_statement
+            .to_felts()
+            .iter()
+            .map(|f| format!("0x{:x}", f))
+            .collect::<Vec<_>>();
+        let conversation_statement_json = serde_json::json!({
+            "schema": "obelyzk.conversation_statement.v1",
+            "scope": "decode_kv_chain_synthetic_inputs",
+            "statement_hash": format!("0x{:x}", conversation_statement.statement_hash()),
+            "expected_cairo_output_hash": format!("0x{:x}", conversation_statement.statement_hash()),
+            "verifier_program_hash": "0x0",
+            "security_bits": obelyzk::conversation_statement::PRODUCTION_SECURITY_BITS,
+            "n_conversations": conversation_statement.n_conversations,
+            "n_steps": conversation_statement.n_steps,
+            "n_prefill_tokens": conversation_statement.n_prefill_tokens,
+            "n_generated_tokens": conversation_statement.n_generated_tokens,
+            "conversation_root": format!("0x{:x}", conversation_statement.conversation_root),
+            "generation_root": format!("0x{:x}", conversation_statement.generation_root),
+            "action_root": format!("0x{:x}", conversation_statement.action_root),
+            "initial_kv_root": format!("0x{:x}", conversation_statement.initial_kv_root),
+            "final_kv_root": format!("0x{:x}", conversation_statement.final_kv_root),
+            "statement_felts": conversation_statement_felts,
+        });
         let manifest = serde_json::json!({
             "model_id": format!("0x{:x}", model_id),
             "circuit_hash": manifest_circuit_hash.clone().unwrap_or_else(|| "0x0".to_string()),
@@ -7853,15 +9158,55 @@ fn run_decode_mode(
             "initial_kv_commitment": initial_kv_commit_hex,
             // Populated later by the Hades Phase A aggregator script.
             "level1_proof_hash": "0x0",
+            "conversation_statement": conversation_statement_json,
+            "strict_gkr_conversation": if gkr_statement_steps.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!({
+                    "schema": "obelyzk.conversation_gkr_statement_artifact.v1",
+                    "verifier": "conversation-gkr-statement-verifier",
+                    "artifact_path": format!("{basename}.conversation_gkr.artifact.json"),
+                    "cairo_args_path": format!("{basename}.conversation_gkr.args.json"),
+                    "proof_path": format!("{basename}.conversation_gkr.proof.json"),
+                    "prove_script": "engine/scripts/prove_conversation_gkr_statement.sh",
+                })
+            },
             "steps": manifest_steps,
         });
         let manifest_path = output_dir.join("chain_manifest.json");
         let manifest_str = serde_json::to_string_pretty(&manifest).unwrap();
         std::fs::write(&manifest_path, &manifest_str).unwrap_or_else(|e| {
-            eprintln!("Error writing chain manifest to '{}': {e}", manifest_path.display());
+            eprintln!(
+                "Error writing chain manifest to '{}': {e}",
+                manifest_path.display()
+            );
             process::exit(1);
         });
         eprintln!("Chain manifest written to {}", manifest_path.display());
+
+        if !gkr_statement_steps.is_empty() {
+            let gkr_conversation_statement = emit_strict_gkr_conversation_artifacts(
+                &output_dir,
+                &basename,
+                model_id,
+                gkr_conversation_circuit_hash.unwrap_or(FieldElement::ZERO),
+                gkr_conversation_weight_root.unwrap_or(FieldElement::ZERO),
+                resolved_policy.policy_commitment(),
+                initial_kv_commitment_for_manifest,
+                final_kv_commitment,
+                cli.prefill_len as u64,
+                &gkr_statement_steps,
+                &gkr_step_proofs,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("Error writing strict GKR conversation artifact: {e}");
+                process::exit(1);
+            });
+            eprintln!(
+                "Strict GKR conversation artifact written: statement_hash=0x{:x}",
+                gkr_conversation_statement.statement_hash(),
+            );
+        }
     }
 
     // 5. Save KV cache state if --kv-cache specified
@@ -7881,6 +9226,141 @@ fn run_decode_mode(
         total.as_secs_f64(),
         kv_commitment.commitment(),
     );
+}
+
+#[cfg(any(feature = "cli", feature = "model-loading"))]
+#[allow(clippy::too_many_arguments)]
+fn emit_strict_gkr_conversation_artifacts(
+    output_dir: &std::path::Path,
+    basename: &str,
+    model_id: FieldElement,
+    circuit_hash: FieldElement,
+    weight_super_root: FieldElement,
+    policy_commitment: FieldElement,
+    initial_kv_commitment: FieldElement,
+    final_kv_commitment: FieldElement,
+    n_prefill_tokens: u64,
+    gkr_statement_steps: &[obelyzk::conversation_statement::GenerationStepStatement],
+    gkr_step_proofs: &[obelyzk::conversation_statement::ConversationGkrStepProofArgs],
+) -> Result<obelyzk::conversation_statement::ConversationBatchStatement, String> {
+    if gkr_statement_steps.is_empty() {
+        return Err("no GKR statement steps to emit".to_string());
+    }
+    if circuit_hash == FieldElement::ZERO {
+        return Err("strict GKR conversation circuit_hash is zero".to_string());
+    }
+    if weight_super_root == FieldElement::ZERO {
+        return Err("strict GKR conversation weight_super_root is zero".to_string());
+    }
+
+    let actions: Vec<obelyzk::conversation_statement::ConversationActionStatement> = Vec::new();
+    let conversations = vec![
+        obelyzk::conversation_statement::ConversationTraceStatement {
+            conversation_index: 0,
+            conversation_id_hash: obelyzk::conversation_statement::text_commitment(
+                0x434944, basename,
+            ),
+            prompt_commitment: FieldElement::ZERO,
+            transcript_commitment: FieldElement::ZERO,
+            action_root: obelyzk::conversation_statement::action_root(&actions),
+            initial_kv_commitment,
+            final_kv_commitment,
+            n_turns: 0,
+            n_prefill_tokens,
+            n_generated_tokens: gkr_statement_steps.len() as u64,
+            first_step_index: 0,
+            n_steps: gkr_statement_steps.len() as u64,
+        },
+    ];
+
+    let statement = obelyzk::conversation_statement::build_conversation_batch_statement(
+        model_id,
+        FieldElement::ZERO,
+        circuit_hash,
+        weight_super_root,
+        policy_commitment,
+        FieldElement::ZERO,
+        FieldElement::ZERO,
+        &conversations,
+        gkr_statement_steps,
+        &actions,
+        obelyzk::conversation_statement::PRODUCTION_SECURITY_BITS,
+    )
+    .map_err(|e| e.to_string())?;
+
+    let cairo_args = obelyzk::conversation_statement::conversation_gkr_verifier_args(
+        &statement,
+        &conversations,
+        gkr_statement_steps,
+        &actions,
+        gkr_step_proofs,
+    )?;
+    let statement_felts = statement
+        .to_felts()
+        .iter()
+        .map(|felt| format!("0x{:x}", felt))
+        .collect::<Vec<_>>();
+
+    let artifact = serde_json::json!({
+        "schema": "obelyzk.conversation_gkr_statement_artifact.v1",
+        "verifier": "conversation-gkr-statement-verifier",
+        "scope": "decode_kv_chain_full_gkr_synthetic_inputs",
+        "statement_hash": format!("0x{:x}", statement.statement_hash()),
+        "expected_cairo_output_hash": format!("0x{:x}", statement.statement_hash()),
+        "statement_felts": statement_felts,
+        "cairo_args_path": format!("{basename}.conversation_gkr.args.json"),
+        "proof_path": format!("{basename}.conversation_gkr.proof.json"),
+        "proof_command": {
+            "script": "engine/scripts/prove_conversation_gkr_statement.sh",
+            "env": {
+                "ARTIFACT": format!("{basename}.conversation_gkr.artifact.json"),
+                "PROOF_FORMAT": "json",
+            },
+            "cairo_prove_flags": ["--recursive-160"],
+        },
+        "batch": {
+            "version": statement.version,
+            "model_id": format!("0x{:x}", statement.model_id),
+            "verifier_program_hash": format!("0x{:x}", statement.verifier_program_hash),
+            "circuit_hash": format!("0x{:x}", statement.circuit_hash),
+            "weight_super_root": format!("0x{:x}", statement.weight_super_root),
+            "policy_commitment": format!("0x{:x}", statement.policy_commitment),
+            "tokenizer_config_hash": format!("0x{:x}", statement.tokenizer_config_hash),
+            "hades_commitment": format!("0x{:x}", statement.hades_commitment),
+            "conversation_root": format!("0x{:x}", statement.conversation_root),
+            "generation_root": format!("0x{:x}", statement.generation_root),
+            "action_root": format!("0x{:x}", statement.action_root),
+            "initial_kv_root": format!("0x{:x}", statement.initial_kv_root),
+            "final_kv_root": format!("0x{:x}", statement.final_kv_root),
+            "n_conversations": statement.n_conversations,
+            "n_steps": statement.n_steps,
+            "n_prefill_tokens": statement.n_prefill_tokens,
+            "n_generated_tokens": statement.n_generated_tokens,
+            "security_bits": statement.security_bits,
+        },
+        "gkr_witness": {
+            "n_step_proofs": gkr_step_proofs.len(),
+            "total_cairo_arg_felts": cairo_args.len(),
+            "weight_binding": "mode4_aggregated_oracle_sumcheck",
+        },
+    });
+
+    let artifact_path = output_dir.join(format!("{basename}.conversation_gkr.artifact.json"));
+    let args_path = output_dir.join(format!("{basename}.conversation_gkr.args.json"));
+    std::fs::write(
+        &artifact_path,
+        serde_json::to_string_pretty(&artifact).map_err(|e| format!("artifact json: {e}"))?,
+    )
+    .map_err(|e| format!("write {}: {e}", artifact_path.display()))?;
+    std::fs::write(
+        &args_path,
+        serde_json::to_string_pretty(&cairo_args).map_err(|e| format!("args json: {e}"))?,
+    )
+    .map_err(|e| format!("write {}: {e}", args_path.display()))?;
+    eprintln!("Strict GKR artifact: {}", artifact_path.display());
+    eprintln!("Strict GKR Cairo args: {}", args_path.display());
+
+    Ok(statement)
 }
 
 /// Build a recursive STARK proof from an `AggregatedModelProofOnChain` plus its
@@ -7909,10 +9389,16 @@ fn emit_recursive_step_json(
     manifest_circuit_hash: &mut Option<String>,
     manifest_weight_super_root: &mut Option<String>,
     manifest_policy_commitment: &mut Option<String>,
+    statement_steps: &mut Vec<obelyzk::conversation_statement::GenerationStepStatement>,
+    gkr_statement_steps: &mut Vec<obelyzk::conversation_statement::GenerationStepStatement>,
+    gkr_step_proofs: &mut Vec<obelyzk::conversation_statement::ConversationGkrStepProofArgs>,
+    gkr_conversation_circuit_hash: &mut Option<FieldElement>,
+    gkr_conversation_weight_root: &mut Option<FieldElement>,
 ) -> Result<(), String> {
     // Compile circuit (cheap; reuses graph topology).
     let circuit = obelyzk::gkr::LayeredCircuit::from_graph(&decode_model.graph)
         .map_err(|e| format!("circuit compile: {e}"))?;
+    let circuit_depth = circuit.layers.len() as u32;
 
     // weight_super_root: input-independent Poseidon hash of weight Merkle roots.
     // Mirrors the construction in the single-pass path.
@@ -7930,16 +9416,105 @@ fn emit_recursive_step_json(
     // io_commitment: Poseidon over packed (input, output) — same domain
     // separators as the single-pass path.
     let recursive_io = compute_io_commitment(input, &proof.execution.output);
-    let recursive_io_qm31 =
-        obelyzk::crypto::poseidon_channel::felt_to_securefield(recursive_io);
+    let recursive_io_qm31 = obelyzk::crypto::poseidon_channel::felt_to_securefield(recursive_io);
 
-    let recursive_proof = obelyzk::recursive::prove_recursive_with_policy(
+    let raw_io_data = obelyzk::cairo_serde::serialize_raw_io(input, &proof.execution.output);
+    let gkr_step_args =
+        obelyzk::conversation_statement::ConversationGkrStepProofArgs::from_gkr_proof(
+            gkr,
+            raw_io_data,
+            circuit_depth,
+            obelyzk::starknet::extract_matmul_dims(&circuit),
+            obelyzk::starknet::extract_dequantize_bits(&circuit),
+            false,
+            true,
+        )?;
+    let gkr_circuit_hash = obelyzk::conversation_statement::gkr_circuit_hash(circuit_depth, gkr);
+    let gkr_weight_root = gkr_step_args.weight_binding_root;
+    let gkr_prev_kv = gkr.prev_kv_cache_commitment.unwrap_or(FieldElement::ZERO);
+    let gkr_kv = gkr.kv_cache_commitment.unwrap_or(FieldElement::ZERO);
+    let gkr_receipt_hash = obelyzk::conversation_statement::ml_verification_receipt_hash(
+        *model_id,
+        gkr_step_args.io_commitment(),
+        gkr_weight_root,
+        gkr_step_args.num_layers as u64,
+        gkr_step_args.num_matmuls as u64,
+        true,
+    );
+    if let Some(existing) = *gkr_conversation_circuit_hash {
+        if existing != gkr_circuit_hash {
+            return Err("GKR circuit hash changed across decode steps".to_string());
+        }
+    } else {
+        *gkr_conversation_circuit_hash = Some(gkr_circuit_hash);
+    }
+    if let Some(existing) = *gkr_conversation_weight_root {
+        if existing != gkr_weight_root {
+            return Err("GKR weight binding root changed across decode steps".to_string());
+        }
+    } else {
+        *gkr_conversation_weight_root = Some(gkr_weight_root);
+    }
+
+    // Bind the recursive proof to a non-circular per-step conversation
+    // statement. The full multi-step manifest is emitted after all proofs, but
+    // a batch hash over proof hashes would be circular if it were mixed into
+    // each proof. This step statement instead binds the ML verification receipt
+    // plus the KV transition that the proof must attest.
+    let step_statement_actions: Vec<obelyzk::conversation_statement::ConversationActionStatement> =
+        Vec::new();
+    let step_statement_step = obelyzk::conversation_statement::GenerationStepStatement {
+        global_step_index: step_idx as u64,
+        conversation_index: 0,
+        turn_index: 0,
+        token_index: step_idx as u64,
+        generated_token_id: 0,
+        io_commitment: gkr_step_args.io_commitment(),
+        sampling_commitment: FieldElement::ZERO,
+        prev_kv_commitment: gkr_prev_kv,
+        kv_commitment: gkr_kv,
+        recursive_proof_hash: gkr_receipt_hash,
+    };
+    let step_statement_conversation = obelyzk::conversation_statement::ConversationTraceStatement {
+        conversation_index: 0,
+        conversation_id_hash: obelyzk::conversation_statement::text_commitment(0x434944, basename),
+        prompt_commitment: FieldElement::ZERO,
+        transcript_commitment: FieldElement::ZERO,
+        action_root: obelyzk::conversation_statement::action_root(&step_statement_actions),
+        initial_kv_commitment: gkr_prev_kv,
+        final_kv_commitment: gkr_kv,
+        n_turns: 0,
+        n_prefill_tokens: 0,
+        n_generated_tokens: 1,
+        first_step_index: 0,
+        n_steps: 1,
+    };
+    let step_conversation_statement =
+        obelyzk::conversation_statement::build_conversation_batch_statement(
+            *model_id,
+            FieldElement::ZERO,
+            gkr_circuit_hash,
+            gkr_weight_root,
+            resolved_policy.policy_commitment(),
+            FieldElement::ZERO,
+            FieldElement::ZERO,
+            &[step_statement_conversation],
+            std::slice::from_ref(&step_statement_step),
+            &step_statement_actions,
+            obelyzk::conversation_statement::PRODUCTION_SECURITY_BITS,
+        )
+        .map_err(|e| format!("step conversation statement: {e}"))?;
+    let step_conversation_statement_hash = step_conversation_statement.statement_hash();
+
+    let recursive_proof = obelyzk::recursive::prove_recursive_with_policy_io_and_statement(
         &circuit,
         gkr,
         &proof.execution.output,
         &decode_model.weights,
         recursive_weight_root,
         recursive_io_qm31,
+        Some(recursive_io),
+        Some(step_conversation_statement_hash),
         prove_time_secs,
         Some(resolved_policy),
     )
@@ -7947,6 +9522,7 @@ fn emit_recursive_step_json(
 
     let calldata = obelyzk::cairo_serde::serialize_recursive_proof_calldata(&recursive_proof);
     let summary = obelyzk::cairo_serde::recursive_proof_calldata_summary(&recursive_proof);
+    let recursive_proof_hash = starknet_crypto::poseidon_hash_many(&calldata);
 
     eprintln!(
         "  [recursive step {}] {:.2}s prove, log_size={}, {} felts ({} commitments, {} FRI layers, {} queries)",
@@ -7989,6 +9565,33 @@ fn emit_recursive_step_json(
         "0x{:x}",
         recursive_proof.public_inputs.prev_kv_cache_commitment
     );
+    statement_steps.push(obelyzk::conversation_statement::GenerationStepStatement {
+        global_step_index: step_idx as u64,
+        conversation_index: 0,
+        turn_index: 0,
+        token_index: step_idx as u64,
+        // Current decode mode proves synthetic one-token inputs. Real generated
+        // token IDs are bound by the conversation verifier path.
+        generated_token_id: 0,
+        io_commitment: recursive_io,
+        sampling_commitment: FieldElement::ZERO,
+        prev_kv_commitment: recursive_proof.public_inputs.prev_kv_cache_commitment,
+        kv_commitment: recursive_proof.public_inputs.kv_cache_commitment,
+        recursive_proof_hash: gkr_receipt_hash,
+    });
+    gkr_statement_steps.push(obelyzk::conversation_statement::GenerationStepStatement {
+        global_step_index: step_idx as u64,
+        conversation_index: 0,
+        turn_index: 0,
+        token_index: step_idx as u64,
+        generated_token_id: 0,
+        io_commitment: gkr_step_args.io_commitment(),
+        sampling_commitment: FieldElement::ZERO,
+        prev_kv_commitment: gkr_prev_kv,
+        kv_commitment: gkr_kv,
+        recursive_proof_hash: gkr_receipt_hash,
+    });
+    gkr_step_proofs.push(gkr_step_args);
 
     let recursive_contract = std::env::var("RECURSIVE_CONTRACT").ok();
     let recursive_proof_obj = serde_json::json!({
@@ -8002,8 +9605,9 @@ fn emit_recursive_step_json(
         "n_queries": summary.n_queries,
         "total_felts": summary.total_felts,
         "policy_commitment": policy_commitment_str.clone(),
+        "conversation_statement_hash": format!("0x{:x}", step_conversation_statement_hash),
         "contract": recursive_contract,
-        "entrypoint": "verify_recursive",
+        "entrypoint": "verify_decode_step_with_statement",
     });
 
     let json_obj = serde_json::json!({
@@ -8011,17 +9615,19 @@ fn emit_recursive_step_json(
         "step_idx": step_idx,
         "is_prefill": is_prefill,
         "model_id": format!("0x{:x}", model_id),
-        "io_commitment": io_commitment_top,
+        "io_commitment": io_commitment_top.clone(),
         "policy_commitment": policy_commitment_str,
         "recursive_proof": recursive_proof_obj,
         "kv_cache_commitment": kv_cache_commitment_hex.clone(),
         "prev_kv_cache_commitment": prev_kv_cache_commitment_hex.clone(),
+        "conversation_statement_hash": format!("0x{:x}", step_conversation_statement_hash),
+        "recursive_proof_hash": format!("0x{:x}", recursive_proof_hash),
     });
 
     let proof_filename = format!("{basename}_step_{step_idx}.recursive.json");
     let proof_path = output_dir.join(&proof_filename);
-    let output_str = serde_json::to_string_pretty(&json_obj)
-        .map_err(|e| format!("json serialize: {e}"))?;
+    let output_str =
+        serde_json::to_string_pretty(&json_obj).map_err(|e| format!("json serialize: {e}"))?;
     std::fs::write(&proof_path, &output_str)
         .map_err(|e| format!("write {}: {e}", proof_path.display()))?;
     eprintln!("    Proof written to {}", proof_path.display());
@@ -8032,9 +9638,8 @@ fn emit_recursive_step_json(
     // resulting Level-1 proof, and registers the hash on-chain.
     let hades_sidecar_filename = format!("{}.hades_args.json", proof_filename);
     let hades_sidecar_path = output_dir.join(&hades_sidecar_filename);
-    let hades_args = obelyzk::recursive::export_hades_pairs_cairo_args(
-        &recursive_proof.hades_pairs,
-    );
+    let hades_args =
+        obelyzk::recursive::export_hades_pairs_cairo_args(&recursive_proof.hades_pairs);
     std::fs::write(&hades_sidecar_path, &hades_args)
         .map_err(|e| format!("write {}: {e}", hades_sidecar_path.display()))?;
     eprintln!(
@@ -8047,7 +9652,11 @@ fn emit_recursive_step_json(
         "step_idx": step_idx,
         "is_prefill": is_prefill,
         "proof_file": proof_filename,
+        "io_commitment": io_commitment_top,
+        "recursive_proof_hash": format!("0x{:x}", recursive_proof_hash),
+        "prev_kv_cache_commitment": prev_kv_cache_commitment_hex,
         "kv_cache_commitment": kv_cache_commitment_hex,
+        "conversation_statement_hash": format!("0x{:x}", step_conversation_statement_hash),
     }));
 
     Ok(())
@@ -8088,7 +9697,9 @@ fn run_prefill(
                     current = obelyzk::components::matmul::matmul_m31(&current, w);
                 }
             }
-            GraphOp::Activation { activation_type, .. } => {
+            GraphOp::Activation {
+                activation_type, ..
+            } => {
                 let f = activation_type.as_fn();
                 let output_data: Vec<M31> = current.data.iter().map(|&x| (*f)(x)).collect();
                 current = M31Matrix {
@@ -8118,11 +9729,18 @@ fn run_prefill(
                         w_o: wo.clone(),
                     };
                     let intermediates = attention_forward_cached(
-                        &current, &attn_weights, config, cache, config.causal,
+                        &current,
+                        &attn_weights,
+                        config,
+                        cache,
+                        config.causal,
                     );
                     current = intermediates.final_output;
                 } else {
-                    eprintln!("  WARN: Attention node {} missing weights, passing through", idx);
+                    eprintln!(
+                        "  WARN: Attention node {} missing weights, passing through",
+                        idx
+                    );
                 }
             }
             GraphOp::Add { .. } => {

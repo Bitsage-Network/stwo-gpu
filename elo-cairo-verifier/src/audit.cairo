@@ -12,7 +12,8 @@
 
 use starknet::ContractAddress;
 
-// ─── Types ──────────────────────────────────────────────────────────────────
+// ─── Types
+// ──────────────────────────────────────────────────────────────────
 
 /// Packed M31 digest (8 M31 elements packed into two felt252 values).
 ///
@@ -56,7 +57,8 @@ pub struct AuditRecord {
     pub privacy_tier: u8,
 }
 
-// ─── Events ─────────────────────────────────────────────────────────────────
+// ─── Events
+// ─────────────────────────────────────────────────────────────────
 
 #[derive(Drop, starknet::Event)]
 pub struct AuditSubmitted {
@@ -76,7 +78,8 @@ pub struct AuditSubmitted {
     pub privacy_tier: u8,
 }
 
-// ─── Interface ──────────────────────────────────────────────────────────────
+// ─── Interface
+// ──────────────────────────────────────────────────────────────
 
 #[starknet::interface]
 pub trait IAuditVerifier<TContractState> {
@@ -117,26 +120,21 @@ pub trait IAuditVerifier<TContractState> {
     /// Check if a model has been audited within a time range.
     /// Returns true if any proof-verified audit overlaps [since, until].
     fn is_audited_in_range(
-        self: @TContractState,
-        model_id: felt252,
-        since: u64,
-        until: u64,
+        self: @TContractState, model_id: felt252, since: u64, until: u64,
     ) -> bool;
 
     /// Get total inferences proven across all audits for a model.
     fn get_total_proven_inferences(self: @TContractState, model_id: felt252) -> u64;
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// ─── Helpers
+// ────────────────────────────────────────────────────────────────
 
 /// Generate a unique audit ID.
 ///
 /// Poseidon hash of (nonce, model_id, submitter, time_start).
 pub fn generate_audit_id(
-    nonce: u32,
-    model_id: felt252,
-    submitter: ContractAddress,
-    time_start: u64,
+    nonce: u32, model_id: felt252, submitter: ContractAddress, time_start: u64,
 ) -> felt252 {
     let submitter_felt: felt252 = submitter.into();
     core::poseidon::poseidon_hash_span(

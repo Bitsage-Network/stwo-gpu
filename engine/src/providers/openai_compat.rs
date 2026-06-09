@@ -70,7 +70,8 @@ impl OpenAiCompatProvider {
 
         let url = format!("{}/chat/completions", self.base_url);
         let client = reqwest::Client::new();
-        let mut req = client.post(&url)
+        let mut req = client
+            .post(&url)
             .header("Content-Type", "application/json")
             .json(&body);
 
@@ -78,7 +79,9 @@ impl OpenAiCompatProvider {
             req = req.header("Authorization", format!("Bearer {key}"));
         }
 
-        let resp = req.send().await
+        let resp = req
+            .send()
+            .await
             .map_err(|e| OpenAiError::RequestFailed(format!("{e}")))?;
 
         if !resp.status().is_success() {
@@ -87,7 +90,9 @@ impl OpenAiCompatProvider {
             return Err(OpenAiError::ApiError(format!("{status}: {body}")));
         }
 
-        let json: serde_json::Value = resp.json().await
+        let json: serde_json::Value = resp
+            .json()
+            .await
             .map_err(|e| OpenAiError::ParseFailed(format!("{e}")))?;
 
         // Extract response text
@@ -99,7 +104,8 @@ impl OpenAiCompatProvider {
         let inference_time_ms = t_start.elapsed().as_millis() as u64;
 
         // Compute IO commitment
-        let prompt_text = messages.iter()
+        let prompt_text = messages
+            .iter()
             .map(|m| format!("{}: {}", m.role, m.content))
             .collect::<Vec<_>>()
             .join("\n");

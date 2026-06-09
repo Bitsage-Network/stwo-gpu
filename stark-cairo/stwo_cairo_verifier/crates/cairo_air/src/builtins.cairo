@@ -38,9 +38,20 @@ pub struct BuiltinComponents {
 }
 
 #[derive(Drop)]
-#[cfg(and(feature: "poseidon252_verifier", feature: "poseidon_outputs_packing"))]
+#[cfg(feature: "poseidon252_verifier")]
+#[cfg(feature: "poseidon_outputs_packing")]
+#[cfg(not(feature: "conversation_pruned"))]
 pub struct BuiltinComponents {
     pub bitwise_builtin: Option<components::bitwise_builtin::Component>,
+    pub poseidon_builtin: Option<components::poseidon_builtin::Component>,
+    pub range_check_128_builtin: Option<components::range_check_builtin::Component>,
+}
+
+#[derive(Drop)]
+#[cfg(feature: "poseidon252_verifier")]
+#[cfg(feature: "poseidon_outputs_packing")]
+#[cfg(feature: "conversation_pruned")]
+pub struct BuiltinComponents {
     pub poseidon_builtin: Option<components::poseidon_builtin::Component>,
     pub range_check_128_builtin: Option<components::range_check_builtin::Component>,
 }
@@ -250,7 +261,8 @@ pub impl BuiltinComponentsImpl of BuiltinComponentsTrait {
         // Poseidon builtin CAN coexist with Poseidon252 channel — the builtin handles
         // the program's hades_permutation calls while the channel handles STARK Fiat-Shamir.
         // assert!(
-        //     cairo_claim.poseidon_builtin.is_none() && interaction_claim.poseidon_builtin.is_none(),
+        //     cairo_claim.poseidon_builtin.is_none() &&
+        //     interaction_claim.poseidon_builtin.is_none(),
         // );
         assert!(cairo_claim.ec_op_builtin.is_none() && interaction_claim.ec_op_builtin.is_none());
 
@@ -306,7 +318,9 @@ pub impl BuiltinComponentsImpl of BuiltinComponentsTrait {
 }
 
 #[generate_trait]
-#[cfg(and(feature: "poseidon252_verifier", feature: "poseidon_outputs_packing"))]
+#[cfg(feature: "poseidon252_verifier")]
+#[cfg(feature: "poseidon_outputs_packing")]
+#[cfg(not(feature: "conversation_pruned"))]
 pub impl BuiltinComponentsImpl of BuiltinComponentsTrait {
     fn new(
         cairo_claim: @CairoClaim,
@@ -376,6 +390,91 @@ pub impl BuiltinComponentsImpl of BuiltinComponentsTrait {
                     random_coeff,
                 );
         }
+
+        if let Option::Some(component) = poseidon_builtin.as_snap() {
+            component
+                .evaluate_constraints_at_point(
+                    ref sum,
+                    ref preprocessed_mask_values,
+                    ref trace_mask_values,
+                    ref interaction_trace_mask_values,
+                    random_coeff,
+                );
+        }
+
+        if let Option::Some(component) = range_check_128_builtin.as_snap() {
+            component
+                .evaluate_constraints_at_point(
+                    ref sum,
+                    ref preprocessed_mask_values,
+                    ref trace_mask_values,
+                    ref interaction_trace_mask_values,
+                    random_coeff,
+                );
+        }
+    }
+}
+
+#[generate_trait]
+#[cfg(feature: "poseidon252_verifier")]
+#[cfg(feature: "poseidon_outputs_packing")]
+#[cfg(feature: "conversation_pruned")]
+pub impl BuiltinComponentsImpl of BuiltinComponentsTrait {
+    fn new(
+        cairo_claim: @CairoClaim,
+        common_lookup_elements: @CommonLookupElements,
+        interaction_claim: @CairoInteractionClaim,
+    ) -> BuiltinComponents {
+        assert!(
+            cairo_claim.range_check96_builtin.is_none()
+                && interaction_claim.range_check96_builtin.is_none(),
+        );
+        assert!(
+            cairo_claim.add_mod_builtin.is_none() && interaction_claim.add_mod_builtin.is_none(),
+        );
+        assert!(
+            cairo_claim.bitwise_builtin.is_none() && interaction_claim.bitwise_builtin.is_none(),
+        );
+        assert!(
+            cairo_claim.mul_mod_builtin.is_none() && interaction_claim.mul_mod_builtin.is_none(),
+        );
+        assert!(
+            cairo_claim.pedersen_builtin.is_none() && interaction_claim.pedersen_builtin.is_none(),
+        );
+        assert!(
+            cairo_claim.pedersen_builtin_narrow_windows.is_none()
+                && interaction_claim.pedersen_builtin_narrow_windows.is_none(),
+        );
+        assert!(cairo_claim.ec_op_builtin.is_none() && interaction_claim.ec_op_builtin.is_none());
+
+        let poseidon_builtin_component = components::poseidon_builtin::NewComponentImpl::try_new(
+            cairo_claim.poseidon_builtin,
+            interaction_claim.poseidon_builtin,
+            common_lookup_elements,
+        );
+
+        let range_check_128_builtin_component =
+            components::range_check_builtin::NewComponentImpl::try_new(
+            cairo_claim.range_check_builtin,
+            interaction_claim.range_check_builtin,
+            common_lookup_elements,
+        );
+
+        BuiltinComponents {
+            poseidon_builtin: poseidon_builtin_component,
+            range_check_128_builtin: range_check_128_builtin_component,
+        }
+    }
+
+    fn evaluate_constraints_at_point(
+        self: @BuiltinComponents,
+        ref sum: QM31,
+        ref preprocessed_mask_values: PreprocessedMaskValues,
+        ref trace_mask_values: ColumnSpan<Span<QM31>>,
+        ref interaction_trace_mask_values: ColumnSpan<Span<QM31>>,
+        random_coeff: QM31,
+    ) {
+        let BuiltinComponents { poseidon_builtin, range_check_128_builtin } = self;
 
         if let Option::Some(component) = poseidon_builtin.as_snap() {
             component

@@ -13,10 +13,10 @@
 //   7. verify_mle_opening(A, assignment, channel)
 //   8. verify_mle_opening(B, assignment, channel)
 
-use crate::types::{GKRClaim, MleOpeningProof};
-use crate::vm31_merkle::PackedDigest;
 // QM31 imported only by v4_packed_io (inside module scope)
 use starknet::ClassHash;
+use crate::types::{GKRClaim, MleOpeningProof};
+use crate::vm31_merkle::PackedDigest;
 
 /// Minimum delay (seconds) between propose_upgrade and execute_upgrade.
 pub const UPGRADE_DELAY: u64 = 300; // 5 minutes
@@ -24,9 +24,7 @@ pub const UPGRADE_DELAY: u64 = 300; // 5 minutes
 #[starknet::interface]
 pub trait ISumcheckVerifier<TContractState> {
     /// Register a model's weight commitment on-chain.
-    fn register_model(
-        ref self: TContractState, model_id: felt252, weight_commitment: felt252,
-    );
+    fn register_model(ref self: TContractState, model_id: felt252, weight_commitment: felt252);
 
     /// Get the weight commitment for a registered model.
     fn get_model_commitment(self: @TContractState, model_id: felt252) -> felt252;
@@ -79,13 +77,11 @@ pub trait ISumcheckVerifier<TContractState> {
     );
 
     /// Re-register model circuit hash for streaming (v25) verification.
-    /// Uses incremental Poseidon: poseidon(circuit_depth, poseidon(...poseidon(0, tag_0)..., tag_N)).
+    /// Uses incremental Poseidon: poseidon(circuit_depth, poseidon(...poseidon(0, tag_0)...,
+    /// tag_N)).
     /// Only updates the circuit_hash — weight commitments remain from register_model_gkr.
     fn register_model_gkr_streaming_circuit(
-        ref self: TContractState,
-        model_id: felt252,
-        circuit_depth: u32,
-        layer_tags: Array<u32>,
+        ref self: TContractState, model_id: felt252, circuit_depth: u32, layer_tags: Array<u32>,
     );
 
     /// Full on-chain ZKML verification via ML GKR walk with input claim verification.
@@ -193,9 +189,7 @@ pub trait ISumcheckVerifier<TContractState> {
     /// Register a policy commitment for a model (owner only).
     /// The policy_hash is the Poseidon hash of the PolicyConfig struct.
     /// When set (non-zero), streaming verification requires matching policy.
-    fn register_model_policy(
-        ref self: TContractState, model_id: felt252, policy_hash: felt252,
-    );
+    fn register_model_policy(ref self: TContractState, model_id: felt252, policy_hash: felt252);
 
     /// Get the registered policy commitment for a model. Returns 0 if none set.
     fn get_model_policy(self: @TContractState, model_id: felt252) -> felt252;
@@ -209,7 +203,8 @@ pub trait ISumcheckVerifier<TContractState> {
     /// Get the model ID for a verified proof. Returns 0 if not found.
     fn get_proof_model_id(self: @TContractState, proof_hash: felt252) -> felt252;
 
-    // ─── Chunked GKR Session Entrypoints ─────────────────────────────
+    // ─── Chunked GKR Session Entrypoints
+    // ─────────────────────────────
     // For proofs exceeding Starknet's per-TX calldata limit (~5K felts).
     // 4-step protocol: open → upload chunks → seal → verify.
 
@@ -228,10 +223,7 @@ pub trait ISumcheckVerifier<TContractState> {
     /// Upload a chunk of session data. Chunks must be uploaded sequentially.
     /// chunk_data length is used as the chunk felt count (no separate param needed).
     fn upload_gkr_chunk(
-        ref self: TContractState,
-        session_id: u64,
-        chunk_idx: u32,
-        chunk_data: Array<felt252>,
+        ref self: TContractState, session_id: u64, chunk_idx: u32, chunk_data: Array<felt252>,
     );
 
     /// Seal a session after all chunks are uploaded. Verifies total felt count.
@@ -241,7 +233,8 @@ pub trait ISumcheckVerifier<TContractState> {
     /// the same verification as verify_model_gkr_v4_packed_io.
     fn verify_gkr_from_session(ref self: TContractState, session_id: u64) -> bool;
 
-    // ─── Two-Phase Verification (v24+) ───────────────────────────────
+    // ─── Two-Phase Verification (v24+)
+    // ───────────────────────────────
     // For proofs where verify_gkr_from_session exceeds the step limit.
     // Phase 1: feed chunks as calldata (hash-verified against upload hashes)
     // Phase 2: execute verification from stored data
@@ -250,17 +243,15 @@ pub trait ISumcheckVerifier<TContractState> {
     /// the hash stored during upload, then stores data with flat index.
     /// Chunks must be fed in order (chunk_idx = 0, 1, 2, ...).
     fn verify_gkr_feed_chunk(
-        ref self: TContractState,
-        session_id: u64,
-        chunk_idx: u32,
-        chunk_data: Array<felt252>,
+        ref self: TContractState, session_id: u64, chunk_idx: u32, chunk_data: Array<felt252>,
     );
 
     /// Execute verification after all chunks have been fed.
     /// Reads data from flat-indexed storage and runs the GKR walk.
     fn verify_gkr_execute(ref self: TContractState, session_id: u64) -> bool;
 
-    // ─── Streaming GKR Verification (v25) ────────────────────────────
+    // ─── Streaming GKR Verification (v25)
+    // ────────────────────────────
     // Zero-storage-read verification: proof data flows as calldata only.
     // Protocol: stream_init → stream_layers × M → stream_finalize.
     // Only ~28 felts of checkpoint state stored between TXs.
@@ -371,42 +362,29 @@ pub trait ISumcheckVerifier<TContractState> {
 
     /// Finalize streaming verification: reads pre-computed input MLE value,
     /// asserts it matches the final GKR claim, and records the proof on-chain.
-    fn verify_gkr_stream_finalize(
-        ref self: TContractState,
-        session_id: u64,
-    ) -> bool;
+    fn verify_gkr_stream_finalize(ref self: TContractState, session_id: u64) -> bool;
 }
 
 #[starknet::contract]
 mod SumcheckVerifierContract {
-    use super::{
-        GKRClaim, MleOpeningProof, UPGRADE_DELAY,
+    use starknet::storage::{
+        Map, StoragePathEntry, StoragePointerReadAccess, StoragePointerWriteAccess,
+    };
+    use starknet::{ClassHash, ContractAddress, get_block_timestamp, get_caller_address};
+    use crate::aggregated_binding::{deserialize_binding_proof_packed, verify_aggregated_binding};
+    use crate::channel::{
+        PoseidonChannel, channel_default, channel_draw_qm31s, channel_mix_felt,
+        channel_mix_secure_field, channel_mix_u64,
     };
     use crate::field::{
-        QM31, log2_ceil, next_power_of_two,
-        evaluate_mle_eq_dot_partial,
-        extract_m31_from_packed,
-        pack_qm31_to_felt, unpack_qm31_from_felt,
-        qm31_zero, qm31_add,
-    };
-    use crate::channel::{
-        PoseidonChannel,
-        channel_default, channel_mix_u64, channel_mix_felt,
-        channel_draw_qm31s, channel_mix_secure_field,
+        QM31, evaluate_mle_eq_dot_partial, extract_m31_from_packed, log2_ceil, next_power_of_two,
+        pack_qm31_to_felt, qm31_add, qm31_zero, unpack_qm31_from_felt,
     };
     use crate::model_verifier::{
-        verify_gkr_layers_batch, WeightClaimData,
-        reader_new as mv_reader_new, read_u32 as mv_read_u32,
-        read_qm31 as mv_read_qm31, dispatch_matmul as mv_dispatch_matmul,
+        WeightClaimData, dispatch_matmul as mv_dispatch_matmul, read_qm31 as mv_read_qm31,
+        read_u32 as mv_read_u32, reader_new as mv_reader_new, verify_gkr_layers_batch,
     };
-    use crate::aggregated_binding::{
-        verify_aggregated_binding, deserialize_binding_proof_packed,
-    };
-    use super::PackedDigest;
-    use starknet::storage::{
-        StoragePointerReadAccess, StoragePointerWriteAccess, Map, StoragePathEntry,
-    };
-    use starknet::{ClassHash, ContractAddress, get_caller_address, get_block_timestamp};
+    use super::{GKRClaim, MleOpeningProof, PackedDigest, UPGRADE_DELAY};
 
     #[storage]
     struct Storage {
@@ -447,7 +425,8 @@ mod SumcheckVerifierContract {
         // Audit/Access/ViewKey storage stripped for lean v18b deploy.
         // Storage slots preserved on-chain. Will be restored in next version.
 
-        // ─── Chunked GKR Session Storage ─────────────────────────────────
+        // ─── Chunked GKR Session Storage
+        // ─────────────────────────────────
         /// Next session ID (incremented on each open_gkr_session call).
         next_session_id: u64,
         /// session_id → session metadata.
@@ -475,8 +454,8 @@ mod SumcheckVerifierContract {
         session_verify_fed_total: Map<u64, u32>,
         /// session_id → number of chunks fed for verification (v24+).
         session_verify_chunks_fed: Map<u64, u32>,
-
-        // ─── Streaming GKR Verification State (v25) ─────────────────────
+        // ─── Streaming GKR Verification State (v25)
+        // ─────────────────────
         // Checkpoint state between streaming TXs (~28 felts per TX).
         // Each streaming session processes layers in batches via calldata,
         // storing only intermediate verification state (no proof data).
@@ -509,7 +488,6 @@ mod SumcheckVerifierContract {
         stream_total_layers: Map<u64, u32>,
         /// session_id → circuit_depth for Fiat-Shamir seeding.
         stream_circuit_depth: Map<u64, u32>,
-
         // ─── Streaming IO metadata (for input MLE check in finalize) ────
         /// session_id → packed_raw_io stored for finalize input MLE evaluation.
         /// (session_id, felt_idx) → packed felt252 value.
@@ -576,14 +554,14 @@ mod SumcheckVerifierContract {
         stream_new_tokens: Map<u64, u32>,
         /// session_id → whether to validate decode chain continuity.
         stream_decode_chain_validate: Map<u64, bool>,
-
-        // ─── Policy binding ─────────────────────────────────────────────
+        // ─── Policy binding
+        // ─────────────────────────────────────────────
         /// model_id → registered policy commitment hash (0 = no policy, permissive).
         model_policy_hash: Map<felt252, felt252>,
         /// session_id → policy commitment bound to this streaming session.
         stream_policy_hash: Map<u64, felt252>,
-
-        // ─── Chunked weight binding ────────────────────────────────────
+        // ─── Chunked weight binding
+        // ────────────────────────────────────
         /// session_id → total chunks expected for weight binding.
         stream_wb_total_chunks: Map<u64, u32>,
         /// session_id → chunks received so far.
@@ -753,9 +731,7 @@ mod SumcheckVerifierContract {
 
     #[abi(embed_v0)]
     impl SumcheckVerifierImpl of super::ISumcheckVerifier<ContractState> {
-        fn register_model(
-            ref self: ContractState, model_id: felt252, weight_commitment: felt252,
-        ) {
+        fn register_model(ref self: ContractState, model_id: felt252, weight_commitment: felt252) {
             let existing = self.model_commitments.entry(model_id).read();
             assert!(existing == 0, "Model already registered");
             assert!(weight_commitment != 0, "Commitment cannot be zero");
@@ -798,13 +774,10 @@ mod SumcheckVerifierContract {
             ref self: ContractState, proof_hash: felt252, vm31_public_hash: PackedDigest,
         ) {
             assert!(get_caller_address() == self.vm31_binder.read(), "Only vm31 binder");
-            assert!(
-                self.verified_proofs.entry(proof_hash).read(),
-                "Proof hash not verified"
-            );
+            assert!(self.verified_proofs.entry(proof_hash).read(), "Proof hash not verified");
             assert!(
                 !self.vm31_public_hash_set.entry(proof_hash).read(),
-                "VM31 public hash already bound"
+                "VM31 public hash already bound",
             );
             self.vm31_public_hash.entry(proof_hash).write(vm31_public_hash);
             self.vm31_public_hash_set.entry(proof_hash).write(true);
@@ -812,8 +785,7 @@ mod SumcheckVerifierContract {
 
         fn get_vm31_public_hash(self: @ContractState, proof_hash: felt252) -> PackedDigest {
             assert!(
-                self.vm31_public_hash_set.entry(proof_hash).read(),
-                "VM31 public hash not bound"
+                self.vm31_public_hash_set.entry(proof_hash).read(), "VM31 public hash not bound",
             );
             self.vm31_public_hash.entry(proof_hash).read()
         }
@@ -845,9 +817,12 @@ mod SumcheckVerifierContract {
             self.pending_upgrade.write(new_class_hash);
             self.upgrade_proposed_at.write(now);
 
-            self.emit(UpgradeProposed {
-                new_class_hash, proposed_at: now, proposer: get_caller_address(),
-            });
+            self
+                .emit(
+                    UpgradeProposed {
+                        new_class_hash, proposed_at: now, proposer: get_caller_address(),
+                    },
+                );
         }
 
         fn execute_upgrade(ref self: ContractState) {
@@ -865,9 +840,10 @@ mod SumcheckVerifierContract {
             self.upgrade_proposed_at.write(0);
 
             let executed_at = now;
-            self.emit(UpgradeExecuted {
-                new_class_hash, executed_at, executor: get_caller_address(),
-            });
+            self
+                .emit(
+                    UpgradeExecuted { new_class_hash, executed_at, executor: get_caller_address() },
+                );
 
             starknet::syscalls::replace_class_syscall(new_class_hash).unwrap();
         }
@@ -881,9 +857,12 @@ mod SumcheckVerifierContract {
             self.pending_upgrade.write(0.try_into().unwrap());
             self.upgrade_proposed_at.write(0);
 
-            self.emit(UpgradeCancelled {
-                cancelled_class_hash: pending, cancelled_by: get_caller_address(),
-            });
+            self
+                .emit(
+                    UpgradeCancelled {
+                        cancelled_class_hash: pending, cancelled_by: get_caller_address(),
+                    },
+                );
         }
 
         fn get_pending_upgrade(self: @ContractState) -> (ClassHash, u64) {
@@ -916,7 +895,7 @@ mod SumcheckVerifierContract {
                 self.model_gkr_weights.entry((model_id, i)).write(root);
                 weight_hash_input.append(root);
                 i += 1;
-            };
+            }
             // Single aggregate hash: saves N-1 storage reads during verification
             let weight_root_hash = core::poseidon::poseidon_hash_span(weight_hash_input.span());
             self.model_weight_root_hash.entry(model_id).write(weight_root_hash);
@@ -931,21 +910,23 @@ mod SumcheckVerifierContract {
                 let v: felt252 = (*circuit_descriptor.at(j)).into();
                 desc_felts.append(v);
                 j += 1;
-            };
+            }
             let circuit_hash = core::poseidon::poseidon_hash_span(desc_felts.span());
             self.model_circuit_hash.entry(model_id).write(circuit_hash);
 
-            self.emit(ModelGkrRegistered {
-                model_id, num_weight_commitments: num_weights, circuit_hash,
-                registrar: get_caller_address(),
-            });
+            self
+                .emit(
+                    ModelGkrRegistered {
+                        model_id,
+                        num_weight_commitments: num_weights,
+                        circuit_hash,
+                        registrar: get_caller_address(),
+                    },
+                );
         }
 
         fn register_model_gkr_streaming_circuit(
-            ref self: ContractState,
-            model_id: felt252,
-            circuit_depth: u32,
-            layer_tags: Array<u32>,
+            ref self: ContractState, model_id: felt252, circuit_depth: u32, layer_tags: Array<u32>,
         ) {
             assert!(get_caller_address() == self.owner.read(), "Only owner");
             // Model must already be registered for GKR (weights exist)
@@ -960,11 +941,9 @@ mod SumcheckVerifierContract {
                     break;
                 }
                 let tag_felt: felt252 = (*layer_tags.at(i)).into();
-                tags_hash = core::poseidon::poseidon_hash_span(
-                    array![tags_hash, tag_felt].span(),
-                );
+                tags_hash = core::poseidon::poseidon_hash_span(array![tags_hash, tag_felt].span());
                 i += 1;
-            };
+            }
             // Final circuit hash: poseidon(circuit_depth, tags_hash)
             let streaming_circuit_hash = core::poseidon::poseidon_hash_span(
                 array![circuit_depth.into(), tags_hash].span(),
@@ -980,11 +959,7 @@ mod SumcheckVerifierContract {
         /// (computed off-chain by the Rust prover). When registered (non-zero),
         /// streaming verification requires the submitted policy to match.
         /// Decode chain validation becomes automatically enforced for KV sessions.
-        fn register_model_policy(
-            ref self: ContractState,
-            model_id: felt252,
-            policy_hash: felt252,
-        ) {
+        fn register_model_policy(ref self: ContractState, model_id: felt252, policy_hash: felt252) {
             assert!(get_caller_address() == self.owner.read(), "Only owner");
             // Model must be registered (GKR or legacy)
             let has_gkr = self.model_circuit_hash.entry(model_id).read() != 0;
@@ -992,11 +967,12 @@ mod SumcheckVerifierContract {
             assert!(has_gkr || has_simple, "MODEL_NOT_REGISTERED");
 
             self.model_policy_hash.entry(model_id).write(policy_hash);
-            self.emit(ModelPolicyRegistered {
-                model_id,
-                policy_hash,
-                registrar: get_caller_address(),
-            });
+            self
+                .emit(
+                    ModelPolicyRegistered {
+                        model_id, policy_hash, registrar: get_caller_address(),
+                    },
+                );
         }
 
         fn get_model_policy(self: @ContractState, model_id: felt252) -> felt252 {
@@ -1004,7 +980,8 @@ mod SumcheckVerifierContract {
         }
 
         // ─── Legacy single-TX entrypoints stubbed for lean v20 deploy ──────
-        // Superseded by streaming verification (v25). Use stream_init → stream_layers → finalize.
+        // Superseded by streaming verification (v25). Use stream_init → stream_layers →
+        // finalize.
         // Storage is preserved across upgrades; these can be restored from git history.
 
         fn verify_model_gkr_v4_packed_io(
@@ -1110,18 +1087,13 @@ mod SumcheckVerifierContract {
             self.session_sealed.entry(session_id).write(false);
             self.session_chunks_uploaded.entry(session_id).write(0);
 
-            self.emit(GkrSessionOpened {
-                session_id, caller, model_id, total_felts,
-            });
+            self.emit(GkrSessionOpened { session_id, caller, model_id, total_felts });
 
             session_id
         }
 
         fn upload_gkr_chunk(
-            ref self: ContractState,
-            session_id: u64,
-            chunk_idx: u32,
-            chunk_data: Array<felt252>,
+            ref self: ContractState, session_id: u64, chunk_idx: u32, chunk_data: Array<felt252>,
         ) {
             // Still needed by streaming flow for hash commitment
             let caller = get_caller_address();
@@ -1162,7 +1134,7 @@ mod SumcheckVerifierContract {
                 }
                 actual_total += self.session_chunk_len.entry((session_id, c)).read();
                 c += 1;
-            };
+            }
             assert!(actual_total == expected_total, "TOTAL_FELTS_MISMATCH");
 
             self.session_sealed.entry(session_id).write(true);
@@ -1175,13 +1147,11 @@ mod SumcheckVerifierContract {
             panic!("USE_STREAMING_V25")
         }
 
-        // ─── Two-Phase Verification (stubbed for lean v20) ───────────────
+        // ─── Two-Phase Verification (stubbed for lean v20)
+        // ───────────────
 
         fn verify_gkr_feed_chunk(
-            ref self: ContractState,
-            session_id: u64,
-            chunk_idx: u32,
-            chunk_data: Array<felt252>,
+            ref self: ContractState, session_id: u64, chunk_idx: u32, chunk_data: Array<felt252>,
         ) {
             panic!("USE_STREAMING_V25")
         }
@@ -1190,7 +1160,8 @@ mod SumcheckVerifierContract {
             panic!("USE_STREAMING_V25")
         }
 
-        // ─── Streaming GKR Verification (v25) ───────────────────────────
+        // ─── Streaming GKR Verification (v25)
+        // ───────────────────────────
 
         fn verify_gkr_stream_init(
             ref self: ContractState,
@@ -1214,7 +1185,9 @@ mod SumcheckVerifierContract {
             let caller = get_caller_address();
             let owner = self.session_owner.entry(session_id).read();
             assert!(caller == owner, "NOT_SESSION_OWNER");
-            assert!(!self.stream_initialized.entry(session_id).read(), "STREAM_ALREADY_INITIALIZED");
+            assert!(
+                !self.stream_initialized.entry(session_id).read(), "STREAM_ALREADY_INITIALIZED",
+            );
 
             // Policy validation: if model has a registered policy, submitted hash must match.
             let model_id = self.session_model_id.entry(session_id).read();
@@ -1232,7 +1205,7 @@ mod SumcheckVerifierContract {
                 }
                 commitment_input.append(*packed_raw_io.at(ci));
                 ci += 1;
-            };
+            }
             let io_commitment = core::poseidon::poseidon_hash_span(commitment_input.span());
 
             // Validate dimensions against packed data
@@ -1336,7 +1309,9 @@ mod SumcheckVerifierContract {
             is_last_chunk: bool,
         ) {
             assert!(self.stream_initialized.entry(session_id).read(), "STREAM_NOT_INITIALIZED");
-            assert!(!self.stream_output_mle_done.entry(session_id).read(), "OUTPUT_MLE_ALREADY_DONE");
+            assert!(
+                !self.stream_output_mle_done.entry(session_id).read(), "OUTPUT_MLE_ALREADY_DONE",
+            );
             let caller = get_caller_address();
             let owner = self.session_owner.entry(session_id).read();
             assert!(caller == owner, "NOT_SESSION_OWNER");
@@ -1368,16 +1343,18 @@ mod SumcheckVerifierContract {
                     if ri >= n_vars {
                         break;
                     }
-                    self.stream_output_mle_r_point.entry((session_id, ri)).write(
-                        pack_qm31_to_felt(*r_out.at(ri)),
-                    );
+                    self
+                        .stream_output_mle_r_point
+                        .entry((session_id, ri))
+                        .write(pack_qm31_to_felt(*r_out.at(ri)));
                     ri += 1;
-                };
+                }
 
                 // Initialize partial sum to zero
-                self.stream_output_mle_partial_sum.entry(session_id).write(
-                    pack_qm31_to_felt(qm31_zero()),
-                );
+                self
+                    .stream_output_mle_partial_sum
+                    .entry(session_id)
+                    .write(pack_qm31_to_felt(qm31_zero()));
 
                 r_out
             } else {
@@ -1390,20 +1367,23 @@ mod SumcheckVerifierContract {
                     if ri >= n_vars {
                         break;
                     }
-                    r_out.append(unpack_qm31_from_felt(
-                        self.stream_output_mle_r_point.entry((session_id, ri)).read(),
-                    ));
+                    r_out
+                        .append(
+                            unpack_qm31_from_felt(
+                                self.stream_output_mle_r_point.entry((session_id, ri)).read(),
+                            ),
+                        );
                     ri += 1;
-                };
+                }
                 r_out
             };
 
             // Compute partial sum for this chunk using eq-table dot product
             let partial = evaluate_mle_eq_dot_partial(
                 packed_output_data.span(),
-                0,              // m31_start within this chunk's packed data
+                0, // m31_start within this chunk's packed data
                 chunk_len,
-                chunk_offset,   // global offset in padded output
+                chunk_offset, // global offset in padded output
                 padded_out_cols,
                 r_out.span(),
             );
@@ -1413,9 +1393,7 @@ mod SumcheckVerifierContract {
                 self.stream_output_mle_partial_sum.entry(session_id).read(),
             );
             let new_sum = qm31_add(prev_sum, partial);
-            self.stream_output_mle_partial_sum.entry(session_id).write(
-                pack_qm31_to_felt(new_sum),
-            );
+            self.stream_output_mle_partial_sum.entry(session_id).write(pack_qm31_to_felt(new_sum));
             self.stream_output_mle_chunks_done.entry(session_id).write(chunks_done + 1);
 
             // Last chunk: finalize — mix output value into channel and store initial claim
@@ -1434,9 +1412,10 @@ mod SumcheckVerifierContract {
                 let initial_claim = GKRClaim { point: r_out, value: output_value };
                 self.stream_channel_digest.entry(session_id).write(ch.digest);
                 self.stream_channel_counter.entry(session_id).write(ch.n_draws);
-                self.stream_claim_value.entry(session_id).write(
-                    pack_qm31_to_felt(initial_claim.value),
-                );
+                self
+                    .stream_claim_value
+                    .entry(session_id)
+                    .write(pack_qm31_to_felt(initial_claim.value));
                 let point_len = initial_claim.point.len();
                 self.stream_claim_point_len.entry(session_id).write(point_len);
                 let mut pi: u32 = 0;
@@ -1444,11 +1423,12 @@ mod SumcheckVerifierContract {
                     if pi >= point_len {
                         break;
                     }
-                    self.stream_claim_point.entry((session_id, pi)).write(
-                        pack_qm31_to_felt(*initial_claim.point.at(pi)),
-                    );
+                    self
+                        .stream_claim_point
+                        .entry((session_id, pi))
+                        .write(pack_qm31_to_felt(*initial_claim.point.at(pi)));
                     pi += 1;
-                };
+                }
 
                 self.stream_output_mle_done.entry(session_id).write(true);
             }
@@ -1493,13 +1473,14 @@ mod SumcheckVerifierContract {
                 if pi >= point_len {
                     break;
                 }
-                point.append(
-                    unpack_qm31_from_felt(
-                        self.stream_claim_point.entry((session_id, pi)).read(),
-                    ),
-                );
+                point
+                    .append(
+                        unpack_qm31_from_felt(
+                            self.stream_claim_point.entry((session_id, pi)).read(),
+                        ),
+                    );
                 pi += 1;
-            };
+            }
 
             let claim_value = unpack_qm31_from_felt(
                 self.stream_claim_value.entry(session_id).read(),
@@ -1527,9 +1508,10 @@ mod SumcheckVerifierContract {
             // Save updated checkpoint state
             self.stream_channel_digest.entry(session_id).write(ch.digest);
             self.stream_channel_counter.entry(session_id).write(ch.n_draws);
-            self.stream_claim_value.entry(session_id).write(
-                pack_qm31_to_felt(result.next_claim.value),
-            );
+            self
+                .stream_claim_value
+                .entry(session_id)
+                .write(pack_qm31_to_felt(result.next_claim.value));
             let old_point_len = point_len;
             let new_point_len = result.next_claim.point.len();
             self.stream_claim_point_len.entry(session_id).write(new_point_len);
@@ -1538,11 +1520,12 @@ mod SumcheckVerifierContract {
                 if pi >= new_point_len {
                     break;
                 }
-                self.stream_claim_point.entry((session_id, pi)).write(
-                    pack_qm31_to_felt(*result.next_claim.point.at(pi)),
-                );
+                self
+                    .stream_claim_point
+                    .entry((session_id, pi))
+                    .write(pack_qm31_to_felt(*result.next_claim.point.at(pi)));
                 pi += 1;
-            };
+            }
             // Clear stale claim point entries if the point shrank
             loop {
                 if pi >= old_point_len {
@@ -1550,7 +1533,7 @@ mod SumcheckVerifierContract {
                 }
                 self.stream_claim_point.entry((session_id, pi)).write(0);
                 pi += 1;
-            };
+            }
 
             self.stream_weight_hash.entry(session_id).write(result.weight_hash);
             self.stream_tags_hash.entry(session_id).write(result.tags_hash);
@@ -1572,24 +1555,26 @@ mod SumcheckVerifierContract {
                     if ci >= pt_len {
                         break;
                     }
-                    self.stream_deferred_point.entry((session_id, deferred_base, ci)).write(
-                        pack_qm31_to_felt(*pt.at(ci)),
-                    );
+                    self
+                        .stream_deferred_point
+                        .entry((session_id, deferred_base, ci))
+                        .write(pack_qm31_to_felt(*pt.at(ci)));
                     ci += 1;
-                };
+                }
                 deferred_base += 1;
                 di += 1;
-            };
+            }
             self.stream_deferred_count.entry(session_id).write(deferred_base);
 
             let new_layers_verified = layers_so_far + num_layers_in_batch;
             self.stream_layers_verified.entry(session_id).write(new_layers_verified);
 
-            self.emit(GkrStreamProgress {
-                session_id,
-                layers_verified: new_layers_verified,
-                total_layers,
-            });
+            self
+                .emit(
+                    GkrStreamProgress {
+                        session_id, layers_verified: new_layers_verified, total_layers,
+                    },
+                );
         }
 
         fn verify_gkr_stream_weight_binding(
@@ -1605,7 +1590,10 @@ mod SumcheckVerifierContract {
         ) {
             assert!(self.stream_initialized.entry(session_id).read(), "STREAM_NOT_INITIALIZED");
             assert!(!self.stream_finalized.entry(session_id).read(), "STREAM_ALREADY_FINALIZED");
-            assert!(!self.stream_weight_binding_done.entry(session_id).read(), "WEIGHT_BINDING_ALREADY_DONE");
+            assert!(
+                !self.stream_weight_binding_done.entry(session_id).read(),
+                "WEIGHT_BINDING_ALREADY_DONE",
+            );
             let caller = get_caller_address();
             let owner = self.session_owner.entry(session_id).read();
             assert!(caller == owner, "NOT_SESSION_OWNER");
@@ -1649,11 +1637,12 @@ mod SumcheckVerifierContract {
                 if wi >= expected_weight_count {
                     break;
                 }
-                recomputed_weight_hash = core::poseidon::poseidon_hash_span(
-                    array![recomputed_weight_hash, *weight_expected_values.at(wi)].span(),
-                );
+                recomputed_weight_hash =
+                    core::poseidon::poseidon_hash_span(
+                        array![recomputed_weight_hash, *weight_expected_values.at(wi)].span(),
+                    );
                 wi += 1;
-            };
+            }
             assert!(recomputed_weight_hash == stream_weight_hash, "STREAM_WEIGHT_HASH_MISMATCH");
 
             // ── Deferred proof verification ──
@@ -1684,13 +1673,14 @@ mod SumcheckVerifierContract {
                     if ci >= pt_len {
                         break;
                     }
-                    deferred_point.append(
-                        unpack_qm31_from_felt(
-                            self.stream_deferred_point.entry((session_id, def_idx, ci)).read(),
-                        ),
-                    );
+                    deferred_point
+                        .append(
+                            unpack_qm31_from_felt(
+                                self.stream_deferred_point.entry((session_id, def_idx, ci)).read(),
+                            ),
+                        );
                     ci += 1;
-                };
+                }
                 channel_mix_secure_field(ref ch, claim_value);
                 let dims_base = deferred_dims_idx * 3;
                 assert!(dims_base + 2 < deferred_dims_span.len(), "DEFERRED_DIMS_UNDERRUN");
@@ -1704,14 +1694,13 @@ mod SumcheckVerifierContract {
                 );
                 deferred_weight_evs.append(pack_qm31_to_felt(final_b_eval));
                 def_idx += 1;
-            };
+            }
 
             // ── Weight commitment verification ──
             let registered_weight_count = self.model_gkr_weight_count.entry(model_id).read();
             let total_weight_count = stream_weight_count + num_deferred;
             assert!(
-                total_weight_count == registered_weight_count,
-                "STREAM_WEIGHT_COUNT_VS_REGISTERED",
+                total_weight_count == registered_weight_count, "STREAM_WEIGHT_COUNT_VS_REGISTERED",
             );
 
             // ── Weight binding (Mode 4: aggregated binding proof, packed QM31) ──
@@ -1729,7 +1718,7 @@ mod SumcheckVerifierContract {
                 }
                 registered_weights.append(self.model_gkr_weights.entry((model_id, wi2)).read());
                 wi2 += 1;
-            };
+            }
 
             // Build WeightClaimData array from expected values + eval points
             let mut all_weight_claims: Array<WeightClaimData> = array![];
@@ -1758,13 +1747,10 @@ mod SumcheckVerifierContract {
                     eval_point.append(unpack_qm31_from_felt(*eval_pts_span.at(ep_offset)));
                     ep_offset += 1;
                     pi += 1;
-                };
-                all_weight_claims.append(WeightClaimData {
-                    eval_point,
-                    expected_value: ev,
-                });
+                }
+                all_weight_claims.append(WeightClaimData { eval_point, expected_value: ev });
                 claim_i += 1;
-            };
+            }
 
             // Parse deferred eval points and combine with deferred weight evals
             let def_ep_span = deferred_eval_points.span();
@@ -1794,13 +1780,10 @@ mod SumcheckVerifierContract {
                     eval_point.append(unpack_qm31_from_felt(*def_ep_span.at(dep_offset)));
                     dep_offset += 1;
                     pi += 1;
-                };
-                all_weight_claims.append(WeightClaimData {
-                    eval_point,
-                    expected_value: ev,
-                });
+                }
+                all_weight_claims.append(WeightClaimData { eval_point, expected_value: ev });
                 def_wi += 1;
-            };
+            }
 
             // Deserialize aggregated binding proof from packed QM31 format
             let mut weight_binding_span = weight_binding_data.span();
@@ -1808,10 +1791,7 @@ mod SumcheckVerifierContract {
 
             // Verify aggregated binding against registered weight commitments
             let binding_ok = verify_aggregated_binding(
-                @binding_proof,
-                all_weight_claims.span(),
-                registered_weights.span(),
-                ref ch,
+                @binding_proof, all_weight_claims.span(), registered_weights.span(), ref ch,
             );
             assert!(binding_ok, "STREAM_AGGREGATED_BINDING_FAILED");
 
@@ -1836,7 +1816,10 @@ mod SumcheckVerifierContract {
         ) {
             assert!(self.stream_initialized.entry(session_id).read(), "STREAM_NOT_INITIALIZED");
             assert!(!self.stream_finalized.entry(session_id).read(), "STREAM_ALREADY_FINALIZED");
-            assert!(!self.stream_weight_binding_done.entry(session_id).read(), "WEIGHT_BINDING_ALREADY_DONE");
+            assert!(
+                !self.stream_weight_binding_done.entry(session_id).read(),
+                "WEIGHT_BINDING_ALREADY_DONE",
+            );
             let caller = get_caller_address();
             let owner = self.session_owner.entry(session_id).read();
             assert!(caller == owner, "NOT_SESSION_OWNER");
@@ -1864,9 +1847,12 @@ mod SumcheckVerifierContract {
                 if fi >= chunk_len {
                     break;
                 }
-                self.stream_wb_chunk_data.entry((session_id, chunk_idx, fi)).write(*chunk_data.at(fi));
+                self
+                    .stream_wb_chunk_data
+                    .entry((session_id, chunk_idx, fi))
+                    .write(*chunk_data.at(fi));
                 fi += 1;
-            };
+            }
             self.stream_wb_chunks_received.entry(session_id).write(chunks_received + 1);
 
             // If this is the last chunk, reconstruct full calldata and verify
@@ -1884,13 +1870,12 @@ mod SumcheckVerifierContract {
                         if fj >= cl {
                             break;
                         }
-                        full_calldata.append(
-                            self.stream_wb_chunk_data.entry((session_id, ci, fj)).read()
-                        );
+                        full_calldata
+                            .append(self.stream_wb_chunk_data.entry((session_id, ci, fj)).read());
                         fj += 1;
-                    };
+                    }
                     ci += 1;
-                };
+                }
 
                 // Parse the reconstructed calldata into the expected format
                 // Format: [weight_expected_values_len, ...values,
@@ -1903,49 +1888,99 @@ mod SumcheckVerifierContract {
                 let fc = full_calldata.span();
                 let mut off: u32 = 0;
 
-                let wev_len: u32 = (*fc.at(off)).try_into().unwrap(); off += 1;
+                let wev_len: u32 = (*fc.at(off)).try_into().unwrap();
+                off += 1;
                 let mut weight_expected_values: Array<felt252> = array![];
                 let mut i: u32 = 0;
-                loop { if i >= wev_len { break; } weight_expected_values.append(*fc.at(off)); off += 1; i += 1; };
+                loop {
+                    if i >= wev_len {
+                        break;
+                    }
+                    weight_expected_values.append(*fc.at(off));
+                    off += 1;
+                    i += 1;
+                }
 
-                let wep_len: u32 = (*fc.at(off)).try_into().unwrap(); off += 1;
+                let wep_len: u32 = (*fc.at(off)).try_into().unwrap();
+                off += 1;
                 let mut weight_eval_points: Array<felt252> = array![];
                 i = 0;
-                loop { if i >= wep_len { break; } weight_eval_points.append(*fc.at(off)); off += 1; i += 1; };
+                loop {
+                    if i >= wep_len {
+                        break;
+                    }
+                    weight_eval_points.append(*fc.at(off));
+                    off += 1;
+                    i += 1;
+                }
 
-                let dep_len: u32 = (*fc.at(off)).try_into().unwrap(); off += 1;
+                let dep_len: u32 = (*fc.at(off)).try_into().unwrap();
+                off += 1;
                 let mut deferred_eval_points: Array<felt252> = array![];
                 i = 0;
-                loop { if i >= dep_len { break; } deferred_eval_points.append(*fc.at(off)); off += 1; i += 1; };
+                loop {
+                    if i >= dep_len {
+                        break;
+                    }
+                    deferred_eval_points.append(*fc.at(off));
+                    off += 1;
+                    i += 1;
+                }
 
-                let weight_binding_mode: u32 = (*fc.at(off)).try_into().unwrap(); off += 1;
+                let weight_binding_mode: u32 = (*fc.at(off)).try_into().unwrap();
+                off += 1;
 
-                let wbd_len: u32 = (*fc.at(off)).try_into().unwrap(); off += 1;
+                let wbd_len: u32 = (*fc.at(off)).try_into().unwrap();
+                off += 1;
                 let mut weight_binding_data: Array<felt252> = array![];
                 i = 0;
-                loop { if i >= wbd_len { break; } weight_binding_data.append(*fc.at(off)); off += 1; i += 1; };
+                loop {
+                    if i >= wbd_len {
+                        break;
+                    }
+                    weight_binding_data.append(*fc.at(off));
+                    off += 1;
+                    i += 1;
+                }
 
-                let dpd_len: u32 = (*fc.at(off)).try_into().unwrap(); off += 1;
+                let dpd_len: u32 = (*fc.at(off)).try_into().unwrap();
+                off += 1;
                 let mut deferred_proof_data: Array<felt252> = array![];
                 i = 0;
-                loop { if i >= dpd_len { break; } deferred_proof_data.append(*fc.at(off)); off += 1; i += 1; };
+                loop {
+                    if i >= dpd_len {
+                        break;
+                    }
+                    deferred_proof_data.append(*fc.at(off));
+                    off += 1;
+                    i += 1;
+                }
 
-                let dmd_len: u32 = (*fc.at(off)).try_into().unwrap(); off += 1;
+                let dmd_len: u32 = (*fc.at(off)).try_into().unwrap();
+                off += 1;
                 let mut deferred_matmul_dims: Array<u32> = array![];
                 i = 0;
-                loop { if i >= dmd_len { break; } deferred_matmul_dims.append((*fc.at(off)).try_into().unwrap()); off += 1; i += 1; };
+                loop {
+                    if i >= dmd_len {
+                        break;
+                    }
+                    deferred_matmul_dims.append((*fc.at(off)).try_into().unwrap());
+                    off += 1;
+                    i += 1;
+                }
 
                 // Call the existing verification logic
-                self.verify_gkr_stream_weight_binding(
-                    session_id,
-                    weight_expected_values,
-                    weight_eval_points,
-                    deferred_eval_points,
-                    weight_binding_mode,
-                    weight_binding_data,
-                    deferred_proof_data,
-                    deferred_matmul_dims,
-                );
+                self
+                    .verify_gkr_stream_weight_binding(
+                        session_id,
+                        weight_expected_values,
+                        weight_eval_points,
+                        deferred_eval_points,
+                        weight_binding_mode,
+                        weight_binding_data,
+                        deferred_proof_data,
+                        deferred_matmul_dims,
+                    );
             }
         }
 
@@ -1960,7 +1995,9 @@ mod SumcheckVerifierContract {
             assert!(self.stream_initialized.entry(session_id).read(), "STREAM_NOT_INITIALIZED");
             assert!(!self.stream_finalized.entry(session_id).read(), "STREAM_ALREADY_FINALIZED");
             assert!(!self.stream_input_mle_done.entry(session_id).read(), "INPUT_MLE_ALREADY_DONE");
-            assert!(self.stream_weight_binding_done.entry(session_id).read(), "WEIGHT_BINDING_NOT_DONE");
+            assert!(
+                self.stream_weight_binding_done.entry(session_id).read(), "WEIGHT_BINDING_NOT_DONE",
+            );
             let caller = get_caller_address();
             let owner = self.session_owner.entry(session_id).read();
             assert!(caller == owner, "NOT_SESSION_OWNER");
@@ -1986,7 +2023,7 @@ mod SumcheckVerifierContract {
                     );
                     r_in.append(rp);
                     pi += 1;
-                };
+                }
 
                 // Store r-points for subsequent chunk TXs
                 self.stream_input_mle_r_count.entry(session_id).write(n_vars);
@@ -1995,16 +2032,18 @@ mod SumcheckVerifierContract {
                     if ri >= n_vars {
                         break;
                     }
-                    self.stream_input_mle_r_point.entry((session_id, ri)).write(
-                        pack_qm31_to_felt(*r_in.at(ri)),
-                    );
+                    self
+                        .stream_input_mle_r_point
+                        .entry((session_id, ri))
+                        .write(pack_qm31_to_felt(*r_in.at(ri)));
                     ri += 1;
-                };
+                }
 
                 // Initialize partial sum to zero
-                self.stream_input_mle_partial_sum.entry(session_id).write(
-                    pack_qm31_to_felt(qm31_zero()),
-                );
+                self
+                    .stream_input_mle_partial_sum
+                    .entry(session_id)
+                    .write(pack_qm31_to_felt(qm31_zero()));
 
                 r_in
             } else {
@@ -2016,11 +2055,14 @@ mod SumcheckVerifierContract {
                     if ri >= stored_n {
                         break;
                     }
-                    r_in.append(unpack_qm31_from_felt(
-                        self.stream_input_mle_r_point.entry((session_id, ri)).read(),
-                    ));
+                    r_in
+                        .append(
+                            unpack_qm31_from_felt(
+                                self.stream_input_mle_r_point.entry((session_id, ri)).read(),
+                            ),
+                        );
                     ri += 1;
-                };
+                }
                 r_in
             };
 
@@ -2029,12 +2071,7 @@ mod SumcheckVerifierContract {
             let padded_in_cols = next_power_of_two(in_cols);
 
             let partial = evaluate_mle_eq_dot_partial(
-                packed_input_data.span(),
-                0,
-                chunk_len,
-                chunk_offset,
-                padded_in_cols,
-                r_in.span(),
+                packed_input_data.span(), 0, chunk_len, chunk_offset, padded_in_cols, r_in.span(),
             );
 
             // Accumulate
@@ -2042,27 +2079,22 @@ mod SumcheckVerifierContract {
                 self.stream_input_mle_partial_sum.entry(session_id).read(),
             );
             let new_sum = qm31_add(prev_sum, partial);
-            self.stream_input_mle_partial_sum.entry(session_id).write(
-                pack_qm31_to_felt(new_sum),
-            );
+            self.stream_input_mle_partial_sum.entry(session_id).write(pack_qm31_to_felt(new_sum));
             self.stream_input_mle_chunks_done.entry(session_id).write(chunks_done + 1);
 
             if is_last_chunk {
-                self.stream_input_mle_value.entry(session_id).write(
-                    pack_qm31_to_felt(new_sum),
-                );
+                self.stream_input_mle_value.entry(session_id).write(pack_qm31_to_felt(new_sum));
                 self.stream_input_mle_done.entry(session_id).write(true);
             }
         }
 
-        fn verify_gkr_stream_finalize(
-            ref self: ContractState,
-            session_id: u64,
-        ) -> bool {
+        fn verify_gkr_stream_finalize(ref self: ContractState, session_id: u64) -> bool {
             assert!(self.stream_initialized.entry(session_id).read(), "STREAM_NOT_INITIALIZED");
             assert!(!self.stream_finalized.entry(session_id).read(), "STREAM_ALREADY_FINALIZED");
             assert!(self.stream_input_mle_done.entry(session_id).read(), "INPUT_MLE_NOT_DONE");
-            assert!(self.stream_weight_binding_done.entry(session_id).read(), "WEIGHT_BINDING_NOT_DONE");
+            assert!(
+                self.stream_weight_binding_done.entry(session_id).read(), "WEIGHT_BINDING_NOT_DONE",
+            );
             let caller = get_caller_address();
             let owner = self.session_owner.entry(session_id).read();
             assert!(caller == owner, "NOT_SESSION_OWNER");
@@ -2080,10 +2112,7 @@ mod SumcheckVerifierContract {
             );
 
             // Verify input MLE matches final GKR claim
-            assert!(
-                crate::field::qm31_eq(input_value, final_value),
-                "STREAM_INPUT_CLAIM_MISMATCH",
-            );
+            assert!(crate::field::qm31_eq(input_value, final_value), "STREAM_INPUT_CLAIM_MISMATCH");
 
             // Compute proof hash using channel state after weight binding.
             // Backward-compatible: only include KV commitment when present.
@@ -2097,17 +2126,26 @@ mod SumcheckVerifierContract {
             let proof_hash = if has_kv {
                 if policy != 0 {
                     core::poseidon::poseidon_hash_span(
-                        array![ch_digest, stored_io_commitment, model_id, num_layers.into(), stored_kv, stored_prev_kv, policy].span(),
+                        array![
+                            ch_digest, stored_io_commitment, model_id, num_layers.into(), stored_kv,
+                            stored_prev_kv, policy,
+                        ]
+                            .span(),
                     )
                 } else {
                     core::poseidon::poseidon_hash_span(
-                        array![ch_digest, stored_io_commitment, model_id, num_layers.into(), stored_kv, stored_prev_kv].span(),
+                        array![
+                            ch_digest, stored_io_commitment, model_id, num_layers.into(), stored_kv,
+                            stored_prev_kv,
+                        ]
+                            .span(),
                     )
                 }
             } else {
                 if policy != 0 {
                     core::poseidon::poseidon_hash_span(
-                        array![ch_digest, stored_io_commitment, model_id, num_layers.into(), policy].span(),
+                        array![ch_digest, stored_io_commitment, model_id, num_layers.into(), policy]
+                            .span(),
                     )
                 } else {
                     core::poseidon::poseidon_hash_span(
@@ -2147,30 +2185,33 @@ mod SumcheckVerifierContract {
             self.proof_model_id.entry(proof_hash).write(model_id);
             let count = self.verification_counts.entry(model_id).read();
             self.verification_counts.entry(model_id).write(count + 1);
-            self.emit(ModelGkrVerified {
-                model_id,
-                proof_hash,
-                io_commitment: stored_io_commitment,
-                num_layers,
-                kv_cache_commitment: stored_kv,
-                prev_kv_cache_commitment: stored_prev_kv,
-                position_offset,
-                full_seq_len,
-                new_tokens,
-                policy_hash: policy,
-            });
+            self
+                .emit(
+                    ModelGkrVerified {
+                        model_id,
+                        proof_hash,
+                        io_commitment: stored_io_commitment,
+                        num_layers,
+                        kv_cache_commitment: stored_kv,
+                        prev_kv_cache_commitment: stored_prev_kv,
+                        position_offset,
+                        full_seq_len,
+                        new_tokens,
+                        policy_hash: policy,
+                    },
+                );
 
             self.stream_finalized.entry(session_id).write(true);
             self.emit(GkrStreamFinalized { session_id, proof_hash });
             true
         }
     }
-
-    // ─── Audit/Access/ViewKey impls stripped for lean v18b deploy ──────────
-    // Will be restored in next version. Storage is preserved across upgrades.
-    // See git history for full audit/access-control/view-key implementations.
+    // ─── Audit/Access/ViewKey impls stripped for lean v18b deploy
+// ──────────
+// Will be restored in next version. Storage is preserved across upgrades.
+// See git history for full audit/access-control/view-key implementations.
 
     // ─── Private core verification logic (stubbed for lean v20) ────────
-    // Single-TX core functions removed — streaming verification handles all verification.
-    // See git history for full implementations.
+// Single-TX core functions removed — streaming verification handles all verification.
+// See git history for full implementations.
 }

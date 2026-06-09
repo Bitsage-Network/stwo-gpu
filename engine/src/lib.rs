@@ -51,30 +51,31 @@ pub fn is_profile() -> bool {
 
 pub mod aggregation;
 pub mod backend;
+#[cfg(feature = "binary-proof")]
+pub mod binary_serde;
 pub mod cairo_serde;
 pub mod circuits;
 pub mod classifier;
 pub mod compiler;
 pub mod components;
+pub mod conversation_statement;
 pub mod crypto;
+#[cfg(feature = "cli")]
+pub mod economics;
 pub mod gadgets;
 pub mod gkr;
 pub mod gpu;
 pub mod gpu_forward;
 pub mod json_serde;
-pub mod policy;
-pub mod providers;
-pub mod vm;
-#[cfg(feature = "binary-proof")]
-pub mod binary_serde;
 #[cfg(any(feature = "cli", feature = "audit", feature = "server"))]
 pub mod kv_state;
-#[cfg(feature = "cli")]
-pub mod economics;
+pub mod policy;
+pub mod providers;
 pub mod receipt;
-pub mod starknet;
 pub mod recursive;
+pub mod starknet;
 pub mod tee;
+pub mod vm;
 pub mod weight_cache;
 
 #[cfg(any(feature = "cli", feature = "audit", feature = "server"))]
