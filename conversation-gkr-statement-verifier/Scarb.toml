@@ -1,0 +1,13 @@
+[package]
+name = "conversation_gkr_statement_verifier"
+version = "0.1.0"
+edition = "2024_07"
+
+[cairo]
+enable-gas = false
+
+[dependencies]
+cairo_execute = "2.12.2"
+elo_cairo_verifier = { path = "../elo-cairo-verifier" }
+
+[[target.executable]]

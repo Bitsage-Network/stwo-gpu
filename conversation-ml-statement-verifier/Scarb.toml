@@ -1,0 +1,13 @@
+[package]
+name = "conversation_ml_statement_verifier"
+version = "0.1.0"
+edition = "2024_07"
+
+[cairo]
+enable-gas = false
+
+[dependencies]
+cairo_execute = "2.12.2"
+obelysk_ml_air = { path = "../stark-cairo/stwo_cairo_verifier/crates/ml_air" }
+
+[[target.executable]]
